@@ -44,7 +44,8 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package
+      - name: Package (unix)
+        if: matrix.name != 'windows-amd64'
         env:
           NAME: ${{ matrix.name }}
           TARGET: ${{ matrix.target }}
@@ -55,18 +56,27 @@ jobs:
             version="${{ github.event.inputs.tag }}"
             version="${version#v}"
           fi
-          echo "VERSION=$version" >> "$GITHUB_ENV"
           dir="rustograph-${version}-${NAME}"
-          bin="rustograph"
-          [ "$NAME" = "windows-amd64" ] && bin="rustograph.exe"
           mkdir -p "$dir"
-          cp "target/${TARGET}/release/${bin}" "$dir/"
+          cp "target/${TARGET}/release/rustograph" "$dir/"
           cp LICENSE README.md "$dir/"
-          if [ "$NAME" = "windows-amd64" ]; then
-            zip -qr "rustograph-${version}-${NAME}.zip" "$dir"
-          else
-            tar -czf "rustograph-${version}-${NAME}.tar.gz" "$dir"
-          fi
+          tar -czf "rustograph-${version}-${NAME}.tar.gz" "$dir"
+
+      - name: Package (windows)
+        if: matrix.name == 'windows-amd64'
+        env:
+          NAME: ${{ matrix.name }}
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: |
+          $version = "${{ github.event.inputs.tag }}"
+          if ($version -eq "") { $version = "${GITHUB_REF_NAME}" }
+          $version = $version -replace '^v', ''
+          $dir = "rustograph-$version-$env:NAME"
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          Copy-Item "target/$env:TARGET/release/rustograph.exe" $dir/
+          Copy-Item LICENSE, README.md $dir/
+          Compress-Archive -Path $dir -DestinationPath "rustograph-$version-$env:NAME.zip"
 
       - uses: actions/upload-artifact@v4
         with:
