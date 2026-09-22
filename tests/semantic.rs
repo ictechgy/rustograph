@@ -205,6 +205,53 @@ fn pattern_paths_reference_targets() {
 }
 
 #[test]
+fn boxed_dyn_receiver_stays_open() {
+    let d = sem_doc();
+    // Box<dyn Greet> — 조정 전 타입(Box)은 ADT지만 역참조 후 수신 타입은
+    // dyn이라 디스패치가 열려 있다. impl 후보로 펼쳐지되 tentative여야 한다.
+    let e = call(
+        &d,
+        "fixture_core::boxed_dispatch",
+        "fixture_core::Used::<Greet>::greet",
+    )
+    .expect("trait-matrix candidate edge");
+    assert!(
+        e.tentative,
+        "Box<dyn> receiver must keep dispatch tentative"
+    );
+    let decl = call(
+        &d,
+        "fixture_core::boxed_dispatch",
+        "fixture_core::Greet::greet",
+    )
+    .expect("trait decl edge");
+    assert!(decl.tentative);
+}
+
+#[test]
+fn merged_bin_root_body_uses_its_own_file() {
+    let d = sem_doc();
+    // lib와 같은 이름의 bin — 루트 합본에서 bin 본문의 파일은
+    // src/bin/fixture_core.rs다. 대표 파일(lib.rs)을 쓰면 소스 정체 검사에
+    // 걸려 syn 폴백이 되고 메서드 호출은 확정될 수 없다.
+    let e = call(
+        &d,
+        "fixture_core::main",
+        "fixture_core::Used::<Greet>::greet",
+    )
+    .expect("bin main body must be analyzed semantically");
+    assert!(!e.tentative, "merged bin body resolved via types");
+}
+
+#[test]
+fn block_local_ctor_does_not_collide() {
+    let d = sem_doc();
+    // local_ctor 안의 `struct local_scope` — 이름이 같아도 모듈 아이템과
+    // 다른 정의다. 생성자 호출이 같은 이름의 정점으로 가면 안 된다.
+    assert!(call(&d, "fixture_app::local_ctor", "fixture_app::local_scope").is_none());
+}
+
+#[test]
 fn syn_mode_still_fans_out() {
     // 기본 모드 계약은 그대로 — 같은-이름 팬아웃이 추정 간선으로 남는다.
     let s = syn_doc();

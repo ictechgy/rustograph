@@ -49,6 +49,11 @@ pub struct ImplBlock {
     pub cfg: Option<String>,
     /// `unsafe impl` — 이 구현이 만드는 정점·implements 간선은 경계의 일부다.
     pub unsafe_: bool,
+    /// impl이 실제로 선언된 파일 — lib/bin 합본 루트는 아이템마다 파일이
+    /// 다르므로 모듈의 대표 파일이 아니라 블록 자신의 파일을 들고 다닌다.
+    pub file: PathBuf,
+    /// 선언 파일의 생성 코드 마커 — 메서드 정점의 generated 플래그.
+    pub generated: bool,
 }
 
 /// 본문을 나중에 방문할 항목.
@@ -98,11 +103,13 @@ fn block_exprs_ref(b: &syn::Block) -> Vec<syn::Expr> {
 }
 
 /// 모듈의 파일 AST를 1패스로 돌려 선언 정점을 수확한다.
+/// `groups`는 (선언 파일, 그 파일의 아이템 목록) — lib/bin 합본 루트처럼
+/// 한 모듈의 아이템이 여러 파일에 걸칠 수 있어 위치·본문 정체는 아이템의
+/// 실제 파일을 따라야 한다.
 pub fn decls<'a>(
     module_path: &str,
     krate: &str,
-    items: &[&'a syn::Item],
-    file: &Path,
+    groups: &[(PathBuf, &'a [syn::Item])],
     harvest: &mut Harvest,
 ) -> ModuleDecls<'a> {
     let mut out = ModuleDecls {
@@ -112,176 +119,184 @@ pub fn decls<'a>(
         entry_roots: Vec::new(),
         test_roots: Vec::new(),
     };
-    let generated = file_has_generated_marker(file);
-    for &item in items {
-        let cfg = cfg_of(attrs_of(item));
-        if cfg.is_some() {
-            harvest.cfg_items += 1;
-        }
-        let pos = position_of(file, item);
-        let v = |id: String, kind: Kind, exported: bool, unsafe_: bool| Vertex {
-            id,
-            kind,
-            krate: krate.to_string(),
-            module: module_path.to_string(),
-            position: pos.clone(),
-            exported,
-            generated,
-            cfg: cfg.clone(),
-            unsafe_,
-        };
-        match item {
-            syn::Item::Fn(f) => {
-                let id = format!("{module_path}::{}", f.sig.ident);
-                let exprs = block_exprs(&f.block);
-                // unsafe fn이거나 본문에 unsafe 블록이 있으면 경계의 안쪽이다.
-                let unsafe_ = f.sig.unsafety.is_some() || exprs_have_unsafe(&exprs);
-                out.vertices
-                    .push(v(id.clone(), Kind::Fn, is_pub(&f.vis), unsafe_));
-                if is_extern_entry(&f.attrs) {
-                    out.entry_roots.push(id.clone());
-                } else if is_test_entry(&f.attrs) {
-                    out.test_roots.push(id.clone());
+    for (file, items) in groups {
+        let generated = file_has_generated_marker(file);
+        for item in items.iter() {
+            let cfg = cfg_of(attrs_of(item));
+            if cfg.is_some() {
+                harvest.cfg_items += 1;
+            }
+            let pos = position_of(file, item);
+            let v = |id: String, kind: Kind, exported: bool, unsafe_: bool| Vertex {
+                id,
+                kind,
+                krate: krate.to_string(),
+                module: module_path.to_string(),
+                position: pos.clone(),
+                exported,
+                generated,
+                cfg: cfg.clone(),
+                unsafe_,
+            };
+            match item {
+                syn::Item::Fn(f) => {
+                    let id = format!("{module_path}::{}", f.sig.ident);
+                    let exprs = block_exprs(&f.block);
+                    // unsafe fn이거나 본문에 unsafe 블록이 있으면 경계의 안쪽이다.
+                    let unsafe_ = f.sig.unsafety.is_some() || exprs_have_unsafe(&exprs);
+                    out.vertices
+                        .push(v(id.clone(), Kind::Fn, is_pub(&f.vis), unsafe_));
+                    if is_extern_entry(&f.attrs) {
+                        out.entry_roots.push(id.clone());
+                    } else if is_test_entry(&f.attrs) {
+                        out.test_roots.push(id.clone());
+                    }
+                    out.bodies.push(BodyItem {
+                        id,
+                        module: module_path.to_string(),
+                        self_ty: None,
+                        exprs,
+                        signature_surface: fn_signature_types(&f.sig),
+                        cfg: cfg.clone(),
+                        file: file.to_path_buf(),
+                        range: f.span().byte_range(),
+                    });
                 }
-                out.bodies.push(BodyItem {
-                    id,
-                    module: module_path.to_string(),
-                    self_ty: None,
-                    exprs,
-                    signature_surface: fn_signature_types(&f.sig),
-                    cfg: cfg.clone(),
-                    file: file.to_path_buf(),
-                    range: f.span().byte_range(),
-                });
-            }
-            syn::Item::Struct(s) => {
-                out.vertices.push(v(
-                    format!("{module_path}::{}", s.ident),
-                    Kind::Struct,
-                    is_pub(&s.vis),
-                    false,
-                ));
-            }
-            syn::Item::Enum(e) => {
-                out.vertices.push(v(
-                    format!("{module_path}::{}", e.ident),
-                    Kind::Enum,
-                    is_pub(&e.vis),
-                    false,
-                ));
-            }
-            syn::Item::Trait(t) => {
-                // unsafe trait — 구현·사용이 전부 경계를 넘는다.
-                out.vertices.push(v(
-                    format!("{module_path}::{}", t.ident),
-                    Kind::Trait,
-                    is_pub(&t.vis),
-                    t.unsafety.is_some(),
-                ));
-                // 트레이트 기본 메서드는 트레이트 소유 메서드 정점이다.
-                for ti in &t.items {
-                    if let syn::TraitItem::Fn(m) = ti {
-                        let mid = format!("{module_path}::{}::{}", t.ident, m.sig.ident);
-                        let exprs = m.default.as_ref().map(block_exprs_ref).unwrap_or_default();
-                        let unsafe_ = m.sig.unsafety.is_some() || exprs_have_unsafe(&exprs);
-                        out.vertices
-                            .push(v(mid.clone(), Kind::Method, is_pub(&t.vis), unsafe_));
-                        if m.default.is_some() {
-                            out.bodies.push(BodyItem {
-                                id: mid,
-                                module: module_path.to_string(),
-                                self_ty: None,
-                                exprs,
-                                signature_surface: fn_signature_types(&m.sig),
-                                cfg: cfg.clone(),
-                                file: file.to_path_buf(),
-                                range: m.span().byte_range(),
-                            });
+                syn::Item::Struct(s) => {
+                    out.vertices.push(v(
+                        format!("{module_path}::{}", s.ident),
+                        Kind::Struct,
+                        is_pub(&s.vis),
+                        false,
+                    ));
+                }
+                syn::Item::Enum(e) => {
+                    out.vertices.push(v(
+                        format!("{module_path}::{}", e.ident),
+                        Kind::Enum,
+                        is_pub(&e.vis),
+                        false,
+                    ));
+                }
+                syn::Item::Trait(t) => {
+                    // unsafe trait — 구현·사용이 전부 경계를 넘는다.
+                    out.vertices.push(v(
+                        format!("{module_path}::{}", t.ident),
+                        Kind::Trait,
+                        is_pub(&t.vis),
+                        t.unsafety.is_some(),
+                    ));
+                    // 트레이트 기본 메서드는 트레이트 소유 메서드 정점이다.
+                    for ti in &t.items {
+                        if let syn::TraitItem::Fn(m) = ti {
+                            let mid = format!("{module_path}::{}::{}", t.ident, m.sig.ident);
+                            let exprs = m.default.as_ref().map(block_exprs_ref).unwrap_or_default();
+                            let unsafe_ = m.sig.unsafety.is_some() || exprs_have_unsafe(&exprs);
+                            out.vertices.push(v(
+                                mid.clone(),
+                                Kind::Method,
+                                is_pub(&t.vis),
+                                unsafe_,
+                            ));
+                            if m.default.is_some() {
+                                out.bodies.push(BodyItem {
+                                    id: mid,
+                                    module: module_path.to_string(),
+                                    self_ty: None,
+                                    exprs,
+                                    signature_surface: fn_signature_types(&m.sig),
+                                    cfg: cfg.clone(),
+                                    file: file.to_path_buf(),
+                                    range: m.span().byte_range(),
+                                });
+                            }
                         }
                     }
                 }
-            }
-            syn::Item::Union(u) => {
-                out.vertices.push(v(
-                    format!("{module_path}::{}", u.ident),
-                    Kind::Union,
-                    is_pub(&u.vis),
-                    false,
-                ));
-            }
-            syn::Item::Type(t) => {
-                out.vertices.push(v(
-                    format!("{module_path}::{}", t.ident),
-                    Kind::TypeAlias,
-                    is_pub(&t.vis),
-                    false,
-                ));
-            }
-            syn::Item::Const(c) => {
-                let id = format!("{module_path}::{}", c.ident);
-                let exprs = vec![(*c.expr).clone()];
-                let unsafe_ = exprs_have_unsafe(&exprs);
-                out.vertices
-                    .push(v(id.clone(), Kind::Const, is_pub(&c.vis), unsafe_));
-                out.bodies.push(BodyItem {
-                    id,
-                    module: module_path.to_string(),
-                    self_ty: None,
-                    exprs,
-                    signature_surface: vec![&c.ty],
-                    cfg: cfg.clone(),
-                    file: file.to_path_buf(),
-                    range: c.span().byte_range(),
-                });
-            }
-            syn::Item::Static(s) => {
-                let id = format!("{module_path}::{}", s.ident);
-                let exprs = vec![(*s.expr).clone()];
-                // static mut 초기화의 unsafe 블록도 경계다.
-                let unsafe_ = exprs_have_unsafe(&exprs);
-                out.vertices
-                    .push(v(id.clone(), Kind::Static, is_pub(&s.vis), unsafe_));
-                out.bodies.push(BodyItem {
-                    id,
-                    module: module_path.to_string(),
-                    self_ty: None,
-                    exprs,
-                    signature_surface: vec![&s.ty],
-                    cfg: cfg.clone(),
-                    file: file.to_path_buf(),
-                    range: s.span().byte_range(),
-                });
-            }
-            syn::Item::Macro(m) => {
-                if let Some(id) = &m.ident {
-                    if m.mac.path.is_ident("macro_rules") {
-                        out.vertices.push(v(
-                            format!("{module_path}::{id}"),
-                            Kind::Macro,
-                            true,
-                            false,
-                        ));
+                syn::Item::Union(u) => {
+                    out.vertices.push(v(
+                        format!("{module_path}::{}", u.ident),
+                        Kind::Union,
+                        is_pub(&u.vis),
+                        false,
+                    ));
+                }
+                syn::Item::Type(t) => {
+                    out.vertices.push(v(
+                        format!("{module_path}::{}", t.ident),
+                        Kind::TypeAlias,
+                        is_pub(&t.vis),
+                        false,
+                    ));
+                }
+                syn::Item::Const(c) => {
+                    let id = format!("{module_path}::{}", c.ident);
+                    let exprs = vec![(*c.expr).clone()];
+                    let unsafe_ = exprs_have_unsafe(&exprs);
+                    out.vertices
+                        .push(v(id.clone(), Kind::Const, is_pub(&c.vis), unsafe_));
+                    out.bodies.push(BodyItem {
+                        id,
+                        module: module_path.to_string(),
+                        self_ty: None,
+                        exprs,
+                        signature_surface: vec![&c.ty],
+                        cfg: cfg.clone(),
+                        file: file.to_path_buf(),
+                        range: c.span().byte_range(),
+                    });
+                }
+                syn::Item::Static(s) => {
+                    let id = format!("{module_path}::{}", s.ident);
+                    let exprs = vec![(*s.expr).clone()];
+                    // static mut 초기화의 unsafe 블록도 경계다.
+                    let unsafe_ = exprs_have_unsafe(&exprs);
+                    out.vertices
+                        .push(v(id.clone(), Kind::Static, is_pub(&s.vis), unsafe_));
+                    out.bodies.push(BodyItem {
+                        id,
+                        module: module_path.to_string(),
+                        self_ty: None,
+                        exprs,
+                        signature_surface: vec![&s.ty],
+                        cfg: cfg.clone(),
+                        file: file.to_path_buf(),
+                        range: s.span().byte_range(),
+                    });
+                }
+                syn::Item::Macro(m) => {
+                    if let Some(id) = &m.ident {
+                        if m.mac.path.is_ident("macro_rules") {
+                            out.vertices.push(v(
+                                format!("{module_path}::{id}"),
+                                Kind::Macro,
+                                true,
+                                false,
+                            ));
+                        }
                     }
                 }
+                syn::Item::Impl(i) => {
+                    out.impls.push(ImplBlock {
+                        self_ty: type_path(&i.self_ty),
+                        trait_path: i.trait_.as_ref().map(|(_, p, _)| path_segments(p)),
+                        methods: i
+                            .items
+                            .iter()
+                            .filter_map(|x| match x {
+                                syn::ImplItem::Fn(f) => Some(f.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                        items_module: module_path.to_string(),
+                        cfg: cfg.clone(),
+                        unsafe_: i.unsafety.is_some(),
+                        file: file.clone(),
+                        generated,
+                    });
+                }
+                _ => {}
             }
-            syn::Item::Impl(i) => {
-                out.impls.push(ImplBlock {
-                    self_ty: type_path(&i.self_ty),
-                    trait_path: i.trait_.as_ref().map(|(_, p, _)| path_segments(p)),
-                    methods: i
-                        .items
-                        .iter()
-                        .filter_map(|x| match x {
-                            syn::ImplItem::Fn(f) => Some(f.clone()),
-                            _ => None,
-                        })
-                        .collect(),
-                    items_module: module_path.to_string(),
-                    cfg: cfg.clone(),
-                    unsafe_: i.unsafety.is_some(),
-                });
-            }
-            _ => {}
         }
     }
     out
@@ -293,8 +308,6 @@ pub fn impls<'a>(
     blocks: &'a [ImplBlock],
     krate: &str,
     tree: &ModTree,
-    file: &Path,
-    generated: bool,
     harvest: &mut Harvest,
 ) -> (Vec<Vertex>, Vec<Edge>, Vec<BodyItem<'a>>) {
     let mut vertices = Vec::new();
@@ -334,9 +347,9 @@ pub fn impls<'a>(
                 kind: Kind::Method,
                 krate: krate.to_string(),
                 module: b.items_module.clone(),
-                position: Some(format!("{}:{}", file.display(), line_of(&m.sig.ident))),
+                position: Some(format!("{}:{}", b.file.display(), line_of(&m.sig.ident))),
                 exported: matches!(m.vis, syn::Visibility::Public(_)),
-                generated,
+                generated: b.generated,
                 cfg: b.cfg.clone(),
                 unsafe_,
             });
@@ -351,7 +364,7 @@ pub fn impls<'a>(
                 exprs,
                 signature_surface: fn_signature_types(&m.sig),
                 cfg: b.cfg.clone(),
-                file: file.to_path_buf(),
+                file: b.file.clone(),
                 range: m.span().byte_range(),
             });
         }

@@ -99,6 +99,12 @@ pub fn generic_dispatch<T: Greet>(t: &T) -> u32 {
     t.greet()
 }
 
+/// Box<dyn> 수신자 — 조정 전 타입(Box)은 ADT지만 역참조 후 수신 타입은
+/// dyn이라 디스패치가 열려 있다. 조정 후 타입으로 판정해야 한다.
+pub fn boxed_dispatch(x: Box<dyn Greet>) -> u32 {
+    x.greet()
+}
+
 pub fn entry() -> u32 {
     util::helper() + local_shout!(0)
 }

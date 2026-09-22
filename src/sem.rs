@@ -559,11 +559,18 @@ impl<'a, 'b> Walker<'a, 'b> {
     }
 
     /// 수신자 타입이 구체 ADT로 잡히는가 — dyn/impl Trait/제네릭이면
-    /// 디스패치가 열려 있으므로 false다.
+    /// 디스패치가 열려 있으므로 false다. `Box<dyn Tr>` 같은 스마트 포인터는
+    /// 조정 전 타입이 ADT이므로 역참조·자동 참조가 반영된 조정 후 타입으로 판정한다.
     fn receiver_is_concrete(&self, mc: &ast::MethodCallExpr) -> bool {
         mc.receiver()
             .and_then(|r| self.sema.type_of_expr(&r))
-            .is_some_and(|t| t.original.strip_references().as_adt().is_some())
+            .is_some_and(|t| {
+                t.adjusted
+                    .unwrap_or(t.original)
+                    .strip_references()
+                    .as_adt()
+                    .is_some()
+            })
     }
 
     /// 해석된 함수를 간선으로 — 트레이트 정의 메서드는, 수신자가 구체
@@ -666,15 +673,24 @@ impl<'a, 'b> Walker<'a, 'b> {
                 self.emit_function(f, EdgeKind::Call, un, false)
             }
             ra_ap_hir::CallableKind::TupleStruct(s) => {
-                let id = adt_id(self.db(), Adt::Struct(s));
-                if let Pushed::Miss = self.push(id, EdgeKind::Call, false, un) {
+                // 블록 지역 튜플 구조체의 정규 ID는 같은 이름의 정점과 충돌한다.
+                if block_local_def(self.sema, Adt::Struct(s)) {
                     self.st.external += 1;
+                } else {
+                    let id = adt_id(self.db(), Adt::Struct(s));
+                    if let Pushed::Miss = self.push(id, EdgeKind::Call, false, un) {
+                        self.st.external += 1;
+                    }
                 }
             }
             ra_ap_hir::CallableKind::TupleEnumVariant(v) => {
-                let id = enum_id(self.db(), v.parent_enum(self.db()));
-                if let Pushed::Miss = self.push(id, EdgeKind::References, false, un) {
+                if block_local_def(self.sema, v) {
                     self.st.external += 1;
+                } else {
+                    let id = enum_id(self.db(), v.parent_enum(self.db()));
+                    if let Pushed::Miss = self.push(id, EdgeKind::References, false, un) {
+                        self.st.external += 1;
+                    }
                 }
             }
             // 클로저·fn 포인터·Fn 트레이트 객체 — 정적 해석 밖.
@@ -712,7 +728,10 @@ impl<'a, 'b> Walker<'a, 'b> {
             Some(PathResolution::Def(d)) => self.emit_def(d, kind, un),
             // `Self::x` — impl의 self 타입으로의 참조다.
             Some(PathResolution::SelfType(imp)) => {
-                if let Some(adt) = imp.self_ty(self.db()).as_adt() {
+                // 블록 지역 impl의 self 타입도 정규 ID 충돌이 가능하다.
+                if block_local_def(self.sema, imp) {
+                    self.st.external += 1;
+                } else if let Some(adt) = imp.self_ty(self.db()).as_adt() {
                     let id = adt_id(self.db(), adt);
                     if let Pushed::Miss = self.push(id, EdgeKind::References, false, un) {
                         self.st.external += 1;
