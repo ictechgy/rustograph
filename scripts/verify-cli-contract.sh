@@ -72,6 +72,20 @@ for c in "graph --dir /nonexistent-xyz"; do
 	fi
 done
 
+# mcp — stdio 서버는 EOF까지 읽는다: initialize+tools/list를 밀어 넣고
+# 정상 종료(0)와 도구 6개가 나오는지 본다.
+mcp_out="$(printf '%s\n' \
+	'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+	'{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+	| "$BIN" mcp --dir "$FIX/fixture" 2>/dev/null)" || {
+	echo "FAIL mcp: exit $? " >&2
+	fails=$((fails+1))
+}
+echo "$mcp_out" | grep -q "rustograph_rules" || {
+	echo "FAIL mcp: tools/list missing rustograph_rules" >&2
+	fails=$((fails+1))
+}
+
 if [ "$fails" -gt 0 ]; then
 	echo "$fails contract checks failed" >&2
 	exit 1

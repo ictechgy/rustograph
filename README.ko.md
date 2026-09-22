@@ -35,7 +35,7 @@ Rust에는 `cargo-modules`, `cargo deps`, 그리고 syn/tree-sitter 기반 콜�
 ```bash
 brew install ictechgy/tap/rustograph
 # 또는
-cargo install --git https://github.com/ictechgy/rustograph --tag v0.1.0
+cargo install --git https://github.com/ictechgy/rustograph --tag v0.2.0
 ```
 
 ## 사용
@@ -51,7 +51,19 @@ rustograph rules --strict                # .rustograph.yml 레이어 규칙
 rustograph rules --format sarif          # GitHub 코드 스캐닝용
 rustograph query mycrate::module::f --depth 2
 rustograph impact mycrate::Type --depth 3
+rustograph mcp                           # MCP stdio 서버 — 에이전트가 되묻는 통로
 ```
+
+`#[cfg]` 조건은 메타데이터로 그래프에 실립니다 — 정점의 `cfg`는 자기
+`#[cfg(...)]` 토큰, 간선의 `cfg`는 그 조건 아래서만 성립하는 의존을
+표시합니다. `unsafe`는 경계를 표시합니다 — `unsafe fn`/`unsafe trait`이거나
+`unsafe {}` 블록을 품은 정점에 `unsafe: true`, `unsafe {}` 안에서 만든
+간선은 경계 진입 간선입니다.
+
+`rustograph mcp`는 개행 구분 JSON-RPC 2.0을 stdio로 말하고 도구 6종
+(`rustograph_summary`/`_query`/`_impact`/`_cycles`/`_dead`/`_rules`)을
+서빙합니다. 문서는 기동 시 한 번 수확해(또는 `--graph`로 읽어) 같은
+스냅샷 위에서 답합니다.
 
 종료 코드: `0` 정상 · `1` strict 위반/발견 · `2` 사용법/분석 오류.
 

@@ -4,7 +4,7 @@
 //! 플래그 파서는 외부 크레이트 없이 직접 만든다 — 명령이 적고 계약이 단순해서다.
 
 use crate::graph::{Document, Level};
-use crate::{analysis, config, export, rules, sarif, source};
+use crate::{analysis, config, export, mcp, rules, sarif, source};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -22,12 +22,14 @@ usage:
   rustograph rules [--strict] [--format text|json|sarif] [--config FILE]
   rustograph query ID [--depth N] [--max N]
   rustograph impact ID [--depth N] [--max N]
+  rustograph mcp [--dir DIR] [--graph FILE] [--config FILE] [--deps] [--tests]
   rustograph version
 
 exit codes: 0 ok · 1 strict violation found · 2 usage/analysis error";
 
 /// 인자 묶음 — 플래그 값은 반복 가능해 Vec로 둔다.
-struct Args {
+/// mcp 명령이 같은 파서를 공유하므로 크레이트 안에서는 보인다.
+pub(crate) struct Args {
     cmd: String,
     positional: Vec<String>,
     values: std::collections::BTreeMap<String, Vec<String>>,
@@ -35,19 +37,19 @@ struct Args {
 }
 
 impl Args {
-    fn get(&self, key: &str) -> Option<&str> {
+    pub(crate) fn get(&self, key: &str) -> Option<&str> {
         self.values
             .get(key)
             .and_then(|v| v.last())
             .map(|s| s.as_str())
     }
-    fn get_all(&self, key: &str) -> Vec<&str> {
+    pub(crate) fn get_all(&self, key: &str) -> Vec<&str> {
         self.values
             .get(key)
             .map(|v| v.iter().map(|s| s.as_str()).collect())
             .unwrap_or_default()
     }
-    fn has(&self, key: &str) -> bool {
+    pub(crate) fn has(&self, key: &str) -> bool {
         self.flags.contains(key)
     }
 }
@@ -57,7 +59,7 @@ const VALUE_FLAGS: &[&str] = &[
 ];
 const BOOL_FLAGS: &[&str] = &["deps", "tests", "retain-public", "strict"];
 
-fn parse(args: &[String]) -> Result<Args, String> {
+pub(crate) fn parse(args: &[String]) -> Result<Args, String> {
     let Some(cmd) = args.first() else {
         return Err("no command".to_string());
     };
@@ -94,7 +96,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
 }
 
 /// 수확 또는 저장 문서 로드 — 모든 명령이 같은 경로로 문서를 얻는다.
-fn document_for(a: &Args, symbol_level: bool) -> Result<Document, String> {
+pub(crate) fn document_for(a: &Args, symbol_level: bool) -> Result<Document, String> {
     if let Some(f) = a.get("graph") {
         return export::load_file(Path::new(f));
     }
@@ -123,7 +125,7 @@ fn level_of(a: &Args) -> Result<Level, String> {
 /// 명령을 실행하고 종료 코드를 돌려준다.
 /// os::exit 대신 반환값을 쓰는 것은 종료 코드 계약을 테스트하기 위함이다.
 pub fn run(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
-    match run_inner(args, stdout) {
+    match run_inner(args, stdout, stderr) {
         Ok(code) => code,
         Err(e) => {
             let _ = writeln!(stderr, "error: {e}");
@@ -132,7 +134,7 @@ pub fn run(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i
     }
 }
 
-fn run_inner(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
+fn run_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
     let a = parse(args).map_err(|e| format!("{e}\n{USAGE}"))?;
     match a.cmd.as_str() {
         "version" => {
@@ -145,6 +147,7 @@ fn run_inner(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
         "rules" => cmd_rules(&a, out),
         "query" => cmd_query(&a, out, false),
         "impact" => cmd_query(&a, out, true),
+        "mcp" => mcp::cmd(&a, &mut std::io::stdin().lock(), out, err),
         "-h" | "--help" | "help" => {
             writeln!(out, "{USAGE}").ok();
             Ok(0)

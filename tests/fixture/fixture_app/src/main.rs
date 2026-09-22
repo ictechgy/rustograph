@@ -3,6 +3,8 @@ mod extra;
 use fixture_core::Greet;
 use fixture_core::Used as Renamed;
 use fixture_core::inline::*;
+#[cfg(feature = "never")]
+use fixture_core::cfg_gated;
 
 fn main() {
     let u = Renamed { v: 1 };

@@ -5,3 +5,6 @@ edition = "2021"
 
 [dependencies]
 fixture_core = { path = "../fixture_core" }
+
+[features]
+never = []

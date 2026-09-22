@@ -181,6 +181,8 @@ mod tests {
             position: None,
             exported,
             generated: false,
+            cfg: None,
+            unsafe_: false,
         }
     }
 

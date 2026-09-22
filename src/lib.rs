@@ -11,6 +11,7 @@ pub mod config;
 pub mod export;
 pub mod graph;
 pub mod harvest;
+pub mod mcp;
 pub mod modtree;
 pub mod rules;
 pub mod sarif;

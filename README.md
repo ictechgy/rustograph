@@ -38,7 +38,7 @@ over it, with a deterministic JSON contract meant for coding agents:
 ```bash
 brew install ictechgy/tap/rustograph
 # or
-cargo install --git https://github.com/ictechgy/rustograph --tag v0.1.0
+cargo install --git https://github.com/ictechgy/rustograph --tag v0.2.0
 ```
 
 Or from source:
@@ -80,6 +80,10 @@ rustograph rules --format sarif           # GitHub code scanning ready
 # Ask about one symbol (agent-oriented JSON)
 rustograph query mycrate::module::f --depth 2
 rustograph impact mycrate::Type --depth 3  # reverse transitive closure
+
+# Serve the graph over MCP (stdio JSON-RPC) for coding agents
+rustograph mcp                            # harvests once, serves a snapshot
+rustograph mcp --graph .rustograph/graph.json
 ```
 
 Exit codes: `0` ok · `1` strict violation/finding · `2` usage or analysis
@@ -97,6 +101,22 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
 - `signature` edges record types leaked through a function's public
   signature — they power the `signature` rule and reachability, and let a
   rules file say "public API may not mention component X".
+- `#[cfg]` conditions travel as metadata: a vertex's `cfg` holds the tokens
+  of its own `#[cfg(...)]` (e.g. `feature = "x"`), and an edge's `cfg` marks
+  dependencies that only exist under that condition — `use` statements,
+  `contains` of gated items, bodies of gated functions.
+- `unsafe` marks the boundary: vertices that are `unsafe fn`/`unsafe trait`
+  or contain an `unsafe {}` block carry `unsafe: true`, and an edge made
+  inside an `unsafe {}` block is an entry edge — `unsafe impl` marks its
+  `implements` edge too.
+
+## MCP server
+
+`rustograph mcp` speaks newline-delimited JSON-RPC 2.0 on stdio and serves
+six tools — `rustograph_summary`, `rustograph_query`, `rustograph_impact`,
+`rustograph_cycles`, `rustograph_dead`, `rustograph_rules`. The document is
+harvested once at startup (or loaded via `--graph`), so every call answers
+over the same snapshot.
 
 ## Rules — .rustograph.yml
 

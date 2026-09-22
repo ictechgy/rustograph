@@ -81,6 +81,29 @@ pub extern "C" fn ffi_entry() -> u32 {
 #[cfg(feature = "never")]
 pub fn cfg_gated() {}
 
+#[cfg(unix)]
+pub mod unix_only;
+
+/// unsafe fn — 경계의 안쪽 정점.
+pub unsafe fn raw_read(p: *const u32) -> u32 {
+    unsafe { *p }
+}
+
+/// 본문에 unsafe 블록이 있는 안전한 fn — 안쪽 표시 + 진입 간선.
+pub fn safe_wrapper(p: &u32) -> u32 {
+    unsafe { raw_read(p as *const u32) }
+}
+
+/// unsafe trait — 구현이 경계를 넘는다.
+pub unsafe trait RawBytes {}
+
+unsafe impl RawBytes for Used {}
+
+/// 트레이트 안의 unsafe fn 선언.
+pub trait PtrMath {
+    unsafe fn deref_raw(&self) -> u32;
+}
+
 fn dead_private() -> u32 {
     0
 }

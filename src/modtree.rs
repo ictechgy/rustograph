@@ -7,6 +7,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+/// `use` 임포트 하나 — 해석된 정규 경로와 `#[cfg]` 조건.
+/// 조건이 있으면 그 빌드에서만 존재하는 임포트다 — 간선도 조건을 물려받는다.
+#[derive(Debug, Clone)]
+pub struct Import {
+    /// 정규 ID (`crate::mod::item`).
+    pub target: String,
+    /// `#[cfg(...)]` 조건 토큰 — 없으면 무조건 임포트.
+    pub cfg: Option<String>,
+}
+
 /// 모듈 하나 — 파일 단위든 인라인 `mod x {}`든 동일하게 표현한다.
 /// 경로는 트리의 맵 키이므로 필드로 중복 저장하지 않는다.
 #[derive(Debug)]
@@ -21,10 +31,12 @@ pub struct Module {
     pub file_module: bool,
     /// `pub mod`로 선언됐는가 — 크레이트 루트는 항상 true다.
     pub public: bool,
+    /// `#[cfg(...)]` 조건 토큰 — `mod` 선언에 붙은 것만(조상 조건은 조상 정점에).
+    pub cfg: Option<String>,
     /// 직접 선언된 아이템 이름들(모듈 스코프 해석용).
     pub items: BTreeSet<String>,
-    /// `use` 임포트 맵: 마지막 세그먼트(또는 as 이름) → 정규 경로.
-    pub imports: BTreeMap<String, String>,
+    /// `use` 임포트 맵: 마지막 세그먼트(또는 as 이름) → 임포트.
+    pub imports: BTreeMap<String, Import>,
     /// 자식 모듈 이름 → 경로.
     pub children: BTreeMap<String, String>,
 }
@@ -37,6 +49,7 @@ impl Module {
             extra_files: Vec::new(),
             file_module,
             public,
+            cfg: None,
             items: BTreeSet::new(),
             imports: BTreeMap::new(),
             children: BTreeMap::new(),
@@ -123,8 +136,8 @@ impl ModTree {
                 let module = self.modules.get(from)?;
                 if module.items.contains(first) || module.children.contains_key(first) {
                     format!("{from}::{first}")
-                } else if let Some(target) = module.imports.get(first) {
-                    target.clone()
+                } else if let Some(imp) = module.imports.get(first) {
+                    imp.target.clone()
                 } else {
                     let root = crate_of(from);
                     let root_mod = self.modules.get(&root)?;
@@ -195,7 +208,8 @@ pub fn collect_submodules(
         let path = format!("{parent_path}::{name}");
         // 병합 루트(lib+같은 이름 bin)를 두 번째 타깃이 다시 훑을 때 같은
         // mod 선언을 재계수하지 않는다 — 처음 보는 경로일 때만 센다.
-        if has_cfg(&m.attrs) && !tree.modules.contains_key(&path) {
+        let cfg = cfg_of(&m.attrs);
+        if cfg.is_some() && !tree.modules.contains_key(&path) {
             *conditional_count += 1;
         }
         let (file, is_file_module) = if let Some((_, _)) = &m.content {
@@ -214,8 +228,9 @@ pub fn collect_submodules(
             }
         };
         let public = matches!(m.vis, syn::Visibility::Public(_));
-        tree.modules
-            .insert(path.clone(), Module::new(file, is_file_module, public));
+        let mut module = Module::new(file, is_file_module, public);
+        module.cfg = cfg;
+        tree.modules.insert(path.clone(), module);
         tree.modules
             .get_mut(parent_path)
             .expect("parent module must exist")
@@ -229,6 +244,22 @@ pub fn collect_submodules(
 /// `#[cfg]`가 붙어 있으면 조건부로 본다 — 포함은 하되 실측으로 센다.
 pub fn has_cfg(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| a.path().is_ident("cfg"))
+}
+
+/// `#[cfg(...)]`의 조건 토큰을 그대로 돌려준다 — `feature = "x"`, `test` 등.
+/// 여러 cfg 속성이 붙으면 모두 성립해야 하니 `all(...)`로 합성해 돌린다 —
+/// 정점 하나에 조건 하나라는 필드 계약을 유지하기 위해서다.
+pub fn cfg_of(attrs: &[syn::Attribute]) -> Option<String> {
+    let conds: Vec<String> = attrs
+        .iter()
+        .filter(|a| a.path().is_ident("cfg"))
+        .filter_map(|a| a.meta.require_list().ok().map(|l| l.tokens.to_string()))
+        .collect();
+    match conds.len() {
+        0 => None,
+        1 => Some(conds.into_iter().next().expect("len checked")),
+        _ => Some(format!("all({})", conds.join(" , "))),
+    }
 }
 
 /// 모듈의 직접 아이템 이름을 채운다(1단계).
@@ -288,18 +319,21 @@ pub fn fill_imports(
     items: &[&syn::Item],
     dep_crates: &BTreeSet<String>,
 ) {
-    let mut uses: Vec<Vec<String>> = Vec::new();
+    let mut uses: Vec<(Vec<String>, Option<String>)> = Vec::new();
     for item in items {
         if let syn::Item::Use(u) = item {
-            flatten_use(&u.tree, &mut Vec::new(), &mut uses);
+            let cfg = cfg_of(&u.attrs);
+            flatten_use(&u.tree, &mut Vec::new(), &mut |segs| {
+                uses.push((segs, cfg.clone()));
+            });
         }
     }
     // 해석은 불변 참조가 필요하니 먼저 모으고 그 다음 심는다.
     // 글롭(`use m::*`)은 대상 모듈의 모든 공개 아이템과 자식 모듈을
     // 임포트한다 — `m` 자체만 매핑하면 `f()` 호출이 미해석으로 새니
     // 아이템별로 임포트 맵을 펼친다.
-    let mut resolved: Vec<(String, String)> = Vec::new();
-    for segs in &uses {
+    let mut resolved: Vec<(String, Import)> = Vec::new();
+    for (segs, cfg) in &uses {
         let glob = segs.last().is_some_and(|s| s == "*");
         let clean: Vec<String> = segs
             .iter()
@@ -312,10 +346,22 @@ pub fn fill_imports(
         if glob {
             if let Some(target) = tree.modules.get(&full) {
                 for name in target.items.iter().chain(target.children.keys()) {
-                    resolved.push((name.clone(), format!("{full}::{name}")));
+                    resolved.push((
+                        name.clone(),
+                        Import {
+                            target: format!("{full}::{name}"),
+                            cfg: cfg.clone(),
+                        },
+                    ));
                 }
             }
-            resolved.push((full.rsplit("::").next().unwrap_or(&full).to_string(), full));
+            resolved.push((
+                full.rsplit("::").next().unwrap_or(&full).to_string(),
+                Import {
+                    target: full,
+                    cfg: cfg.clone(),
+                },
+            ));
             continue;
         }
         let alias = segs
@@ -324,16 +370,23 @@ pub fn fill_imports(
             .find(|s| s.starts_with("as "))
             .map(|s| s[3..].to_string())
             .unwrap_or_else(|| segs.last().unwrap().clone());
-        resolved.push((alias, full));
+        resolved.push((
+            alias,
+            Import {
+                target: full,
+                cfg: cfg.clone(),
+            },
+        ));
     }
     let module = tree.modules.get_mut(path).expect("module must exist");
-    for (alias, full) in resolved {
-        module.imports.insert(alias, full);
+    for (alias, imp) in resolved {
+        module.imports.insert(alias, imp);
     }
 }
 
 /// `use` 트리를 평탄한 경로 목록으로 펼친다 — `{a, b}` 그룹과 `as` 별칭을 처리한다.
-fn flatten_use(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+/// 경로마다 use 아이템의 cfg를 붙여야 해서 결과는 콜백으로 흘려보낸다.
+fn flatten_use(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut dyn FnMut(Vec<String>)) {
     match tree {
         syn::UseTree::Path(p) => {
             prefix.push(p.ident.to_string());
@@ -343,20 +396,20 @@ fn flatten_use(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec<Vec<
         syn::UseTree::Name(n) => {
             let mut p = prefix.clone();
             p.push(n.ident.to_string());
-            out.push(p);
+            out(p);
         }
         syn::UseTree::Rename(r) => {
             let mut p = prefix.clone();
             p.push(r.ident.to_string());
             p.push(format!("as {}", r.rename));
-            out.push(p);
+            out(p);
         }
         syn::UseTree::Glob(_) => {
             // glob은 모듈 자체 + 그 아이템 전부 — `*` 마커를 남겨
             // fill_imports가 아이템별로 펼치게 한다.
             let mut p = prefix.clone();
             p.push("*".to_string());
-            out.push(p);
+            out(p);
         }
         syn::UseTree::Group(g) => {
             for t in &g.items {
@@ -379,7 +432,13 @@ mod tests {
         t.modules.insert("c".to_string(), root);
         let mut m = Module::new(PathBuf::from("m.rs"), true, true);
         m.items = BTreeSet::from(["g".to_string()]);
-        m.imports.insert("h".to_string(), "c::util::h".to_string());
+        m.imports.insert(
+            "h".to_string(),
+            Import {
+                target: "c::util::h".to_string(),
+                cfg: None,
+            },
+        );
         t.modules.insert("c::m".to_string(), m);
         let mut u = Module::new(PathBuf::from("util.rs"), true, true);
         u.items = BTreeSet::from(["h".to_string()]);
@@ -466,6 +525,29 @@ mod tests {
         std::fs::write(dir.join("elsewhere.rs"), "").unwrap();
         assert!(mod_file(&dir, "z", Some("elsewhere.rs")).is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cfg_of_extracts_condition_tokens() {
+        // #[cfg(test)]와 #[cfg(feature = "x")]는 조건 토큰 그대로 나온다.
+        let item: syn::Item = syn::parse_str("#[cfg(test)] fn f() {}").unwrap();
+        let attrs = match &item {
+            syn::Item::Fn(f) => &f.attrs,
+            _ => unreachable!(),
+        };
+        assert_eq!(cfg_of(attrs), Some("test".to_string()));
+        let item: syn::Item =
+            syn::parse_str("#[cfg(all(unix, feature = \"x\"))] #[cfg(debug_assertions)] fn f() {}")
+                .unwrap();
+        let attrs = match &item {
+            syn::Item::Fn(f) => &f.attrs,
+            _ => unreachable!(),
+        };
+        // 여러 cfg는 전부 성립해야 한다 — all()로 합성해 한 필드에 담는다.
+        assert_eq!(
+            cfg_of(attrs),
+            Some("all(all (unix , feature = \"x\") , debug_assertions)".to_string())
+        );
     }
 
     #[test]

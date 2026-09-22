@@ -98,6 +98,8 @@ mod tests {
                     position: None,
                     exported: true,
                     generated: false,
+                    cfg: None,
+                    unsafe_: false,
                 },
                 Vertex {
                     id: "c::m".into(),
@@ -107,6 +109,8 @@ mod tests {
                     position: Some("src/m.rs:1".into()),
                     exported: false,
                     generated: false,
+                    cfg: None,
+                    unsafe_: false,
                 },
             ],
             vec![Edge::new("c".into(), "c::m".into(), EdgeKind::Contains)],

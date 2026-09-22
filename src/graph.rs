@@ -111,6 +111,13 @@ pub struct Vertex {
     /// cfg/생성 파일 등 조건부 출처 표시.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub generated: bool,
+    /// 이 정점 자체에 붙은 `#[cfg(...)]` 조건 — 토큰 그대로(예: `feature = "x"`).
+    /// 조상 모듈의 조건은 조상 정점에 있다 — contains 사슬을 따라 합성하면 된다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cfg: Option<String>,
+    /// unsafe fn·unsafe trait이거나 unsafe 블록을 품은 본문 — 경계의 안쪽 표시.
+    #[serde(default, rename = "unsafe", skip_serializing_if = "std::ops::Not::not")]
+    pub unsafe_: bool,
 }
 
 /// 방향 간선. from→to. 의존 계열은 "from이 to를 필요로 한다"로 읽는다.
@@ -124,6 +131,13 @@ pub struct Edge {
     /// 가능한 디스패치가 확정 위반·순환으로 둔갑하면 안 된다.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tentative: bool,
+    /// 이 간선이 성립하는 `#[cfg(...)]` 조건 — cfg가 다른 같은 (from,to,kind)는
+    /// 별개 간선이다. 조건이 다르면 존재 자체가 다른 빌드에서만 성립하므로.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cfg: Option<String>,
+    /// 호출·참조 지점이 `unsafe {}` 블록 안에 있다 — 경계를 넘는 진입 간선.
+    #[serde(default, rename = "unsafe", skip_serializing_if = "std::ops::Not::not")]
+    pub unsafe_: bool,
 }
 
 impl Edge {
@@ -134,6 +148,8 @@ impl Edge {
             to,
             kind,
             tentative: false,
+            cfg: None,
+            unsafe_: false,
         }
     }
 
@@ -144,6 +160,8 @@ impl Edge {
             to,
             kind,
             tentative: true,
+            cfg: None,
+            unsafe_: false,
         }
     }
 }
@@ -170,15 +188,24 @@ pub struct Document {
 
 impl Document {
     /// 정렬된 문서 — 같은 입력이 같은 바이트가 되게 하는 계약의 핵심.
-    /// (from,to,kind)이 같은 확정·추정 간선이 겹치면 확정 쪽을 남긴다 —
-    /// tentative=false가 정렬에서 먼저 오므로 dedup이 그것을 택한다.
+    /// (from,to,kind,cfg)가 같은 간선이 겹치면 하나로 합친다 — 정렬에서
+    /// 확정·unsafe 표시가 먼저 오므로 dedup이 확정·경계 진입 쪽을 남긴다.
+    /// cfg가 다르면 다른 빌드 조건의 별개 간선이라 합치지 않는다.
     pub fn sort(&mut self) {
         self.vertices.sort_by(|a, b| a.id.cmp(&b.id));
         self.edges.sort_by(|a, b| {
-            (&a.from, &a.to, a.kind, a.tentative).cmp(&(&b.from, &b.to, b.kind, b.tentative))
+            (&a.from, &a.to, a.kind, a.tentative, &a.cfg, !a.unsafe_).cmp(&(
+                &b.from,
+                &b.to,
+                b.kind,
+                b.tentative,
+                &b.cfg,
+                !b.unsafe_,
+            ))
         });
-        self.edges
-            .dedup_by(|a, b| a.from == b.from && a.to == b.to && a.kind == b.kind);
+        self.edges.dedup_by(|a, b| {
+            a.from == b.from && a.to == b.to && a.kind == b.kind && a.cfg == b.cfg
+        });
         self.roots.sort();
         self.roots.dedup();
         self.limitations.sort();
@@ -241,9 +268,12 @@ impl Document {
             self.vertices.iter().map(|v| (v.id.as_str(), v)).collect();
         let owner = |id: &str| -> Option<String> { self.owner_at_level(id, level, &by_id) };
         let mut vertices: BTreeMap<String, Vertex> = BTreeMap::new();
-        // 같은 (from,to,kind)에 확정·추정 간선이 섞여 투영되면 확정으로 —
-        // AND 병합이 아니라 "하나라도 확정이면 확정"이다.
-        let mut edges: BTreeMap<(String, String, EdgeKind), bool> = BTreeMap::new();
+        // 같은 (from,to,kind,cfg)에 확정·추정 간선이 섞여 투영되면 확정으로 —
+        // AND 병합이 아니라 "하나라도 확정이면 확정"이다. unsafe는 OR — 하나의
+        // 진입 지점이라도 경계 안에 있으면 투영 간선도 경계를 넘는다.
+        // 투영 간선 키: (from,to,kind,cfg) → (tentative AND, unsafe OR).
+        type ProjectedKey = (String, String, EdgeKind, Option<String>);
+        let mut edges: BTreeMap<ProjectedKey, (bool, bool)> = BTreeMap::new();
         for v in &self.vertices {
             if let Some(oid) = owner(&v.id) {
                 if let Some(src) = by_id.get(oid.as_str()) {
@@ -257,9 +287,12 @@ impl Document {
             };
             if f != t {
                 edges
-                    .entry((f, t, e.kind))
-                    .and_modify(|tent| *tent &= e.tentative)
-                    .or_insert(e.tentative);
+                    .entry((f, t, e.kind, e.cfg.clone()))
+                    .and_modify(|(tent, uns)| {
+                        *tent &= e.tentative;
+                        *uns |= e.unsafe_;
+                    })
+                    .or_insert((e.tentative, e.unsafe_));
             }
         }
         Document {
@@ -278,11 +311,13 @@ impl Document {
             vertices: vertices.into_values().collect(),
             edges: edges
                 .into_iter()
-                .map(|((from, to, kind), tentative)| Edge {
+                .map(|((from, to, kind, cfg), (tentative, unsafe_))| Edge {
                     from,
                     to,
                     kind,
                     tentative,
+                    cfg,
+                    unsafe_,
                 })
                 .collect(),
             limitations: self.limitations.clone(),
@@ -362,6 +397,8 @@ mod tests {
             position: None,
             exported: false,
             generated: false,
+            cfg: None,
+            unsafe_: false,
         }
     }
 
