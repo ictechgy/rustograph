@@ -5,7 +5,7 @@
 //! 재수확하면 같은 세션 안에서 그래프가 흔들린다.
 //! 반환 형식은 CLI의 JSON 출력과 같다 — 같은 계약을 두 통로가 공유한다.
 
-use crate::cli::{self, Args};
+use crate::cli_args::{self, Args};
 use crate::graph::{Document, Level};
 use crate::{analysis, config, export, rules};
 use serde::{Deserialize, Serialize};
@@ -57,7 +57,7 @@ pub(crate) fn cmd(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<i32, String> {
-    let doc = cli::document_for(a, true)?;
+    let doc = cli_args::document_for(a, true)?;
     let dir = PathBuf::from(a.get("dir").unwrap_or("."));
     let cfg_path = match a.get("config") {
         Some(f) => Some(PathBuf::from(f)),
@@ -156,7 +156,7 @@ impl Server {
                 reply(Ok(serde_json::json!({
                     "protocolVersion": protocol,
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "rustograph", "version": cli::VERSION},
+                    "serverInfo": {"name": "rustograph", "version": env!("CARGO_PKG_VERSION")},
                 })))
             }
             "ping" => reply(Ok(serde_json::json!({}))),
