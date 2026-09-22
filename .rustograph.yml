@@ -22,12 +22,15 @@ components:
   sarif: ["rustograph::sarif/**"]
   config: ["rustograph::config/**"]
   mcp: ["rustograph::mcp/**"]
+  sem: ["rustograph::sem/**"]
 deps:
   app: [cli]
   cli: [source, analysis, rules, export, sarif, config, graph, mcp, cli_args]
   mcp: [cli_args, analysis, rules, export, config, graph]
   cli_args: [source, export, graph]
-  source: [graph, harvest, modtree, cargo_meta]
+  source: [graph, harvest, modtree, cargo_meta, sem]
+  # sem은 ra_ap 경계 — source만 호출하고, syn 경계·도메인 위층은 모른다.
+  sem: [graph, cargo_meta]
   harvest: [graph, modtree]
   analysis: [graph]
   rules: [graph, config]
@@ -39,10 +42,12 @@ deps:
   config: []
 deny:
   # 도메인은 수확 경계와 CLI를 절대 모른다 — 순수성이 테스트 가능성이다.
-  graph: [cli, source, harvest, modtree, cargo_meta, analysis, rules, export, sarif, config, app]
-  # cli는 cargo/syn 경계를 직접 만지지 않는다 — source를 통한다.
-  cli: [cargo_meta, harvest, modtree]
+  graph: [cli, source, harvest, modtree, cargo_meta, analysis, rules, export, sarif, config, app, sem]
+  # cli는 cargo/syn/ra_ap 경계를 직접 만지지 않는다 — source를 통한다.
+  cli: [cargo_meta, harvest, modtree, sem]
   # mcp도 마찬가지 — 수확 경계는 source 뒤에만 있다.
-  mcp: [cargo_meta, harvest, modtree, cli]
+  mcp: [cargo_meta, harvest, modtree, cli, sem]
+  # sem은 위층과 syn 경계를 모른다 — source가 정점·간선을 맞춰 넘겨준다.
+  sem: [source, harvest, modtree, cli, cli_args, mcp, analysis, rules, export, sarif, config, app]
   # cli_args는 cli/mcp를 모른다 — 파서가 최하층이라 순환이 안 생긴다.
-  cli_args: [cli, mcp, cargo_meta, harvest, modtree, analysis, rules, sarif, config]
+  cli_args: [cli, mcp, cargo_meta, harvest, modtree, analysis, rules, sarif, config, sem]

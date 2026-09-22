@@ -7,6 +7,8 @@ use crate::cargo_meta::{self, Metadata};
 use crate::graph::{self, Document, Edge, EdgeKind, Kind, Level, Vertex};
 use crate::harvest::{self, BodyItem, Harvest};
 use crate::modtree::{self, ModTree};
+#[cfg(feature = "semantic")]
+use crate::sem;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -23,6 +25,9 @@ pub struct Options {
     pub retain_public: bool,
     /// 추가 보존 루트 ID.
     pub extra_roots: Vec<String>,
+    /// ra_ap 의미 해석으로 본문 간선을 보강할지 — `semantic` feature 빌드 필요.
+    /// 타입 해석 메서드 호출·매크로 확장·trait impl 행렬이 켜진다.
+    pub semantic: bool,
 }
 
 /// 파싱된 파일 AST 아레나 — 수확이 끝날 때까지 아이템이 살아 있어야 해서
@@ -32,6 +37,14 @@ type Arena = BTreeMap<PathBuf, &'static [syn::Item]>;
 /// `dir`의 cargo 워크스페이스를 수확해 문서를 만든다.
 /// 실패는 문자열 오류 — 빈 그래프로 성공한 척하지 않는다.
 pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
+    // feature가 꺼진 빌드는 여기서 오류 — 조용히 syn으로 떨어지면
+    // --semantic이 받은 결과가 의미 해석이 아니게 되어 거짓이 된다.
+    if opts.semantic && !cfg!(feature = "semantic") {
+        return Err(
+            "--semantic requires a build with the `semantic` feature (cargo build --features semantic)"
+                .to_string(),
+        );
+    }
     let meta = cargo_meta::load(dir)?;
     let mut harvest = Harvest::default();
     let mut vertices: Vec<Vertex> = Vec::new();
@@ -109,19 +122,19 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
     // 하기 때문 — 한 패스로 하면 처리 순서에 따라 크로스 크레이트 임포트가
     // 조용히 유실된다.
     for mp in tree.modules.keys().cloned().collect::<Vec<_>>() {
-        if let Some(items) = module_items(&tree, &arena, &mp) {
-            modtree::fill_items(&mut tree, &mp, &items);
+        if let Some(groups) = module_items(&tree, &arena, &mp) {
+            modtree::fill_items(&mut tree, &mp, &flatten_items(&groups));
         }
     }
     for mp in tree.modules.keys().cloned().collect::<Vec<_>>() {
-        if let Some(items) = module_items(&tree, &arena, &mp) {
-            modtree::fill_imports(&mut tree, &mp, &items, &dep_crates);
+        if let Some(groups) = module_items(&tree, &arena, &mp) {
+            modtree::fill_imports(&mut tree, &mp, &flatten_items(&groups), &dep_crates);
         }
     }
 
     // 1패스: 모듈·아이템 선언 — 정점과 contains/uses/implements 간선.
     let mut bodies: Vec<BodyItem<'_>> = Vec::new();
-    let mut impls: Vec<(harvest::ImplBlock, PathBuf, bool)> = Vec::new();
+    let mut impls: Vec<harvest::ImplBlock> = Vec::new();
     let mut test_roots: Vec<String> = Vec::new();
     for mp in tree.modules.keys().cloned().collect::<Vec<_>>() {
         let mh = harvest_module(&mut tree, &arena, &mp, &mut harvest);
@@ -131,26 +144,18 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
         entry_roots.extend(mh.decls.entry_roots);
         test_roots.extend(mh.decls.test_roots);
         bodies.extend(mh.decls.bodies);
-        for (i, (file, generated)) in mh.impl_meta.into_iter().enumerate() {
-            impls.push((mh.decls.impls[i].clone(), file, generated));
-        }
+        impls.extend(mh.decls.impls);
     }
-    for (block, file, generated) in &impls {
+    for block in &impls {
         let krate = modtree::crate_of(&block.items_module);
-        let (vs, es, bs) = harvest::impls(
-            std::slice::from_ref(block),
-            &krate,
-            &tree,
-            file,
-            *generated,
-            &mut harvest,
-        );
+        let (vs, es, bs) = harvest::impls(std::slice::from_ref(block), &krate, &tree, &mut harvest);
         vertices.extend(vs);
         edges.extend(es);
         bodies.extend(bs);
     }
 
-    // 메서드 이름 → ID 인덱스 — 타입 정보가 없어 이름 팬아웃에 쓴다.
+    // 메서드 이름 → ID 인덱스 — 이름 팬아웃 폴백에 쓴다(semantic에서는
+    // ra가 해석하지 못한 호출에만 쓰인다).
     let mut method_index: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for v in &vertices {
         if v.kind == Kind::Method {
@@ -164,6 +169,54 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
     }
 
     // 2패스: 본문 — 모든 정점이 준비된 뒤에 해석한다.
+    // semantic 엔진이 붙어 있으면 hir이 아는 본문은 타입 해석으로 정확히
+    // 잡고, 모르는 본문(cfg 비활성·매크로 생성)만 syn 팬아웃으로 돌아간다.
+    #[cfg(feature = "semantic")]
+    let engine = if opts.semantic {
+        Some(sem::Engine::load(&meta.workspace_root)?)
+    } else {
+        None
+    };
+    #[cfg(feature = "semantic")]
+    if let Some(eng) = &engine {
+        let ids: BTreeSet<&str> = vertices.iter().map(|v| v.id.as_str()).collect();
+        let mut st = sem::Stats::default();
+        for b in &bodies {
+            let site = sem::OwnerSite {
+                id: &b.id,
+                cfg: &b.cfg,
+                file: &b.file,
+                range: &b.range,
+            };
+            match eng.body_edges(&site, &ids, &method_index, &mut st) {
+                Some(es) => {
+                    // 시그니처 간선은 엔진과 무관하게 syn이 권위다.
+                    edges.extend(harvest::signature_edges(b, &tree, &dep_crates));
+                    edges.extend(es);
+                }
+                None => {
+                    st.unmapped += 1;
+                    edges.extend(harvest::bodies(
+                        std::slice::from_ref(b),
+                        &tree,
+                        &dep_crates,
+                        &method_index,
+                        &mut harvest,
+                    ));
+                }
+            }
+        }
+        push_sem_stats(&st, eng.has_proc_macros(), &mut limitations, &mut harvest);
+    } else {
+        edges.extend(harvest::bodies(
+            &bodies,
+            &tree,
+            &dep_crates,
+            &method_index,
+            &mut harvest,
+        ));
+    }
+    #[cfg(not(feature = "semantic"))]
     edges.extend(harvest::bodies(
         &bodies,
         &tree,
@@ -309,11 +362,13 @@ fn grow_tree(
         if !visited.insert(mp.clone()) {
             continue;
         }
-        let Some(items) = module_items(tree, arena, &mp) else {
+        let Some(groups) = module_items(tree, arena, &mp) else {
             continue;
         };
         let dir = modtree::module_dir(&tree.modules[&mp].file);
-        for sub in modtree::collect_submodules(&items, &mp, &dir, tree, conditional_count) {
+        for sub in
+            modtree::collect_submodules(&flatten_items(&groups), &mp, &dir, tree, conditional_count)
+        {
             let file = tree.modules[&sub].file.clone();
             if tree.modules[&sub].file_module {
                 parse_into(arena, &file)?;
@@ -364,19 +419,25 @@ fn parse_into(arena: &mut Arena, file: &Path) -> Result<(), String> {
     }
 }
 
-/// 모듈의 아이템 목록 — 파일 모듈은 파일 AST(루트는 extra_files 포함),
-/// 인라인 모듈은 조상의 mod 본문.
-fn module_items<'a>(tree: &ModTree, arena: &'a Arena, path: &str) -> Option<Vec<&'a syn::Item>> {
+/// 모듈의 아이템 그룹 — (선언 파일, 그 파일의 아이템 목록) 쌍.
+/// 파일 모듈은 파일 AST(루트는 extra_files까지 — 같은 이름의 lib/bin이
+/// 루트를 공유할 때 각 아이템의 실제 파일을 보존해야 semantic 엔진이
+/// 본문 소유자를 올바른 소스에 맞춘다), 인라인 모듈은 조상의 mod 본문.
+fn module_items<'a>(
+    tree: &ModTree,
+    arena: &'a Arena,
+    path: &str,
+) -> Option<Vec<(PathBuf, &'a [syn::Item])>> {
     let module = tree.modules.get(path)?;
     if module.file_module {
-        let mut out: Vec<&'a syn::Item> = arena
-            .get(&module.file)
-            .copied()
-            .unwrap_or_default()
-            .iter()
-            .collect();
+        let mut out: Vec<(PathBuf, &'a [syn::Item])> = Vec::new();
+        if let Some(items) = arena.get(&module.file).copied() {
+            out.push((module.file.clone(), items));
+        }
         for f in &module.extra_files {
-            out.extend(arena.get(f).copied().unwrap_or_default().iter());
+            if let Some(items) = arena.get(f).copied() {
+                out.push((f.clone(), items));
+            }
         }
         return Some(out);
     }
@@ -405,7 +466,13 @@ fn module_items<'a>(tree: &ModTree, arena: &'a Arena, path: &str) -> Option<Vec<
         }
         items = next?;
     }
-    Some(items.iter().collect())
+    Some(vec![(tree.modules[&top].file.clone(), items)])
+}
+
+/// 파일 그룹을 아이템 목록으로 펼친다 — 스코프 채우기·mod 수집처럼
+/// 선언 파일이 필요 없는 호출자용.
+fn flatten_items<'a>(groups: &[(PathBuf, &'a [syn::Item])]) -> Vec<&'a syn::Item> {
+    groups.iter().flat_map(|(_, items)| items.iter()).collect()
 }
 
 /// 모듈 하나의 수확 산출물 — 호출자가 순서대로 합친다.
@@ -413,8 +480,6 @@ struct ModuleHarvest<'a> {
     vertex: Vertex,
     edges: Vec<Edge>,
     decls: harvest::ModuleDecls<'a>,
-    /// decls.impls와 평행 — 각 impl 블록의 파일과 생성 여부.
-    impl_meta: Vec<(PathBuf, bool)>,
 }
 
 /// 한 모듈의 선언을 수확한다 — 모듈 정점, contains/uses 간선, 본문 보관.
@@ -424,10 +489,10 @@ fn harvest_module<'a>(
     mp: &str,
     harvest: &mut Harvest,
 ) -> ModuleHarvest<'a> {
-    let items = module_items(tree, arena, mp).expect("module items must exist");
+    let groups = module_items(tree, arena, mp).expect("module items must exist");
     let file = tree.modules[mp].file.clone();
     let krate = modtree::crate_of(mp);
-    let decls = harvest::decls(mp, &krate, &items, &file, harvest);
+    let decls = harvest::decls(mp, &krate, &groups, harvest);
 
     // 모듈 정점 — 타깃 루트는 크레이트 정점을 겸한다(rustc 의미론).
     // 위치는 파일 시작, exported는 `pub mod` 여부를 따른다.
@@ -465,11 +530,6 @@ fn harvest_module<'a>(
             edges.push(e);
         }
     }
-    let impl_meta = decls
-        .impls
-        .iter()
-        .map(|_| (file.clone(), generated))
-        .collect();
     // use 임포트 → uses 간선. 해석된 정규 경로가 아이템이면 그 정점으로,
     // 아니면 소유 모듈로. 아이템 표는 1단계에서 전 모듈에 채워졌으므로
     // 모듈 처리 순서와 무관하게 같은 결과가 나온다. 임포트에 cfg가 있으면
@@ -493,7 +553,6 @@ fn harvest_module<'a>(
         vertex,
         edges,
         decls,
-        impl_meta,
     }
 }
 
@@ -548,6 +607,56 @@ fn push_limitations(h: &Harvest, limitations: &mut Vec<String>) {
         limitations.push(format!(
             "{} items behind #[cfg] were included without feature evaluation",
             h.cfg_items
+        ));
+    }
+}
+
+/// 의미 해석 실측을 limitation 문장과 공유 카운터로 옮긴다.
+/// fanned/unresolved는 syn과 같은 버킷 — 메시지가 두 개로 갈라지면
+/// "총 몇 개인가"가 읽기 어려워진다. ext_macros는 별도 문장으로 둔다 —
+/// syn 문구는 "인자를 구문으로 파싱했다"는 전제를 담는데 의미 해석은
+/// 확장 트리를 걷기 때문에 그 주장이 거짓이 된다.
+#[cfg(feature = "semantic")]
+fn push_sem_stats(
+    st: &sem::Stats,
+    has_proc_macros: bool,
+    limitations: &mut Vec<String>,
+    harvest: &mut Harvest,
+) {
+    harvest.fanned_method_calls += st.fanned;
+    harvest.unresolved_paths += st.unresolved;
+    limitations.push(format!(
+        "semantic analysis: {} call/reference edges resolved via types; \
+         {} macro expansions walked; {} trait-dispatch sites expanded to candidate impls",
+        st.resolved, st.expanded, st.trait_sites
+    ));
+    if st.ext_macros > 0 {
+        limitations.push(format!(
+            "{} macro invocations resolve to macros outside the graph (std/external defs or unresolved paths)",
+            st.ext_macros
+        ));
+    }
+    if st.external > 0 {
+        limitations.push(format!(
+            "{} call targets resolved to items outside the graph (dependencies, std, or macro/derive-generated defs)",
+            st.external
+        ));
+    }
+    if st.unexpanded > 0 {
+        let cause = if has_proc_macros {
+            "expansion failure or depth limit"
+        } else {
+            "proc-macro server unavailable or expansion failure"
+        };
+        limitations.push(format!(
+            "{} macro calls could not be expanded ({cause})",
+            st.unexpanded
+        ));
+    }
+    if st.unmapped > 0 {
+        limitations.push(format!(
+            "{} bodies invisible to semantic analysis (cfg-disabled or macro-generated); syntactic fan-out used",
+            st.unmapped
         ));
     }
 }

@@ -25,6 +25,10 @@ usage:
   rustograph mcp [--dir DIR] [--graph FILE] [--config FILE] [--deps] [--tests]
   rustograph version
 
+shared flags: --deps --tests --retain-public --semantic
+  --semantic resolves method calls and macro expansions with rust-analyzer
+  semantics (requires a build with `--features semantic`)
+
 exit codes: 0 ok · 1 strict violation found · 2 usage/analysis error";
 
 /// 명령을 실행하고 종료 코드를 돌려준다.

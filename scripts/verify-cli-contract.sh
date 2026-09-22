@@ -60,6 +60,21 @@ check 2 "unknown command"   frobnicate
 check 2 "bad level"         graph --level bogus
 check 2 "bad format"        graph --format xml
 
+# --semantic — opt-in feature 계약: feature 빌드면 분석 성공(0), 아니면
+# 무엇을 빌드해야 하는지 알려주는 명확한 오류(2)여야 한다. 조용한 syn
+# 폴백은 거짓 계약이라 허용하지 않는다.
+got=0
+sem_err="$("$BIN" graph --semantic --dir "$FIX/fixture" 2>&1 >/dev/null)" || got=$?
+if [ "$got" -eq 2 ]; then
+	echo "$sem_err" | grep -q "semantic" || {
+		echo "FAIL graph --semantic: exit 2 but no feature guidance" >&2
+		fails=$((fails+1))
+	}
+elif [ "$got" -ne 0 ]; then
+	echo "FAIL graph --semantic: expected 0 or 2, got $got" >&2
+	fails=$((fails+1))
+fi
+
 # --dir를 붙이지 않는 검사 — check()는 항상 fixture dir을 뒤에 붙이므로
 # 나쁜 --dir 검증은 마지막 인자가 이기는(last-wins) 구조상 여기서 따로 한다.
 for c in "graph --dir /nonexistent-xyz"; do

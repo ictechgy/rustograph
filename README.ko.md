@@ -38,6 +38,14 @@ brew install ictechgy/tap/rustograph
 cargo install --git https://github.com/ictechgy/rustograph --tag v0.2.1
 ```
 
+타입 해석 분석은 opt-in `semantic` feature 빌드가 필요합니다
+(rust-analyzer `ra_ap_*` — 의존이 커서 기본이 아닙니다):
+
+```bash
+cargo build --release --features semantic
+rustograph graph --level symbol --semantic
+```
+
 ## 사용
 
 ```bash
@@ -79,9 +87,14 @@ cargo run -- rules --strict     # 자기 분석(도그푸딩)
 ## MVP의 한계
 
 구문 분석(syn)은 매크로 확장·`dyn` 디스패치·제네릭을 꿰뚫지 못합니다 —
-모든 사각지대는 `limitations`에 실측으로 잡힙니다. 로드맵은 이 수확기를
-rust-analyzer(`ra_ap_*`) 의미론으로 대체/보강하는 것이며, 그래프 계약은
-그대로입니다.
+모든 사각지대는 `limitations`에 실측으로 잡힙니다. opt-in `semantic`
+feature(`--features semantic` 빌드 후 `--semantic`)는 rust-analyzer
+(`ra_ap_*`) 의미론으로 본문 수확을 보강합니다 — 메서드 호출은 수신자
+타입으로 해석하고, 매크로 확장 트리를 걷고, `dyn`/제네릭 트레이트 호출은
+워크스페이스 impl 후보로 펼칩니다(실제 impl은 런타임 사실이라 여전히
+추정 간선). 그래프 계약은 그대로이고 정확도만 올라갑니다 — 의미 해석이
+보지 못하는 본문(cfg 비활성·매크로 생성)은 syn 경로로 되돌아가고 그 수를
+셉니다.
 
 ## 라이선스
 

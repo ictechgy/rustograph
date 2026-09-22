@@ -39,7 +39,7 @@ impl Args {
 const VALUE_FLAGS: &[&str] = &[
     "dir", "level", "format", "out", "graph", "root", "explain", "config", "depth", "max",
 ];
-const BOOL_FLAGS: &[&str] = &["deps", "tests", "retain-public", "strict"];
+const BOOL_FLAGS: &[&str] = &["deps", "tests", "retain-public", "strict", "semantic"];
 
 pub(crate) fn parse(args: &[String]) -> Result<Args, String> {
     let Some(cmd) = args.first() else {
@@ -91,6 +91,7 @@ pub(crate) fn document_for(a: &Args, symbol_level: bool) -> Result<Document, Str
             tests: a.has("tests"),
             retain_public: a.has("retain-public"),
             extra_roots: a.get_all("root").iter().map(|s| s.to_string()).collect(),
+            semantic: a.has("semantic"),
         },
     )
 }
