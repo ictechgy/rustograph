@@ -490,10 +490,7 @@ fn owner_module(tree: &ModTree, id: &str) -> Option<String> {
         if tree.modules.contains_key(&cur) {
             return Some(cur);
         }
-        cur = match cur.rfind("::") {
-            Some(i) => cur[..i].to_string(),
-            None => return None,
-        };
+        cur = cur.rfind("::").map(|i| cur[..i].to_string())?;
     }
 }
 
