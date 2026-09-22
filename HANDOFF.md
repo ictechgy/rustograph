@@ -4,8 +4,10 @@
 
 ## 현재 상태 (2026-09-22)
 
-**v0.2.0 개발 중 — feat/mcp-cfg-unsafe 브랜치.** v0.1.0은 배포 완료
-(public 리포 + Homebrew tap). PR #1~#4 머지됨.
+**v0.2.1 배포 완료.** https://github.com/ictechgy/rustograph (public),
+`brew install ictechgy/tap/rustograph`로 설치 가능(brew test 통과).
+v0.2.0도 배포됐으나 자기 분석에서 cli↔mcp 모듈 순환이 잡혀
+인자 파서를 cli_args로 분리한 0.2.1이 최신이다. PR #1~#6 머지됨.
 
 검증 상태: `cargo test` 63개 통과(단위 40 + 통합 23), 커버리지 91.2%
 (게이트 90), clippy 클린, verify-cli-contract OK(mcp 포함),
@@ -35,6 +37,9 @@
 - `src/config.rs` — `.rustograph.yml` 파싱(serde_yml 격리).
 - `src/cli.rs` — graph/cycles/dead/rules/query/impact/mcp/version,
   종료 코드 0/1/2.
+- `src/cli_args.rs` — cli/mcp 공유 인자 파서(최하층, 순환 방지).
+  이름이 args가 아닌 이유는 파일 헤더 주석 참고 — 지역 변수 `args`가
+  이름 해석으로 모듈을 가리키는 가짜 참조를 피한다.
 - `src/mcp.rs` — MCP stdio 서버(NDJSON JSON-RPC 2.0). 기동 시 문서 1회
   수확 후 스냅샷 서빙. 도구: rustograph_summary/query/impact/cycles/
   dead/rules. stdin을 파라미터로 받아 테스트 가능.

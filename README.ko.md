@@ -35,7 +35,7 @@ Rust에는 `cargo-modules`, `cargo deps`, 그리고 syn/tree-sitter 기반 콜�
 ```bash
 brew install ictechgy/tap/rustograph
 # 또는
-cargo install --git https://github.com/ictechgy/rustograph --tag v0.2.0
+cargo install --git https://github.com/ictechgy/rustograph --tag v0.2.1
 ```
 
 ## 사용
