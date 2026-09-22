@@ -1,0 +1,175 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and release (vX.Y.Z)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      matrix:
+        include:
+          # 패키지 이름은 계열 공통(go 관례 darwin-amd64), 타깃은 Rust 트리플.
+          - { name: darwin-arm64,  os: macos-latest,   target: aarch64-apple-darwin }
+          - { name: darwin-amd64,  os: macos-latest,   target: x86_64-apple-darwin }
+          - { name: linux-amd64,   os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
+          - { name: linux-arm64,   os: ubuntu-latest,  target: aarch64-unknown-linux-gnu }
+          - { name: windows-amd64, os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Linux arm64 cross linker
+        if: matrix.name == 'linux-arm64'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        env:
+          NAME: ${{ matrix.name }}
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            version="${{ github.event.inputs.tag }}"
+            version="${version#v}"
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          dir="rustograph-${version}-${NAME}"
+          bin="rustograph"
+          [ "$NAME" = "windows-amd64" ] && bin="rustograph.exe"
+          mkdir -p "$dir"
+          cp "target/${TARGET}/release/${bin}" "$dir/"
+          cp LICENSE README.md "$dir/"
+          if [ "$NAME" = "windows-amd64" ]; then
+            zip -qr "rustograph-${version}-${NAME}.zip" "$dir"
+          else
+            tar -czf "rustograph-${version}-${NAME}.tar.gz" "$dir"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustograph-${{ matrix.name }}
+          path: rustograph-*
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve version and check Cargo.toml agreement
+        env:
+          REQUESTED_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          tag="$REQUESTED_TAG"
+          if [ -z "$tag" ]; then tag="${GITHUB_REF_NAME}"; fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release tag: expected vMAJOR.MINOR.PATCH." >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          # 소스의 버전과 태그가 어긋나면 cargo install 사용자가 잘못된 값을 본다.
+          declared="$(grep -oE '^version = "[^"]+"' Cargo.toml | head -1 | cut -d'"' -f2)"
+          if [ "$declared" != "$version" ]; then
+            echo "태그($tag)와 Cargo.toml version($declared)이 다릅니다." >&2
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rustograph-*
+          merge-multiple: true
+
+      # 배포하기 전에 압축을 푼 그 바이너리로 CLI 계약 전체를 검증한다.
+      - name: Verify the packaged binary
+        run: |
+          tar -xzf "rustograph-${VERSION}-darwin-arm64.tar.gz" -C "$RUNNER_TEMP"
+          bin="$RUNNER_TEMP/rustograph-${VERSION}-darwin-arm64/rustograph"
+          test "$("$bin" version)" = "rustograph ${VERSION}"
+          cmp README.md "$RUNNER_TEMP/rustograph-${VERSION}-darwin-arm64/README.md"
+          scripts/verify-cli-contract.sh "$bin"
+
+      - name: Compute checksums
+        run: |
+          shasum -a 256 rustograph-*.tar.gz rustograph-*.zip > checksums.txt
+          cat checksums.txt
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<NOTES
+          ## Install
+
+          \`\`\`bash
+          brew install ictechgy/tap/rustograph
+          # or
+          cargo install --git https://github.com/ictechgy/rustograph --tag ${TAG}
+          \`\`\`
+
+          ## Assets
+
+          \`rustograph-${VERSION}-<os>-<arch>.tar.gz\` — macOS (arm64/x86_64), Linux (arm64/x86_64); \`.zip\` for Windows. \`checksums.txt\` has SHA-256 for every asset.
+          NOTES
+          gh release create "$TAG" rustograph-*.tar.gz rustograph-*.zip checksums.txt \
+            --title "$TAG" --notes-file notes.md --verify-tag
+
+      # tap 저장소는 다른 저장소라 기본 GITHUB_TOKEN으로는 쓸 수 없다.
+      # HOMEBREW_TAP_TOKEN 시크릿이 있을 때만 formula를 갱신하고, 없으면 조용히 건너뛴다.
+      - name: Update the Homebrew tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          sha() { grep "rustograph-${VERSION}-$1" checksums.txt | cut -d' ' -f1; }
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN is not configured; update the tap with these values:"
+            echo "  version   ${VERSION}"
+            for t in darwin-arm64 darwin-amd64 linux-arm64 linux-amd64; do
+              echo "  $t  $(sha "$t.tar.gz")"
+            done
+            exit 0
+          fi
+          git clone "https://${HOMEBREW_TAP_TOKEN}@github.com/ictechgy/homebrew-tap.git" tap
+          # formula 원본은 이 저장소 Formula/rustograph.rb — 자리표시자만 채워 탭에 둔다.
+          sed -e "s|@TAG@|${TAG}|g" \
+              -e "s|@VERSION@|${VERSION}|g" \
+              -e "s|@SHA_DARWIN_ARM64@|$(sha darwin-arm64.tar.gz)|" \
+              -e "s|@SHA_DARWIN_AMD64@|$(sha darwin-amd64.tar.gz)|" \
+              -e "s|@SHA_LINUX_ARM64@|$(sha linux-arm64.tar.gz)|" \
+              -e "s|@SHA_LINUX_AMD64@|$(sha linux-amd64.tar.gz)|" \
+              Formula/rustograph.rb > tap/Formula/rustograph.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/rustograph.rb
+          git commit -m "rustograph ${VERSION}"
+          git push
