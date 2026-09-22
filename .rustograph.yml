@@ -1,0 +1,40 @@
+# rustograph 자기 분석 규칙 — 계층을 한 방향으로 유지한다.
+#
+#   graph (순수 도메인)
+#     ↑ modtree · cargo_meta · harvest (수확 경계 — syn/cargo는 여기만)
+#     ↑ source (오케스트레이터)
+#     ↑ analysis · rules · export · sarif · config (질의/출력)
+#     ↑ cli · app (진입점)
+#
+# deps에 없는 컴포넌트로의 의존은 위반이다. deny가 deps를 이긴다.
+components:
+  app: ["rustograph"]
+  cli: ["rustograph::cli/**"]
+  source: ["rustograph::source/**"]
+  cargo_meta: ["rustograph::cargo_meta/**"]
+  modtree: ["rustograph::modtree/**"]
+  harvest: ["rustograph::harvest/**"]
+  graph: ["rustograph::graph/**"]
+  analysis: ["rustograph::analysis/**"]
+  rules: ["rustograph::rules/**"]
+  export: ["rustograph::export/**"]
+  sarif: ["rustograph::sarif/**"]
+  config: ["rustograph::config/**"]
+deps:
+  app: [cli]
+  cli: [source, analysis, rules, export, sarif, config, graph]
+  source: [graph, harvest, modtree, cargo_meta]
+  harvest: [graph, modtree]
+  analysis: [graph]
+  rules: [graph, config]
+  export: [graph]
+  sarif: [graph, rules]
+  cargo_meta: []
+  modtree: []
+  graph: []
+  config: []
+deny:
+  # 도메인은 수확 경계와 CLI를 절대 모른다 — 순수성이 테스트 가능성이다.
+  graph: [cli, source, harvest, modtree, cargo_meta, analysis, rules, export, sarif, config, app]
+  # cli는 cargo/syn 경계를 직접 만지지 않는다 — source를 통한다.
+  cli: [cargo_meta, harvest, modtree]

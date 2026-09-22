@@ -1,0 +1,26 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - run: cargo build --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo fmt --check
+      - run: scripts/coverage.sh
+      - run: scripts/verify-cli-contract.sh
+
+      # 도그푸딩 — 이 도구로 이 저장소를 분석한다
+      - run: cargo run --quiet -- rules --strict
+      - run: cargo run --quiet -- cycles --level symbol --strict
