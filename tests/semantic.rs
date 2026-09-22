@@ -260,6 +260,20 @@ fn concrete_generic_instance_stays_firm() {
 }
 
 #[test]
+fn auto_trait_only_object_stays_open() {
+    let d = sem_doc();
+    // `&dyn Send` — principal trait이 없어 as_dyn_trait가 못 잡는다.
+    // blanket impl 기본 메서드 호출은 열린 디스패치여야 한다.
+    let e = call(
+        &d,
+        "fixture_core::poke_on_dyn_send",
+        "fixture_core::Poke::poke",
+    )
+    .expect("default method on principal-less dyn object");
+    assert!(e.tentative, "dyn Send receiver is not concrete");
+}
+
+#[test]
 fn merged_bin_root_body_uses_its_own_file() {
     let d = sem_doc();
     // lib와 같은 이름의 bin — 루트 합본에서 bin 본문의 파일은

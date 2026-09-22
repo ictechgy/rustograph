@@ -572,17 +572,24 @@ impl<'a, 'b> Walker<'a, 'b> {
     /// 겉이 ADT(Box 등)여도 인자 안에 그런 종류가 있으면 열린다 —
     /// `self: Box<Self>` 메서드는 조정 후에도 `Box<dyn Tr>` 형태가
     /// 유지되므로 겉 타입이 아니라 구성 타입 전부를 walk로 본다.
+    /// 열린 종류를 나열하지 않고 구체로 확인된 종류만 허용한다 —
+    /// `dyn Send`처럼 principal trait이 없어 `as_dyn_trait`가 못 잡는
+    /// 객체나 미지의 kind도 안전한 쪽(열림)으로 떨어진다.
     fn type_is_concrete(&self, ty: &Type) -> bool {
-        let mut open = false;
+        let mut concrete = true;
         ty.walk(self.db(), |t| {
-            open = open
-                || t.as_dyn_trait().is_some()
-                || t.as_type_param(self.db()).is_some()
-                || t.as_associated_type_parent_trait(self.db()).is_some()
-                || t.as_impl_traits(self.db()).is_some()
-                || t.is_unknown();
+            concrete &= t.as_adt().is_some()
+                || t.as_builtin().is_some()
+                || t.is_tuple()
+                || t.is_slice()
+                || t.is_array()
+                || t.as_reference().is_some()
+                || t.is_raw_ptr()
+                || t.is_fn()
+                || t.is_closure()
+                || t.as_coroutine().is_some();
         });
-        !open
+        concrete
     }
 
     /// 해석된 함수를 간선으로 — 트레이트 정의 메서드는, 수신자가 구체

@@ -133,6 +133,22 @@ pub fn wrap_call() -> u32 {
     Wrap(()).name()
 }
 
+/// blanket impl 트레이트 — `dyn Send`처럼 principal trait이 없는 객체도
+/// 수신자가 될 수 있다. as_dyn_trait는 principal만 돌려주므로 겉 kind가
+/// Dynamic인지 별도로 잡아야 한다.
+pub trait Poke {
+    fn poke(&self) -> u32 {
+        3
+    }
+}
+
+impl<T: ?Sized> Poke for T {}
+
+/// `&dyn Send` 수신자 — auto trait만 가진 객체. 디스패치는 열려 있다.
+pub fn poke_on_dyn_send(x: &dyn Send) -> u32 {
+    x.poke()
+}
+
 pub fn entry() -> u32 {
     util::helper() + local_shout!(0)
 }
