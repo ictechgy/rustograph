@@ -70,7 +70,7 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ github.event.inputs.tag }}"
-          if ($version -eq "") { $version = "${GITHUB_REF_NAME}" }
+          if ($version -eq "") { $version = $env:GITHUB_REF_NAME }
           $version = $version -replace '^v', ''
           $dir = "rustograph-$version-$env:NAME"
           New-Item -ItemType Directory -Path $dir | Out-Null
