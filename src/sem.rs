@@ -16,7 +16,7 @@ use crate::graph::{Edge, EdgeKind};
 use ra_ap_hir::db::HirDatabase;
 use ra_ap_hir::{
     Adt, AsAssocItem, AssocItem, AssocItemContainer, Const, Crate, Enum, Function, Impl, Macro,
-    Module, ModuleDef, PathResolution, Semantics, Static, Trait, TypeAlias,
+    Module, ModuleDef, PathResolution, Semantics, Static, Trait, Type, TypeAlias,
 };
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice};
@@ -558,19 +558,31 @@ impl<'a, 'b> Walker<'a, 'b> {
         }
     }
 
-    /// 수신자 타입이 구체 ADT로 잡히는가 — dyn/impl Trait/제네릭이면
+    /// 수신자 타입이 완전히 구체적인가 — dyn/impl Trait/제네릭이면
     /// 디스패치가 열려 있으므로 false다. `Box<dyn Tr>` 같은 스마트 포인터는
-    /// 조정 전 타입이 ADT이므로 역참조·자동 참조가 반영된 조정 후 타입으로 판정한다.
+    /// 조정 전 타입이 ADT이므로 역참조·자동 참조가 반영된 조정 후 타입을 본다.
     fn receiver_is_concrete(&self, mc: &ast::MethodCallExpr) -> bool {
         mc.receiver()
             .and_then(|r| self.sema.type_of_expr(&r))
-            .is_some_and(|t| {
-                t.adjusted
-                    .unwrap_or(t.original)
-                    .strip_references()
-                    .as_adt()
-                    .is_some()
-            })
+            .is_some_and(|t| self.type_is_concrete(&t.adjusted.unwrap_or(t.original)))
+    }
+
+    /// 타입이 완전히 구체적인가 — dyn·타입 파라미터·연관 타입·opaque·
+    /// 미해석(infer 실패) 종류가 하나라도 섞이면 디스패치는 열려 있다.
+    /// 겉이 ADT(Box 등)여도 인자 안에 그런 종류가 있으면 열린다 —
+    /// `self: Box<Self>` 메서드는 조정 후에도 `Box<dyn Tr>` 형태가
+    /// 유지되므로 겉 타입이 아니라 구성 타입 전부를 walk로 본다.
+    fn type_is_concrete(&self, ty: &Type) -> bool {
+        let mut open = false;
+        ty.walk(self.db(), |t| {
+            open = open
+                || t.as_dyn_trait().is_some()
+                || t.as_type_param(self.db()).is_some()
+                || t.as_associated_type_parent_trait(self.db()).is_some()
+                || t.as_impl_traits(self.db()).is_some()
+                || t.is_unknown();
+        });
+        !open
     }
 
     /// 해석된 함수를 간선으로 — 트레이트 정의 메서드는, 수신자가 구체

@@ -229,6 +229,37 @@ fn boxed_dyn_receiver_stays_open() {
 }
 
 #[test]
+fn boxed_self_receiver_stays_open() {
+    let d = sem_doc();
+    // `consume(self: Box<Self>)`는 역참조 없이 Box<dyn> 그대로 받는다 —
+    // 조정 후 타입이 Box(ADT)여도 인자 안이 dyn이면 디스패치는 열려 있다.
+    let e = call(
+        &d,
+        "fixture_core::consume_dispatch",
+        "fixture_core::Used::<Consume>::consume",
+    )
+    .expect("impl candidate edge");
+    assert!(e.tentative, "self: Box<Self> on dyn must stay tentative");
+    let decl = call(
+        &d,
+        "fixture_core::consume_dispatch",
+        "fixture_core::Consume::consume",
+    )
+    .expect("trait decl edge");
+    assert!(decl.tentative);
+}
+
+#[test]
+fn concrete_generic_instance_stays_firm() {
+    let d = sem_doc();
+    // Wrap<()> — 제네릭 ADT라도 인자가 전부 구체적이면 디스패치는 닫힌다.
+    // 기본 구현 상속은 선언점이 확정 타깃 — tentative로 떨어지면 회귀.
+    let e = call(&d, "fixture_core::wrap_call", "fixture_core::Named::name")
+        .expect("default method on concrete generic instance");
+    assert!(!e.tentative, "Wrap<()> receiver is concrete");
+}
+
+#[test]
 fn merged_bin_root_body_uses_its_own_file() {
     let d = sem_doc();
     // lib와 같은 이름의 bin — 루트 합본에서 bin 본문의 파일은

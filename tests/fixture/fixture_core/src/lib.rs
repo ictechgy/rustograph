@@ -105,6 +105,34 @@ pub fn boxed_dispatch(x: Box<dyn Greet>) -> u32 {
     x.greet()
 }
 
+/// Box<Self> 수신자 트레이트 — 역참조 없이 Box<dyn> 그대로 받는 메서드는
+/// 조정 후 타입도 Box(ADT)라 겉 타입만 보면 닫힌 디스패치로 오인된다.
+pub trait Consume {
+    fn consume(self: Box<Self>) -> u32;
+}
+
+impl Consume for Used {
+    fn consume(self: Box<Self>) -> u32 {
+        self.v
+    }
+}
+
+/// Box<dyn>의 self: Box<Self> 호출 — 실제 impl은 런타임에 정해진다.
+pub fn consume_dispatch(x: Box<dyn Consume>) -> u32 {
+    x.consume()
+}
+
+/// 제네릭 ADT — 인자가 튜플이어도 구체 인스턴스면 디스패치는 닫혀 있다.
+pub struct Wrap<T>(pub T);
+
+/// 구체 인스턴스의 기본 구현 상속 — 선언점 디폴트가 확정 타깃이다.
+impl Named for Wrap<()> {}
+
+/// Wrap<()>의 기본 메서드 호출 — 구체라 `Named::name`이 확정이다.
+pub fn wrap_call() -> u32 {
+    Wrap(()).name()
+}
+
 pub fn entry() -> u32 {
     util::helper() + local_shout!(0)
 }

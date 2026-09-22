@@ -20,6 +20,8 @@ fn main() {
     let _g = fixture_core::generic_dispatch(&u);
     // Box<dyn> 수신자 — 조정 후 타입이 dyn이라 후보 행렬이어야 한다.
     let _b = fixture_core::boxed_dispatch(Box::new(Renamed { v: 2 }));
+    // self: Box<Self> 수신자 — 조정 후에도 Box<dyn>이지만 역시 열린다.
+    let _cd = fixture_core::consume_dispatch(Box::new(Renamed { v: 4 }));
     // 기본 구현 상속 — 구체 수신자라 선언점 디폴트가 확정 타깃이다.
     let _n = u.name();
     // fn 아이템을 담은 지역 바인딩 — callable 해석이 ffi_entry까지 따라간다.
