@@ -580,6 +580,7 @@ impl<'a, 'b> Walker<'a, 'b> {
         ty.walk(self.db(), |t| {
             concrete &= t.as_adt().is_some()
                 || t.as_builtin().is_some()
+                || t.is_never()
                 || t.is_tuple()
                 || t.is_slice()
                 || t.is_array()
