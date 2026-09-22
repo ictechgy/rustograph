@@ -20,9 +20,11 @@ components:
   export: ["rustograph::export/**"]
   sarif: ["rustograph::sarif/**"]
   config: ["rustograph::config/**"]
+  mcp: ["rustograph::mcp/**"]
 deps:
   app: [cli]
-  cli: [source, analysis, rules, export, sarif, config, graph]
+  cli: [source, analysis, rules, export, sarif, config, graph, mcp]
+  mcp: [cli, analysis, rules, export, config, graph]
   source: [graph, harvest, modtree, cargo_meta]
   harvest: [graph, modtree]
   analysis: [graph]
@@ -38,3 +40,5 @@ deny:
   graph: [cli, source, harvest, modtree, cargo_meta, analysis, rules, export, sarif, config, app]
   # cli는 cargo/syn 경계를 직접 만지지 않는다 — source를 통한다.
   cli: [cargo_meta, harvest, modtree]
+  # mcp도 마찬가지 — 수확 경계는 source 뒤에만 있다.
+  mcp: [cargo_meta, harvest, modtree]
