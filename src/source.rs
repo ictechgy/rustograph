@@ -182,12 +182,7 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
     // 잡고, 모르는 본문(cfg 비활성·매크로 생성)만 syn 팬아웃으로 돌아간다.
     #[cfg(feature = "semantic")]
     let engine = if opts.semantic {
-        let e = sem::Engine::load(&meta.workspace_root)?;
-        if !e.has_proc_macros() {
-            limitations
-                .push("proc-macro server unavailable; proc-macro calls not expanded".to_string());
-        }
-        Some(e)
+        Some(sem::Engine::load(&meta.workspace_root)?)
     } else {
         None
     };
@@ -196,7 +191,13 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
         let ids: BTreeSet<&str> = vertices.iter().map(|v| v.id.as_str()).collect();
         let mut st = sem::Stats::default();
         for b in &bodies {
-            match eng.body_edges(&b.id, &b.cfg, &ids, &method_index, &mut st) {
+            let site = sem::OwnerSite {
+                id: &b.id,
+                cfg: &b.cfg,
+                file: &b.file,
+                range: &b.range,
+            };
+            match eng.body_edges(&site, &ids, &method_index, &mut st) {
                 Some(es) => {
                     // 시그니처 간선은 엔진과 무관하게 syn이 권위다.
                     edges.extend(harvest::signature_edges(b, &tree, &dep_crates));
@@ -214,7 +215,7 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
                 }
             }
         }
-        push_sem_stats(&st, &mut limitations, &mut harvest);
+        push_sem_stats(&st, eng.has_proc_macros(), &mut limitations, &mut harvest);
     } else {
         edges.extend(harvest::bodies(
             &bodies,
@@ -614,18 +615,30 @@ fn push_limitations(h: &Harvest, limitations: &mut Vec<String>) {
 }
 
 /// 의미 해석 실측을 limitation 문장과 공유 카운터로 옮긴다.
-/// fanned/unresolved/ext_macros는 syn과 같은 버킷 — 메시지가 두 개로
-/// 갈라지면 "총 몇 개인가"가 읽기 어려워진다.
+/// fanned/unresolved는 syn과 같은 버킷 — 메시지가 두 개로 갈라지면
+/// "총 몇 개인가"가 읽기 어려워진다. ext_macros는 별도 문장으로 둔다 —
+/// syn 문구는 "인자를 구문으로 파싱했다"는 전제를 담는데 의미 해석은
+/// 확장 트리를 걷기 때문에 그 주장이 거짓이 된다.
 #[cfg(feature = "semantic")]
-fn push_sem_stats(st: &sem::Stats, limitations: &mut Vec<String>, harvest: &mut Harvest) {
+fn push_sem_stats(
+    st: &sem::Stats,
+    has_proc_macros: bool,
+    limitations: &mut Vec<String>,
+    harvest: &mut Harvest,
+) {
     harvest.fanned_method_calls += st.fanned;
     harvest.unresolved_paths += st.unresolved;
-    harvest.external_macros += st.ext_macros;
     limitations.push(format!(
         "semantic analysis: {} call/reference edges resolved via types; \
          {} macro expansions walked; {} trait-dispatch sites expanded to candidate impls",
         st.resolved, st.expanded, st.trait_sites
     ));
+    if st.ext_macros > 0 {
+        limitations.push(format!(
+            "{} macro invocations resolve to macros outside the graph (std/external defs or unresolved paths)",
+            st.ext_macros
+        ));
+    }
     if st.external > 0 {
         limitations.push(format!(
             "{} call targets resolved to items outside the graph (dependencies, std, or macro/derive-generated defs)",
@@ -633,8 +646,13 @@ fn push_sem_stats(st: &sem::Stats, limitations: &mut Vec<String>, harvest: &mut 
         ));
     }
     if st.unexpanded > 0 {
+        let cause = if has_proc_macros {
+            "expansion failure or depth limit"
+        } else {
+            "proc-macro server unavailable or expansion failure"
+        };
         limitations.push(format!(
-            "{} macro calls could not be expanded (proc-macro server missing or expansion failure)",
+            "{} macro calls could not be expanded ({cause})",
             st.unexpanded
         ));
     }

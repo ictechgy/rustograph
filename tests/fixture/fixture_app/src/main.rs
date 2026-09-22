@@ -1,6 +1,7 @@
 mod extra;
 
 use fixture_core::Greet;
+use fixture_core::Named;
 use fixture_core::Used as Renamed;
 use fixture_core::inline::*;
 #[cfg(feature = "never")]
@@ -17,4 +18,23 @@ fn main() {
     let _via_macro = fixture_core::emit_helper!();
     let _d = fixture_core::dyn_dispatch(&u);
     let _g = fixture_core::generic_dispatch(&u);
+    // 기본 구현 상속 — 구체 수신자라 선언점 디폴트가 확정 타깃이다.
+    let _n = u.name();
+    // fn 아이템을 담은 지역 바인딩 — callable 해석이 ffi_entry까지 따라간다.
+    let f = fixture_core::ffi_entry;
+    let _fv = f();
+    // 패턴 위치의 경로 — 상수 패턴 참조다(BASE는 여기서만 참조된다).
+    match _n {
+        fixture_core::BASE => {}
+        _ => {}
+    }
+    local_scope();
+}
+
+/// 블록 지역 정의 — `inner` 본문의 호출은 `local_scope`의 것이 아니다.
+fn local_scope() {
+    fn inner() -> u32 {
+        fixture_core::util::helper()
+    }
+    let _ = inner();
 }

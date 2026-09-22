@@ -163,6 +163,48 @@ fn graph_schema_and_ids_unchanged() {
 }
 
 #[test]
+fn default_trait_method_on_concrete_type_is_firm() {
+    let d = sem_doc();
+    // u: Used는 Named::name을 오버라이드하지 않는다 — 선언점 디폴트가
+    // 확정 타깃이지 후보 행렬이 아니다.
+    let e = call(&d, "fixture_app::main", "fixture_core::Named::name")
+        .expect("default trait method edge");
+    assert!(!e.tentative, "concrete receiver on default method is firm");
+}
+
+#[test]
+fn block_local_defs_do_not_leak_calls() {
+    let d = sem_doc();
+    // local_scope 안의 블록 지역 inner 본문 호출은 소유자에게 귀속되지 않는다.
+    assert!(call(&d, "fixture_app::local_scope", "fixture_core::util::helper").is_none());
+    // 블록 지역 fn은 정점이 없다 — 같은 이름의 정점으로의 간선도 없어야 한다.
+    assert!(call(&d, "fixture_app::local_scope", "fixture_app::inner").is_none());
+}
+
+#[test]
+fn local_fn_item_call_resolves() {
+    let d = sem_doc();
+    // let f = fixture_core::ffi_entry; f() — 지역 바인딩이지만 callable 해석이
+    // fn 아이템까지 따라간다. syn은 이름 `f`를 못 잡아 간선이 없다.
+    let e = call(&d, "fixture_app::main", "fixture_core::ffi_entry").expect("fn-item call edge");
+    assert!(!e.tentative);
+    let s = syn_doc();
+    assert!(call(&s, "fixture_app::main", "fixture_core::ffi_entry").is_none());
+}
+
+#[test]
+fn pattern_paths_reference_targets() {
+    let d = sem_doc();
+    // match 갈래의 `fixture_core::BASE` — 패턴 위치의 경로도 참조로 잡힌다.
+    let e = d.edges.iter().find(|e| {
+        e.from == "fixture_app::main"
+            && e.to == "fixture_core::BASE"
+            && e.kind == EdgeKind::References
+    });
+    assert!(e.is_some_and(|e| !e.tentative), "pattern path must resolve");
+}
+
+#[test]
 fn syn_mode_still_fans_out() {
     // 기본 모드 계약은 그대로 — 같은-이름 팬아웃이 추정 간선으로 남는다.
     let s = syn_doc();

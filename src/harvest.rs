@@ -7,8 +7,9 @@
 use crate::graph::{Edge, EdgeKind, Kind, Vertex};
 use crate::modtree::{cfg_of, ModTree};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use syn::parse::Parser;
+use syn::spanned::Spanned;
 use syn::visit::Visit;
 
 /// 수확 중간 산출물 — 문서 조립 전의 실측 카운터.
@@ -61,6 +62,11 @@ pub struct BodyItem<'a> {
     pub signature_surface: Vec<&'a syn::Type>,
     /// 소유 아이템의 `#[cfg]` — 이 본문이 만드는 간선 전부가 그 조건 아래 있다.
     pub cfg: Option<String>,
+    /// 소유 아이템이 선언된 파일 — semantic 엔진이 소스 정체를 맞출 때 쓴다.
+    pub file: PathBuf,
+    /// 소유 아이템의 바이트 범위 — cfg 변형·블록 지역 정의 같은
+    /// 정규 ID 충돌을 소스 위치로 걸러내는 데 쓴다.
+    pub range: std::ops::Range<usize>,
 }
 
 /// 블록 `{ ... }`의 구문들을 표현식 목록으로 펼친다.
@@ -144,6 +150,8 @@ pub fn decls<'a>(
                     exprs,
                     signature_surface: fn_signature_types(&f.sig),
                     cfg: cfg.clone(),
+                    file: file.to_path_buf(),
+                    range: f.span().byte_range(),
                 });
             }
             syn::Item::Struct(s) => {
@@ -186,6 +194,8 @@ pub fn decls<'a>(
                                 exprs,
                                 signature_surface: fn_signature_types(&m.sig),
                                 cfg: cfg.clone(),
+                                file: file.to_path_buf(),
+                                range: m.span().byte_range(),
                             });
                         }
                     }
@@ -220,6 +230,8 @@ pub fn decls<'a>(
                     exprs,
                     signature_surface: vec![&c.ty],
                     cfg: cfg.clone(),
+                    file: file.to_path_buf(),
+                    range: c.span().byte_range(),
                 });
             }
             syn::Item::Static(s) => {
@@ -236,6 +248,8 @@ pub fn decls<'a>(
                     exprs,
                     signature_surface: vec![&s.ty],
                     cfg: cfg.clone(),
+                    file: file.to_path_buf(),
+                    range: s.span().byte_range(),
                 });
             }
             syn::Item::Macro(m) => {
@@ -337,6 +351,8 @@ pub fn impls<'a>(
                 exprs,
                 signature_surface: fn_signature_types(&m.sig),
                 cfg: b.cfg.clone(),
+                file: file.to_path_buf(),
+                range: m.span().byte_range(),
             });
         }
     }
