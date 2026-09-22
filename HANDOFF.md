@@ -4,8 +4,9 @@
 
 ## 현재 상태 (2026-09-22)
 
-**MVP 완성 — 로컬 전용, 아직 push 안 함.** git init + 초기 커밋 단계.
-원격 리포는 없다.
+**v0.1.0 릴리스 완료.** https://github.com/ictechgy/rustograph (public),
+`brew install ictechgy/tap/rustograph`로 설치 가능(brew test 통과).
+PR #1~#3 머지됨(clippy 수정 + 릴리스 워크플로우 + pwsh 문법 수정).
 
 검증 상태: `cargo test` 55개 통과(단위 34 + 통합 21), 커버리지 91.6%
 (게이트 90), clippy 클린, verify-cli-contract OK, 자기 분석
@@ -48,10 +49,8 @@
 
 ## 다음 단계 (우선순위 순)
 
-1. **공개 리포 + 릴리스** — 계열 관례: GitHub `ictechgy/rustograph`,
-   CI(`.github/workflows/ci.yml` 작성 필요), release 워크플로우 +
-   Formula 템플릿(`Formula/rustograph.rb`), `ictechgy/homebrew-tap`.
-   버전 태그는 cargo 관례 `v0.1.0`.
+1. ~~공개 리포 + 릴리스~~ — 완료. `HOMEBREW_TAP_TOKEN` 리포 시크릿이
+   없어 탭 갱신은 수동으로 했다 — 넣으면 다음 릴리스부터 자동.
 2. **MCP 서버** — `rustograph mcp` stdio, 계열과 같은 도구 셋
    (graph/cycles/dead/rules/query/impact).
 3. **ra_ap_* 의미 해석** — MVP의 syn 수확을 rust-analyzer 의미론으로
