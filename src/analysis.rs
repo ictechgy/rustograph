@@ -374,6 +374,8 @@ mod tests {
             position: None,
             exported: false,
             generated: false,
+            cfg: None,
+            unsafe_: false,
         }
     }
 

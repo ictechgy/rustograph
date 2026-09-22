@@ -343,6 +343,81 @@ fn local_macro_and_variant_and_rename_resolve() {
 }
 
 #[test]
+fn cfg_conditions_are_metadata_on_vertices_and_edges() {
+    let d = doc(&source::Options {
+        symbol_level: true,
+        ..Default::default()
+    });
+    let v = |id: &str| d.vertices.iter().find(|v| v.id == id).unwrap();
+    // 아이템·모듈의 자체 #[cfg]가 정점에 실린다 — 토큰 그대로.
+    assert_eq!(
+        v("fixture_core::cfg_gated").cfg.as_deref(),
+        Some("feature = \"never\"")
+    );
+    assert_eq!(v("fixture_core::unix_only").cfg.as_deref(), Some("unix"));
+    assert_eq!(v("fixture_core::t").cfg.as_deref(), Some("test"));
+    // 조건 없는 정점은 키가 없다 — "무조건"과 "모름"을 구분하는 계약.
+    assert!(v("fixture_core::entry").cfg.is_none());
+    // cfg-gated use → uses 간선에 조건이 실린다.
+    let e = d
+        .edges
+        .iter()
+        .find(|e| {
+            e.from == "fixture_app" && e.to == "fixture_core::cfg_gated" && e.kind == EdgeKind::Uses
+        })
+        .unwrap();
+    assert_eq!(e.cfg.as_deref(), Some("feature = \"never\""));
+    // 조건부 mod의 contains 간선도 조건을 물려받는다.
+    let e = d
+        .edges
+        .iter()
+        .find(|e| {
+            e.from == "fixture_core"
+                && e.to == "fixture_core::unix_only"
+                && e.kind == EdgeKind::Contains
+        })
+        .unwrap();
+    assert_eq!(e.cfg.as_deref(), Some("unix"));
+}
+
+#[test]
+fn unsafe_boundaries_mark_vertices_and_entry_edges() {
+    let d = doc(&source::Options {
+        symbol_level: true,
+        ..Default::default()
+    });
+    let v = |id: &str| d.vertices.iter().find(|v| v.id == id).unwrap();
+    // unsafe fn / unsafe 블록 포함 본문 / unsafe trait / unsafe fn 선언.
+    assert!(v("fixture_core::raw_read").unsafe_);
+    assert!(v("fixture_core::safe_wrapper").unsafe_);
+    assert!(v("fixture_core::RawBytes").unsafe_);
+    assert!(v("fixture_core::PtrMath::deref_raw").unsafe_);
+    assert!(!v("fixture_core::entry").unsafe_);
+    // unsafe 블록 안의 호출은 경계 진입 간선이다.
+    let e = d
+        .edges
+        .iter()
+        .find(|e| {
+            e.from == "fixture_core::safe_wrapper"
+                && e.to == "fixture_core::raw_read"
+                && e.kind == EdgeKind::Call
+        })
+        .unwrap();
+    assert!(e.unsafe_);
+    // unsafe impl의 implements 간선도 경계다.
+    let e = d
+        .edges
+        .iter()
+        .find(|e| {
+            e.from == "fixture_core::Used"
+                && e.to == "fixture_core::RawBytes"
+                && e.kind == EdgeKind::Implements
+        })
+        .unwrap();
+    assert!(e.unsafe_);
+}
+
+#[test]
 fn no_mangle_is_retention_root() {
     let d = doc(&source::Options {
         symbol_level: true,

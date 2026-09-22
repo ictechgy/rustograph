@@ -5,7 +5,7 @@
 //! 과대 근사한다 — 오탐은 "살아 있다" 쪽으로만 기울게 하는 계약이다.
 
 use crate::graph::{Edge, EdgeKind, Kind, Vertex};
-use crate::modtree::{has_cfg, ModTree};
+use crate::modtree::{cfg_of, ModTree};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use syn::parse::Parser;
@@ -44,6 +44,10 @@ pub struct ImplBlock {
     pub trait_path: Option<Vec<String>>,
     pub methods: Vec<syn::ImplItemFn>,
     pub items_module: String,
+    /// `#[cfg]`가 붙은 impl — 메서드 정점과 그 본문 간선이 조건을 물려받는다.
+    pub cfg: Option<String>,
+    /// `unsafe impl` — 이 구현이 만드는 정점·implements 간선은 경계의 일부다.
+    pub unsafe_: bool,
 }
 
 /// 본문을 나중에 방문할 항목.
@@ -55,6 +59,8 @@ pub struct BodyItem<'a> {
     /// 블록의 표현식들 — 문 위치 매크로는 ExprMacro로 감싸져 있다.
     pub exprs: Vec<syn::Expr>,
     pub signature_surface: Vec<&'a syn::Type>,
+    /// 소유 아이템의 `#[cfg]` — 이 본문이 만드는 간선 전부가 그 조건 아래 있다.
+    pub cfg: Option<String>,
 }
 
 /// 블록 `{ ... }`의 구문들을 표현식 목록으로 펼친다.
@@ -80,6 +86,11 @@ fn block_exprs(b: &syn::Block) -> Vec<syn::Expr> {
     out
 }
 
+/// Option<&Block>의 map에 바로 쓰기 위한 참조 어댑터 — 클로저 감쌈을 피한다.
+fn block_exprs_ref(b: &syn::Block) -> Vec<syn::Expr> {
+    block_exprs(b)
+}
+
 /// 모듈의 파일 AST를 1패스로 돌려 선언 정점을 수확한다.
 pub fn decls<'a>(
     module_path: &str,
@@ -97,12 +108,12 @@ pub fn decls<'a>(
     };
     let generated = file_has_generated_marker(file);
     for &item in items {
-        let conditional = has_cfg(attrs_of(item));
-        if conditional {
+        let cfg = cfg_of(attrs_of(item));
+        if cfg.is_some() {
             harvest.cfg_items += 1;
         }
         let pos = position_of(file, item);
-        let v = |id: String, kind: Kind, exported: bool| Vertex {
+        let v = |id: String, kind: Kind, exported: bool, unsafe_: bool| Vertex {
             id,
             kind,
             krate: krate.to_string(),
@@ -110,11 +121,17 @@ pub fn decls<'a>(
             position: pos.clone(),
             exported,
             generated,
+            cfg: cfg.clone(),
+            unsafe_,
         };
         match item {
             syn::Item::Fn(f) => {
                 let id = format!("{module_path}::{}", f.sig.ident);
-                out.vertices.push(v(id.clone(), Kind::Fn, is_pub(&f.vis)));
+                let exprs = block_exprs(&f.block);
+                // unsafe fn이거나 본문에 unsafe 블록이 있으면 경계의 안쪽이다.
+                let unsafe_ = f.sig.unsafety.is_some() || exprs_have_unsafe(&exprs);
+                out.vertices
+                    .push(v(id.clone(), Kind::Fn, is_pub(&f.vis), unsafe_));
                 if is_extern_entry(&f.attrs) {
                     out.entry_roots.push(id.clone());
                 } else if is_test_entry(&f.attrs) {
@@ -124,8 +141,9 @@ pub fn decls<'a>(
                     id,
                     module: module_path.to_string(),
                     self_ty: None,
-                    exprs: block_exprs(&f.block),
+                    exprs,
                     signature_surface: fn_signature_types(&f.sig),
+                    cfg: cfg.clone(),
                 });
             }
             syn::Item::Struct(s) => {
@@ -133,6 +151,7 @@ pub fn decls<'a>(
                     format!("{module_path}::{}", s.ident),
                     Kind::Struct,
                     is_pub(&s.vis),
+                    false,
                 ));
             }
             syn::Item::Enum(e) => {
@@ -140,27 +159,33 @@ pub fn decls<'a>(
                     format!("{module_path}::{}", e.ident),
                     Kind::Enum,
                     is_pub(&e.vis),
+                    false,
                 ));
             }
             syn::Item::Trait(t) => {
+                // unsafe trait — 구현·사용이 전부 경계를 넘는다.
                 out.vertices.push(v(
                     format!("{module_path}::{}", t.ident),
                     Kind::Trait,
                     is_pub(&t.vis),
+                    t.unsafety.is_some(),
                 ));
                 // 트레이트 기본 메서드는 트레이트 소유 메서드 정점이다.
                 for ti in &t.items {
                     if let syn::TraitItem::Fn(m) = ti {
                         let mid = format!("{module_path}::{}::{}", t.ident, m.sig.ident);
+                        let exprs = m.default.as_ref().map(block_exprs_ref).unwrap_or_default();
+                        let unsafe_ = m.sig.unsafety.is_some() || exprs_have_unsafe(&exprs);
                         out.vertices
-                            .push(v(mid.clone(), Kind::Method, is_pub(&t.vis)));
-                        if let Some(default) = &m.default {
+                            .push(v(mid.clone(), Kind::Method, is_pub(&t.vis), unsafe_));
+                        if m.default.is_some() {
                             out.bodies.push(BodyItem {
                                 id: mid,
                                 module: module_path.to_string(),
                                 self_ty: None,
-                                exprs: block_exprs(default),
+                                exprs,
                                 signature_surface: fn_signature_types(&m.sig),
+                                cfg: cfg.clone(),
                             });
                         }
                     }
@@ -171,6 +196,7 @@ pub fn decls<'a>(
                     format!("{module_path}::{}", u.ident),
                     Kind::Union,
                     is_pub(&u.vis),
+                    false,
                 ));
             }
             syn::Item::Type(t) => {
@@ -178,37 +204,49 @@ pub fn decls<'a>(
                     format!("{module_path}::{}", t.ident),
                     Kind::TypeAlias,
                     is_pub(&t.vis),
+                    false,
                 ));
             }
             syn::Item::Const(c) => {
                 let id = format!("{module_path}::{}", c.ident);
+                let exprs = vec![(*c.expr).clone()];
+                let unsafe_ = exprs_have_unsafe(&exprs);
                 out.vertices
-                    .push(v(id.clone(), Kind::Const, is_pub(&c.vis)));
+                    .push(v(id.clone(), Kind::Const, is_pub(&c.vis), unsafe_));
                 out.bodies.push(BodyItem {
                     id,
                     module: module_path.to_string(),
                     self_ty: None,
-                    exprs: vec![(*c.expr).clone()],
+                    exprs,
                     signature_surface: vec![&c.ty],
+                    cfg: cfg.clone(),
                 });
             }
             syn::Item::Static(s) => {
                 let id = format!("{module_path}::{}", s.ident);
+                let exprs = vec![(*s.expr).clone()];
+                // static mut 초기화의 unsafe 블록도 경계다.
+                let unsafe_ = exprs_have_unsafe(&exprs);
                 out.vertices
-                    .push(v(id.clone(), Kind::Static, is_pub(&s.vis)));
+                    .push(v(id.clone(), Kind::Static, is_pub(&s.vis), unsafe_));
                 out.bodies.push(BodyItem {
                     id,
                     module: module_path.to_string(),
                     self_ty: None,
-                    exprs: vec![(*s.expr).clone()],
+                    exprs,
                     signature_surface: vec![&s.ty],
+                    cfg: cfg.clone(),
                 });
             }
             syn::Item::Macro(m) => {
                 if let Some(id) = &m.ident {
                     if m.mac.path.is_ident("macro_rules") {
-                        out.vertices
-                            .push(v(format!("{module_path}::{id}"), Kind::Macro, true));
+                        out.vertices.push(v(
+                            format!("{module_path}::{id}"),
+                            Kind::Macro,
+                            true,
+                            false,
+                        ));
                     }
                 }
             }
@@ -225,6 +263,8 @@ pub fn decls<'a>(
                         })
                         .collect(),
                     items_module: module_path.to_string(),
+                    cfg: cfg.clone(),
+                    unsafe_: i.unsafety.is_some(),
                 });
             }
             _ => {}
@@ -254,11 +294,11 @@ pub fn impls<'a>(
         };
         if let Some(tp) = &b.trait_path {
             if let Some(trait_id) = tree.resolve(&b.items_module, tp, &BTreeSet::new()) {
-                edges.push(Edge::new(
-                    self_id.clone(),
-                    trait_id.clone(),
-                    EdgeKind::Implements,
-                ));
+                // unsafe impl의 implements는 경계의 일부다.
+                let mut e = Edge::new(self_id.clone(), trait_id.clone(), EdgeKind::Implements);
+                e.cfg = b.cfg.clone();
+                e.unsafe_ = b.unsafe_;
+                edges.push(e);
             } else {
                 harvest.unresolved_paths += 1;
             }
@@ -272,6 +312,9 @@ pub fn impls<'a>(
                 }
                 None => format!("{self_id}::{}", m.sig.ident),
             };
+            let exprs = block_exprs(&m.block);
+            // unsafe impl의 메서드, unsafe fn 메서드, unsafe 본문 모두 경계다.
+            let unsafe_ = b.unsafe_ || m.sig.unsafety.is_some() || exprs_have_unsafe(&exprs);
             vertices.push(Vertex {
                 id: mid.clone(),
                 kind: Kind::Method,
@@ -280,14 +323,20 @@ pub fn impls<'a>(
                 position: Some(format!("{}:{}", file.display(), line_of(&m.sig.ident))),
                 exported: matches!(m.vis, syn::Visibility::Public(_)),
                 generated,
+                cfg: b.cfg.clone(),
+                unsafe_,
             });
-            edges.push(Edge::new(self_id.clone(), mid.clone(), EdgeKind::Contains));
+            let mut contains = Edge::new(self_id.clone(), mid.clone(), EdgeKind::Contains);
+            contains.cfg = b.cfg.clone();
+            contains.unsafe_ = b.unsafe_;
+            edges.push(contains);
             bodies.push(BodyItem {
                 id: mid,
                 module: b.items_module.clone(),
                 self_ty: Some(b.self_ty.clone()),
-                exprs: block_exprs(&m.block),
+                exprs,
                 signature_surface: fn_signature_types(&m.sig),
+                cfg: b.cfg.clone(),
             });
         }
     }
@@ -325,6 +374,8 @@ pub fn bodies(
             tree,
             dep_crates,
             method_index,
+            edge_cfg: &b.cfg,
+            in_unsafe: 0,
             edges: Vec::new(),
             unresolved: 0,
             fanned: 0,
@@ -333,14 +384,17 @@ pub fn bodies(
         for e in &b.exprs {
             vis.visit_expr(e);
         }
-        // 시그니처 표면의 타입 참조 — signature 간선.
+        // 시그니처 표면의 타입 참조 — signature 간선. 소유 아이템이 cfg면
+        // 시그니처 자체가 그 조건 아래 있으니 간선도 조건을 물려받는다.
         for t in &b.signature_surface {
             let mut sv = TypeVisitor { paths: Vec::new() };
             sv.visit_type(t);
             for p in sv.paths {
                 if let Some(id) = tree.resolve(&b.module, &p, dep_crates) {
                     if id != b.id {
-                        edges.push(Edge::new(b.id.clone(), id, EdgeKind::Signature));
+                        let mut e = Edge::new(b.id.clone(), id, EdgeKind::Signature);
+                        e.cfg = b.cfg.clone();
+                        edges.push(e);
                     }
                 }
             }
@@ -354,6 +408,7 @@ pub fn bodies(
 }
 
 /// 본문 방문자 — 호출·경로 참조·매크로 호출을 간선으로 옮긴다.
+/// `unsafe {}` 블록 안에서 만든 간선은 경계 진입으로 표시한다.
 struct BodyVisitor<'a> {
     owner: &'a str,
     module: &'a str,
@@ -361,6 +416,10 @@ struct BodyVisitor<'a> {
     tree: &'a ModTree,
     dep_crates: &'a BTreeSet<String>,
     method_index: &'a BTreeMap<String, Vec<String>>,
+    /// 소유 아이템의 cfg — 이 본문의 간선은 전부 그 조건 아래 있다.
+    edge_cfg: &'a Option<String>,
+    /// 현재 unsafe 블록 깊이 — 0보다 크면 간선에 unsafe를 찍는다.
+    in_unsafe: usize,
     edges: Vec<Edge>,
     unresolved: usize,
     fanned: usize,
@@ -370,15 +429,20 @@ struct BodyVisitor<'a> {
 impl BodyVisitor<'_> {
     fn push(&mut self, to: String, kind: EdgeKind) {
         if to != self.owner {
-            self.edges.push(Edge::new(self.owner.to_string(), to, kind));
+            let mut e = Edge::new(self.owner.to_string(), to, kind);
+            e.cfg = self.edge_cfg.clone();
+            e.unsafe_ = self.in_unsafe > 0;
+            self.edges.push(e);
         }
     }
 
     /// 추정 간선 — 팬아웃의 "이 중 하나일 수 있다"는 확정이 아니다.
     fn push_maybe(&mut self, to: String, kind: EdgeKind) {
         if to != self.owner {
-            self.edges
-                .push(Edge::maybe(self.owner.to_string(), to, kind));
+            let mut e = Edge::maybe(self.owner.to_string(), to, kind);
+            e.cfg = self.edge_cfg.clone();
+            e.unsafe_ = self.in_unsafe > 0;
+            self.edges.push(e);
         }
     }
 
@@ -501,6 +565,14 @@ impl Visit<'_> for BodyVisitor<'_> {
         syn::visit::visit_expr_struct(self, e);
     }
 
+    fn visit_expr_unsafe(&mut self, e: &syn::ExprUnsafe) {
+        // unsafe 블록 안의 호출·참조는 경계를 넘는 진입이다 — 깊이를 세어
+        // 이 블록에서 나오는 동안 만드는 간선 전부에 표시한다.
+        self.in_unsafe += 1;
+        syn::visit::visit_expr_unsafe(self, e);
+        self.in_unsafe -= 1;
+    }
+
     fn visit_expr_path(&mut self, e: &syn::ExprPath) {
         // 호출이 아닌 경로 참조 — filter_map(f) 같은 함수 값 포함.
         // 단일 식별자는 모듈 아이템이면 잡고 지역 변수면 조용히 넘긴다.
@@ -614,6 +686,24 @@ fn file_has_generated_marker(file: &Path) -> bool {
             || l.contains("auto-generated")
             || l.contains("autogenerated")
     })
+}
+
+/// 표현식 목록 안에 `unsafe {}` 블록이 있는지 본다 — 재귀 방문.
+fn exprs_have_unsafe(exprs: &[syn::Expr]) -> bool {
+    struct Finder(bool);
+    impl Visit<'_> for Finder {
+        fn visit_expr_unsafe(&mut self, _e: &syn::ExprUnsafe) {
+            self.0 = true;
+        }
+    }
+    let mut f = Finder(false);
+    for e in exprs {
+        if f.0 {
+            break;
+        }
+        f.visit_expr(e);
+    }
+    f.0
 }
 
 /// 포맷 문자열의 `{ident}`·`{ident:spec}` 캡처 이름을 뽑는다.

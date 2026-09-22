@@ -96,6 +96,8 @@ mod tests {
                 position: Some("src/lib.rs:10".into()),
                 exported: true,
                 generated: false,
+                cfg: None,
+                unsafe_: false,
             }],
             vec![],
             vec![],

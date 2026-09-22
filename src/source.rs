@@ -250,6 +250,8 @@ fn emit_crate_level(
             position: None,
             exported: false,
             generated: false,
+            cfg: None,
+            unsafe_: false,
         });
     }
     if skipped > 0 {
@@ -432,6 +434,7 @@ fn harvest_module<'a>(
     let is_root = !mp.contains("::");
     let public = tree.modules[mp].public;
     let generated = file_has_marker(&file);
+    let mod_cfg = tree.modules[mp].cfg.clone();
     let vertex = Vertex {
         id: mp.to_string(),
         kind: if is_root { Kind::Crate } else { Kind::Module },
@@ -440,18 +443,26 @@ fn harvest_module<'a>(
         position: Some(format!("{}:1", file.display())),
         exported: public,
         generated,
+        cfg: mod_cfg.clone(),
+        unsafe_: false,
     };
     let mut edges = Vec::new();
     if let Some(parent) = modtree::parent_of(mp) {
-        edges.push(Edge::new(parent, mp.to_string(), EdgeKind::Contains));
+        // 조건부 mod 선언의 contains는 그 조건 아래서만 성립한다.
+        let mut e = Edge::new(parent, mp.to_string(), EdgeKind::Contains);
+        e.cfg = mod_cfg.clone();
+        edges.push(e);
     }
     // 모듈 직속 아이템에 contains 간선 — impl 메서드는 impls()가 타입 아래로 단다.
+    // 아이템이 cfg면 그 아이템은 그 조건 아래서만 존재하니 contains도 같다.
     for v in &decls.vertices {
         if v.id
             .strip_prefix(&format!("{mp}::"))
             .is_some_and(|rest| !rest.contains("::"))
         {
-            edges.push(Edge::new(mp.to_string(), v.id.clone(), EdgeKind::Contains));
+            let mut e = Edge::new(mp.to_string(), v.id.clone(), EdgeKind::Contains);
+            e.cfg = v.cfg.clone();
+            edges.push(e);
         }
     }
     let impl_meta = decls
@@ -461,18 +472,21 @@ fn harvest_module<'a>(
         .collect();
     // use 임포트 → uses 간선. 해석된 정규 경로가 아이템이면 그 정점으로,
     // 아니면 소유 모듈로. 아이템 표는 1단계에서 전 모듈에 채워졌으므로
-    // 모듈 처리 순서와 무관하게 같은 결과가 나온다.
-    for target in tree.modules[mp].imports.values() {
-        let to = if tree.item_exists(target) {
-            target.clone()
+    // 모듈 처리 순서와 무관하게 같은 결과가 나온다. 임포트에 cfg가 있으면
+    // 간선도 그 조건 아래서만 성립한다.
+    for imp in tree.modules[mp].imports.values() {
+        let to = if tree.item_exists(&imp.target) {
+            imp.target.clone()
         } else {
-            match owner_module(tree, target) {
+            match owner_module(tree, &imp.target) {
                 Some(m) if m != mp => m.clone(),
                 _ => continue,
             }
         };
         if to != mp {
-            edges.push(Edge::new(mp.to_string(), to, EdgeKind::Uses));
+            let mut e = Edge::new(mp.to_string(), to, EdgeKind::Uses);
+            e.cfg = imp.cfg.clone();
+            edges.push(e);
         }
     }
     ModuleHarvest {
