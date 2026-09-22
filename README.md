@@ -35,7 +35,13 @@ over it, with a deterministic JSON contract meant for coding agents:
 
 ## Install
 
-From source:
+```bash
+brew install ictechgy/tap/rustograph
+# or
+cargo install --git https://github.com/ictechgy/rustograph --tag v0.1.0
+```
+
+Or from source:
 
 ```bash
 git clone https://github.com/ictechgy/rustograph.git
