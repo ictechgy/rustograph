@@ -4,24 +4,25 @@
 
 ## 현재 상태 (2026-09-22)
 
-**v0.1.0 릴리스 완료.** https://github.com/ictechgy/rustograph (public),
-`brew install ictechgy/tap/rustograph`로 설치 가능(brew test 통과).
-PR #1~#3 머지됨(clippy 수정 + 릴리스 워크플로우 + pwsh 문법 수정).
+**v0.2.0 개발 중 — feat/mcp-cfg-unsafe 브랜치.** v0.1.0은 배포 완료
+(public 리포 + Homebrew tap). PR #1~#4 머지됨.
 
-검증 상태: `cargo test` 55개 통과(단위 34 + 통합 21), 커버리지 91.6%
-(게이트 90), clippy 클린, verify-cli-contract OK, 자기 분석
-`rules --strict` 0 위반 / `cycles --strict` 0.
+검증 상태: `cargo test` 63개 통과(단위 40 + 통합 23), 커버리지 91.2%
+(게이트 90), clippy 클린, verify-cli-contract OK(mcp 포함),
+자기 분석 `rules --strict` 0 위반 / `cycles --strict` 0.
 
 ## 구조
 
 - `src/graph.rs` — 순수 도메인(Document/Vertex/Edge/Level), 결정적 정렬,
-  `Edge.tentative` + 투영 병합. 외부 의존 0(serde만).
+  `Edge.tentative` + 투영 병합. `Vertex.cfg`/`unsafe` + `Edge.cfg`/`unsafe`
+  메타데이터. 외부 의존 0(serde만).
 - `src/cargo_meta.rs` — `cargo metadata` → 패키지/타깃/depends 간선.
 - `src/modtree.rs` — `mod` 선언만으로 모듈 트리(`x.rs`|`x/mod.rs`|
   `#[path]`|인라인), orphan .rs 계수, 2단계 스코프(fill_items→fill_imports,
   글롭 확장 포함), 경로 해석.
 - `src/harvest.rs` — syn 방문자. 아이템→정점, impl→메서드+implements,
-  본문→call/references, 시그니처→signature, 매크로 인자·포맷 캡처.
+  본문→call/references, 시그니처→signature, 매크로 인자·포맷 캡처,
+  `#[cfg]` 추출(cfg_of), unsafe 감지(unsafety/unsafe 블록/unsafe impl).
 - `src/source.rs` — 오케스트레이터. AST arena('static 누수), 루트 병합
   (lib/bin 같은 이름 → extra_files), 보존 루트(main/#[no_mangle]/
   --tests/--retain-public).
@@ -32,8 +33,11 @@ PR #1~#3 머지됨(clippy 수정 + 릴리스 워크플로우 + pwsh 문법 수�
 - `src/export.rs` — 결정적 JSON + mermaid + save/load.
 - `src/sarif.rs` — SARIF 2.1.0(`rustograph/deny` 등 ruleId).
 - `src/config.rs` — `.rustograph.yml` 파싱(serde_yml 격리).
-- `src/cli.rs` — graph/cycles/dead/rules/query/impact/version,
+- `src/cli.rs` — graph/cycles/dead/rules/query/impact/mcp/version,
   종료 코드 0/1/2.
+- `src/mcp.rs` — MCP stdio 서버(NDJSON JSON-RPC 2.0). 기동 시 문서 1회
+  수확 후 스냅샷 서빙. 도구: rustograph_summary/query/impact/cycles/
+  dead/rules. stdin을 파라미터로 받아 테스트 가능.
 - `tests/fixture/` — 두 멤버 워크스페이스, 모든 아이템 종류+글롭/별칭/
   cfg/generated/orphan 커버.
 - `scripts/` — coverage.sh(llvm-cov), verify-cli-contract.sh.
@@ -51,13 +55,16 @@ PR #1~#3 머지됨(clippy 수정 + 릴리스 워크플로우 + pwsh 문법 수�
 
 1. ~~공개 리포 + 릴리스~~ — 완료. `HOMEBREW_TAP_TOKEN` 리포 시크릿이
    없어 탭 갱신은 수동으로 했다 — 넣으면 다음 릴리스부터 자동.
-2. **MCP 서버** — `rustograph mcp` stdio, 계열과 같은 도구 셋
-   (graph/cycles/dead/rules/query/impact).
-3. **ra_ap_* 의미 해석** — MVP의 syn 수확을 rust-analyzer 의미론으로
+2. ~~MCP 서버~~ — 완료(v0.2.0).
+3. ~~feature/cfg 의존 모델링~~ — 완료: 정점·간선 `cfg` 필드, 여러 cfg는
+   `all(...)` 합성, cfg 다른 같은 간선은 별개로 유지.
+4. ~~unsafe 경계~~ — 완료: 정점 `unsafe`(unsafe fn/trait/impl, unsafe 블록
+   본문), 간선 `unsafe`(unsafe {} 안의 참조·호출 = 경계 진입).
+5. **ra_ap_* 의미 해석** — MVP의 syn 수확을 rust-analyzer 의미론으로
    보강/대체: 타입 해석 메서드 호출, 매크로 확장, trait impl 행렬.
-   그래프 계약은 불변 — 정확도만 올린다.
-4. **feature/cfg 의존 모델링** — `#[cfg(feature)]`를 간선 메타데이터로.
-5. **unsafe 경계** — `unsafe` 블록 진입을 간선/정점 속성으로 표시.
+   그래프 계약은 불변 — 정확도만 올린다. 의존 크기와 주 단위 API 변동
+   때문에 v0.2.0에서는 유보했다 — cargo feature로 opt-in 경로가
+   자연스럽다.
 
 ## 막힌 것 / 주의
 
