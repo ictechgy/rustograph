@@ -12,8 +12,8 @@ v0.2.0도 배포됐으나 자기 분석에서 cli↔mcp 모듈 순환이 잡혀
 검증 상태: `cargo test` 63개 통과(단위 40 + 통합 23), 커버리지 91.2%
 (게이트 90), clippy 클린, verify-cli-contract OK(mcp 포함),
 자기 분석 `rules --strict` 0 위반 / `cycles --strict` 0.
-`--features semantic` 빌드에서는 +6 semantic 테스트, 자기 분석
-`rules`/`cycles` 동일 0.
+`--features semantic` 빌드에서는 +16 semantic 테스트, 자기 분석
+`rules`/`cycles` 동일 0. PR #8(의미 해석) 머지됨 — 70ea82e.
 
 ## 구조
 
@@ -72,7 +72,7 @@ v0.2.0도 배포됐으나 자기 분석에서 cli↔mcp 모듈 순환이 잡혀
    `all(...)` 합성, cfg 다른 같은 간선은 별개로 유지.
 4. ~~unsafe 경계~~ — 완료: 정점 `unsafe`(unsafe fn/trait/impl, unsafe 블록
    본문), 간선 `unsafe`(unsafe {} 안의 참조·호출 = 경계 진입).
-5. **ra_ap_* 의미 해석** — 구현됨(feature/semantic-engine, 머지 대기).
+5. ~~ra_ap_* 의미 해석~~ — 완료. PR #8 머지됨(머지 커밋 70ea82e).
    `semantic` feature로 opt-in: `u.m()` 수신자 타입 해석(확정 간선),
    매크로 확장 워크, dyn/제네릭 디스패치 → 워크스페이스 impl 후보
    행렬(tentative 유지 — 실제 impl은 런타임 사실). hir이 모르는 본문은
@@ -81,6 +81,7 @@ v0.2.0도 배포됐으나 자기 분석에서 cli↔mcp 모듈 순환이 잡혀
    남은 것: derive 생성 impl, OUT_DIR 빌드 산출물(load_out_dirs_from_check
    off), proc 매크로 서버(Sysroot 선택 — rustup 구성 없으면
    unexpanded로 계측), semantic 경로의 대형 레포 성능.
+   로드맵 1~5 모두 완료 — 다음 우선순위는 사용자가 정한다.
 
 ## 막힌 것 / 주의
 
@@ -95,6 +96,11 @@ v0.2.0도 배포됐으나 자기 분석에서 cli↔mcp 모듈 순환이 잡혀
 - **ra_ap 트레이트·타입 쿼리는 `ra_ap_hir::attach_db`가 선행 조건이다.**
   스레드 로컬 attached db 없이 self_ty/resolve_method_call을 부르면
   panic. Engine::load의 인덱스 빌드와 본문 워크 둘 다 attach 안에서 돈다.
+- **ra 타입의 "구체 여부"는 화이트리스트로 판정한다.** `type_is_concrete`가
+  `Type::walk`으로 구성 타입 전부를 순회하며 알려진 구체 kind만 허용 —
+  블랙리스트는 `dyn Send`처럼 principal 없는 객체(as_dyn_trait → None)와
+  `!`(독립 kind, builtin 아님)를 놓쳤다. 모르는 kind는 열림으로 — 불확실성은
+  항상 tentative 쪽으로만 새게 하는 계약과 같은 방향.
 - `cargo metadata`는 비워크스페이스 의존을 패키지로만 준다 — `--deps`는
   정점만 만들고 내부 수확은 안 한다.
 - AST arena는 `Box::leak` — CLI 수명 모델이라 의도적.
