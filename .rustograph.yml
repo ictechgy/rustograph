@@ -10,6 +10,7 @@
 components:
   app: ["rustograph"]
   cli: ["rustograph::cli/**"]
+  cli_args: ["rustograph::cli_args/**"]
   source: ["rustograph::source/**"]
   cargo_meta: ["rustograph::cargo_meta/**"]
   modtree: ["rustograph::modtree/**"]
@@ -23,8 +24,9 @@ components:
   mcp: ["rustograph::mcp/**"]
 deps:
   app: [cli]
-  cli: [source, analysis, rules, export, sarif, config, graph, mcp]
-  mcp: [cli, analysis, rules, export, config, graph]
+  cli: [source, analysis, rules, export, sarif, config, graph, mcp, cli_args]
+  mcp: [cli_args, analysis, rules, export, config, graph]
+  cli_args: [source, export, graph]
   source: [graph, harvest, modtree, cargo_meta]
   harvest: [graph, modtree]
   analysis: [graph]
@@ -41,4 +43,6 @@ deny:
   # cli는 cargo/syn 경계를 직접 만지지 않는다 — source를 통한다.
   cli: [cargo_meta, harvest, modtree]
   # mcp도 마찬가지 — 수확 경계는 source 뒤에만 있다.
-  mcp: [cargo_meta, harvest, modtree]
+  mcp: [cargo_meta, harvest, modtree, cli]
+  # cli_args는 cli/mcp를 모른다 — 파서가 최하층이라 순환이 안 생긴다.
+  cli_args: [cli, mcp, cargo_meta, harvest, modtree, analysis, rules, sarif, config]
