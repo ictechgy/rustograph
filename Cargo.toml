@@ -11,3 +11,29 @@ serde_json = "1"
 syn = { version = "2", features = ["full", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 serde_yml = "0.0.12"
+# ra_ap_*는 주 단위로 API가 바뀌어 exact pin이다. 0.0.350부터 rust-version이
+# 1.98로 올라가 현재 최소 toolchain(rustc 1.96)과 어긋나 0.0.349를 쓴다.
+# Cargo.lock의 salsa 0.28.2·salsa-macro-rules 0.28.2·unicode-ident 1.0.24
+# 핀도 이 버전 세트에 맞춘 것이다 — `cargo update`로만 바꾸면 ra_ap가
+# 깨진다(salsa-macro-rules/unicode 버전 결합이 코드 생성에 박혀 있다).
+ra_ap_load-cargo = { version = "=0.0.349", optional = true }
+ra_ap_hir = { version = "=0.0.349", optional = true }
+ra_ap_ide_db = { version = "=0.0.349", optional = true }
+ra_ap_syntax = { version = "=0.0.349", optional = true }
+ra_ap_project_model = { version = "=0.0.349", optional = true }
+ra_ap_vfs = { version = "=0.0.349", optional = true }
+ra_ap_proc_macro_api = { version = "=0.0.349", optional = true }
+
+[features]
+# rust-analyzer(ra_ap_*) 의미 해석 엔진 — 타입 해석된 메서드 호출, 매크로
+# 확장, trait impl 행렬. 의존이 크고 주 단위로 API가 바뀌어 opt-in이다.
+# 켜면 --semantic 플래그가 동작한다.
+semantic = [
+    "dep:ra_ap_load-cargo",
+    "dep:ra_ap_hir",
+    "dep:ra_ap_ide_db",
+    "dep:ra_ap_syntax",
+    "dep:ra_ap_project_model",
+    "dep:ra_ap_vfs",
+    "dep:ra_ap_proc_macro_api",
+]

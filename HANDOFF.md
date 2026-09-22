@@ -12,6 +12,8 @@ v0.2.0도 배포됐으나 자기 분석에서 cli↔mcp 모듈 순환이 잡혀
 검증 상태: `cargo test` 63개 통과(단위 40 + 통합 23), 커버리지 91.2%
 (게이트 90), clippy 클린, verify-cli-contract OK(mcp 포함),
 자기 분석 `rules --strict` 0 위반 / `cycles --strict` 0.
+`--features semantic` 빌드에서는 +6 semantic 테스트, 자기 분석
+`rules`/`cycles` 동일 0.
 
 ## 구조
 
@@ -43,6 +45,11 @@ v0.2.0도 배포됐으나 자기 분석에서 cli↔mcp 모듈 순환이 잡혀
 - `src/mcp.rs` — MCP stdio 서버(NDJSON JSON-RPC 2.0). 기동 시 문서 1회
   수확 후 스냅샷 서빙. 도구: rustograph_summary/query/impact/cycles/
   dead/rules. stdin을 파라미터로 받아 테스트 가능.
+- `src/sem.rs` — ra_ap_* 의미 해석 엔진(`semantic` feature, opt-in).
+  `Engine::load`(load_workspace_at+attach_db), 정규 ID↔hir 인덱스,
+  본문 워커(메서드 타입 해석·경로 해석·매크로 확장·trait impl 행렬),
+  Stats 실측. 정점·구조는 syn이 권위 — sem은 본문 간선만 낸다.
+  hir이 모르는 본문(cfg 비활성·매크로 생성)은 syn 폴백으로 돌아간다.
 - `tests/fixture/` — 두 멤버 워크스페이스, 모든 아이템 종류+글롭/별칭/
   cfg/generated/orphan 커버.
 - `scripts/` — coverage.sh(llvm-cov), verify-cli-contract.sh.
@@ -65,16 +72,29 @@ v0.2.0도 배포됐으나 자기 분석에서 cli↔mcp 모듈 순환이 잡혀
    `all(...)` 합성, cfg 다른 같은 간선은 별개로 유지.
 4. ~~unsafe 경계~~ — 완료: 정점 `unsafe`(unsafe fn/trait/impl, unsafe 블록
    본문), 간선 `unsafe`(unsafe {} 안의 참조·호출 = 경계 진입).
-5. **ra_ap_* 의미 해석** — MVP의 syn 수확을 rust-analyzer 의미론으로
-   보강/대체: 타입 해석 메서드 호출, 매크로 확장, trait impl 행렬.
-   그래프 계약은 불변 — 정확도만 올린다. 의존 크기와 주 단위 API 변동
-   때문에 v0.2.0에서는 유보했다 — cargo feature로 opt-in 경로가
-   자연스럽다.
+5. **ra_ap_* 의미 해석** — 구현됨(feature/semantic-engine, 머지 대기).
+   `semantic` feature로 opt-in: `u.m()` 수신자 타입 해석(확정 간선),
+   매크로 확장 워크, dyn/제네릭 디스패치 → 워크스페이스 impl 후보
+   행렬(tentative 유지 — 실제 impl은 런타임 사실). hir이 모르는 본문은
+   syn 폴백 + unmapped 실측. feature 없는 빌드에서 --semantic은
+   종료 코드 2 + 빌드 안내(조용한 폴백은 거짓 계약이라 금지).
+   남은 것: derive 생성 impl, OUT_DIR 빌드 산출물(load_out_dirs_from_check
+   off), proc 매크로 서버(Sysroot 선택 — rustup 구성 없으면
+   unexpanded로 계측), semantic 경로의 대형 레포 성능.
 
 ## 막힌 것 / 주의
 
 - Homebrew의 rust가 PATH를 잡는다 — llvm-tools 없음. coverage.sh가
   rustup 툴체인으로 자동 폴백한다.
+- **ra_ap 버전 결합 함정.** ra_ap_*는 주 단위 릴리스이고 rust-version이
+  자주 오른다 — 0.0.350부터 rustc 1.98 요구라 현재 최소 toolchain(rustc
+  1.96)에는 0.0.349가 마지막이다. 게다가 0.0.349는 salsa 0.28.2·
+  unicode-ident 1.0.24 조합에서만 빌드된다(salsa-macro-rules의 생성 코드가
+  라이브러리 버전과 결합, unicode-properties와 unicode-ident의 유니코드
+  버전이 일치해야 함) — Cargo.lock 핀을 함부로 `cargo update`하지 말 것.
+- **ra_ap 트레이트·타입 쿼리는 `ra_ap_hir::attach_db`가 선행 조건이다.**
+  스레드 로컬 attached db 없이 self_ty/resolve_method_call을 부르면
+  panic. Engine::load의 인덱스 빌드와 본문 워크 둘 다 attach 안에서 돈다.
 - `cargo metadata`는 비워크스페이스 의존을 패키지로만 준다 — `--deps`는
   정점만 만들고 내부 수확은 안 한다.
 - AST arena는 `Box::leak` — CLI 수명 모델이라 의도적.

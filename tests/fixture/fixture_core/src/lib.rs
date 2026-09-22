@@ -39,6 +39,16 @@ pub trait Greet {
     fn greet(&self) -> u32;
 }
 
+/// 같은 이름의 메서드를 가진 무관한 타입 — syn 이름 팬아웃은 여기에도
+/// 간선을 만들지만, 의미 해석은 만들지 않아야 한다(정밀도 검증용).
+pub struct Other;
+
+impl Other {
+    pub fn greet(&self) -> u32 {
+        0
+    }
+}
+
 pub trait Named {
     fn name(&self) -> u32 {
         9
@@ -67,6 +77,26 @@ impl Used {
     pub fn quadrupled(&self) -> u32 {
         self.doubled() * 2
     }
+}
+
+/// 표현식 매크로 — 확장하면 crate 안 helper 호출이 나온다.
+/// syn은 빈 토큰만 보지만, 의미 해석은 확장 트리 안의 호출을 잡는다.
+#[macro_export]
+macro_rules! emit_helper {
+    () => {
+        $crate::util::helper()
+    };
+}
+
+/// dyn 수신자의 트레이트 디스패치 — 실제 impl은 런타임에 정해지므로
+/// 의미 해석도 워크스페이스 impl 후보 행렬로 펼친다(추정 간선).
+pub fn dyn_dispatch(x: &dyn Greet) -> u32 {
+    x.greet()
+}
+
+/// 제네릭 수신자 — 구체 impl을 모르니 같은 후보 행렬이다.
+pub fn generic_dispatch<T: Greet>(t: &T) -> u32 {
+    t.greet()
 }
 
 pub fn entry() -> u32 {

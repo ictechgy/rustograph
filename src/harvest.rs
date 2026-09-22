@@ -367,42 +367,62 @@ pub fn bodies(
 ) -> Vec<Edge> {
     let mut edges = Vec::new();
     for b in items {
-        let mut vis = BodyVisitor {
-            owner: &b.id,
-            module: &b.module,
-            self_ty: b.self_ty.as_deref(),
-            tree,
-            dep_crates,
-            method_index,
-            edge_cfg: &b.cfg,
-            in_unsafe: 0,
-            edges: Vec::new(),
-            unresolved: 0,
-            fanned: 0,
-            ext_macros: 0,
-        };
-        for e in &b.exprs {
-            vis.visit_expr(e);
-        }
-        // 시그니처 표면의 타입 참조 — signature 간선. 소유 아이템이 cfg면
-        // 시그니처 자체가 그 조건 아래 있으니 간선도 조건을 물려받는다.
-        for t in &b.signature_surface {
-            let mut sv = TypeVisitor { paths: Vec::new() };
-            sv.visit_type(t);
-            for p in sv.paths {
-                if let Some(id) = tree.resolve(&b.module, &p, dep_crates) {
-                    if id != b.id {
-                        let mut e = Edge::new(b.id.clone(), id, EdgeKind::Signature);
-                        e.cfg = b.cfg.clone();
-                        edges.push(e);
-                    }
+        edges.extend(body_edges(b, tree, dep_crates, method_index, harvest));
+        edges.extend(signature_edges(b, tree, dep_crates));
+    }
+    edges
+}
+
+/// 본문 하나의 syn 방문 — 표현식 안의 호출·참조·매크로 간선.
+/// semantic 엔진이 못 보는 본문(cfg 비활성·매크로 생성 정의)의 폴백이기도 하다.
+pub fn body_edges(
+    b: &BodyItem,
+    tree: &ModTree,
+    dep_crates: &BTreeSet<String>,
+    method_index: &BTreeMap<String, Vec<String>>,
+    harvest: &mut Harvest,
+) -> Vec<Edge> {
+    let mut vis = BodyVisitor {
+        owner: &b.id,
+        module: &b.module,
+        self_ty: b.self_ty.as_deref(),
+        tree,
+        dep_crates,
+        method_index,
+        edge_cfg: &b.cfg,
+        in_unsafe: 0,
+        edges: Vec::new(),
+        unresolved: 0,
+        fanned: 0,
+        ext_macros: 0,
+    };
+    for e in &b.exprs {
+        vis.visit_expr(e);
+    }
+    harvest.unresolved_paths += vis.unresolved;
+    harvest.fanned_method_calls += vis.fanned;
+    harvest.external_macros += vis.ext_macros;
+    vis.edges
+}
+
+/// 시그니처 표면(파라미터·반환)의 타입 참조를 signature 간선으로 만든다.
+/// semantic 엔진이 본문을 맡을 때도 이 부분은 syn이 권위다 — 두 경로가
+/// 같은 간선을 내므로 엔진 선택과 무관하게 일관된다.
+pub fn signature_edges(b: &BodyItem, tree: &ModTree, dep_crates: &BTreeSet<String>) -> Vec<Edge> {
+    let mut edges = Vec::new();
+    // 소유 아이템이 cfg면 시그니처 자체가 그 조건 아래 있으니 간선도 물려받는다.
+    for t in &b.signature_surface {
+        let mut sv = TypeVisitor { paths: Vec::new() };
+        sv.visit_type(t);
+        for p in sv.paths {
+            if let Some(id) = tree.resolve(&b.module, &p, dep_crates) {
+                if id != b.id {
+                    let mut e = Edge::new(b.id.clone(), id, EdgeKind::Signature);
+                    e.cfg = b.cfg.clone();
+                    edges.push(e);
                 }
             }
         }
-        harvest.unresolved_paths += vis.unresolved;
-        harvest.fanned_method_calls += vis.fanned;
-        harvest.external_macros += vis.ext_macros;
-        edges.extend(vis.edges);
     }
     edges
 }

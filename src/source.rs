@@ -7,6 +7,8 @@ use crate::cargo_meta::{self, Metadata};
 use crate::graph::{self, Document, Edge, EdgeKind, Kind, Level, Vertex};
 use crate::harvest::{self, BodyItem, Harvest};
 use crate::modtree::{self, ModTree};
+#[cfg(feature = "semantic")]
+use crate::sem;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -23,6 +25,9 @@ pub struct Options {
     pub retain_public: bool,
     /// 추가 보존 루트 ID.
     pub extra_roots: Vec<String>,
+    /// ra_ap 의미 해석으로 본문 간선을 보강할지 — `semantic` feature 빌드 필요.
+    /// 타입 해석 메서드 호출·매크로 확장·trait impl 행렬이 켜진다.
+    pub semantic: bool,
 }
 
 /// 파싱된 파일 AST 아레나 — 수확이 끝날 때까지 아이템이 살아 있어야 해서
@@ -32,6 +37,14 @@ type Arena = BTreeMap<PathBuf, &'static [syn::Item]>;
 /// `dir`의 cargo 워크스페이스를 수확해 문서를 만든다.
 /// 실패는 문자열 오류 — 빈 그래프로 성공한 척하지 않는다.
 pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
+    // feature가 꺼진 빌드는 여기서 오류 — 조용히 syn으로 떨어지면
+    // --semantic이 받은 결과가 의미 해석이 아니게 되어 거짓이 된다.
+    if opts.semantic && !cfg!(feature = "semantic") {
+        return Err(
+            "--semantic requires a build with the `semantic` feature (cargo build --features semantic)"
+                .to_string(),
+        );
+    }
     let meta = cargo_meta::load(dir)?;
     let mut harvest = Harvest::default();
     let mut vertices: Vec<Vertex> = Vec::new();
@@ -150,7 +163,8 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
         bodies.extend(bs);
     }
 
-    // 메서드 이름 → ID 인덱스 — 타입 정보가 없어 이름 팬아웃에 쓴다.
+    // 메서드 이름 → ID 인덱스 — 이름 팬아웃 폴백에 쓴다(semantic에서는
+    // ra가 해석하지 못한 호출에만 쓰인다).
     let mut method_index: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for v in &vertices {
         if v.kind == Kind::Method {
@@ -164,6 +178,53 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
     }
 
     // 2패스: 본문 — 모든 정점이 준비된 뒤에 해석한다.
+    // semantic 엔진이 붙어 있으면 hir이 아는 본문은 타입 해석으로 정확히
+    // 잡고, 모르는 본문(cfg 비활성·매크로 생성)만 syn 팬아웃으로 돌아간다.
+    #[cfg(feature = "semantic")]
+    let engine = if opts.semantic {
+        let e = sem::Engine::load(&meta.workspace_root)?;
+        if !e.has_proc_macros() {
+            limitations
+                .push("proc-macro server unavailable; proc-macro calls not expanded".to_string());
+        }
+        Some(e)
+    } else {
+        None
+    };
+    #[cfg(feature = "semantic")]
+    if let Some(eng) = &engine {
+        let ids: BTreeSet<&str> = vertices.iter().map(|v| v.id.as_str()).collect();
+        let mut st = sem::Stats::default();
+        for b in &bodies {
+            match eng.body_edges(&b.id, &b.cfg, &ids, &method_index, &mut st) {
+                Some(es) => {
+                    // 시그니처 간선은 엔진과 무관하게 syn이 권위다.
+                    edges.extend(harvest::signature_edges(b, &tree, &dep_crates));
+                    edges.extend(es);
+                }
+                None => {
+                    st.unmapped += 1;
+                    edges.extend(harvest::bodies(
+                        std::slice::from_ref(b),
+                        &tree,
+                        &dep_crates,
+                        &method_index,
+                        &mut harvest,
+                    ));
+                }
+            }
+        }
+        push_sem_stats(&st, &mut limitations, &mut harvest);
+    } else {
+        edges.extend(harvest::bodies(
+            &bodies,
+            &tree,
+            &dep_crates,
+            &method_index,
+            &mut harvest,
+        ));
+    }
+    #[cfg(not(feature = "semantic"))]
     edges.extend(harvest::bodies(
         &bodies,
         &tree,
@@ -548,6 +609,39 @@ fn push_limitations(h: &Harvest, limitations: &mut Vec<String>) {
         limitations.push(format!(
             "{} items behind #[cfg] were included without feature evaluation",
             h.cfg_items
+        ));
+    }
+}
+
+/// 의미 해석 실측을 limitation 문장과 공유 카운터로 옮긴다.
+/// fanned/unresolved/ext_macros는 syn과 같은 버킷 — 메시지가 두 개로
+/// 갈라지면 "총 몇 개인가"가 읽기 어려워진다.
+#[cfg(feature = "semantic")]
+fn push_sem_stats(st: &sem::Stats, limitations: &mut Vec<String>, harvest: &mut Harvest) {
+    harvest.fanned_method_calls += st.fanned;
+    harvest.unresolved_paths += st.unresolved;
+    harvest.external_macros += st.ext_macros;
+    limitations.push(format!(
+        "semantic analysis: {} call/reference edges resolved via types; \
+         {} macro expansions walked; {} trait-dispatch sites expanded to candidate impls",
+        st.resolved, st.expanded, st.trait_sites
+    ));
+    if st.external > 0 {
+        limitations.push(format!(
+            "{} call targets resolved to items outside the graph (dependencies, std, or macro/derive-generated defs)",
+            st.external
+        ));
+    }
+    if st.unexpanded > 0 {
+        limitations.push(format!(
+            "{} macro calls could not be expanded (proc-macro server missing or expansion failure)",
+            st.unexpanded
+        ));
+    }
+    if st.unmapped > 0 {
+        limitations.push(format!(
+            "{} bodies invisible to semantic analysis (cfg-disabled or macro-generated); syntactic fan-out used",
+            st.unmapped
         ));
     }
 }

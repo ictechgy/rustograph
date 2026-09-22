@@ -26,13 +26,16 @@ Cargo 워크스페이스의 의존성 그래프를 만들고, 그 위에서 순�
 
 수확은 두 층입니다: `cargo metadata`가 크레이트·의존을 주고, `syn`이
 모듈 트리와 아이템·간선을 줍니다. 얕은 레벨(crate/module)은 심볼 그래프의
-투영이지 별도 분석이 아닙니다.
+투영이지 별도 분석이 아닙니다. opt-in `semantic` feature를 켜면 `sem`이
+rust-analyzer(`ra_ap_*`)로 본문 간선을 보강합니다 — 정점과 구조는 여전히
+syn이 권위이고, 의미 해석은 호출·참조의 정확도만 올립니다.
 
 ## 명령
 
 ```bash
 cargo build
 cargo test                      # 단위 + tests/fixture 통합
+cargo test --features semantic  # + tests/semantic.rs 의미 해석 테스트
 scripts/coverage.sh             # 테스트 + 커버리지 게이트(기준 90%)
 scripts/verify-cli-contract.sh  # 빌드된 바이너리로 종료 코드 계약 검증
 cargo clippy --all-targets      # 경고 0 유지
@@ -62,7 +65,8 @@ cargo run -- cycles --level symbol --strict
 - **`graph`에 외부 의존성을 추가하지 마세요.** 순수 도메인이어야 분석 계층
   전체를 cargo/syn 없이 테스트할 수 있습니다. `serde`만 허용됩니다.
 - **`syn`과 `cargo`를 `harvest`/`modtree`/`cargo_meta`/`source` 밖에서
-  쓰지 마세요.** 마찬가지로 `serde_yml`은 `config` 안에만 있습니다.
+  쓰지 마세요.** `ra_ap_*`는 `sem` 안에만 있습니다(semantic feature).
+  마찬가지로 `serde_yml`은 `config` 안에만 있습니다.
   `.rustograph.yml`이 이 경계를 스스로 강제합니다 — `rules --strict`가
   0이어야 합니다.
 - **유령 정점을 만들지 마세요.** 해석 불가한 경로는 간선이 아니라
@@ -70,7 +74,9 @@ cargo run -- cycles --level symbol --strict
   겸합니다 — 별도 루트 정점은 ID 충돌을 만듭니다. 같은 이름의 lib/bin은
   하나의 루트를 공유합니다(`extra_files`).
 - **추정 간선을 확정 증거로 쓰지 마세요.** 메서드 팬아웃(`tentative: true`)은
-  dead/도달성에만 쓰이고 cycles/rules는 제외+계수합니다.
+  dead/도달성에만 쓰이고 cycles/rules는 제외+계수합니다. semantic 모드도
+  같은 규칙입니다 — 타입으로 확정된 호출만 확정이고, `dyn`/제네릭 트레이트
+  디스패치는 impl 후보 행렬로 펼치되 tentative를 유지합니다.
 - **삭제 판정을 내지 마세요.** `dead`는 `unreachable` 그래프 사실만
   보고합니다. trait 객체·제네릭·매크로로의 디스패치는 구문 분석에
   보이지 않습니다 — 그래서 limitation에 실측으로 남습니다.
@@ -109,7 +115,7 @@ cargo run -- cycles --level symbol --strict
 
 Conventional Commits, 본문은 한국어. 스코프는 모듈 이름을 씁니다
 (`graph`, `modtree`, `harvest`, `source`, `analysis`, `rules`, `export`,
-`sarif`, `cli`, `config`, `cargo_meta`).
+`sarif`, `cli`, `config`, `cargo_meta`, `sem`).
 
 ```
 feat(harvest): 구조체 리터럴 참조 간선 수확

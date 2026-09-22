@@ -50,6 +50,14 @@ cargo build --release
 # binary at target/release/rustograph
 ```
 
+For type-resolved analysis, build with the optional `semantic` feature
+(rust-analyzer `ra_ap_*` crates — heavy, opt-in):
+
+```bash
+cargo build --release --features semantic
+rustograph graph --level symbol --semantic
+```
+
 ## Usage
 
 ```bash
@@ -58,6 +66,7 @@ rustograph graph                          # module level
 rustograph graph --level crate            # packages + dependencies
 rustograph graph --level crate --deps     # include external crates
 rustograph graph --level symbol           # call/references/implements/signature
+rustograph graph --level symbol --semantic  # + type-resolved calls (feature build)
 rustograph graph --level type --format mermaid
 rustograph graph --out .rustograph/graph.json   # persist, then reuse:
 
@@ -162,9 +171,15 @@ rustup or the active sysroot.
 ## Limitations of the MVP
 
 Syntactic analysis (syn) cannot see through macros, `dyn` dispatch, or
-generics — every such gap is counted in `limitations`. The roadmap replaces
-or augments this with rust-analyzer (`ra_ap_*`) semantics; the graph contract
-will not change.
+generics — every such gap is counted in `limitations`. The optional
+`semantic` feature (`cargo build --features semantic`, then `--semantic`)
+augments body harvesting with rust-analyzer (`ra_ap_*`) semantics: method
+calls resolve by receiver type instead of name fan-out, macro expansions are
+walked, and `dyn`/generic trait calls expand to workspace impl candidates
+(still tentative — the real impl is a runtime fact). The graph contract —
+vertices, edge kinds, `tentative`, `limitations` — is unchanged; only
+accuracy improves. Bodies the semantic engine cannot see (cfg-disabled,
+macro-generated) fall back to the syntactic path with measured counters.
 
 ## License
 

@@ -16,4 +16,6 @@ pub mod mcp;
 pub mod modtree;
 pub mod rules;
 pub mod sarif;
+#[cfg(feature = "semantic")]
+pub mod sem;
 pub mod source;
