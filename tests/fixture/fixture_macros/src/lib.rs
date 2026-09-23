@@ -13,3 +13,11 @@ use proc_macro::TokenStream;
 pub fn emit_helper_call(_input: TokenStream) -> TokenStream {
     "crate::util::helper()".parse().unwrap()
 }
+
+/// 입력을 그대로 돌려주는 속성 매크로 — 확장 안의 impl은 매크로 파일
+/// 소스를 가지지만 syn이 만든 메서드 정점이 실재하므로, 호출은
+/// 타입이 아니라 그 메서드 정점으로 가야 한다.
+#[proc_macro_attribute]
+pub fn keep(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
+}

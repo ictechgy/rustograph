@@ -162,16 +162,48 @@ pub fn proc_call() -> u32 {
     fixture_macros::emit_helper_call!()
 }
 
+/// 속성 매크로가 그대로 돌려주는 타입 — impl은 매크로 확장 안에 있지만
+/// `Kept::ping` 정점은 syn이 소스에서 만들었다.
+pub struct Kept;
+
+#[fixture_macros::keep]
+impl Kept {
+    pub fn ping(&self) -> u32 {
+        7
+    }
+}
+
+/// 속성 매크로 impl 메서드 호출 — 생성 impl 귀속이 아니라 실제
+/// 메서드 정점 `Kept::ping`으로 가야 한다.
+pub fn kept_ping() -> u32 {
+    Kept.ping()
+}
+
+/// 모듈 레벨 `Local` — 아래 블록 지역 타입과 이름이 같다.
+pub struct Local;
+
+/// 블록 지역 `#[derive]` 타입 — `l.clone()`이 모듈 레벨 `Local`
+/// 정점으로의 확정 간선을 만들면 안 된다.
+pub fn local_derived() -> u32 {
+    #[derive(Clone)]
+    struct Local(u32);
+    let l = Local(1);
+    l.clone().0
+}
+
 /// build.rs가 OUT_DIR에 쓴 파일 — `load_out_dirs_from_check` 없이는
 /// 해석되지 않는다.
 pub mod built {
     include!(concat!(env!("OUT_DIR"), "/built_defs.rs"));
 }
 
-/// OUT_DIR 생성 상수 참조 — out_dirs가 로드되면 그래프 밖 정의로
-/// 해석되고(external), 아니면 미해석(unresolved)으로 센다.
+/// 크레이트 루트에 직접 include!된 정의 — 소속 모듈이 크레이트 루트다.
+include!(concat!(env!("OUT_DIR"), "/root_defs.rs"));
+
+/// OUT_DIR 생성 정의 참조 — `built` 안의 상수·함수와 루트 상수.
+/// out_dirs가 로드되면 모듈 정점으로 귀속되고, 아니면 미해석으로 센다.
 pub fn uses_built() -> u32 {
-    built::BUILT_ANSWER
+    built::BUILT_ANSWER + built::built_answer() + ROOT_ANSWER
 }
 
 pub fn entry() -> u32 {

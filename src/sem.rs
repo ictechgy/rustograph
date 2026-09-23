@@ -70,9 +70,9 @@ pub struct Engine {
     /// 정규 ID → 본문 소유자 정의(fn·const·static)와 소스 정체.
     /// 워크스페이스 크레이트만, 블록 지역·매크로 생성 정의는 제외.
     defs: BTreeMap<String, BodyEntry>,
-    /// (트레이트 정규 ID, 메서드 이름) → 워크스페이스 impl 메서드 ID들.
+    /// (트레이트 정규 ID, 메서드 이름) → 워크스페이스 impl 후보들.
     /// 디스패치 지점마다 impl을 다시 훑지 않게 빌드 때 한 번 만든다.
-    matrix: BTreeMap<(String, String), Vec<String>>,
+    matrix: BTreeMap<(String, String), Vec<Candidate>>,
 }
 
 /// 본문을 가질 수 있는 정의 — fn·const·static.
@@ -91,12 +91,22 @@ struct BodyEntry {
     range: TextRange,
 }
 
+/// 디스패치 후보 — 메서드 정점을 우선 쓰고, 정점이 없는 생성 impl이면
+/// impl 대상 타입 정점으로 폴백한다. 속성 매크로가 감싼 impl은
+/// 확장 파일 소스를 가져도 메서드 정점이 실재하므로 method가 먼저다.
+struct Candidate {
+    /// `T::m`·`T::<Tr>::m` 정규 ID — 생성 impl이면 정점이 없을 수 있다.
+    method: Option<String>,
+    /// impl 대상 타입 정점 — 생성 impl에서만 채우는 폴백.
+    owner: Option<String>,
+}
+
 /// 빌드 결과 — 본문 소유자 인덱스 + 트레이트 디스패치 후보 표.
 struct Index {
     /// 정규 ID → 본문 소유자 정의와 소스 정체.
     defs: BTreeMap<String, BodyEntry>,
-    /// (트레이트 정규 ID, 메서드 이름) → 워크스페이스 impl 메서드 ID들.
-    matrix: BTreeMap<(String, String), Vec<String>>,
+    /// (트레이트 정규 ID, 메서드 이름) → 워크스페이스 impl 후보들.
+    matrix: BTreeMap<(String, String), Vec<Candidate>>,
 }
 
 /// 본문 소유자 항목 — 정규 ID + 소스 정체(파일·바이트 범위) + cfg.
@@ -208,7 +218,7 @@ impl Engine {
 fn build_index(db: &RootDatabase) -> Index {
     let sema = Semantics::new(db);
     let mut defs: BTreeMap<String, BodyEntry> = BTreeMap::new();
-    let mut matrix: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    let mut matrix: BTreeMap<(String, String), Vec<Candidate>> = BTreeMap::new();
     let mut stack: Vec<Module> = Vec::new();
     for krate in Crate::all(db) {
         if !krate.origin(db).is_local() {
@@ -248,25 +258,33 @@ fn build_index(db: &RootDatabase) -> Index {
         }
         // impl 블록 메서드 — 선언 모듈이 아니라 self 타입 소속으로 ID를 만든다.
         for imp in Impl::all_in_crate(db, krate) {
+            // 블록 지역 impl은 syn이 정점을 만들지 않는다 — 후보 ID가
+            // 같은 이름의 모듈 정점과 충돌할 수 있으므로 아예 제외한다.
+            if block_local_def(&sema, imp) {
+                continue;
+            }
             // 트레이트 impl이면 디스패치 후보 표에도 넣는다.
             let tid = imp.trait_(db).map(|t| trait_id(db, t));
+            // derive·매크로가 만든 impl은 메서드 정점이 없을 수 있다 —
+            // 그때는 impl 대상 타입 정점으로 폴백한다.
+            let owner = if impl_is_generated(&sema, imp) {
+                imp.self_ty(db).as_adt().map(|a| adt_id(db, a))
+            } else {
+                None
+            };
             for item in imp.items(db) {
                 let AssocItem::Function(f) = item else {
                     continue;
                 };
                 push_fn(&sema, &mut defs, f);
-                // derive·매크로가 만든 impl은 메서드 정점이 없다 — 후보는
-                // impl 대상 타입 정점으로 귀속한다.
-                let mid = if impl_is_generated(&sema, imp) {
-                    imp.self_ty(db).as_adt().map(|a| adt_id(db, a))
-                } else {
-                    fn_id(&sema, f)
-                };
-                if let (Some(tid), Some(id)) = (&tid, mid) {
+                if let Some(tid) = &tid {
                     matrix
                         .entry((tid.clone(), f.name(db).as_str().to_string()))
                         .or_default()
-                        .push(id);
+                        .push(Candidate {
+                            method: fn_id(&sema, f),
+                            owner: owner.clone(),
+                        });
                 }
             }
         }
@@ -481,7 +499,7 @@ struct Walker<'a, 'b> {
     ids: &'a BTreeSet<&'a str>,
     method_index: &'a BTreeMap<String, Vec<String>>,
     /// (트레이트 ID, 메서드 이름) → impl 메서드 후보 — 빌드 때 계산됐다.
-    matrix: &'a BTreeMap<(String, String), Vec<String>>,
+    matrix: &'a BTreeMap<(String, String), Vec<Candidate>>,
     st: &'b mut Stats,
     edges: Vec<Edge>,
 }
@@ -627,28 +645,50 @@ impl<'a, 'b> Walker<'a, 'b> {
             }
             return self.trait_matrix(t, f, kind, un);
         }
-        // derive·매크로가 만든 impl 메서드 — 메서드 정점이 없으므로
-        // 호출을 impl 대상 타입 정점으로 귀속한다.
-        if let Some(AssocItemContainer::Impl(i)) = f.as_assoc_item(db).map(|a| a.container(db)) {
-            if impl_is_generated(self.sema, i) {
-                return self.emit_impl_owner(i, kind, un);
-            }
-        }
         // 블록 지역 fn은 정규 ID가 없다 — 같은 이름의 정점으로 보내지 않는다.
         if block_local_def(self.sema, f) {
             self.st.external += 1;
             return;
         }
-        self.emit_fn_vertex(f, kind, un)
+        // 정점으로 직행 — 속성 매크로가 감싼 impl의 메서드처럼 확장 파일
+        // 소스를 가져도 syn이 만든 정점이 실재하면 그 정점을 쓴다.
+        if let Some(id) = fn_id(self.sema, f) {
+            if matches!(
+                self.push(id, kind, false, un),
+                Pushed::Yes | Pushed::SelfEdge
+            ) {
+                return;
+            }
+        }
+        // 정점이 없는 정의 — derive·매크로가 만든 impl 메서드면 impl 대상
+        // 타입으로, include!·생성 파일의 정의면 소속 모듈로 귀속한다.
+        if let Some(AssocItemContainer::Impl(i)) = f.as_assoc_item(db).map(|a| a.container(db)) {
+            if impl_is_generated(self.sema, i) {
+                return self.emit_impl_owner(i, kind, un);
+            }
+        }
+        if !matches!(
+            self.push(module_path(db, f.module(db)), kind, false, un),
+            Pushed::Miss
+        ) {
+            return;
+        }
+        self.st.external += 1;
     }
 
     /// 생성 impl 메서드 호출 — 메서드 정점이 없으므로 impl 대상 타입 정점을
     /// 가리킨다(튜플 구조체 생성자 호출이 구조체 정점을 가리키는 것과 같다).
+    /// 블록 지역 타입의 생성 impl은 정규 ID가 같은 이름의 정점과 충돌할 수
+    /// 있으므로 외부로 보낸다.
     fn emit_impl_owner(&mut self, i: Impl, kind: EdgeKind, un: bool) {
         let Some(adt) = i.self_ty(self.db()).as_adt() else {
             self.st.external += 1;
             return;
         };
+        if block_local_def(self.sema, adt) {
+            self.st.external += 1;
+            return;
+        }
         let id = adt_id(self.db(), adt);
         if let Pushed::Miss = self.push(id, kind, false, un) {
             self.st.external += 1;
@@ -683,9 +723,14 @@ impl<'a, 'b> Walker<'a, 'b> {
         let Some(candidates) = self.matrix.get(&key) else {
             return;
         };
-        for id in candidates {
-            // impl 메서드 정점이 없으면(cfg·생성) 해석됐지만 그래프 밖이다.
-            if let Pushed::Miss = self.push(id.clone(), kind, true, un) {
+        for cand in candidates {
+            // 메서드 정점이 있으면 그쪽, 없으면(생성 impl) 타입 정점으로.
+            let hit = [cand.method.as_ref(), cand.owner.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|id| matches!(self.push(id.clone(), kind, true, un), Pushed::Yes));
+            // 둘 다 없으면(cfg·생성) 해석됐지만 그래프 밖이다.
+            if !hit {
                 self.st.external += 1;
             }
         }
@@ -839,10 +884,10 @@ impl<'a, 'b> Walker<'a, 'b> {
         if let Pushed::Miss = self.push(id, kind, false, un) {
             // 정점이 없는 정의 — include!·생성 파일 안의 정의면 소속 모듈
             // 정점으로 귀속해 사용처를 보존한다(syn이 모듈 경로로 잡던 것).
-            let module_fallback = d.module(db).map(|m| module_path(db, m));
-            let own = self.owner.split("::").next().unwrap_or(self.owner);
-            if let Some(module) = module_fallback {
-                if module != own && matches!(self.push(module, kind, false, un), Pushed::Yes) {
+            // 크레이트 루트 include!면 크레이트 정점으로 간다 — 자기 간선은
+            // push가 알아서 걸러준다.
+            if let Some(module) = d.module(db).map(|m| module_path(db, m)) {
+                if matches!(self.push(module, kind, false, un), Pushed::Yes) {
                     return;
                 }
             }

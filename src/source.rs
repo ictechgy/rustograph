@@ -662,7 +662,7 @@ fn push_sem_stats(
     }
     if st.proc_macros > 0 && !has_proc_macros {
         limitations.push(format!(
-            "{} proc-macro invocations could not be expanded (rust-analyzer-proc-macro-srv not found in sysroot)",
+            "{} proc-macro invocations could not be expanded (proc-macro server unavailable)",
             st.proc_macros
         ));
     }

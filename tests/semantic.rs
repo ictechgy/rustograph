@@ -298,30 +298,65 @@ fn proc_macro_call_keeps_crate_use() {
     let e = call(&d, "fixture_core::proc_call", "fixture_macros")
         .expect("proc-macro use edge to the crate vertex");
     assert!(!e.tentative);
-    // 확장은 proc 매크로 서버가 있을 때만 — 없으면 limitation이 실측한다.
-    let expanded = call(&d, "fixture_core::proc_call", "fixture_core::util::helper").is_some();
-    let srv_down = d
-        .limitations
-        .iter()
-        .any(|l| l.contains("proc-macro") || l.contains("could not be expanded"));
+    // 확장은 proc 매크로 서버가 있을 때만 — 서버가 붙으면 확장 안의
+    // 호출이 확정 간선으로, 없으면 proc-macro 전용 limitation이 실측한다.
+    let expanded = call(&d, "fixture_core::proc_call", "fixture_core::util::helper")
+        .is_some_and(|e| !e.tentative);
+    let srv_down = d.limitations.iter().any(|l| l.contains("proc-macro"));
     assert!(
         expanded || srv_down,
-        "expansion edge or a measured limitation"
+        "firm expansion edge or the proc-macro limitation"
     );
+}
+
+/// 속성 매크로가 감싼 impl — 메서드 정점이 실재하므로 호출은 타입이
+/// 아니라 그 정점으로 간다.
+#[test]
+fn attr_macro_impl_keeps_method_vertex() {
+    let d = sem_doc();
+    let e = call(&d, "fixture_core::kept_ping", "fixture_core::Kept::ping")
+        .expect("call edge to the real method vertex");
+    assert!(!e.tentative);
+    // 생성 impl 타입 귀속이면 생기는 잘못된 call 간선 — `Kept`는
+    // 생성자 참조(References)로만 가야 한다.
+    assert!(
+        call(&d, "fixture_core::kept_ping", "fixture_core::Kept").is_none(),
+        "call edge must not collapse to the type vertex"
+    );
+}
+
+/// 블록 지역 `#[derive]` 타입의 생성 메서드 호출은 같은 이름의 모듈
+/// 정점으로 귀속되면 안 된다 — 정규 ID 충돌이다.
+#[test]
+fn block_local_derive_does_not_collide() {
+    let d = sem_doc();
+    assert!(call(&d, "fixture_core::local_derived", "fixture_core::Local").is_none());
 }
 
 #[test]
 fn out_dir_defs_resolve_to_module() {
     let d = sem_doc();
-    // OUT_DIR 산출물 안의 const — 정점은 없지만 소속 모듈 정점으로
-    // 귀속돼야 한다(syn이 `built::BUILT_ANSWER`를 모듈로 잡던 것과 같은
-    // 표면). out_dirs 로드가 꺼져 있으면 이 간선은 만들어지지 않는다.
-    let e = d.edges.iter().find(|e| {
-        e.from == "fixture_core::uses_built"
-            && e.to == "fixture_core::built"
-            && e.kind == EdgeKind::References
-    });
-    assert!(e.is_some(), "include!-ed module reference must be kept");
+    // OUT_DIR 산출물 안의 정의들 — 정점은 없지만 소속 모듈 정점으로
+    // 귀속돼야 한다(syn이 모듈 경로로 잡던 것과 같은 표면).
+    // out_dirs 로드가 꺼져 있으면 이 간선은 만들어지지 않는다.
+    let refs = |to: &str, kind: EdgeKind| {
+        d.edges
+            .iter()
+            .any(|e| e.from == "fixture_core::uses_built" && e.to == to && e.kind == kind)
+    };
+    assert!(
+        refs("fixture_core::built", EdgeKind::References),
+        "const ref to module"
+    );
+    assert!(
+        refs("fixture_core::built", EdgeKind::Call),
+        "generated fn call to module"
+    );
+    // 크레이트 루트에 include!된 상수 — 소속 모듈이 크레이트 루트다.
+    assert!(
+        refs("fixture_core", EdgeKind::References),
+        "root-included const"
+    );
 }
 
 #[test]
