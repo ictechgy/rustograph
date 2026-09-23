@@ -786,6 +786,50 @@ fn inline_path_attr_overrides_dir() {
     .is_some());
 }
 
+/// 활성 매크로 호출 앞의 미검증 속성 — dormant `cfg_attr` 안에 원본
+/// 사본이 있고 활성 `emit_args`는 위조 형제만 emit한다. 아이템 전체
+/// `is_attr_macro_call`은 true지만 `cfg_attr` 자신은 호출이 아니다 —
+/// 속성 단위 판별 없이는 위조가 단독 후보로 스틸한다.
+#[test]
+fn unverifiable_attr_before_macro_call_fails_closed() {
+    let d = sem_doc();
+    assert!(call(
+        &d,
+        "fixture_core::S8::<Tr>::m",
+        "fixture_core::forged_target"
+    )
+    .is_none());
+    assert!(
+        call(&d, "fixture_core::S8::<Tr>::m", "fixture_core::a::probe").is_some(),
+        "real body's call edge must exist"
+    );
+    assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S8::<Tr>::m").is_none());
+    assert!(
+        call(&d, "fixture_core::dispatch_c", "fixture_core::S8").is_some(),
+        "forged impl must fall back to its owner type vertex"
+    );
+}
+
+/// 확장 출력 안의 `#[cfg]`가 달린 무관한 아이템 — cfg는 inert 내장
+/// 속성인데 전용 Meta 변형이라 path()가 None이다. 정체 불명으로
+/// 오인해 후보 탐색 전체가 애매해지면 안 된다.
+#[test]
+fn cfg_attr_on_sibling_item_is_inert() {
+    let d = sem_doc();
+    // `self.probe2()`는 semantic 해석이 필요한 메서드 호출이다 — cfg가
+    // 오인돼 사이트 해석이 애매해지면 syn 팬아웃의 tentative로 떨어진다.
+    let e = call(
+        &d,
+        "fixture_core::S10::<Tr>::m",
+        "fixture_core::S10::probe2",
+    )
+    .expect("real body's call edge must exist");
+    assert!(
+        !e.tentative,
+        "cfg-annotated sibling must not lose ownership"
+    );
+}
+
 /// 비-mod.rs 파일 안 인라인 조상의 `#[path]` — `single.rs`의
 /// `#[path="pathdir"] mod pin`은 `src/single/pathdir/`가 아니라
 /// `src/pathdir/`를 자식 기준으로 한다(rustc 규칙 — 파일에 직접

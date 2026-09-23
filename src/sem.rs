@@ -659,7 +659,7 @@ fn walk_expansion(
         }
         if let Some(it) = ast::Item::cast(n.clone()) {
             if !n.ancestors().skip(1).any(|a| ast::Fn::cast(a).is_some()) {
-                let (is_macro, roots) = classify_item_attrs(sema, root.file_id, &it)?;
+                let (is_macro, roots) = classify_item_attrs(sema, &it)?;
                 derive_roots.extend(roots);
                 if is_macro {
                     pending.push(it);
@@ -755,51 +755,124 @@ fn walk_expansion(
 /// 아이템에 달린 각 속성을 판별해 (속성 매크로 여부, derive 확장
 /// 루트들)을 돌려준다. inert 내장 속성과 derive는 아이템을 emit하는
 /// 매크로가 아니지만, derive 출력 자체는 숨은 후보원이라 확장해 둔다.
-/// 정체를 판별할 수 없는 속성 — 내장도 매크로 호출도 아닌 것(미해석
-/// proc 매크로·derive 헬퍼 등)과 미평가 `cfg_attr` — 는 인자 토큰에
-/// 사본을 숨길 수 있어 None으로 애매를 유도한다.
+/// `cfg_attr`는 `skip_cfg_attrs`로 안쪽 메타까지 펼쳐 판별한다 — 술어
+/// 평가 없이 전부 보므로 dormant 속성의 내용도 검증된다(실제로는
+/// 활성이 아닌 확장을 더 걷는 것은 후보를 늘릴 뿐 줄이지 않아 안전
+/// 방향이다). 정체를 판별할 수 없는 속성 — 내장도 호출로 확인된
+/// 매크로도 아닌 것(미해석 proc 매크로 등) — 는 인자 토큰에 사본을
+/// 숨길 수 있어 None으로 애매를 유도한다.
 fn classify_item_attrs(
     sema: &Semantics<RootDatabase>,
-    file_id: ra_ap_hir::HirFileId,
     it: &ast::Item,
 ) -> Option<(bool, Vec<SyntaxNode>)> {
     let mut is_macro = false;
     let mut roots = Vec::new();
     for attr in it.attrs() {
-        // `cfg_attr`는 전용 Meta 변형이라 path()가 None이다 — 이름이
-        // 안 잡히는 속성은 `_` 암에서 매크로 호출 여부로 판별한다
-        // (ra는 cfg_attr를 평가해 안쪽 매크로 호출을 찾는다 — 평가가
-        // 안 된 채 남은 것은 인자를 검증할 수 없어 None).
-        let name = attr
-            .path()
-            .and_then(|p| p.as_single_name_ref())
-            .map(|n| n.text().to_string());
-        match name.as_deref() {
-            Some("derive") | Some("derive_const") => {
-                // derive 호출 하나라도 해석·확장에 실패하면 출력이
-                // 불완전하다 — None/err 모두 애매다.
-                for er in sema.expand_derive_macro(&attr.meta()?)? {
-                    let er = er?;
-                    if er.err.is_some() {
+        for meta in attr.skip_cfg_attrs() {
+            // `cfg`/`cfg_attr`는 전용 Meta 변형이라 path()가 None이다 —
+            // simple_name은 두 변형의 이름도 준다.
+            match meta.simple_name().as_deref() {
+                Some("derive") | Some("derive_const") => {
+                    // ra는 derive 인자 목록의 malformed 항목을 조용히
+                    // 버린다 — 세그먼트 수와 확장 호출 수가 다르면 인자가
+                    // 유실된 것이라 출력을 신뢰할 수 없다.
+                    let exps = sema.expand_derive_macro(&meta)?;
+                    if derive_arg_count(&meta)? != exps.len() {
                         return None;
                     }
-                    roots.push(er.value);
+                    // derive 호출 하나라도 해석·확장에 실패하면 출력이
+                    // 불완전하다 — None/err 모두 애매다.
+                    for er in exps {
+                        let er = er?;
+                        if er.err.is_some() {
+                            return None;
+                        }
+                        roots.push(er.value);
+                    }
+                }
+                // rustc/ra가 inert로 등록한 내장 속성 — 아이템을 emit하지
+                // 않는다. `cfg`도 여기 잡힌다(게이트만 한다).
+                Some(n) if is_inert_attr(n) => {}
+                _ => {
+                    // derive 헬퍼는 토큰이 derive 매크로 입력으로 들어간다
+                    // — derive 출력은 이미 걷는다.
+                    if sema.derive_helper(&attr).is_some() {
+                        continue;
+                    }
+                    // 이 속성이 이 아이템의 실제 매크로 호출인지 meta
+                    // 단위로 확인한다 — 아이템 전체 판정(is_attr_macro_call)
+                    // 으로는 다른 속성의 매크로로 미해석 속성까지 통과된다.
+                    if !is_invoc_attr(sema, it, &attr, &meta)? {
+                        return None;
+                    }
+                    is_macro = true;
                 }
             }
-            // rustc/ra가 inert로 등록한 내장 속성 — 아이템을 emit하지
-            // 않는다.
-            Some(n) if is_inert_attr(n) => {}
-            _ => {
-                // derive 헬퍼·미해석 매크로 등 — 매크로 호출로 확인된
-                // 것만 연다. 아니면 인자 토큰을 검증할 수 없다.
-                if !sema.is_attr_macro_call(InFile::new(file_id, it)) {
-                    return None;
-                }
-                is_macro = true;
-            }
+        }
+        if is_macro {
+            // 호출 속성 이후의 속성은 매크로 입력 토큰이다 — 매크로가
+            // emit하는 것은 확장 출력에서 전부 본다.
+            break;
         }
     }
     Some((is_macro, roots))
+}
+
+/// derive 인자 목록의 최상위 쉼표 구분 세그먼트 수 — `expand_derive_macro`
+/// 의 호출 수와 대조해 인자 유실을 감지한다. 목록 형태가 아니면 None.
+fn derive_arg_count(meta: &ast::Meta) -> Option<usize> {
+    let ast::Meta::TokenTreeMeta(tt) = meta else {
+        return None;
+    };
+    let tt = tt.token_tree()?;
+    let mut count = 0usize;
+    let mut has_tok = false;
+    for e in tt.syntax().children_with_tokens() {
+        match e {
+            ra_ap_syntax::NodeOrToken::Token(t) => match t.kind() {
+                ra_ap_syntax::T![,] => {
+                    count += usize::from(has_tok);
+                    has_tok = false;
+                }
+                k if k.is_trivia() => {}
+                ra_ap_syntax::T!['('] | ra_ap_syntax::T![')'] => {}
+                _ => has_tok = true,
+            },
+            ra_ap_syntax::NodeOrToken::Node(_) => has_tok = true,
+        }
+    }
+    Some(count + usize::from(has_tok))
+}
+
+/// `attr` 안의 `meta`가 이 아이템의 실제 속성 매크로 호출인가 — 호출된
+/// 속성을 `invoc_attr`로 역산해 Attr과 Meta 둘 다 대조한다. `cfg_attr`
+/// 안쪽 메타는 같은 Attr를 공유하므로 meta 범위까지 봐야 구분된다.
+/// 확장 호출을 못 열면 판별 불가(None).
+fn is_invoc_attr(
+    sema: &Semantics<RootDatabase>,
+    it: &ast::Item,
+    attr: &ast::Attr,
+    meta: &ast::Meta,
+) -> Option<bool> {
+    let er = sema.expand_attr_macro(it)?;
+    let call_id = er.value.file_id.macro_file()?;
+    let loc = call_id.loc(sema.db);
+    let ra_ap_hir_expand::MacroCallKind::Attr {
+        ast_id,
+        censored_attr_ids,
+        ..
+    } = &loc.kind
+    else {
+        return Some(false);
+    };
+    let owner = ast_id.to_node(sema.db);
+    let (found_attr, found_meta) = censored_attr_ids
+        .invoc_attr()
+        .find_attr_range_with_source(sema.db, loc.krate, &owner);
+    Some(
+        found_attr.syntax().text_range() == attr.syntax().text_range()
+            && found_meta.syntax().text_range() == meta.syntax().text_range(),
+    )
 }
 
 /// `allow`·`doc` 같은 inert 내장 속성인가 — ra의 등록부를 쓴다.

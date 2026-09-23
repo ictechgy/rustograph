@@ -256,6 +256,54 @@ pub fn forge_via_derive(_attr: TokenStream, item: TokenStream) -> TokenStream {
     out
 }
 
+/// 검증 불가 속성이 진짜 매크로 호출 앞에 있는 형태 — dormant
+/// `cfg_attr` 안에 원본 impl을 숨기고, 활성 `emit_args` 호출은 위조
+/// 형제만 emit한다. 아이템 전체 `is_attr_macro_call`은 `emit_args`가
+/// 있어 true를 주지만, `cfg_attr` 자신은 호출이 아니다 — 속성 단위로
+/// 확인하지 않으면 미검증 cfg_attr가 통과돼 위조가 단독 후보가 된다.
+#[proc_macro_attribute]
+pub fn forge_masked_carrier(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    // #[cfg_attr(never, fixture_macros::emit_args(<item>))]  — dormant, 원본 숨김
+    let args = proc_macro::Group::new(proc_macro::Delimiter::Parenthesis, item.clone());
+    let mut inner: TokenStream = "fixture_macros::emit_args".parse().unwrap();
+    inner.extend(std::iter::once(proc_macro::TokenTree::Group(args)));
+    let mut cfg_body: TokenStream = "never,".parse().unwrap();
+    cfg_body.extend(inner);
+    let cfg_paren = proc_macro::Group::new(proc_macro::Delimiter::Parenthesis, cfg_body);
+    let mut cfg_attr_body: TokenStream = "cfg_attr".parse().unwrap();
+    cfg_attr_body.extend(std::iter::once(proc_macro::TokenTree::Group(cfg_paren)));
+    let mut out: TokenStream = "#".parse().unwrap();
+    out.extend(std::iter::once(proc_macro::TokenTree::Group(
+        proc_macro::Group::new(proc_macro::Delimiter::Bracket, cfg_attr_body),
+    )));
+    // #[fixture_macros::emit_args(<forged>)] — 활성 호출, 위조 형제만 emit
+    let forged = forged_sibling(&item);
+    let fargs = proc_macro::Group::new(proc_macro::Delimiter::Parenthesis, forged);
+    let mut emit_body: TokenStream = "fixture_macros::emit_args".parse().unwrap();
+    emit_body.extend(std::iter::once(proc_macro::TokenTree::Group(fargs)));
+    out.extend("#".parse::<TokenStream>().unwrap());
+    out.extend(std::iter::once(proc_macro::TokenTree::Group(
+        proc_macro::Group::new(proc_macro::Delimiter::Bracket, emit_body),
+    )));
+    out.extend("struct Carrier8;".parse::<TokenStream>().unwrap());
+    out
+}
+
+/// 입력 아이템을 `passthrough!` 안에 넣어 emit하고 `#[cfg]`가 달린
+/// 무관한 형제 아이템을 추가한다 — cfg는 아이템을 emit하지 않는
+/// inert 내장 속성인데 전용 Meta 변형이라 이름 추출이 다르다. cfg
+/// 하나 때문에 후보 탐색 전체가 애매해지면 안 된다. passthrough 래핑은
+/// to_fn_def가 원본을 못 잡게 해 확장 탐색을 강제한다.
+#[proc_macro_attribute]
+pub fn emit_cfg_sibling(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut out: TokenStream = "crate::passthrough!".parse().unwrap();
+    out.extend(std::iter::once(proc_macro::TokenTree::Group(
+        proc_macro::Group::new(proc_macro::Delimiter::Brace, item),
+    )));
+    out.extend("#[cfg(all())] fn cfg_gated() {}".parse::<TokenStream>().unwrap());
+    out
+}
+
 /// 위조 형제 + 죽은 `cfg_attr` 안에 원본을 숨긴 struct를 emit한다 —
 /// 조건이 거짓(`never`)이라 안쪽 속성은 평가되지 않지만, 미평가
 /// cfg_attr는 인자를 검증할 수 없으므로 애매로 빠져야 한다.

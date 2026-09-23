@@ -298,6 +298,18 @@ impl a::Tr for S7 {
     }
 }
 
+pub struct S8;
+
+// `forge_masked_carrier` — dormant cfg_attr 안에 원본을 숨기고 활성
+// emit_args는 위조 형제만 emit한다. cfg_attr를 아이템 전체 매크로
+// 판정으로 통과시키면 위조 사본이 단독 후보로 스틸한다.
+#[fixture_macros::forge_masked_carrier]
+impl a::Tr for S8 {
+    fn m(&self) -> u32 {
+        a::probe()
+    }
+}
+
 pub struct S9;
 
 // `forge_via_cfg` — 죽은 `cfg_attr` 안에 원본 사본이 들어 있다.
@@ -306,6 +318,25 @@ pub struct S9;
 impl a::Tr for S9 {
     fn m(&self) -> u32 {
         a::probe()
+    }
+}
+
+pub struct S10;
+
+impl S10 {
+    pub fn probe2(&self) -> u32 {
+        1
+    }
+}
+
+// `emit_cfg_sibling` — 원본 impl + `#[cfg]`가 달린 무관한 형제를 emit.
+// cfg는 inert 내장 속성이라 형제가 있어도 사이트는 정상 해석돼야 한다.
+// `self.probe2()`는 syn이 타입을 모르는 메서드 호출이라 — 사이트 해석이
+// 깨지면 이 간선이 tentative로 떨어진다(확정 간선 단언의 비공허 앵커).
+#[fixture_macros::emit_cfg_sibling]
+impl a::Tr for S10 {
+    fn m(&self) -> u32 {
+        self.probe2()
     }
 }
 
