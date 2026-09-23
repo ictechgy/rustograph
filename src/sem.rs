@@ -22,7 +22,7 @@ use ra_ap_ide_db::RootDatabase;
 use ra_ap_load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice};
 use ra_ap_proc_macro_api::ProcMacroClient;
 use ra_ap_project_model::{CargoConfig, RustLibSource, TargetDirectoryConfig};
-use ra_ap_syntax::ast::{self, AstNode};
+use ra_ap_syntax::ast::{self, AstNode, HasName};
 use ra_ap_syntax::{SyntaxNode, TextRange, TextSize};
 use ra_ap_vfs::{FileId, Vfs, VfsPath};
 use std::collections::{BTreeMap, BTreeSet};
@@ -56,6 +56,9 @@ pub struct Stats {
     pub unresolved: usize,
     /// hir이 모르는 본문 수 — cfg 비활성·매크로 생성 정의는 syn 폴백으로 간다.
     pub unmapped: usize,
+    /// 디스패치 후보 중 그래프에 표현 불가인 것의 수 — blanket·원시 타입
+    /// impl은 메서드 정점도 ADT owner도 없어 간선이 아니라 여기로 센다.
+    pub unrepresentable: usize,
 }
 
 /// 의미 해석 세션 — 로드된 워크스페이스 DB와 정규 ID → 정의 인덱스.
@@ -92,8 +95,16 @@ enum BodyDef {
 /// 여럿일 수 있어(cfg 변형 등) 파일·범위로 진짜 소유자를 가린다.
 struct BodyEntry {
     def: BodyDef,
+    /// 정의가 속한 크레이트 — 같은 파일·범위가 여러 크레이트 문맥으로
+    /// 로드될 때(include! 공유) 진짜 소유자를 가린다.
+    krate: String,
     file: FileId,
+    /// 아이템 전체의 원본 파일 범위.
     range: TextRange,
+    /// 이름 토큰의 원본 범위 — 주석·속성 포함 범위는 syn과 ra가 다르게
+    /// 나눌 수 있지만 식별자 위치는 양쪽이 같은 선언을 가리킨다.
+    /// `const _` 같은 무명 정의는 없다.
+    anchor: Option<TextRange>,
 }
 
 /// 디스패치 후보 — 메서드 정점을 우선 쓰고, 정점이 없는 생성 impl이면
@@ -220,10 +231,18 @@ impl Engine {
         };
         let want = TextRange::new(TextSize::from(start), TextSize::from(end));
         // 같은 ID의 정의가 여럿이면(제네릭 인자가 다른 impl·cfg 변형)
-        // 파일·범위로 진짜 소유자를 고른다.
-        let entry = entries
+        // 파일·이름 앵커로 진짜 소유자를 고른다 — intersect는 맞닿은
+        // 범위도 성공시키므로 이름 토큰의 포함 여부로 대조한다.
+        let mut matched = entries
             .iter()
-            .find(|e| e.file == file_id && e.range.intersect(want).is_some())?;
+            .filter(|e| e.file == file_id && want.contains_range(e.anchor.unwrap_or(e.range)));
+        // 같은 소스 위치가 여러 크레이트 문맥으로 로드되면(include! 공유)
+        // 크레이트로 가린다 — 크레이트가 안 맞으면 첫 일치로 폴백한다.
+        let krate = site.id.split("::").next();
+        let entry = matched
+            .clone()
+            .find(|e| Some(e.krate.as_str()) == krate)
+            .or_else(|| matched.next())?;
         let sema = Semantics::new(&self.db);
         let root = entry.def.body_root(&sema)?;
         // next-solver의 트레이트 해석은 스레드 로컬 attached db를 요구한다 —
@@ -364,34 +383,51 @@ fn syn_backed(
     let (Some(ss), Some(b)) = (sites.get(id), body_entry(sema, BodyDef::Fn(f))) else {
         return false;
     };
+    // 아이템 전체 범위가 아니라 이름 토큰 앵커로 대조한다 — ra는 선행
+    // 주석을 노드에 붙이고 속성 매크로는 소비된 속성을 확장에서 빼므로,
+    // 아이템 범위 동등 비교는 진짜 선언을 거절할 수 있다.
+    let anchor = b.anchor.unwrap_or(b.range);
     ss.iter()
-        .any(|&(file, range)| file == b.file && range == b.range)
+        .any(|&(file, range)| file == b.file && range.contains_range(anchor))
 }
 
 /// 정의의 소스 정체를 잡아 인덱스 항목으로 만든다 — 블록(fn 본문) 안에
 /// 선언된 정의와 매크로가 만든 정의(원본 파일 범위가 없는 것)는 인덱스하지
 /// 않는다: 둘 다 정규 ID가 실제 정점과 충돌할 수 있기 때문이다.
+/// 지역성은 확장 인지 조상으로 판정한다 — `mod m { include!("x.rs") }`
+/// 같은 지역 복제본은 원본 범위가 실제 선언과 같아 구분이 안 된다.
 fn body_entry(sema: &Semantics<RootDatabase>, def: BodyDef) -> Option<BodyEntry> {
-    let node = match def {
-        BodyDef::Fn(f) => sema.source(f)?.value.syntax().clone(),
-        BodyDef::Const(c) => sema.source(c)?.value.syntax().clone(),
-        BodyDef::Static(s) => sema.source(s)?.value.syntax().clone(),
+    let (node, name_node, module) = match def {
+        BodyDef::Fn(f) => {
+            let v = sema.source(f)?.value;
+            (v.syntax().clone(), v.name(), f.module(sema.db))
+        }
+        BodyDef::Const(c) => {
+            let v = sema.source(c)?.value;
+            (v.syntax().clone(), v.name(), c.module(sema.db))
+        }
+        BodyDef::Static(s) => {
+            let v = sema.source(s)?.value;
+            (v.syntax().clone(), v.name(), s.module(sema.db))
+        }
     };
-    if block_local(&node) {
+    if sema
+        .ancestors_with_macros(node.clone())
+        .any(|a| ast::BlockExpr::cast(a).is_some())
+    {
         return None;
     }
     let fr = sema.original_range_opt(&node)?;
+    let anchor = name_node
+        .and_then(|n| sema.original_range_opt(n.syntax()))
+        .map(|a| a.range);
     Some(BodyEntry {
         def,
+        krate: crate_name(sema.db, module.krate(sema.db)),
         file: fr.file_id.file_id(sema.db),
         range: fr.range,
+        anchor,
     })
-}
-
-/// 구문 노드가 본문(블록) 안에 선언됐는가 — 정규 모듈 경로는 이 위치를
-/// 무시하므로, 이런 정의를 ID로 올리면 같은 이름의 정점과 충돌한다.
-fn block_local(node: &SyntaxNode) -> bool {
-    node.ancestors().any(|a| ast::BlockExpr::cast(a).is_some())
 }
 
 /// impl 블록이 코드 생성물인가 — `#[derive]`가 만드는 builtin impl은 소스가
@@ -715,6 +751,22 @@ impl<'a, 'b> Walker<'a, 'b> {
     /// 디스패치가 열려 있으면(dyn·제네릭) impl 행렬로 펼친다.
     fn emit_function(&mut self, f: Function, kind: EdgeKind, un: bool, concrete: bool) {
         let db = self.db();
+        // 지역성을 provenance보다 먼저 가린다 — `mod m { include!("x.rs") }`
+        // 같은 지역 복제본은 원본 파일·범위가 모듈 선언과 같아 syn_backed를
+        // 통과하므로, 범위 검사만으로는 모듈 정점을 훔칠 수 있다.
+        // impl 메서드는 익명 const 래퍼(serde_derive 패턴)를 허용하기 위해
+        // self 타입의 지역성으로 판정한다.
+        let local = match f.as_assoc_item(db).map(|a| a.container(db)) {
+            Some(AssocItemContainer::Impl(i)) => match i.self_ty(db).as_adt() {
+                Some(a) => block_local_def(self.sema, a),
+                None => block_local_def(self.sema, i),
+            },
+            _ => block_local_def(self.sema, f),
+        };
+        if local {
+            self.st.external += 1;
+            return;
+        }
         if let Some(t) = f.as_assoc_item(db).and_then(|a| a.container_trait(db)) {
             if concrete {
                 return self.emit_fn_vertex(f, kind, un);
@@ -740,11 +792,6 @@ impl<'a, 'b> Walker<'a, 'b> {
             if impl_is_generated(self.sema, i) {
                 return self.emit_impl_owner(i, kind, un);
             }
-        }
-        // 블록 지역 fn은 정규 ID가 없다 — 같은 이름의 정점으로 보내지 않는다.
-        if block_local_def(self.sema, f) {
-            self.st.external += 1;
-            return;
         }
         // include!·생성 파일의 자유 정의 — 소속 모듈 정점으로 귀속한다.
         if !matches!(
@@ -816,9 +863,10 @@ impl<'a, 'b> Walker<'a, 'b> {
                         Pushed::Yes | Pushed::SelfEdge
                     )
                 });
-            // 둘 다 없으면(cfg·생성) 해석됐지만 그래프 밖이다.
+            // 둘 다 없으면(blanket·원시 타입 impl) 해석됐지만 그래프에
+            // 표현할 정점이 없다 — 디스패치 후보 전용으로 따로 센다.
             if !hit {
-                self.st.external += 1;
+                self.st.unrepresentable += 1;
             }
         }
     }

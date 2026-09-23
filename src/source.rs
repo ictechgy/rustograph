@@ -675,6 +675,12 @@ fn push_sem_stats(
             st.proc_macros
         ));
     }
+    if st.unrepresentable > 0 {
+        limitations.push(format!(
+            "{} trait-dispatch candidates have no graph vertex (blanket, primitive, or generated impls); counted at dispatch sites",
+            st.unrepresentable
+        ));
+    }
     if st.unexpanded > 0 {
         let cause = if has_proc_macros {
             "expansion failure or depth limit"

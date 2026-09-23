@@ -407,16 +407,21 @@ fn generated_impl_does_not_steal_sibling_vertex() {
 
 /// `impl Gen<u8>`/`impl Gen<u16>` — 정점 ID는 같고 본문은 다르다.
 /// 인덱스가 한 항목만 저장하면 다른 쪽 본문의 간선이 빠진다.
+/// 메서드 호출의 *확정* 간선으로 검증한다 — syn 폴백은 메서드 호출을
+/// 추정으로만 만들어 같은 단언을 위조할 수 없다.
 #[test]
 fn generic_impls_sharing_id_keep_both_bodies() {
     let d = sem_doc();
     assert!(
-        call(&d, "fixture_core::Gen::pick", "fixture_core::util::helper")
+        call(&d, "fixture_core::Gen::pick", "fixture_core::Used::doubled")
             .is_some_and(|e| !e.tentative)
     );
-    assert!(d.edges.iter().any(|e| e.from == "fixture_core::Gen::pick"
-        && e.to == "fixture_core::BASE"
-        && e.kind == EdgeKind::References));
+    assert!(call(
+        &d,
+        "fixture_core::Gen::pick",
+        "fixture_core::Used::quadrupled"
+    )
+    .is_some_and(|e| !e.tentative));
 }
 
 /// 익명 const 안의 생성 impl(serde_derive 패턴) — self 타입이 모듈
@@ -443,8 +448,21 @@ fn macro_generated_local_type_does_not_collide() {
         .any(|e| e.from == "fixture_core::gen_local" && e.to.starts_with("fixture_core::Shadow")));
 }
 
-/// 메서드 정점도 ADT owner도 없는 impl(`u8` 원시 타입) — 후보를 조용히
-/// 버리면 limitation이 거짓말을 하므로 external로 세어져야 한다.
+/// 속성 매크로가 직접 붙은 fn — 확장은 소비된 속성을 빼므로 ra의 아이템
+/// 범위가 syn보다 짧다. provenance 대조는 이름 토큰 앵커여야 한다.
+#[test]
+fn attr_macro_fn_keeps_provenance() {
+    let d = sem_doc();
+    assert!(
+        call(&d, "fixture_core::call_kept", "fixture_core::kept_fn").is_some_and(|e| !e.tentative)
+    );
+}
+
+/// 메서드 정점도 ADT owner도 없는 impl — 후보를 조용히 버리면
+/// limitation이 거짓말을 하므로 디스패치 후보 전용 카운터로 세어져야 한다.
+/// fixture에서 표현 불가 후보는 정확히 하나다: `impl Primitive for u8`.
+/// (`impl<T: ?Sized> Poke for T` 같은 빈 blanket impl은 디스패치가
+/// 트레이트 기본 구현 정점으로 해석되므로 후보가 표현 가능하다.)
 #[test]
 fn unrepresentable_candidate_is_counted() {
     let d = sem_doc();
@@ -455,11 +473,17 @@ fn unrepresentable_candidate_is_counted() {
         "fixture_core::Primitive::hit"
     )
     .is_some_and(|e| e.tentative));
-    // u8 impl 후보는 그래프에 표현 불가 — 간선이 아니라 external 계측.
-    assert!(d
+    // 표현 불가 후보는 간선이 아니라 전용 limitation으로 실측된다 —
+    // 무관한 external 경로가 이 단언을 통과시키지 않게 수치를 고정한다.
+    let n = d
         .limitations
         .iter()
-        .any(|l| l.contains("call targets resolved to items outside the graph")));
+        .find_map(|l| {
+            l.split_once(" trait-dispatch candidates have no graph vertex")
+                .and_then(|(n, _)| n.parse::<usize>().ok())
+        })
+        .expect("unrepresentable-candidate limitation");
+    assert_eq!(n, 1, "u8 primitive impl only");
 }
 
 #[test]

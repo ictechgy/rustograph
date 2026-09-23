@@ -179,6 +179,18 @@ pub fn kept_ping() -> u32 {
     Kept.ping()
 }
 
+/// 속성 매크로가 직접 붙은 fn — 확장에서 소비된 속성만큼 ra의 아이템
+/// 범위가 syn보다 짧다. 아이템 범위 동등 비교는 이 선언을 거절한다.
+#[fixture_macros::keep]
+pub fn kept_fn() -> u32 {
+    11
+}
+
+/// `#[keep]` fn 호출 — provenance는 이름 토큰으로 대조해야 통과한다.
+pub fn call_kept() -> u32 {
+    kept_fn()
+}
+
 /// 모듈 레벨 `Local` — 아래 블록 지역 타입과 이름이 같다.
 pub struct Local;
 
@@ -241,17 +253,19 @@ pub fn dispatch_b(x: &dyn b::Tr) -> u32 {
 
 /// 제네릭 타입의 서로 다른 구체 impl — 정점 ID는 둘 다 `Gen::pick`이고
 /// 본문은 각각 다르다. 한 항목만 저장하면 다른 쪽 본문 간선이 빠진다.
+/// 메서드 호출로 검증한다 — 경로 호출·상수 참조는 syn 폴백도 만들므로
+/// 의미 해석이 실제로 그 본문을 걸었는지 구분이 안 된다.
 pub struct Gen<T>(pub T);
 
 impl Gen<u8> {
     pub fn pick(&self) -> u32 {
-        util::helper()
+        Used { v: 1 }.doubled()
     }
 }
 
 impl Gen<u16> {
     pub fn pick(&self) -> u32 {
-        self.0 as u32 + BASE
+        Used { v: 1 }.quadrupled()
     }
 }
 
