@@ -15,14 +15,15 @@ use crate::cargo_meta::normalize_name;
 use crate::graph::{Edge, EdgeKind};
 use ra_ap_hir::db::HirDatabase;
 use ra_ap_hir::{
-    Adt, AsAssocItem, AssocItem, AssocItemContainer, Const, Crate, Enum, Function, Impl, InFile,
-    Macro, Module, ModuleDef, PathResolution, Semantics, Static, Trait, Type, TypeAlias,
+    Adt, AsAssocItem, AssocItem, AssocItemContainer, Const, Crate, DisplayTarget, Enum, Function,
+    HirDisplay, Impl, InFile, Macro, Module, ModuleDef, PathResolution, Semantics, Static, Trait,
+    Type, TypeAlias,
 };
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice};
 use ra_ap_proc_macro_api::ProcMacroClient;
 use ra_ap_project_model::{CargoConfig, RustLibSource, TargetDirectoryConfig};
-use ra_ap_syntax::ast::{self, AstNode, HasName};
+use ra_ap_syntax::ast::{self, AstNode, HasGenericArgs, HasName};
 use ra_ap_syntax::{SyntaxNode, TextRange, TextSize};
 use ra_ap_vfs::{FileId, Vfs, VfsPath};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -93,16 +94,10 @@ struct SynSite {
     file: FileId,
     /// 아이템 전체의 바이트 범위.
     range: TextRange,
-    /// impl 메서드면 소속 impl 트레이트의 정규 ID — 워크스페이스 밖이면
-    /// None. `a::Tr`/`b::Tr`처럼 마지막 세그먼트가 같은 트레이트는 ID
-    /// 문자열이 같아 이걸로 가린다.
-    trait_: Option<String>,
-    /// 소스에 쓰인 그대로의 트레이트 경로 — 별칭·외부 트레이트처럼
-    /// 정규 ID로 못 잡는 경우의 대조 키다.
-    trait_written: Option<String>,
-    /// self 타입의 소스 원문 — `S<u8>`/`S<u16>`처럼 정점 ID가 같은
-    /// impl을 가리는 대조 키다.
-    self_written: Option<String>,
+    /// 사이트 선언이 impl의 직속 멤버면 그 impl의 정규 서명 — 헤더를
+    /// ra가 직접 해석하므로 `use` 별칭·외부 트레이트·섀도잉된 타입
+    /// 별칭 인자까지 실제 정체로 비교된다. impl과 무관한 선언이면 None.
+    sig: Option<String>,
 }
 
 /// syn 측 선언 위치 입력 — 엔진이 vfs 좌표로 변환해 보관한다.
@@ -111,12 +106,6 @@ pub struct Site {
     pub file: PathBuf,
     /// 아이템 전체의 바이트 범위.
     pub range: Range<usize>,
-    /// impl 메서드면 소속 impl 트레이트의 정규 ID — 해석 불가면 None.
-    pub trait_: Option<String>,
-    /// 소스에 쓰인 그대로의 트레이트 경로(`a::Tr`·`std::fmt::Debug` 류).
-    pub trait_written: Option<String>,
-    /// self 타입의 소스 원문(공백 제거).
-    pub self_written: Option<String>,
 }
 
 /// 본문을 가질 수 있는 정의 — fn·const·static.
@@ -141,14 +130,11 @@ struct BodyEntry {
     /// 나눌 수 있지만 식별자 위치는 양쪽이 같은 선언을 가리킨다.
     /// `const _` 같은 무명 정의는 없다.
     anchor: Option<TextRange>,
-    /// impl 메서드면 소속 impl 트레이트의 정규 ID — span을 보존한 채
-    /// 재사용된 이름 토큰은 위치만으로는 구분이 안 되므로 선언의
-    /// 컨테이너 정체를 함께 둔다.
-    trait_res: Option<String>,
-    /// 소스에 쓰인 그대로의 트레이트 경로 — 외부 트레이트·별칭 대조용.
-    trait_written: Option<String>,
-    /// self 타입의 소스 원문 — `S<u8>`/`S<u16>` 대조용.
-    self_written: Option<String>,
+    /// impl 메서드면 소속 impl의 정규 서명 — span을 보존한 채 재사용된
+    /// 이름 토큰은 위치만으로는 구분이 안 되므로 선언의 컨테이너 정체를
+    /// 함께 둔다. `a::Tr`/`b::Tr`·`G<u8>`/`G<u16>`·`use` 별칭까지
+    /// 해석된 정체로 구분한다.
+    sig: Option<String>,
 }
 
 /// 디스패치 후보 — 메서드 정점을 우선 쓰고, 정점이 없는 생성 impl이면
@@ -186,12 +172,6 @@ pub struct OwnerSite<'a> {
     /// 소유 아이템이 선언된 크레이트 — 같은 파일·범위가 여러 크레이트
     /// 문맥으로 로드될 때(공유 include!·`#[path]`) 진짜 소유자를 가른다.
     pub krate: &'a str,
-    /// impl 메서드면 소속 impl 트레이트의 정규 ID — 해석 불가면 None.
-    pub trait_: Option<&'a str>,
-    /// 소스에 쓰인 그대로의 트레이트 경로 — 외부 트레이트·별칭 대조용.
-    pub trait_written: Option<&'a str>,
-    /// self 타입의 소스 원문.
-    pub self_written: Option<&'a str>,
 }
 
 impl Engine {
@@ -224,34 +204,39 @@ impl Engine {
             .map_err(|e| format!("semantic engine could not load {}: {e:#}", dir.display()))?;
         // syn 선언 위치를 vfs 좌표로 변환해 둔다 — hir 정의의 원본
         // 파일·범위와 직접 비교해 정점 provenance를 확인한다.
-        let sites: BTreeMap<String, Vec<SynSite>> = sites
-            .iter()
-            .map(|(id, ss)| {
-                let vs = ss
-                    .iter()
-                    .filter_map(|s| {
-                        let (file, _) = vfs.file_id(&VfsPath::new_real_path(
-                            s.file.to_string_lossy().into_owned(),
-                        ))?;
-                        let range = TextRange::new(
-                            TextSize::from(u32::try_from(s.range.start).ok()?),
-                            TextSize::from(u32::try_from(s.range.end).ok()?),
-                        );
-                        Some(SynSite {
-                            file,
-                            range,
-                            trait_: s.trait_.clone(),
-                            trait_written: s.trait_written.clone(),
-                            self_written: s.self_written.clone(),
-                        })
-                    })
-                    .collect();
-                (id.clone(), vs)
-            })
-            .collect();
+        let mut site_map: BTreeMap<String, Vec<SynSite>> = BTreeMap::new();
+        for (id, ss) in sites {
+            for s in ss {
+                let Some((file, _)) = vfs.file_id(&VfsPath::new_real_path(
+                    s.file.to_string_lossy().into_owned(),
+                )) else {
+                    continue;
+                };
+                let (Ok(start), Ok(end)) =
+                    (u32::try_from(s.range.start), u32::try_from(s.range.end))
+                else {
+                    continue;
+                };
+                site_map.entry(id.clone()).or_default().push(SynSite {
+                    file,
+                    range: TextRange::new(TextSize::from(start), TextSize::from(end)),
+                    sig: None,
+                });
+            }
+        }
         // 타입 소속(self_ty)·트레이트 쿼리는 next-solver의 스레드 로컬
-        // attached db를 요구한다 — 인덱스 빌드부터 붙여야 panic이 안 난다.
-        let index = ra_ap_hir::attach_db(&db, || build_index(&db, &sites));
+        // attached db를 요구한다 — 인덱스 빌드·사이트 서명 해석부터 붙인다.
+        let (sites, index) = ra_ap_hir::attach_db(&db, || {
+            let sema = Semantics::new(&db);
+            let mut site_map = site_map;
+            for ss in site_map.values_mut() {
+                for s in ss.iter_mut() {
+                    s.sig = site_impl_sig(&sema, s.file, s.range);
+                }
+            }
+            let index = build_index(&db, &site_map);
+            (site_map, index)
+        });
         Ok(Engine {
             db,
             vfs,
@@ -290,50 +275,46 @@ impl Engine {
             return None;
         };
         let want = TextRange::new(TextSize::from(start), TextSize::from(end));
-        // 같은 ID의 정의가 여럿이면(제네릭 인자가 다른 impl·cfg 변형)
-        // 파일·이름 앵커로 진짜 소유자를 고른다 — intersect는 맞닿은
-        // 범위도 성공시키므로 이름 토큰의 포함 여부로 대조한다.
-        // 같은 소스 위치가 여러 크레이트 문맥으로 로드되거나(공유
-        // include!·`#[path]`), span을 보존하는 생성 선언이 진짜 선언과
-        // 겹칠 수 있다 — 파일·범위에 선언 크레이트·트레이트 정체까지
-        // 대조해 정확히 하나의 항목만 고른다. 남는 게 없거나 여럿이면
-        // 잘못된 본문의 간선이 이 정점에 귀속될 수 있으므로 억지로
-        // 고르지 않고 syn 폴백으로 돌린다.
-        let mut matched = entries.iter().filter(|e| {
-            e.file == file_id
-                && want.contains_range(e.anchor.unwrap_or(e.range))
-                && e.krate == site.krate
-                && decl_match(
-                    (site.trait_, site.trait_written, site.self_written),
-                    (
-                        e.trait_res.as_deref(),
-                        e.trait_written.as_deref(),
-                        e.self_written.as_deref(),
-                    ),
-                )
-        });
-        let entry = match (matched.next(), matched.next()) {
-            (Some(e), None) => e,
-            _ => return None,
-        };
-        let sema = Semantics::new(&self.db);
-        let root = entry.def.body_root(&sema)?;
-        // next-solver의 트레이트 해석은 스레드 로컬 attached db를 요구한다 —
-        // resolve_method_call 안에서 panic 나지 않게 걷기 전에 붙인다.
-        let mut w = Walker {
-            sema: &sema,
-            owner: site.id,
-            cfg: site.cfg,
-            ids,
-            method_index,
-            sites: &self.sites,
-            impls: &self.impls,
-            matrix: &self.matrix,
-            st,
-            edges: Vec::new(),
-        };
-        ra_ap_hir::attach_db(&self.db, || w.walk(&root, false, 0));
-        Some(w.edges)
+        ra_ap_hir::attach_db(&self.db, || {
+            let sema = Semantics::new(&self.db);
+            // 사이트 선언의 정규 서명 — syn이 못 잡는 외부 트레이트·
+            // 별칭·섀도잉된 인자도 ra가 직접 해석한 정체로 대조한다.
+            let site_sig = site_impl_sig(&sema, file_id, want);
+            // 같은 ID의 정의가 여럿이면(제네릭 인자가 다른 impl·cfg 변형)
+            // 파일·이름 앵커로 진짜 소유자를 고른다 — intersect는 맞닿은
+            // 범위도 성공시키므로 이름 토큰의 포함 여부로 대조한다.
+            // 같은 소스 위치가 여러 크레이트 문맥으로 로드되거나(공유
+            // include!·`#[path]`), span을 보존하는 생성 선언이 진짜 선언과
+            // 겹칠 수 있다 — 파일·범위에 선언 크레이트·정규 서명까지
+            // 대조해 정확히 하나의 항목만 고른다. 남는 게 없거나 여럿이면
+            // 잘못된 본문의 간선이 이 정점에 귀속될 수 있으므로 억지로
+            // 고르지 않고 syn 폴백으로 돌린다.
+            let mut matched = entries.iter().filter(|e| {
+                e.file == file_id
+                    && want.contains_range(e.anchor.unwrap_or(e.range))
+                    && e.krate == site.krate
+                    && e.sig.as_deref() == site_sig.as_deref()
+            });
+            let entry = match (matched.next(), matched.next()) {
+                (Some(e), None) => e,
+                _ => return None,
+            };
+            let root = entry.def.body_root(&sema)?;
+            let mut w = Walker {
+                sema: &sema,
+                owner: site.id,
+                cfg: site.cfg,
+                ids,
+                method_index,
+                sites: &self.sites,
+                impls: &self.impls,
+                matrix: &self.matrix,
+                st,
+                edges: Vec::new(),
+            };
+            w.walk(&root, false, 0);
+            Some(w.edges)
+        })
     }
 }
 
@@ -478,64 +459,146 @@ fn syn_backed(
     // 주석을 노드에 붙이고 속성 매크로는 소비된 속성을 확장에서 빼므로,
     // 아이템 범위 동등 비교는 진짜 선언을 거절할 수 있다.
     let anchor = b.anchor.unwrap_or(b.range);
-    ss.iter().any(|s| {
-        s.file == b.file
-            && s.range.contains_range(anchor)
-            && decl_match(
-                (
-                    s.trait_.as_deref(),
-                    s.trait_written.as_deref(),
-                    s.self_written.as_deref(),
-                ),
-                (
-                    b.trait_res.as_deref(),
-                    b.trait_written.as_deref(),
-                    b.self_written.as_deref(),
-                ),
-            )
-    })
+    ss.iter()
+        .any(|s| s.file == b.file && s.range.contains_range(anchor) && s.sig == b.sig)
 }
 
-/// 선언 정체 대조 — (해석된 트레이트 정규 ID, 소스 표기 트레이트 경로,
-/// 소스 표기 self 타입) 트리플끼리 비교한다.
-///
-/// 규칙:
-/// - 여섯 필드가 전부 없으면(자유 함수·const·static) 위치만으로 충분하다.
-/// - 소스 표기(self·트레이트)는 같은 선언이면 반드시 같다 — 어느 하나라도
-///   다르면 다른 선언이다. `impl Tr for S`의 `Tr`이 use로 `a::Tr`를
-///   가리키는 진짜 선언과, 확장이 `use crate::b::Tr` 뒤 같은 철자
-///   `impl Tr for S`를 뱉은 생성 선언은 표기가 같아도 이 규칙으로는
-///   못 가린다 — 아래 정규 ID 검사가 잡는다.
-/// - 해석된 트레이트 정체가 둘 다 있으면 반드시 같아야 한다 — 소스
-///   표기의 우연 일치가 해석된 모순을 덮지 않는다.
-/// - 한쪽만 해석됐으면(외부 트레이트·별칭) 소스 표기 동등으로 판정한다.
-///   트레이트가 없는 고유 impl이면 self 표기로 판정한다.
-fn decl_match(
-    site: (Option<&str>, Option<&str>, Option<&str>),
-    def: (Option<&str>, Option<&str>, Option<&str>),
-) -> bool {
-    let (sr, sw, ss) = site;
-    let (dr, dw, ds) = def;
-    if [sr, sw, ss, dr, dw, ds].iter().all(Option::is_none) {
-        return true;
+/// impl의 정규 서명 — 해석된 트레이트(정규 ID + 타입 인자)와 해석된
+/// self 타입. 소스 표기와 달리 `use` 별칭·외부 트레이트·섀도잉된 타입
+/// 별칭 인자(`type A=u8` vs `type A=u16`)까지 실제 정체로 비교된다.
+/// 해석할 수 없는 부분은 빈 문자열로 둔다 — 정체를 모르면 표기로
+/// 속이는 비교보다 못하다는 판단에 따른 보수적 렌더링이다.
+fn impl_sig(db: &dyn HirDatabase, i: Impl) -> String {
+    let dt = DisplayTarget::from_crate(db, i.module(db).krate(db).into());
+    let self_t = i.self_ty(db).display(db, dt).to_string();
+    let tr = i
+        .trait_ref(db)
+        .map(|tr| {
+            let name = trait_id(db, tr.trait_());
+            // 첫 인자는 Self 타입 — 트레이트 인자는 1부터.
+            // get_type_argument는 타입 인자만 주므로 const/라이프타임
+            // 인자는 비교에 들어가지 않는다 — 남는 구멍으로 기록한다.
+            let args: Vec<String> = (1..=64)
+                .filter_map(|k| tr.get_type_argument(k))
+                .map(|a| a.display(db, dt).to_string())
+                .collect();
+            if args.is_empty() {
+                name
+            } else {
+                format!("{name}<{}>", args.join(","))
+            }
+        })
+        .unwrap_or_default();
+    format!("{tr} for {self_t}")
+}
+
+/// 사이트 선언이 직속 멤버인 impl의 정규 서명 — 사이트 파일을 ra로
+/// 파싱해 헤더를 *해석*한다. syn은 외부 트레이트·use 별칭을 정점 ID로
+/// 못 잡지만 ra는 해석하므로 양쪽을 같은 정규 형태로 비교할 수 있다.
+/// 사이트 아이템이 impl의 직속 메서드가 아니면(fn 안 지역 함수·자유
+/// 함수·트레이트 선언 메서드) None — 그런 선언은 위치만으로 충분하다.
+fn site_impl_sig(sema: &Semantics<RootDatabase>, file: FileId, range: TextRange) -> Option<String> {
+    let parsed = sema.parse(sema.attach_first_edition_opt(file)?);
+    // preorder라 바깥쪽 fn이 먼저 온다 — 사이트 범위에 이름이 들어있는
+    // 가장 바깥 fn이 사이트 아이템이다(중첩 fn의 이름도 안에 들어가므로
+    // 안쪽이 먼저 오면 안 된다).
+    let f = parsed
+        .syntax()
+        .descendants()
+        .filter_map(ast::Fn::cast)
+        .find(|f| {
+            f.name()
+                .is_some_and(|n| range.contains_range(n.syntax().text_range()))
+        })?;
+    // 직속 멤버만 — 부모가 아이템 목록이고 그 부모가 impl이어야 한다.
+    // 트레이트 선언 메서드·자유 함수·중첩 fn은 여기서 걸러진다.
+    let imp = f.syntax().parent()?.parent().and_then(ast::Impl::cast)?;
+    let dt = DisplayTarget::from_crate(sema.db, sema.first_crate(file)?.into());
+    // 속성 매크로가 달린 impl은 파일 파스에서는 매크로 입력 토큰일 뿐이라
+    // 이름 해석이 닿지 않는다 — 확장 안의 노드로 서명을 만든다. 확장에는
+    // 입력 impl의 사본 외에 형제 impl도 있을 수 있으므로, 사이트 범위로
+    // 되돌아가는 메서드를 포함한 impl 중 입력 토큰 위치(self 타입)가
+    // 정확히 일치하는 사본을 고른다.
+    if let Some(er) = sema.expand_attr_macro(&ast::Item::Impl(imp.clone())) {
+        let want_self = imp.self_ty()?.syntax().text_range();
+        // 확장 노드의 원본 범위 — 사이트와 같은 실제 파일 좌표다.
+        let orig_range = |n: &SyntaxNode| {
+            sema.original_range_opt(n)
+                .and_then(|fr| (fr.file_id.file_id(sema.db) == file).then_some(fr.range))
+        };
+        let mut copies = er
+            .value
+            .value
+            .descendants()
+            .filter_map(ast::Impl::cast)
+            .filter(|e| {
+                // 사이트 메서드를 낳은 impl인가 — 확장 안의 fn 이름이
+                // 사이트 범위로 되돌아가야 한다.
+                let has_site_fn = e
+                    .syntax()
+                    .descendants()
+                    .filter_map(ast::Fn::cast)
+                    .any(|ef| {
+                        ef.name()
+                            .and_then(|n| orig_range(n.syntax()))
+                            .is_some_and(|r| range.contains_range(r))
+                    });
+                // 입력 impl의 토큰 사본인가 — call-site span의 형제 impl은
+                // self 타입 위치가 입력과 다르다.
+                let is_copy = e
+                    .self_ty()
+                    .is_some_and(|t| orig_range(t.syntax()) == Some(want_self));
+                has_site_fn && is_copy
+            });
+        return match (copies.next(), copies.next()) {
+            (Some(e), None) => ast_impl_sig(sema, &e, dt),
+            _ => None,
+        };
     }
-    if let (Some(a), Some(b)) = (ss, ds) {
-        if a != b {
-            return false;
+    ast_impl_sig(sema, &imp, dt)
+}
+
+/// 구문 impl의 정규 서명 — `impl_sig`와 같은 형태를 소스 노드에서 만든다.
+/// 트레이트 경로와 인자·self 타입을 *사이트의* 스코프에서 해석한다.
+/// 어느 부분이든 해석에 실패하면 None — 빈 조각으로 렌더링하면 양쪽이
+/// 같이 실패할 때 다른 impl이 같은 서명으로 보이는 거짓 동등이 생긴다.
+/// 실패는 호출자가 syn 폴백으로 돌리는 신호다.
+/// 라이프타임·const 인자는 hir 측 get_type_argument와 마찬가지로 건너뛴다
+/// — 양쪽이 같은 조각만 비교해야 일치한다.
+fn ast_impl_sig(
+    sema: &Semantics<RootDatabase>,
+    imp: &ast::Impl,
+    dt: DisplayTarget,
+) -> Option<String> {
+    let db = sema.db;
+    let self_t = sema
+        .resolve_type(&imp.self_ty()?)
+        .map(|t| t.display(db, dt).to_string())?;
+    let tr = match imp.trait_() {
+        None => String::new(),
+        Some(ast::Type::PathType(pt)) => {
+            let p = pt.path()?;
+            let name = trait_id(db, sema.resolve_trait(&p)?);
+            let mut args: Vec<String> = Vec::new();
+            if let Some(l) = p.segment().and_then(|s| s.generic_arg_list()) {
+                for a in l.generic_args() {
+                    let ast::GenericArg::TypeArg(ta) = a else {
+                        continue;
+                    };
+                    let t = ta.ty()?;
+                    args.push(sema.resolve_type(&t)?.display(db, dt).to_string());
+                }
+            }
+            if args.is_empty() {
+                name
+            } else {
+                format!("{name}<{}>", args.join(","))
+            }
         }
-    }
-    if let (Some(a), Some(b)) = (sw, dw) {
-        if a != b {
-            return false;
-        }
-    }
-    if let (Some(a), Some(b)) = (sr, dr) {
-        return a == b;
-    }
-    if sw.is_some() || dw.is_some() {
-        return sw.is_some() && sw == dw;
-    }
-    ss.is_some() && ss == ds
+        // 경로가 아닌 트레이트 타입(`impl (dyn Tr) for ..` 류)은 정규화 못 함.
+        Some(_) => return None,
+    };
+    Some(format!("{tr} for {self_t}"))
 }
 
 /// 정의의 소스 정체를 잡아 인덱스 항목으로 만든다 — 블록(fn 본문) 안에
@@ -603,24 +666,16 @@ fn body_entry(
     let anchor = name_node
         .and_then(|n| sema.original_range_opt(n.syntax()))
         .map(|a| a.range);
-    // impl 메서드는 컨테이너 정체를 함께 둔다 — span을 보존한 생성
-    // 메서드는 이름 위치가 진짜 선언과 겹치므로 위치만으로는 부족하다.
-    // 정규 ID(해석된 트레이트)와 소스 표기 둘 다 잡는다 — 정규 ID는
-    // 외부 트레이트를 구분하지만 별칭이 무엇을 가리켰는지는 안 담고,
-    // 소스 표기는 별칭·제네릭 인자까지 그대로 보존한다.
-    let (trait_res, trait_written, self_written) = match def {
+    // impl 메서드는 컨테이너의 정규 서명을 함께 둔다 — span을 보존한
+    // 생성 메서드는 이름 위치가 진짜 선언과 겹치므로 위치만으로는
+    // 부족하다. `a::Tr`/`b::Tr`·`G<u8>`/`G<u16>`·`use` 별칭을 해석된
+    // 정체로 구분한다.
+    let sig = match def {
         BodyDef::Fn(f) => match f.as_assoc_item(sema.db).map(|a| a.container(sema.db)) {
-            Some(AssocItemContainer::Impl(i)) => {
-                let src = sema.source(i);
-                (
-                    i.trait_(sema.db).map(|t| trait_id(sema.db, t)),
-                    src.as_ref().and_then(|s| impl_trait_written(&s.value)),
-                    src.and_then(|s| s.value.self_ty().map(|t| stripped_text(t.syntax()))),
-                )
-            }
-            _ => (None, None, None),
+            Some(AssocItemContainer::Impl(i)) => Some(impl_sig(sema.db, i)),
+            _ => None,
         },
-        _ => (None, None, None),
+        _ => None,
     };
     Some(BodyEntry {
         def,
@@ -628,32 +683,8 @@ fn body_entry(
         file: fr.file_id.file_id(sema.db),
         range: fr.range,
         anchor,
-        trait_res,
-        trait_written,
-        self_written,
+        sig,
     })
-}
-
-/// 노드의 소스 원문에서 공백을 제거해 정규화한다 — syn 측
-/// `written_text`와 같은 규칙이라 표기 차이를 없앤다.
-fn stripped_text(n: &ra_ap_syntax::SyntaxNode) -> String {
-    n.text()
-        .to_string()
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect()
-}
-
-/// impl 헤더의 트레이트 경로를 소스 표기 그대로 — `a::Tr`·`std::fmt::Debug`
-/// 류. 경로가 아닌 형태(드묾)나 세그먼트가 없는 경로(`<T as Tr>` 형태)는
-/// 비교 키로 못 쓰므로 None.
-fn impl_trait_written(imp: &ast::Impl) -> Option<String> {
-    let ast::Type::PathType(pt) = imp.trait_()? else {
-        return None;
-    };
-    let p = pt.path()?;
-    p.segment().and_then(|s| s.name_ref())?;
-    Some(stripped_text(p.syntax()))
 }
 
 /// impl 블록이 코드 생성물인가 — `#[derive]`가 만드는 builtin impl은 소스가
