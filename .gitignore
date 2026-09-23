@@ -2,3 +2,4 @@
 tests/fixture/target/
 .rustograph/
 coverage/
+.serena/
