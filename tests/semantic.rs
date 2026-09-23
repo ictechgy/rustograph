@@ -463,6 +463,58 @@ fn const_wrapped_real_impl_keeps_method_vertex() {
     assert!(call(&d, "fixture_core::wrap_ping", "fixture_core::Cloaked").is_none());
 }
 
+/// 같은 물리 파일을 두 모듈이 가리킨다 — `outer_a::duplex`와
+/// `outer_b::inner`가 같은 `duplex.rs`를 가리키고, `super::` 경로는
+/// 문맥마다 다른 정점(`outer_a::probe`/`outer_b::probe`)을 가리킨다.
+/// ra가 사이트 def를 임의의 문맥으로 묶으면(`file_to_def().first()`)
+/// 잘못된 모듈의 본문이 귀속되고 한쪽 `probe` 간선이 빠진다 —
+/// 소유 모듈 대조로 걸러야 한다. 어느 쪽이 먼저 선택되든 두 간선이
+/// 다 있어야 한다.
+#[test]
+fn shared_file_resolves_per_module_context() {
+    let d = sem_doc();
+    assert!(
+        call(
+            &d,
+            "fixture_core::S::<Tr>::m",
+            "fixture_core::outer_a::probe"
+        )
+        .is_some(),
+        "outer_a::duplex 문맥의 본문이 빠졌다 — 잘못된 문맥 귀속"
+    );
+    assert!(
+        call(
+            &d,
+            "fixture_core::S::<Tr>::m",
+            "fixture_core::outer_b::probe"
+        )
+        .is_some(),
+        "outer_b::inner 문맥의 본문이 빠졌다 — 잘못된 문맥 귀속"
+    );
+}
+
+/// 원본 impl이 함수형 매크로 호출(`passthrough!`) 안에 숨겨지고,
+/// 헤더 span을 위조한 형제 impl(`c::Tr`)이 나란히 나오는 경우 — 확장
+/// 트리의 매크로 호출 안을 재귀 확장하지 않으면 위조 사본이 단독 후보로
+/// 채택된다. 정점 `S4::<Tr>::m`은 진짜 `a::Tr` 본문의 간선만 가져야 한다.
+#[test]
+fn hidden_original_forged_sibling_does_not_steal() {
+    let d = sem_doc();
+    // 위조 사본 본문의 호출 — 절대 귀속되면 안 된다.
+    assert!(call(
+        &d,
+        "fixture_core::S4::<Tr>::m",
+        "fixture_core::forged_target"
+    )
+    .is_none());
+    // 진짜 본문의 호출 — syn 폴백이든 정확한 해결이든 있어야 한다
+    // (공허 통과 방지 대조).
+    assert!(
+        call(&d, "fixture_core::S4::<Tr>::m", "fixture_core::a::probe").is_some(),
+        "real body's call edge must exist"
+    );
+}
+
 /// fn 안 `#[path]` 모듈 — 같은 파일을 가리키는 지역 모듈의 정의는
 /// 원본 위치가 모듈 선언과 같다. 지역 정의가 `fixture_core::shared::*`
 /// 정점으로 귀속되면 모듈 선언을 훔치는 것이다.

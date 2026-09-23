@@ -209,6 +209,11 @@ pub mod a {
     pub trait Tr {
         fn m(&self) -> u32;
     }
+
+    /// `forge_sibling` 입력 메서드의 본문 호출 — 진짜 사본의 간선.
+    pub fn probe() -> u32 {
+        7
+    }
 }
 pub mod b {
     pub trait Tr {
@@ -220,6 +225,39 @@ pub mod c {
         fn m(&self) -> u32;
     }
 }
+
+/// 속성 매크로가 `crate::passthrough! { .. }` 안에 입력을 숨길 때
+/// 쓰는 전달 매크로 — 토큰 트리 안의 사본은 확장 없이는 보이지 않는다.
+macro_rules! passthrough {
+    ($($t:tt)*) => {
+        $($t)*
+    };
+}
+pub(crate) use passthrough;
+
+/// `forge_sibling`이 만드는 위조 형제 impl의 본문 호출 — 잘못 귀속되면
+/// 이 정점으로의 간선이 생긴다.
+pub fn forged_target() -> u32 {
+    0
+}
+
+pub struct S4;
+
+// 입력은 `passthrough!` 안에 숨겨지고, 형제 impl은 `c::Tr` 내용의
+// 토큰에 `a::Tr`의 span을 위조해 단다 — 헤더 원본 범위 대조를 통과하면서
+// 다른 트레이트로 해석되는 사본이다. 원본이 함수형 매크로 안에 숨어
+// 있으므로 확장을 재귀하지 않으면 위조 사본이 단독 후보로 채택된다.
+#[fixture_macros::forge_sibling]
+impl a::Tr for S4 {
+    fn m(&self) -> u32 {
+        a::probe()
+    }
+}
+
+/// 같은 물리 파일을 가리키는 두 모듈 — `super::` 해석이 문맥에 따라
+/// 다르다. ra가 임의의 문맥으로 def를 묶으면 잘못된 본문이 귀속된다.
+pub mod outer_a;
+pub mod outer_b;
 
 pub struct S;
 

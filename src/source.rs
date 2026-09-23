@@ -180,6 +180,7 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
             sites.entry(b.id.clone()).or_default().push(sem::Site {
                 file: b.file.clone(),
                 range: b.range.clone(),
+                module: b.module.clone(),
             });
         }
         Some(sem::Engine::load(&meta.workspace_root, &sites)?)
@@ -196,9 +197,11 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
                 cfg: &b.cfg,
                 file: &b.file,
                 range: &b.range,
-                // 소유 크레이트 — 같은 파일을 둘이 넘는 크레이트가 공유해도
-                // 선언 크레이트로 정확한 항목을 고른다.
+                // 소유 크레이트·모듈 — 같은 파일을 둘이 넘는 문맥이
+                // 공유해도(공유 include!·`#[path]`) 선언 문맥으로 정확한
+                // 항목을 고른다.
                 krate: b.module.split("::").next().unwrap_or_default(),
+                module: &b.module,
             };
             match eng.body_edges(&site, &ids, &method_index, &mut st) {
                 Some(es) => {

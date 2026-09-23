@@ -93,12 +93,16 @@ struct SynSite {
     file: FileId,
     /// 아이템 전체의 바이트 범위.
     range: TextRange,
+    /// 선언이 속한 모듈의 정규 경로 — 같은 물리 파일을 여러 모듈이
+    /// 가리킬 때(`#[path]`·공유 파일) ra가 임의의 문맥으로 def를 묶을
+    /// 수 있으므로 해석된 def의 소유 모듈과 대조한다.
+    module: String,
     /// 사이트 선언이 ra에서 가리키는 정의 — salsa intern ID라 같은
     /// def면 같은 아이템이다: 렌더링된 문자열이 아니므로 `a::Tr`/`b::Tr`·
     /// `G<u8>`/`G<u16>`·타입 별칭 인자의 구분이 공짜로 따라온다.
-    /// 해석 불가·애매(속성 매크로 사본이 여러 def로 갈림)하면 None —
-    /// 위치만으로는 span을 재사용한 생성 정의와 구분이 안 되므로
-    /// 매칭하지 않고 syn 폴백으로 돌린다.
+    /// 해석 불가·애매(속성 매크로 사본이 여러 def로 갈림)·모듈 문맥
+    /// 불일치면 None — 위치만으로는 span을 재사용한 생성 정의와 구분이
+    /// 안 되므로 매칭하지 않고 syn 폴백으로 돌린다.
     def: Option<BodyDef>,
 }
 
@@ -108,6 +112,8 @@ pub struct Site {
     pub file: PathBuf,
     /// 아이템 전체의 바이트 범위.
     pub range: Range<usize>,
+    /// 선언이 속한 모듈의 정규 경로 — `crate::a::b` 형태.
+    pub module: String,
 }
 
 /// 본문을 가질 수 있는 정의 — fn·const·static.
@@ -171,6 +177,10 @@ pub struct OwnerSite<'a> {
     /// 소유 아이템이 선언된 크레이트 — 같은 파일·범위가 여러 크레이트
     /// 문맥으로 로드될 때(공유 include!·`#[path]`) 진짜 소유자를 가른다.
     pub krate: &'a str,
+    /// 소유 아이템이 선언된 모듈의 정규 경로 — 같은 파일을 같은
+    /// 크레이트 안의 여러 모듈이 공유할 때(`#[path]`) 크레이트만으로는
+    /// 문맥이 안 갈리므로 모듈까지 대조한다.
+    pub module: &'a str,
 }
 
 impl Engine {
@@ -219,6 +229,7 @@ impl Engine {
                 site_map.entry(id.clone()).or_default().push(SynSite {
                     file,
                     range: TextRange::new(TextSize::from(start), TextSize::from(end)),
+                    module: s.module.clone(),
                     def: None,
                 });
             }
@@ -230,7 +241,7 @@ impl Engine {
             let mut site_map = site_map;
             for ss in site_map.values_mut() {
                 for s in ss.iter_mut() {
-                    s.def = site_def(&sema, s.file, s.range);
+                    s.def = site_def(&sema, s.file, s.range, &s.module);
                 }
             }
             let index = build_index(&db, &site_map);
@@ -280,7 +291,7 @@ impl Engine {
             // syn이 못 잡는 외부 트레이트·별칭·섀도잉된 인자도 같은 def면
             // 같은 아이템이고, span을 재사용한 생성 정의는 다른 def라
             // 걸러진다.
-            let site_def = site_def(&sema, file_id, want);
+            let site_def = site_def(&sema, file_id, want, site.module);
             // 같은 ID의 정의가 여럿이면(제네릭 인자가 다른 impl·cfg 변형)
             // 파일·이름 앵커로 진짜 소유자를 고른다 — intersect는 맞닿은
             // 범위도 성공시키므로 이름 토큰의 포함 여부로 대조한다.
@@ -424,6 +435,16 @@ fn build_index(db: &RootDatabase, sites: &BTreeMap<String, Vec<SynSite>>) -> Ind
 }
 
 impl BodyDef {
+    /// 정의가 선언된 모듈 — 사이트의 기대 모듈과 대조해 공유 파일의
+    /// 문맥 혼동을 걸러낸다.
+    fn module(&self, db: &dyn HirDatabase) -> Module {
+        match self {
+            BodyDef::Fn(f) => f.module(db),
+            BodyDef::Const(c) => c.module(db),
+            BodyDef::Static(s) => s.module(db),
+        }
+    }
+
     /// 정의의 본문 루트 — 아이템이 아니라 본문(또는 초기값)부터 걷는다.
     /// 블록 안에 선언된 중첩 정의의 본문이 소유자에게 귀속되지 않도록,
     /// 그리고 시그니처 표면이 본문 간선으로 새지 않도록 하는 시작점이다.
@@ -454,7 +475,12 @@ fn syn_backed(sites: &BTreeMap<String, Vec<SynSite>>, f: Function, id: &str) -> 
 /// 손실이 개입할 틈이 없다. 속성 매크로 입력 토큰은 아이템 트리에
 /// 없으므로 확장을 따라가 사본의 def를 읽는다. 해석 불가·애매하면
 /// None — 호출자가 syn 폴백으로 돌린다.
-fn site_def(sema: &Semantics<RootDatabase>, file: FileId, range: TextRange) -> Option<BodyDef> {
+fn site_def(
+    sema: &Semantics<RootDatabase>,
+    file: FileId,
+    range: TextRange,
+    want_module: &str,
+) -> Option<BodyDef> {
     let parsed = sema.parse(sema.attach_first_edition_opt(file)?);
     // preorder라 바깥 아이템이 먼저 온다 — 이름 토큰이 사이트 범위 안에
     // 있는 가장 바깥 선언이 사이트 아이템이다. `const C: () = { impl .. {
@@ -462,7 +488,7 @@ fn site_def(sema: &Semantics<RootDatabase>, file: FileId, range: TextRange) -> O
     // 먼저 잡힌다.
     let anchored =
         |n: Option<ast::Name>| n.is_some_and(|nm| range.contains_range(nm.syntax().text_range()));
-    parsed.syntax().descendants().find_map(|n| {
+    let def = parsed.syntax().descendants().find_map(|n| {
         if let Some(f) = ast::Fn::cast(n.clone()) {
             if !anchored(f.name()) {
                 return None;
@@ -482,7 +508,11 @@ fn site_def(sema: &Semantics<RootDatabase>, file: FileId, range: TextRange) -> O
             return Some(sema.to_def(&s).map(BodyDef::Static));
         }
         None
-    })?
+    })??;
+    // 같은 물리 파일을 여러 모듈이 가리키면(`#[path]`·공유 파일) ra는
+    // 임의의 하나의 문맥으로 def를 묶을 수 있다 — 소유 모듈이 syn이
+    // 수확한 모듈과 다르면 이 문맥의 선언이 아니므로 버린다.
+    (module_path(sema.db, def.module(sema.db)) == want_module).then_some(def)
 }
 
 /// fn 사이트의 hir 정의 — 아이템 트리에 있으면 그 def가 곧 정체다.
@@ -539,9 +569,12 @@ fn site_fn_def(
 /// 한다(메서드 전체를 요구하면 사본에 붙은 새 속성이 원본 범위를
 /// 키워 진짜 사본을 걸러낸다), (2) impl 멤버 입력이면 사본을 담은
 /// impl의 트레이트·self 타입 토큰 원본 범위가 입력 헤더와 같아야
-/// 한다 — call-site span의 형제 impl은 여기서 걸러진다. 헤더를 통째로
-/// 복사한 형제는 같은 헤더를 해석하므로 같은 impl 정체를 갖고, 다른
-/// 헤더로 위조된 형제는 범위가 어긋난다.
+/// 한다 — call-site span의 형제 impl은 여기서 걸러진다.
+/// 확장이 `m! { .. }`처럼 함수형 매크로 호출을 내면 그 안도 재귀적으로
+/// 본다 — 토큰 트리 안에 경쟁 사본이 숨을 수 있으므로 확장하지 못하는
+/// 아이템 위치 호출이 있으면 후보 집합의 완전성을 증명 못 해 애매로
+/// 본다(None). fn 본문 안의 호출은 블록 지역 아이템만 만들 수 있어
+/// 건너뛴다.
 /// 사본이 다시 매크로 입력이면 확장을 반복한다. 어느 후보든 정체를
 /// 확립하지 못하면(None 전파) 결과는 애매다.
 fn expanded_fn_defs(
@@ -557,13 +590,45 @@ fn expanded_fn_defs(
         return None;
     }
     let er = sema.expand_attr_macro(&item)?;
+    walk_expansion(sema, &er.value.value, file, site, header, depth, defs)
+}
+
+/// 확장 트리를 걸어 사본 후보를 모은다 — `expanded_fn_defs`의 재귀
+/// 본체. 아이템 위치의 함수형 매크로 호출은 안쪽이 사본을 숨길 수
+/// 있어 함께 확장한다.
+fn walk_expansion(
+    sema: &Semantics<RootDatabase>,
+    root: &SyntaxNode,
+    file: FileId,
+    site: TextRange,
+    header: Option<(Option<TextRange>, Option<TextRange>)>,
+    depth: usize,
+    defs: &mut HashSet<Function>,
+) -> Option<()> {
+    if depth >= MAX_EXPANSION_DEPTH {
+        return None;
+    }
     // 확장 노드의 원본 범위 — 사이트와 같은 실제 파일 좌표다.
     let orig_range = |n: &SyntaxNode| {
         sema.original_range_opt(n)
             .and_then(|fr| (fr.file_id.file_id(sema.db) == file).then_some(fr.range))
     };
     let mut pending: Vec<ast::Item> = Vec::new();
-    for ef in er.value.value.descendants().filter_map(ast::Fn::cast) {
+    for n in root.descendants() {
+        if let Some(mc) = ast::MacroCall::cast(n.clone()) {
+            // fn 본문 안 호출은 블록 지역 아이템만 만들 수 있다 — 정점
+            // 소유권과 무관하므로 건너뛴다. 아이템 위치 호출은 안쪽이
+            // 보이지 않으면 후보 완전성을 증명 못 해 애매로 본다.
+            if n.ancestors().any(|a| ast::Fn::cast(a).is_some()) {
+                continue;
+            }
+            let er = sema.expand_macro_call(&mc)?;
+            walk_expansion(sema, &er.value, file, site, header, depth + 1, defs)?;
+            continue;
+        }
+        let Some(ef) = ast::Fn::cast(n) else {
+            continue;
+        };
         let anchored = ef
             .name()
             .and_then(|n| orig_range(n.syntax()))
@@ -595,7 +660,8 @@ fn expanded_fn_defs(
             None => {
                 // 사본이 다시 매크로 입력 — impl에 매크로가 달려 있으면
                 // impl을, 아니면 메서드 자체의 매크로를 다음 단계에서
-                // 확장한다.
+                // 확장한다. 확장 결과를 바로 재귀로 걷는다(단방향 재귀 —
+                // 호출 사이클을 만들지 않는다).
                 let next = match &eimp {
                     Some(ei) if ei.attrs().next().is_some() => ast::Item::Impl(ei.clone()),
                     _ => ast::Item::Fn(ef),
@@ -605,7 +671,9 @@ fn expanded_fn_defs(
         }
     }
     for p in pending {
-        expanded_fn_defs(sema, p, file, site, header, depth + 1, defs)?;
+        // 재귀 깊이 상한은 walk_expansion 입구에서 걸린다.
+        let er = sema.expand_attr_macro(&p)?;
+        walk_expansion(sema, &er.value.value, file, site, header, depth + 1, defs)?;
     }
     Some(())
 }

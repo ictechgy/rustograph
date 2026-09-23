@@ -113,3 +113,60 @@ pub fn wrap_in_const(_attr: TokenStream, item: TokenStream) -> TokenStream {
     out.extend(";".parse::<TokenStream>().unwrap());
     out
 }
+
+/// 입력 impl을 `crate::passthrough! { .. }`(함수형 매크로) 안에 숨기고,
+/// 헤더 토큰의 span을 위조한 다른 트레이트(`crate::c::Tr`)의 형제 impl을
+/// 낸다 — 위조 토큰은 `c`/`::`/`Tr` 모두 입력 `a::Tr` 노드의 span을
+/// 가지므로 헤더 원본 범위 대조만으로는 걸러지지 않지만 해석은 다른
+/// 트레이트로 간다. 확장 안의 함수형 매크로 호출을 재귀 확장하지
+/// 않으면 원본 사본이 숨은 채 위조 사본이 단독 후보로 채택된다.
+#[proc_macro_attribute]
+pub fn forge_sibling(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let m = find_ident(item.clone(), "m").expect("method m");
+    let s = find_ident(item.clone(), "S4").expect("self S4");
+    let tr = find_ident(item.clone(), "Tr").expect("trait Tr");
+    let sp = tr.span();
+    // 입력 헤더 범위를 가리키는 위조 토큰 — 내용은 `c::Tr`이지만
+    // 원본 범위는 입력 `a::Tr`과 같다.
+    let forged = |text: &str| {
+        proc_macro::TokenTree::Ident(proc_macro::Ident::new(text, sp))
+    };
+    let colon = |joint: bool| {
+        let mut p = proc_macro::Punct::new(
+            ':',
+            if joint {
+                proc_macro::Spacing::Joint
+            } else {
+                proc_macro::Spacing::Alone
+            },
+        );
+        p.set_span(sp);
+        proc_macro::TokenTree::Punct(p)
+    };
+    let cs = |text: &str| {
+        proc_macro::TokenTree::Ident(proc_macro::Ident::new(text, proc_macro::Span::call_site()))
+    };
+    // 형제: impl c::Tr for S4 { fn m(&self) -> u32 { crate::forged_target() } }
+    let mut sib: TokenStream = [
+        cs("impl"),
+        forged("c"),
+        colon(true),
+        colon(false),
+        forged("Tr"),
+        cs("for"),
+        proc_macro::TokenTree::Ident(s),
+    ]
+    .into_iter()
+    .collect();
+    let body: TokenStream = "fn _m(&self) -> u32 { crate::forged_target() }".parse().unwrap();
+    sib.extend(std::iter::once(proc_macro::TokenTree::Group(
+        proc_macro::Group::new(proc_macro::Delimiter::Brace, substitute(body, "_m", m)),
+    )));
+    // 원본은 함수형 매크로 안으로 — 확장 전에는 토큰 트리라 안이 안 보인다.
+    let mut out: TokenStream = "crate::passthrough!".parse().unwrap();
+    out.extend(std::iter::once(proc_macro::TokenTree::Group(
+        proc_macro::Group::new(proc_macro::Delimiter::Brace, item),
+    )));
+    out.extend(sib);
+    out
+}
