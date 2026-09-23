@@ -695,3 +695,24 @@ fn syn_mode_still_fans_out() {
         call(&s, "fixture_app::main", "fixture_core::Other::greet").is_some_and(|e| e.tentative)
     );
 }
+
+/// 인라인 조상의 `#[path]` 오버라이드 — `mod nest { #[path="deep"]
+/// mod inner { #[path="leaf.rs"] mod leaf; } }`에서 leaf의 기준
+/// 디렉터리는 `src/nest/inner`가 아니라 `src/nest/deep`이다. 조상의
+/// `#[path]`를 무시하면 leaf 모듈이 통째로 빠진다.
+#[test]
+fn inline_path_attr_overrides_dir() {
+    let d = syn_doc();
+    assert!(
+        d.vertices
+            .iter()
+            .any(|v| v.id == "fixture_core::nest::inner::leaf::leaf_probe"),
+        "inline ancestor's #[path] must override the dir segment"
+    );
+    assert!(call(
+        &d,
+        "fixture_core::call_leaf",
+        "fixture_core::nest::inner::leaf::leaf_probe"
+    )
+    .is_some());
+}

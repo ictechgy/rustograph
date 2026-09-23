@@ -33,6 +33,10 @@ pub struct Module {
     pub public: bool,
     /// `#[cfg(...)]` 조건 토큰 — `mod` 선언에 붙은 것만(조상 조건은 조상 정점에).
     pub cfg: Option<String>,
+    /// 인라인 모듈의 `#[path]` — 있으면 자식 모듈의 기준 디렉터리에서
+    /// 이 모듈 이름 대신 이 값이 세그먼트가 된다(rustc 규칙). 파일
+    /// 모듈의 `#[path]`는 파일 위치를 가리키므로 여기에는 싣지 않는다.
+    pub path_attr: Option<String>,
     /// 직접 선언된 아이템 이름들(모듈 스코프 해석용).
     pub items: BTreeSet<String>,
     /// `use` 임포트 맵: 마지막 세그먼트(또는 as 이름) → 임포트.
@@ -50,6 +54,7 @@ impl Module {
             file_module,
             public,
             cfg: None,
+            path_attr: None,
             items: BTreeSet::new(),
             imports: BTreeMap::new(),
             children: BTreeMap::new(),
@@ -212,31 +217,34 @@ pub fn collect_submodules(
         if cfg.is_some() && !tree.modules.contains_key(&path) {
             *conditional_count += 1;
         }
+        // `#[path = "..."]`는 NameValue 메타다 — `parse_args`는
+        // `#[path("...")]` 문법만 받으므로 값은 nv.value에서 읽는다.
+        // 인라인 모듈에도 달 수 있고, 그 값은 자식의 기준 디렉터리를
+        // 덮어쓴다.
+        let path_attr = m
+            .attrs
+            .iter()
+            .find(|a| a.path().is_ident("path"))
+            .and_then(|a| match &a.meta {
+                syn::Meta::NameValue(nv) => match &nv.value {
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(s),
+                        ..
+                    }) => Some(s.value()),
+                    _ => None,
+                },
+                _ => None,
+            });
         let (file, is_file_module) = if let Some((_, _)) = &m.content {
             // 인라인 모듈 — 같은 파일.
             (tree.modules[parent_path].file.clone(), false)
         } else {
-            // `#[path = "..."]`는 NameValue 메타다 — `parse_args`는
-            // `#[path("...")]` 문법만 받으므로 값은 nv.value에서 읽는다.
-            let path_attr =
-                m.attrs
-                    .iter()
-                    .find(|a| a.path().is_ident("path"))
-                    .and_then(|a| match &a.meta {
-                        syn::Meta::NameValue(nv) => match &nv.value {
-                            syn::Expr::Lit(syn::ExprLit {
-                                lit: syn::Lit::Str(s),
-                                ..
-                            }) => Some(s.value()),
-                            _ => None,
-                        },
-                        _ => None,
-                    });
             // `#[path]`의 기준 디렉터리는 모듈 파일이 놓인 디렉터리다 —
             // `mod.rs`는 module_dir과 같지만 `outer.rs` 같은 비-mod.rs
             // 파일에서는 `src/`(파일의 디렉터리)이고, 인라인 모듈이 끼면
-            // 그 이름이 경로에 이어진다. 기본 자식 디렉터리(module_dir)와
-            // 다른 기준이므로 별도로 계산한다.
+            // 그 이름(또는 조상의 `#[path]` 오버라이드)이 경로에 이어진다.
+            // 기본 자식 디렉터리(module_dir)와 다른 기준이므로 별도로
+            // 계산한다.
             let base = if path_attr.is_some() {
                 path_attr_base(parent_path, tree)
             } else {
@@ -250,6 +258,9 @@ pub fn collect_submodules(
         let public = matches!(m.vis, syn::Visibility::Public(_));
         let mut module = Module::new(file, is_file_module, public);
         module.cfg = cfg;
+        if !is_file_module {
+            module.path_attr = path_attr;
+        }
         tree.modules.insert(path.clone(), module);
         tree.modules
             .get_mut(parent_path)
@@ -264,17 +275,21 @@ pub fn collect_submodules(
 /// `#[path]` 어트리뷰트의 기준 디렉터리 — rustc 규칙: 파일 모듈에
 /// 직접 선언된 mod는 파일이 놓인 디렉터리(`outer.rs`면 `src/`)가
 /// 기준이고, 인라인 모듈 안에 선언된 mod는 `module_dir`(파일 스템
-/// 디렉터리)에 인라인 조상 이름이 순서대로 이어진 디렉터리가 기준이다.
+/// 디렉터리)에 인라인 조상의 세그먼트가 순서대로 이어진 디렉터리가
+/// 기준이다. 인라인 조상 자신이 `#[path]`를 달면 그 값이 이름 대신
+/// 세그먼트가 된다.
 fn path_attr_base(parent_path: &str, tree: &ModTree) -> PathBuf {
     let parent = &tree.modules[parent_path];
-    // 부모에서 위로 걸어 같은 파일의 비파일(인라인) 조상 이름을 모은다.
+    // 부모에서 위로 걸어 같은 파일의 비파일(인라인) 조상 세그먼트를
+    // 모은다 — `#[path]`가 달린 조상은 이름 대신 그 값을 쓴다.
     let mut inline: Vec<String> = Vec::new();
     let mut cur = parent_path.to_string();
     while let Some(m) = tree.modules.get(&cur) {
         if m.file_module || m.file != parent.file {
             break;
         }
-        inline.push(cur.rsplit("::").next().unwrap_or(&cur).to_string());
+        let name = cur.rsplit("::").next().unwrap_or(&cur).to_string();
+        inline.push(m.path_attr.clone().unwrap_or(name));
         match parent_of(&cur) {
             Some(p) => cur = p,
             None => break,

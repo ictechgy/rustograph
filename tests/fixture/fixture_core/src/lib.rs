@@ -275,6 +275,22 @@ impl a::Tr for S5 {
     }
 }
 
+/// 인라인 조상의 `#[path]`가 자식 모듈의 기준 디렉터리 세그먼트를
+/// 덮어쓴다 — `inner` 대신 `deep`이 들어가 `src/nest/deep/leaf.rs`다.
+pub mod nest {
+    #[path = "deep"]
+    pub mod inner {
+        #[path = "leaf.rs"]
+        pub mod leaf;
+    }
+}
+
+/// `nest::inner::leaf`의 함수를 호출한다 — `#[path]` 오버라이드가
+/// 풀리지 않으면 leaf 모듈 자체가 없어 이 간선도 없다.
+pub fn call_leaf() -> u32 {
+    nest::inner::leaf::leaf_probe()
+}
+
 pub struct S;
 
 // 속성 매크로가 입력을 재emit하면서 `impl c::Tr for S`를 span 보존으로
