@@ -274,6 +274,57 @@ fn auto_trait_only_object_stays_open() {
 }
 
 #[test]
+fn derived_method_call_targets_type() {
+    let d = sem_doc();
+    // `u.clone()` — Clone impl은 #[derive]가 만든다 — 생성 메서드는
+    // 정점이 없으니 호출은 impl 대상 타입으로 귀속된다.
+    let e = call(&d, "fixture_core::clone_used", "fixture_core::Used")
+        .expect("derived method call resolves to the impl'd type");
+    assert!(!e.tentative, "concrete receiver stays firm");
+    // 생성 메서드 정점 이름으로 가는 간선은 없어야 한다(유령 정점 금지).
+    assert!(call(
+        &d,
+        "fixture_core::clone_used",
+        "fixture_core::Used::<Clone>::clone"
+    )
+    .is_none());
+}
+
+#[test]
+fn proc_macro_call_keeps_crate_use() {
+    let d = sem_doc();
+    // proc 매크로 크레이트는 정점이 없는 타깃 종류라 선언 대신
+    // 크레이트(루트 모듈) 정점으로 귀속한다.
+    let e = call(&d, "fixture_core::proc_call", "fixture_macros")
+        .expect("proc-macro use edge to the crate vertex");
+    assert!(!e.tentative);
+    // 확장은 proc 매크로 서버가 있을 때만 — 없으면 limitation이 실측한다.
+    let expanded = call(&d, "fixture_core::proc_call", "fixture_core::util::helper").is_some();
+    let srv_down = d
+        .limitations
+        .iter()
+        .any(|l| l.contains("proc-macro") || l.contains("could not be expanded"));
+    assert!(
+        expanded || srv_down,
+        "expansion edge or a measured limitation"
+    );
+}
+
+#[test]
+fn out_dir_defs_resolve_to_module() {
+    let d = sem_doc();
+    // OUT_DIR 산출물 안의 const — 정점은 없지만 소속 모듈 정점으로
+    // 귀속돼야 한다(syn이 `built::BUILT_ANSWER`를 모듈로 잡던 것과 같은
+    // 표면). out_dirs 로드가 꺼져 있으면 이 간선은 만들어지지 않는다.
+    let e = d.edges.iter().find(|e| {
+        e.from == "fixture_core::uses_built"
+            && e.to == "fixture_core::built"
+            && e.kind == EdgeKind::References
+    });
+    assert!(e.is_some(), "include!-ed module reference must be kept");
+}
+
+#[test]
 fn merged_bin_root_body_uses_its_own_file() {
     let d = sem_doc();
     // lib와 같은 이름의 bin — 루트 합본에서 bin 본문의 파일은

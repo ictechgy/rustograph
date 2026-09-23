@@ -12,3 +12,10 @@ dependencies = [
 [[package]]
 name = "fixture_core"
 version = "0.0.0"
+dependencies = [
+ "fixture_macros",
+]
+
+[[package]]
+name = "fixture_macros"
+version = "0.0.0"

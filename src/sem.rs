@@ -21,7 +21,7 @@ use ra_ap_hir::{
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice};
 use ra_ap_proc_macro_api::ProcMacroClient;
-use ra_ap_project_model::{CargoConfig, RustLibSource};
+use ra_ap_project_model::{CargoConfig, RustLibSource, TargetDirectoryConfig};
 use ra_ap_syntax::ast::{self, AstNode};
 use ra_ap_syntax::{SyntaxNode, TextRange, TextSize};
 use ra_ap_vfs::{FileId, Vfs, VfsPath};
@@ -45,6 +45,9 @@ pub struct Stats {
     pub external: usize,
     /// 해석된 외부·std 매크로 호출 수 — syn의 external_macros와 같은 버킷.
     pub ext_macros: usize,
+    /// 그중 proc 매크로 호출 수 — 서버가 없으면 확장이 불가하므로
+    /// limitation에서 원인을 별도로 짚는다.
+    pub proc_macros: usize,
     /// 확장에 실패한 매크로 호출 수(proc 서버 부재·확장 오류).
     pub unexpanded: usize,
     /// 확장된 매크로 호출 수 — limitation이 아니라 커버리지 지표.
@@ -111,18 +114,21 @@ pub struct OwnerSite<'a> {
 
 impl Engine {
     /// `dir`의 cargo 워크스페이스를 의미 DB로 로드하고 정의 인덱스를 만든다.
-    /// `cargo check`는 돌리지 않는다(load_out_dirs_from_check: false) —
-    /// 빌드 스크립트 산출물(OUT_DIR·include!)은 해석 밖에 남는다.
-    /// 로드 실패는 오류 — syn으로 조용히 떨어지면 --semantic이 거짓말이 된다.
+    /// 빌드 스크립트는 `cargo check`로 한 번 실행한다(load_out_dirs_from_check) —
+    /// `include!(concat!(env!("OUT_DIR"), ..))`와 proc 매크로 dylib이 여기서
+    /// 준비된다. 산출물은 `target/rust-analyzer`에 모아 분석 대상의 target을
+    /// 더럽히지 않는다. 로드 실패는 오류 — syn으로 조용히 떨어지면
+    /// --semantic이 거짓말이 된다.
     pub fn load(dir: &Path) -> Result<Engine, String> {
         // sysroot 없이는 std 매크로(println! 류)조차 해석되지 않는다 —
         // 확장 실패는 인자 속 호출까지 통째로 잃으므로 반드시 켠다.
         let cargo_config = CargoConfig {
             sysroot: Some(RustLibSource::Discover),
+            target_dir_config: TargetDirectoryConfig::UseSubdirectory,
             ..CargoConfig::default()
         };
         let load_config = LoadCargoConfig {
-            load_out_dirs_from_check: false,
+            load_out_dirs_from_check: true,
             with_proc_macro_server: ProcMacroServerChoice::Sysroot,
             prefill_caches: false,
             num_worker_threads: std::thread::available_parallelism()
@@ -249,7 +255,14 @@ fn build_index(db: &RootDatabase) -> Index {
                     continue;
                 };
                 push_fn(&sema, &mut defs, f);
-                if let (Some(tid), Some(id)) = (&tid, fn_id(&sema, f)) {
+                // derive·매크로가 만든 impl은 메서드 정점이 없다 — 후보는
+                // impl 대상 타입 정점으로 귀속한다.
+                let mid = if impl_is_generated(&sema, imp) {
+                    imp.self_ty(db).as_adt().map(|a| adt_id(db, a))
+                } else {
+                    fn_id(&sema, f)
+                };
+                if let (Some(tid), Some(id)) = (&tid, mid) {
                     matrix
                         .entry((tid.clone(), f.name(db).as_str().to_string()))
                         .or_default()
@@ -298,6 +311,16 @@ fn body_entry(sema: &Semantics<RootDatabase>, def: BodyDef) -> Option<BodyEntry>
 /// 무시하므로, 이런 정의를 ID로 올리면 같은 이름의 정점과 충돌한다.
 fn block_local(node: &SyntaxNode) -> bool {
     node.ancestors().any(|a| ast::BlockExpr::cast(a).is_some())
+}
+
+/// impl 블록이 코드 생성물인가 — `#[derive]`가 만드는 builtin impl은 소스가
+/// 없고, proc 매크로·macro_rules 확장 안의 impl은 매크로 파일 소스다.
+/// 둘 다 syn이 만든 정점이 없으므로 호출은 impl 대상 타입으로 귀속한다.
+fn impl_is_generated(sema: &Semantics<RootDatabase>, i: Impl) -> bool {
+    match sema.source(i) {
+        None => true,
+        Some(s) => s.file_id.is_macro(),
+    }
 }
 
 /// hir 정의가 블록 지역 선언인가 — 소스를 얻을 수 없는 정의는 false.
@@ -604,12 +627,32 @@ impl<'a, 'b> Walker<'a, 'b> {
             }
             return self.trait_matrix(t, f, kind, un);
         }
+        // derive·매크로가 만든 impl 메서드 — 메서드 정점이 없으므로
+        // 호출을 impl 대상 타입 정점으로 귀속한다.
+        if let Some(AssocItemContainer::Impl(i)) = f.as_assoc_item(db).map(|a| a.container(db)) {
+            if impl_is_generated(self.sema, i) {
+                return self.emit_impl_owner(i, kind, un);
+            }
+        }
         // 블록 지역 fn은 정규 ID가 없다 — 같은 이름의 정점으로 보내지 않는다.
         if block_local_def(self.sema, f) {
             self.st.external += 1;
             return;
         }
         self.emit_fn_vertex(f, kind, un)
+    }
+
+    /// 생성 impl 메서드 호출 — 메서드 정점이 없으므로 impl 대상 타입 정점을
+    /// 가리킨다(튜플 구조체 생성자 호출이 구조체 정점을 가리키는 것과 같다).
+    fn emit_impl_owner(&mut self, i: Impl, kind: EdgeKind, un: bool) {
+        let Some(adt) = i.self_ty(self.db()).as_adt() else {
+            self.st.external += 1;
+            return;
+        };
+        let id = adt_id(self.db(), adt);
+        if let Pushed::Miss = self.push(id, kind, false, un) {
+            self.st.external += 1;
+        }
     }
 
     /// 함수 정점으로의 확정 간선 — 정점이 없으면 외부 정의다.
@@ -794,6 +837,15 @@ impl<'a, 'b> Walker<'a, 'b> {
             return;
         }
         if let Pushed::Miss = self.push(id, kind, false, un) {
+            // 정점이 없는 정의 — include!·생성 파일 안의 정의면 소속 모듈
+            // 정점으로 귀속해 사용처를 보존한다(syn이 모듈 경로로 잡던 것).
+            let module_fallback = d.module(db).map(|m| module_path(db, m));
+            let own = self.owner.split("::").next().unwrap_or(self.owner);
+            if let Some(module) = module_fallback {
+                if module != own && matches!(self.push(module, kind, false, un), Pushed::Yes) {
+                    return;
+                }
+            }
             self.st.external += 1;
         }
     }
@@ -821,10 +873,21 @@ impl<'a, 'b> Walker<'a, 'b> {
     /// 이것이 syn의 토큰 파싱 폴백을 대체하는 근본적 개선이다.
     fn macro_call(&mut self, mac: &ast::MacroCall, un: bool, depth: usize) {
         if let Some(m) = self.sema.resolve_macro_call(mac) {
+            if m.kind(self.db()) == ra_ap_hir::MacroKind::ProcMacro {
+                self.st.proc_macros += 1;
+            }
             let id = macro_id(self.db(), m);
             if let Pushed::Miss = self.push(id, EdgeKind::Call, false, un) {
-                // 해석됐지만 정점이 없는 매크로 = std/외부 매크로.
-                self.st.ext_macros += 1;
+                // 정점이 없는 매크로 — proc 매크로 크레이트처럼 정점이 안
+                // 생기는 선언이면 소속 모듈(크레이트 루트) 정점으로 귀속해
+                // 실사용을 보존한다. 그래도 없으면 syn과 같은 외부 매크로다.
+                let module = module_path(self.db(), m.module(self.db()));
+                let own = self.owner.split("::").next().unwrap_or(self.owner);
+                if module == own
+                    || matches!(self.push(module, EdgeKind::Call, false, un), Pushed::Miss)
+                {
+                    self.st.ext_macros += 1;
+                }
             }
         } else {
             self.st.ext_macros += 1;

@@ -5,6 +5,7 @@ pub mod util;
 pub mod gen;
 pub mod nested;
 
+#[derive(Clone)]
 pub struct Used {
     pub v: u32,
 }
@@ -147,6 +148,30 @@ impl<T: ?Sized> Poke for T {}
 /// `&dyn Send` 수신자 — auto trait만 가진 객체. 디스패치는 열려 있다.
 pub fn poke_on_dyn_send(x: &dyn Send) -> u32 {
     x.poke()
+}
+
+/// derive가 만든 impl 메서드 호출 — 생성 메서드는 정점이 없으므로
+/// 간선은 impl 대상 타입(Used)으로 귀속돼야 한다.
+pub fn clone_used(u: &Used) -> Used {
+    u.clone()
+}
+
+/// proc 매크로 호출 — 서버가 붙으면 확장 안의 `util::helper` 호출이
+/// 확정 간선으로 잡힌다. 서버가 없으면 unexpanded로 계측된다.
+pub fn proc_call() -> u32 {
+    fixture_macros::emit_helper_call!()
+}
+
+/// build.rs가 OUT_DIR에 쓴 파일 — `load_out_dirs_from_check` 없이는
+/// 해석되지 않는다.
+pub mod built {
+    include!(concat!(env!("OUT_DIR"), "/built_defs.rs"));
+}
+
+/// OUT_DIR 생성 상수 참조 — out_dirs가 로드되면 그래프 밖 정의로
+/// 해석되고(external), 아니면 미해석(unresolved)으로 센다.
+pub fn uses_built() -> u32 {
+    built::BUILT_ANSWER
 }
 
 pub fn entry() -> u32 {

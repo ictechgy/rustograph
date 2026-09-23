@@ -288,6 +288,24 @@ fn emit_crate_level(
         // 충돌한다.
         if p.workspace_member {
             present.insert(p.name.as_str());
+            // lib/bin 타깃이 없는 멤버(proc-macro 크레이트 등)는 겸임할 루트
+            // 모듈이 없다 — depends 간선이 dangling하지 않게 정점을 만든다.
+            if p.targets
+                .iter()
+                .all(|t| !matches!(t.kind.as_str(), "lib" | "bin"))
+            {
+                vertices.push(Vertex {
+                    id: p.name.clone(),
+                    kind: Kind::Crate,
+                    krate: p.name.clone(),
+                    module: p.name.clone(),
+                    position: None,
+                    exported: false,
+                    generated: false,
+                    cfg: None,
+                    unsafe_: false,
+                });
+            }
             continue;
         }
         if !include_deps {
@@ -640,6 +658,12 @@ fn push_sem_stats(
         limitations.push(format!(
             "{} call targets resolved to items outside the graph (dependencies, std, or macro/derive-generated defs)",
             st.external
+        ));
+    }
+    if st.proc_macros > 0 && !has_proc_macros {
+        limitations.push(format!(
+            "{} proc-macro invocations could not be expanded (rust-analyzer-proc-macro-srv not found in sysroot)",
+            st.proc_macros
         ));
     }
     if st.unexpanded > 0 {
