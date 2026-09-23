@@ -590,15 +590,24 @@ fn expanded_fn_defs(
         return None;
     }
     let er = sema.expand_attr_macro(&item)?;
-    walk_expansion(sema, &er.value.value, file, site, header, depth, defs)
+    // 확장은 성공해도 내부 확장 에러가 있으면 트리가 불완전하다 —
+    // 후보 집합이 불완전한 채로 단독 후보를 채택하면 안 되므로 애매로 본다.
+    if er.err.is_some() {
+        return None;
+    }
+    walk_expansion(sema, &er.value, file, site, header, depth, defs)
 }
 
 /// 확장 트리를 걸어 사본 후보를 모은다 — `expanded_fn_defs`의 재귀
-/// 본체. 아이템 위치의 함수형 매크로 호출은 안쪽이 사본을 숨길 수
-/// 있어 함께 확장한다.
+/// 본체. 세 종류의 숨은 후보원을 함께 연다 — (1) 아이템 위치의 함수형
+/// 매크로 호출(토큰 트리라 descendants로 안이 안 보임), (2) 아이템에
+/// 달린 속성 매크로(인자 토큰으로 사본을 emit할 수 있음), (3) 사본이
+/// 다시 매크로 입력인 경우. 어느 것이든 확장에 실패하거나 내부 확장
+/// 에러가 있으면 후보 완전성을 증명 못 해 애매로 본다(None). fn 본문
+/// 안의 호출·아이템은 블록 지역이라 정점 소유권과 무관해 건너뛴다.
 fn walk_expansion(
     sema: &Semantics<RootDatabase>,
-    root: &SyntaxNode,
+    root: &InFile<SyntaxNode>,
     file: FileId,
     site: TextRange,
     header: Option<(Option<TextRange>, Option<TextRange>)>,
@@ -614,7 +623,7 @@ fn walk_expansion(
             .and_then(|fr| (fr.file_id.file_id(sema.db) == file).then_some(fr.range))
     };
     let mut pending: Vec<ast::Item> = Vec::new();
-    for n in root.descendants() {
+    for n in root.value.descendants() {
         if let Some(mc) = ast::MacroCall::cast(n.clone()) {
             // fn 본문 안 호출은 블록 지역 아이템만 만들 수 있다 — 정점
             // 소유권과 무관하므로 건너뛴다. 아이템 위치 호출은 안쪽이
@@ -622,9 +631,35 @@ fn walk_expansion(
             if n.ancestors().any(|a| ast::Fn::cast(a).is_some()) {
                 continue;
             }
-            let er = sema.expand_macro_call(&mc)?;
-            walk_expansion(sema, &er.value, file, site, header, depth + 1, defs)?;
+            // parse_or_expand 계열은 확장 에러를 삼켜 빈 트리를 줄 수
+            // 있으므로 MacroCallId 경로로 err까지 확인한다.
+            let call_id: ra_ap_hir::MacroCallId = sema.to_def(&mc)?;
+            let er = sema.expand(call_id);
+            if er.err.is_some() {
+                return None;
+            }
+            walk_expansion(
+                sema,
+                &InFile::new(call_id.into(), er.value),
+                file,
+                site,
+                header,
+                depth + 1,
+                defs,
+            )?;
             continue;
+        }
+        // 아이템 위치의 속성 매크로 — 인자 토큰이 사본을 숨길 수 있어
+        // fn이 보이든 안 보이든 함께 확장한다. `is_attr_macro_call`은
+        // derive·내장 속성을 걸러낸다.
+        if let Some(it) = ast::Item::cast(n.clone()) {
+            if it.attrs().next().is_some()
+                && !n.ancestors().any(|a| ast::Fn::cast(a).is_some())
+                && sema.is_attr_macro_call(InFile::new(root.file_id, &it))
+            {
+                pending.push(it);
+                continue;
+            }
         }
         let Some(ef) = ast::Fn::cast(n) else {
             continue;
@@ -636,11 +671,11 @@ fn walk_expansion(
         if !anchored {
             continue;
         }
-        let eimp = ef
-            .syntax()
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(ast::Impl::cast);
+        // 소속 impl — 함수형 매크로 안에 들어간 사본은 조상이 별도
+        // 확장 트리에 있으므로 확장을 건너는 조상 순회로 찾는다.
+        let eimp = sema
+            .ancestors_with_macros(ef.syntax().clone())
+            .find_map(ast::Impl::cast);
         // impl 멤버 입력에서는 헤더가 입력 토큰 사본인 impl만 믿는다 —
         // 헤더가 다른 형제 impl의 이름 재사용 메서드는 후보가 아니다.
         // impl 밖 사본(입력은 impl 멤버인데 확장에서 자유 fn)과 자유 fn
@@ -673,7 +708,10 @@ fn walk_expansion(
     for p in pending {
         // 재귀 깊이 상한은 walk_expansion 입구에서 걸린다.
         let er = sema.expand_attr_macro(&p)?;
-        walk_expansion(sema, &er.value.value, file, site, header, depth + 1, defs)?;
+        if er.err.is_some() {
+            return None;
+        }
+        walk_expansion(sema, &er.value, file, site, header, depth + 1, defs)?;
     }
     Some(())
 }

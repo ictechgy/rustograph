@@ -259,6 +259,22 @@ impl a::Tr for S4 {
 pub mod outer_a;
 pub mod outer_b;
 
+/// 비-mod.rs 파일 모듈 — 안의 `#[path]`는 `src/`(파일 디렉터리)가
+/// 기준이지 `src/single/`(module_dir)이 아니다.
+pub mod single;
+
+pub struct S5;
+
+// `forge_via_attr` — 원본 impl이 `#[emit_args(..)]`의 인자 토큰 안에
+// 숨는다. 확장 트리의 아이템 속성 매크로까지 재귀 확장하지 않으면
+// 위조 형제가 단독 후보가 된다.
+#[fixture_macros::forge_via_attr]
+impl a::Tr for S5 {
+    fn m(&self) -> u32 {
+        a::probe()
+    }
+}
+
 pub struct S;
 
 // 속성 매크로가 입력을 재emit하면서 `impl c::Tr for S`를 span 보존으로

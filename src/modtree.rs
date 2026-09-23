@@ -232,7 +232,17 @@ pub fn collect_submodules(
                         },
                         _ => None,
                     });
-            match mod_file(parent_dir, &name, path_attr.as_deref()) {
+            // `#[path]`의 기준 디렉터리는 모듈 파일이 놓인 디렉터리다 —
+            // `mod.rs`는 module_dir과 같지만 `outer.rs` 같은 비-mod.rs
+            // 파일에서는 `src/`(파일의 디렉터리)이고, 인라인 모듈이 끼면
+            // 그 이름이 경로에 이어진다. 기본 자식 디렉터리(module_dir)와
+            // 다른 기준이므로 별도로 계산한다.
+            let base = if path_attr.is_some() {
+                path_attr_base(parent_path, tree)
+            } else {
+                parent_dir.to_path_buf()
+            };
+            match mod_file(&base, &name, path_attr.as_deref()) {
                 Some(f) => (f, true),
                 None => continue, // 파일 없는 mod(조건부·생성) — 정점 없이 limitation만.
             }
@@ -249,6 +259,35 @@ pub fn collect_submodules(
         queued.push(path);
     }
     queued
+}
+
+/// `#[path]` 어트리뷰트의 기준 디렉터리 — rustc 규칙: 파일 모듈에
+/// 직접 선언된 mod는 파일이 놓인 디렉터리(`outer.rs`면 `src/`)가
+/// 기준이고, 인라인 모듈 안에 선언된 mod는 `module_dir`(파일 스템
+/// 디렉터리)에 인라인 조상 이름이 순서대로 이어진 디렉터리가 기준이다.
+fn path_attr_base(parent_path: &str, tree: &ModTree) -> PathBuf {
+    let parent = &tree.modules[parent_path];
+    // 부모에서 위로 걸어 같은 파일의 비파일(인라인) 조상 이름을 모은다.
+    let mut inline: Vec<String> = Vec::new();
+    let mut cur = parent_path.to_string();
+    while let Some(m) = tree.modules.get(&cur) {
+        if m.file_module || m.file != parent.file {
+            break;
+        }
+        inline.push(cur.rsplit("::").next().unwrap_or(&cur).to_string());
+        match parent_of(&cur) {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    if inline.is_empty() {
+        return parent.file.parent().unwrap_or(Path::new(".")).to_path_buf();
+    }
+    let mut dir = module_dir(&parent.file);
+    for name in inline.into_iter().rev() {
+        dir.push(name);
+    }
+    dir
 }
 
 /// `#[cfg]`가 붙어 있으면 조건부로 본다 — 포함은 하되 실측으로 센다.

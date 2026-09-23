@@ -114,59 +114,91 @@ pub fn wrap_in_const(_attr: TokenStream, item: TokenStream) -> TokenStream {
     out
 }
 
-/// 입력 impl을 `crate::passthrough! { .. }`(함수형 매크로) 안에 숨기고,
-/// 헤더 토큰의 span을 위조한 다른 트레이트(`crate::c::Tr`)의 형제 impl을
-/// 낸다 — 위조 토큰은 `c`/`::`/`Tr` 모두 입력 `a::Tr` 노드의 span을
-/// 가지므로 헤더 원본 범위 대조만으로는 걸러지지 않지만 해석은 다른
-/// 트레이트로 간다. 확장 안의 함수형 매크로 호출을 재귀 확장하지
-/// 않으면 원본 사본이 숨은 채 위조 사본이 단독 후보로 채택된다.
-#[proc_macro_attribute]
-pub fn forge_sibling(_attr: TokenStream, item: TokenStream) -> TokenStream {
+/// 입력 impl의 헤더 토큰을 통째로 복제해(`a`만 `c`로 교체, 각 토큰의
+/// span 유지) `crate::c::Tr` 형제 impl을 만든다 — 위조 경로의 원본
+/// 범위는 입력 `a::Tr`과 같으므로 헤더 원본 범위 대조를 통과하지만
+/// 해석은 다른 트레이트로 간다.
+fn forged_sibling(item: &TokenStream) -> TokenStream {
     let m = find_ident(item.clone(), "m").expect("method m");
-    let s = find_ident(item.clone(), "S4").expect("self S4");
-    let tr = find_ident(item.clone(), "Tr").expect("trait Tr");
-    let sp = tr.span();
-    // 입력 헤더 범위를 가리키는 위조 토큰 — 내용은 `c::Tr`이지만
-    // 원본 범위는 입력 `a::Tr`과 같다.
-    let forged = |text: &str| {
-        proc_macro::TokenTree::Ident(proc_macro::Ident::new(text, sp))
+    // 입력 헤더 토큰을 `impl`/`for` 사이(트레이트 경로)와 `for`/본문
+    // 사이(self 타입)로 나눠 복제한다 — 각 토큰의 원본 span이 유지돼
+    // 헤더 원본 범위 대조를 통과한다.
+    let toks: Vec<proc_macro::TokenTree> = item.clone().into_iter().collect();
+    let for_pos = toks
+        .iter()
+        .position(|t| matches!(t, proc_macro::TokenTree::Ident(i) if i.to_string() == "for"))
+        .expect("for keyword");
+    let brace_pos = toks
+        .iter()
+        .position(|t| matches!(t, proc_macro::TokenTree::Group(_)))
+        .expect("body group");
+    let clone_spans = |toks: &[proc_macro::TokenTree]| -> Vec<proc_macro::TokenTree> {
+        toks.iter()
+            .map(|t| match t {
+                // 트레이트 경로의 첫 세그먼트 `a`만 `c`로 바꾼다 —
+                // 나머지 토큰(포함해 `Tr`)은 span까지 그대로다.
+                proc_macro::TokenTree::Ident(i) if i.to_string() == "a" => {
+                    proc_macro::TokenTree::Ident(proc_macro::Ident::new("c", i.span()))
+                }
+                _ => t.clone(),
+            })
+            .collect()
     };
-    let colon = |joint: bool| {
-        let mut p = proc_macro::Punct::new(
-            ':',
-            if joint {
-                proc_macro::Spacing::Joint
-            } else {
-                proc_macro::Spacing::Alone
-            },
-        );
-        p.set_span(sp);
-        proc_macro::TokenTree::Punct(p)
-    };
+    let forged_trait = clone_spans(&toks[1..for_pos]);
+    let forged_self = clone_spans(&toks[for_pos + 1..brace_pos]);
     let cs = |text: &str| {
         proc_macro::TokenTree::Ident(proc_macro::Ident::new(text, proc_macro::Span::call_site()))
     };
     // 형제: impl c::Tr for S4 { fn m(&self) -> u32 { crate::forged_target() } }
-    let mut sib: TokenStream = [
-        cs("impl"),
-        forged("c"),
-        colon(true),
-        colon(false),
-        forged("Tr"),
-        cs("for"),
-        proc_macro::TokenTree::Ident(s),
-    ]
-    .into_iter()
-    .collect();
+    let mut sib: TokenStream = std::iter::once(cs("impl"))
+        .chain(forged_trait)
+        .chain(std::iter::once(cs("for")))
+        .chain(forged_self)
+        .collect();
     let body: TokenStream = "fn _m(&self) -> u32 { crate::forged_target() }".parse().unwrap();
     sib.extend(std::iter::once(proc_macro::TokenTree::Group(
         proc_macro::Group::new(proc_macro::Delimiter::Brace, substitute(body, "_m", m)),
     )));
+    sib
+}
+
+/// 입력 impl을 `crate::passthrough! { .. }`(함수형 매크로) 안에 숨기고
+/// span-위조 형제 impl을 낸다 — 확장 안의 함수형 매크로 호출을 재귀
+/// 확장하지 않으면 원본 사본이 숨은 채 위조 사본이 단독 후보로 채택된다.
+#[proc_macro_attribute]
+pub fn forge_sibling(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // 원본은 함수형 매크로 안으로 — 확장 전에는 토큰 트리라 안이 안 보인다.
     let mut out: TokenStream = "crate::passthrough!".parse().unwrap();
     out.extend(std::iter::once(proc_macro::TokenTree::Group(
-        proc_macro::Group::new(proc_macro::Delimiter::Brace, item),
+        proc_macro::Group::new(proc_macro::Delimiter::Brace, item.clone()),
     )));
-    out.extend(sib);
+    out.extend(forged_sibling(&item));
+    out
+}
+
+/// 어트리뷰트 인자를 그대로 아이템으로 emit하고 입력 아이템은 버린다 —
+/// `#[emit_args(impl ..)] struct X;` 꼴에서 원본 impl이 인자 토큰
+/// 안에만 존재하는 형태를 만든다.
+#[proc_macro_attribute]
+pub fn emit_args(attr: TokenStream, _item: TokenStream) -> TokenStream {
+    attr
+}
+
+/// `forge_sibling`의 변형 — 원본 impl을 `#[emit_args(..)]`의 인자 토큰
+/// 안에 숨긴다. 확장 트리에서 `Carrier` 아이템에 달린 속성 매크로를
+/// 확장하지 않으면 원본 사본이 안 보여 위조 형제가 단독 후보가 된다.
+#[proc_macro_attribute]
+pub fn forge_via_attr(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    // #[fixture_macros::emit_args( <item> )] struct Carrier5;
+    // `#[name( 인자 )]`를 문자열 파싱으로 만들면 미폐쇄 구분자라
+    // 안 되므로 토큰으로 조립한다.
+    let args = proc_macro::Group::new(proc_macro::Delimiter::Parenthesis, item.clone());
+    let mut attr_body: TokenStream = "fixture_macros::emit_args".parse().unwrap();
+    attr_body.extend(std::iter::once(proc_macro::TokenTree::Group(args)));
+    let bracket = proc_macro::Group::new(proc_macro::Delimiter::Bracket, attr_body);
+    let mut out: TokenStream = "#".parse().unwrap();
+    out.extend(std::iter::once(proc_macro::TokenTree::Group(bracket)));
+    out.extend("struct Carrier5;".parse::<TokenStream>().unwrap());
+    out.extend(forged_sibling(&item));
     out
 }

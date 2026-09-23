@@ -513,6 +513,54 @@ fn hidden_original_forged_sibling_does_not_steal() {
         call(&d, "fixture_core::S4::<Tr>::m", "fixture_core::a::probe").is_some(),
         "real body's call edge must exist"
     );
+    // 위조 사본이 단독 후보로 채택되면 그 def가 사이트에 대입되고,
+    // `syn_backed`를 통과해 `dispatch_c`(dyn c::Tr)에서 진짜 `a::Tr`
+    // 정점 `S4::<Tr>::m`을 훔친다 — 이 간선의 부재가 중첩 확장 재귀를
+    // 실제로 구분한다. 걸러지면 impl 소유 타입 `S4`로 폴백한다.
+    assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S4::<Tr>::m").is_none());
+    assert!(
+        call(&d, "fixture_core::dispatch_c", "fixture_core::S4").is_some(),
+        "forged impl must fall back to its owner type vertex"
+    );
+}
+
+/// 원본 impl이 `#[emit_args(..)]`의 인자 토큰 안에 숨겨지는 변형 —
+/// 확장 트리에서 보이는 fn이 없는 아이템의 속성 매크로도 재귀 확장해야
+/// 후보 집합이 완전하다.
+#[test]
+fn hidden_in_attr_args_forged_sibling_does_not_steal() {
+    let d = sem_doc();
+    assert!(call(
+        &d,
+        "fixture_core::S5::<Tr>::m",
+        "fixture_core::forged_target"
+    )
+    .is_none());
+    assert!(
+        call(&d, "fixture_core::S5::<Tr>::m", "fixture_core::a::probe").is_some(),
+        "real body's call edge must exist"
+    );
+    // 위조 사본이 단독 후보로 채택되면 dyn c::Tr 디스패치가 진짜 정점을
+    // 훔친다 — 부재 단언이 아이템 속성 매크로 재귀를 실제로 구분한다.
+    assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S5::<Tr>::m").is_none());
+    assert!(
+        call(&d, "fixture_core::dispatch_c", "fixture_core::S5").is_some(),
+        "forged impl must fall back to its owner type vertex"
+    );
+}
+
+/// `#[path]`가 비-`mod.rs` 파일(`single.rs`) 안에 있으면 기준은
+/// 파일 디렉터리(`src/`)다 — `module_dir`(`src/single/`)을 쓰면
+/// `sibling.rs`를 못 찾아 `inner` 모듈이 통째로 빠진다.
+#[test]
+fn path_attr_in_non_mod_rs_uses_file_dir() {
+    let d = syn_doc();
+    assert!(
+        d.vertices
+            .iter()
+            .any(|v| v.id == "fixture_core::single::inner::right_file"),
+        "#[path] base dir must be the file's directory"
+    );
 }
 
 /// fn 안 `#[path]` 모듈 — 같은 파일을 가리키는 지역 모듈의 정의는
