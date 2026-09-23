@@ -785,3 +785,24 @@ fn inline_path_attr_overrides_dir() {
     )
     .is_some());
 }
+
+/// 비-mod.rs 파일 안 인라인 조상의 `#[path]` — `single.rs`의
+/// `#[path="pathdir"] mod pin`은 `src/single/pathdir/`가 아니라
+/// `src/pathdir/`를 자식 기준으로 한다(rustc 규칙 — 파일에 직접
+/// 선언된 `#[path]`는 파일 디렉터리 기준).
+#[test]
+fn non_mod_rs_inline_path_attr_uses_file_dir() {
+    let d = syn_doc();
+    assert!(
+        d.vertices
+            .iter()
+            .any(|v| v.id == "fixture_core::single::pin::pin_leaf::pv"),
+        "inline #[path] in non-mod.rs file must resolve at the file's dir"
+    );
+    assert!(call(
+        &d,
+        "fixture_core::single::call_pin",
+        "fixture_core::single::pin::pin_leaf::pv"
+    )
+    .is_some());
+}

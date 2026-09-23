@@ -282,14 +282,14 @@ fn path_attr_base(parent_path: &str, tree: &ModTree) -> PathBuf {
     let parent = &tree.modules[parent_path];
     // 부모에서 위로 걸어 같은 파일의 비파일(인라인) 조상 세그먼트를
     // 모은다 — `#[path]`가 달린 조상은 이름 대신 그 값을 쓴다.
-    let mut inline: Vec<String> = Vec::new();
+    let mut inline: Vec<(String, Option<String>)> = Vec::new();
     let mut cur = parent_path.to_string();
     while let Some(m) = tree.modules.get(&cur) {
         if m.file_module || m.file != parent.file {
             break;
         }
         let name = cur.rsplit("::").next().unwrap_or(&cur).to_string();
-        inline.push(m.path_attr.clone().unwrap_or(name));
+        inline.push((name, m.path_attr.clone()));
         match parent_of(&cur) {
             Some(p) => cur = p,
             None => break,
@@ -298,9 +298,16 @@ fn path_attr_base(parent_path: &str, tree: &ModTree) -> PathBuf {
     if inline.is_empty() {
         return parent.file.parent().unwrap_or(Path::new(".")).to_path_buf();
     }
+    // 최외곽 인라인 조상의 `#[path]`는 파일이 놓인 디렉터리 기준이다 —
+    // 비-mod.rs 파일(`outer.rs`)에서는 module_dir(`src/outer/`)이 아니라
+    // `src/`다(rustc 실증). 그보다 안쪽 조상의 `#[path]`는 이미 누적된
+    // 디렉터리에 이어진다.
     let mut dir = module_dir(&parent.file);
-    for name in inline.into_iter().rev() {
-        dir.push(name);
+    for (i, (name, pattr)) in inline.into_iter().rev().enumerate() {
+        if i == 0 && pattr.is_some() {
+            dir = parent.file.parent().unwrap_or(Path::new(".")).to_path_buf();
+        }
+        dir.push(pattr.unwrap_or(name));
     }
     dir
 }
