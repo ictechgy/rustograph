@@ -385,6 +385,14 @@ pub fn local_shadowed() -> u32 {
     local_shared::Shared::val() + local_shared::helper()
 }
 
+/// fn 안의 지역 모듈이 모듈 선언과 *같은 이름*일 때 — 정규 ID까지
+/// 완전히 겹치므로 지역성 판정이 없으면 정점을 통째로 훔친다.
+pub fn local_shadowed_same_name() -> u32 {
+    #[path = "shared.rs"]
+    mod shared;
+    shared::Shared::val() + shared::helper()
+}
+
 /// 모듈 레벨 대조군 — 같은 파일을 가리키는 모듈 레벨 `shared`의 정의는
 /// 진짜 정점으로 해석되어 확정 간선이 생겨야 한다.
 pub fn use_shared() -> u32 {

@@ -181,6 +181,7 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
                 file: b.file.clone(),
                 range: b.range.clone(),
                 trait_: b.trait_.clone(),
+                trait_written: b.trait_written.clone(),
             });
         }
         Some(sem::Engine::load(&meta.workspace_root, &sites)?)
@@ -200,6 +201,10 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
                 // 소유 크레이트 — 같은 파일을 둘이 넘는 크레이트가 공유해도
                 // 선언 크레이트로 정확한 항목을 고른다.
                 krate: b.module.split("::").next().unwrap_or_default(),
+                // impl 메서드의 트레이트 정체 — 같은 파일·범위·ID를 가진
+                // 생성 선언과 진짜 선언을 가른다.
+                trait_: b.trait_.as_deref(),
+                trait_written: b.trait_written.as_deref(),
             };
             match eng.body_edges(&site, &ids, &method_index, &mut st) {
                 Some(es) => {

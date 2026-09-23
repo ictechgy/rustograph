@@ -449,10 +449,19 @@ fn fn_local_path_module_does_not_steal() {
         "fixture_core::shared::helper"
     )
     .is_some_and(|e| !e.tentative));
-    // 지역 모듈의 같은 호출은 그 정점으로 가면 안 된다.
-    assert!(!d.edges.iter().any(|e| {
-        e.from == "fixture_core::local_shadowed" && e.to.starts_with("fixture_core::shared")
-    }));
+    // 지역 모듈의 같은 호출은 그 정점으로 가면 안 된다 — 다른 이름
+    // (local_shared)도, 같은 이름(shared — 정규 ID까지 겹침)도 안 된다.
+    for from in [
+        "fixture_core::local_shadowed",
+        "fixture_core::local_shadowed_same_name",
+    ] {
+        assert!(
+            !d.edges
+                .iter()
+                .any(|e| e.from == from && e.to.starts_with("fixture_core::shared")),
+            "block-local module must not steal module vertices ({from})"
+        );
+    }
 }
 
 /// `impl Gen<u8>`/`impl Gen<u16>` — 정점 ID는 같고 본문은 다르다.

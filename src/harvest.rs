@@ -72,10 +72,14 @@ pub struct BodyItem<'a> {
     /// 소유 아이템의 바이트 범위 — cfg 변형·블록 지역 정의 같은
     /// 정규 ID 충돌을 소스 위치로 걸러내는 데 쓴다.
     pub range: std::ops::Range<usize>,
-    /// 트레이트 impl 메서드면 소속 impl의 트레이트 — 해석된 정규 ID,
-    /// 외부 트레이트면 경로 마지막 세그먼트. 이름이 같은 다른 트레이트
-    /// (`a::Tr`/`b::Tr`)는 ID 문자열이 같아 정체 검증에 이게 필요하다.
+    /// 트레이트 impl 메서드면 소속 impl의 트레이트 정규 ID — 워크스페이스
+    /// 밖이면 None. 이름이 같은 다른 트레이트(`a::Tr`/`b::Tr`)는 ID
+    /// 문자열이 같아 정체 검증에 이게 필요하다.
     pub trait_: Option<String>,
+    /// 소스에 쓰인 그대로의 트레이트 경로(`a::Tr`, `std::fmt::Debug`).
+    /// 정규 ID와 별도로 보관한다 — 별칭·외부 트레이트도 이 형태에서는
+    /// 구분되고, `use Alias` 같은 우회도 소스 표기가 같으면 같은 선언이다.
+    pub trait_written: Option<String>,
 }
 
 /// 블록 `{ ... }`의 구문들을 표현식 목록으로 펼친다.
@@ -165,6 +169,7 @@ pub fn decls<'a>(
                         file: file.to_path_buf(),
                         range: f.span().byte_range(),
                         trait_: None,
+                        trait_written: None,
                     });
                 }
                 syn::Item::Struct(s) => {
@@ -214,6 +219,7 @@ pub fn decls<'a>(
                                     file: file.to_path_buf(),
                                     range: m.span().byte_range(),
                                     trait_: None,
+                                    trait_written: None,
                                 });
                             }
                         }
@@ -251,6 +257,7 @@ pub fn decls<'a>(
                         file: file.to_path_buf(),
                         range: c.span().byte_range(),
                         trait_: None,
+                        trait_written: None,
                     });
                 }
                 syn::Item::Static(s) => {
@@ -270,6 +277,7 @@ pub fn decls<'a>(
                         file: file.to_path_buf(),
                         range: s.span().byte_range(),
                         trait_: None,
+                        trait_written: None,
                     });
                 }
                 syn::Item::Macro(m) => {
@@ -374,10 +382,11 @@ pub fn impls<'a>(
                 cfg: b.cfg.clone(),
                 file: b.file.clone(),
                 range: m.span().byte_range(),
-                trait_: b.trait_path.as_ref().map(|tp| {
-                    tree.resolve(&b.items_module, tp, &BTreeSet::new())
-                        .unwrap_or_else(|| tp.last().cloned().unwrap_or_default())
-                }),
+                trait_: b
+                    .trait_path
+                    .as_ref()
+                    .and_then(|tp| tree.resolve(&b.items_module, tp, &BTreeSet::new())),
+                trait_written: b.trait_path.as_ref().map(|tp| tp.join("::")),
             });
         }
     }
