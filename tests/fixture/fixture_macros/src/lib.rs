@@ -21,3 +21,62 @@ pub fn emit_helper_call(_input: TokenStream) -> TokenStream {
 pub fn keep(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
+
+/// 입력 impl을 그대로 다시 emit하면서, 메서드 이름 토큰의 span을 보존한
+/// 채 다른 트레이트(`crate::c::Tr`)의 형제 impl을 추가한다 — 생성
+/// 메서드의 이름 위치가 진짜 선언과 겹치므로(quote_spanned! 패턴)
+/// provenance 검증은 위치만으로는 부족하고 트레이트 정체까지 봐야 한다.
+#[proc_macro_attribute]
+pub fn spawn_sibling(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    fn find_ident(ts: TokenStream, name: &str) -> Option<proc_macro::Ident> {
+        for tt in ts {
+            match tt {
+                proc_macro::TokenTree::Ident(i) if i.to_string() == name => return Some(i),
+                proc_macro::TokenTree::Group(g) => {
+                    if let Some(i) = find_ident(g.stream(), name) {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    let m = find_ident(item.clone(), "m").expect("method m");
+    // 플레이스홀더 식별자를 파싱한 뒤 원본 span을 가진 토큰으로 치환한다 —
+    // proc_macro만으로는 토큰 중간에 span을 끼울 수 없다.
+    fn substitute(ts: TokenStream, from: &str, to: proc_macro::Ident) -> TokenStream {
+        ts.into_iter()
+            .map(|tt| match tt {
+                proc_macro::TokenTree::Group(g) => proc_macro::TokenTree::Group(
+                    proc_macro::Group::new(g.delimiter(), substitute(g.stream(), from, to.clone())),
+                ),
+                proc_macro::TokenTree::Ident(i) if i.to_string() == from => {
+                    proc_macro::TokenTree::Ident(to.clone())
+                }
+                other => other,
+            })
+            .collect()
+    }
+    let sibling: TokenStream = "impl crate::c::Tr for crate::S { fn _m(&self) -> u32 { 3 } }"
+        .parse()
+        .unwrap();
+    let mut out = item;
+    out.extend(substitute(sibling, "_m", m));
+    out
+}
+
+/// 입력 아이템을 익명 const 블록으로 감싼다 — serde_derive가 impl을
+/// `const _: () = { .. }`로 감싸는 패턴. 입력 토큰은 그대로 유지되므로
+/// 안의 메서드는 진짜 선언 위치를 가진다 — syn이 만든 정점과 매칭돼야
+/// 한다(const 래퍼는 지역성 검사를 트리거하면 안 된다).
+#[proc_macro_attribute]
+pub fn wrap_in_const(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut inner = TokenStream::new();
+    inner.extend(item);
+    let group = proc_macro::Group::new(proc_macro::Delimiter::Brace, inner);
+    let mut out: TokenStream = "const _: () =".parse().unwrap();
+    out.extend(std::iter::once(proc_macro::TokenTree::Group(group)));
+    out.extend(";".parse::<TokenStream>().unwrap());
+    out
+}

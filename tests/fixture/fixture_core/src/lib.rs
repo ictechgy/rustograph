@@ -215,9 +215,17 @@ pub mod b {
         fn m(&self) -> u32;
     }
 }
+pub mod c {
+    pub trait Tr {
+        fn m(&self) -> u32;
+    }
+}
 
 pub struct S;
 
+// 속성 매크로가 입력을 재emit하면서 `impl c::Tr for S`를 span 보존으로
+// 추가한다 — 생성 메서드의 이름 위치가 이 impl의 `fn m`과 겹친다.
+#[fixture_macros::spawn_sibling]
 impl a::Tr for S {
     fn m(&self) -> u32 {
         1
@@ -248,6 +256,13 @@ pub fn dispatch_a(x: &dyn a::Tr) -> u32 {
 /// `b::Tr` 디스패치 — 확장 안의 메서드는 정점이 없으니 impl 대상 타입으로
 /// 귀속한다. 같은 문자열 ID의 `a::Tr` 정점으로 가면 안 된다.
 pub fn dispatch_b(x: &dyn b::Tr) -> u32 {
+    x.m()
+}
+
+/// `c::Tr` 디스패치 — proc 매크로가 span을 보존해 만든 impl의 메서드는
+/// 이름 위치까지 `a::Tr`의 진짜 선언과 겹친다. 위치만으로는 구분이 안
+/// 되므로 트레이트 정체로 가려야 한다 — `S::<Tr>::m`이 아니라 `S`로.
+pub fn dispatch_c(x: &dyn c::Tr) -> u32 {
     x.m()
 }
 
@@ -337,6 +352,43 @@ include!(concat!(env!("OUT_DIR"), "/root_defs.rs"));
 /// out_dirs가 로드되면 모듈 정점으로 귀속되고, 아니면 미해석으로 센다.
 pub fn uses_built() -> u32 {
     built::BUILT_ANSWER + built::built_answer() + ROOT_ANSWER
+}
+
+/// 속성 매크로가 익명 const로 감싼 진짜 impl — syn이 만든
+/// `Cloaked::ping` 정점이 실재하므로 확장이 const 블록을 추가해도 호출은
+/// 그 메서드 정점으로 가야 한다(타입 정점으로 떨어지면 안 된다).
+pub struct Cloaked;
+
+#[fixture_macros::wrap_in_const]
+impl Cloaked {
+    pub fn ping(&self) -> u32 {
+        7
+    }
+}
+
+/// const 래퍼 안의 진짜 메서드 호출 — `fixture_core::Cloaked::ping`으로.
+pub fn wrap_ping() -> u32 {
+    Cloaked.ping()
+}
+
+/// 같은 파일을 두 모듈이 가리킨다 — 모듈 레벨 `shared`는 정점을 만들고,
+/// fn 안 지역 모듈은 그 정점을 훔치면 안 된다.
+#[path = "shared.rs"]
+pub mod shared;
+
+/// fn 안의 `#[path]` 모듈 — shared.rs를 다시 로드하지만 지역 스코프다.
+/// 여기서 해석된 `Shared::val`/`helper`가 `fixture_core::shared::*`
+/// 정점으로 귀속되면 같은 이름의 모듈 선언을 훔치는 셈이다.
+pub fn local_shadowed() -> u32 {
+    #[path = "shared.rs"]
+    mod local_shared;
+    local_shared::Shared::val() + local_shared::helper()
+}
+
+/// 모듈 레벨 대조군 — 같은 파일을 가리키는 모듈 레벨 `shared`의 정의는
+/// 진짜 정점으로 해석되어 확정 간선이 생겨야 한다.
+pub fn use_shared() -> u32 {
+    shared::Shared::val() + shared::helper()
 }
 
 pub fn entry() -> u32 {

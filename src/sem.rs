@@ -15,8 +15,8 @@ use crate::cargo_meta::normalize_name;
 use crate::graph::{Edge, EdgeKind};
 use ra_ap_hir::db::HirDatabase;
 use ra_ap_hir::{
-    Adt, AsAssocItem, AssocItem, AssocItemContainer, Const, Crate, Enum, Function, Impl, Macro,
-    Module, ModuleDef, PathResolution, Semantics, Static, Trait, Type, TypeAlias,
+    Adt, AsAssocItem, AssocItem, AssocItemContainer, Const, Crate, Enum, Function, Impl, InFile,
+    Macro, Module, ModuleDef, PathResolution, Semantics, Static, Trait, Type, TypeAlias,
 };
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice};
@@ -25,7 +25,7 @@ use ra_ap_project_model::{CargoConfig, RustLibSource, TargetDirectoryConfig};
 use ra_ap_syntax::ast::{self, AstNode, HasName};
 use ra_ap_syntax::{SyntaxNode, TextRange, TextSize};
 use ra_ap_vfs::{FileId, Vfs, VfsPath};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -74,13 +74,40 @@ pub struct Engine {
     /// 워크스페이스 크레이트만, 블록 지역 정의는 제외. 같은 ID의 정의가
     /// 여럿일 수 있어(`impl S<u8>`/`S<u16>`) 항목은 벡터다.
     defs: BTreeMap<String, Vec<BodyEntry>>,
-    /// 정규 ID → syn이 수확한 선언 위치들(파일·바이트 범위) — hir 정의의
-    /// 정점 provenance 검증에 쓴다. 문자열 ID만으로는 생성 메서드가
-    /// 같은 이름의 진짜 정점과 충돌하는 것을 구분 못 한다.
-    sites: BTreeMap<String, Vec<(FileId, TextRange)>>,
+    /// 정규 ID → syn이 수확한 선언 위치들(파일·바이트 범위·트레이트) —
+    /// hir 정의의 정점 provenance 검증에 쓴다. 문자열 ID만으로는 생성
+    /// 메서드가 같은 이름의 진짜 정점과 충돌하는 것을 구분 못 한다.
+    sites: BTreeMap<String, Vec<SynSite>>,
+    /// 크레이트 스코프에 보이는 impl들 — `Impl::all_in_crate`가 익명
+    /// const 블록까지 따라가 수집한 집합이다. fn 본문 안 블록 모듈의
+    /// impl은 여기 없으므로 지역 정의와 모듈 정의를 구분하는 열쇠다.
+    impls: HashSet<Impl>,
     /// (트레이트 정규 ID, 메서드 이름) → 워크스페이스 impl 후보들.
     /// 디스패치 지점마다 impl을 다시 훑지 않게 빌드 때 한 번 만든다.
     matrix: BTreeMap<(String, String), Vec<Candidate>>,
+}
+
+/// syn이 수확한 선언 위치 한 건 — provenance 검증의 대조 대상.
+struct SynSite {
+    /// 선언이 수확된 파일.
+    file: FileId,
+    /// 아이템 전체의 바이트 범위.
+    range: TextRange,
+    /// impl 메서드면 소속 impl의 트레이트 — 해석된 정규 ID, 외부
+    /// 트레이트면 경로 마지막 세그먼트. `a::Tr`/`b::Tr`처럼 마지막
+    /// 세그먼트가 같은 트레이트는 ID 문자열이 같아 이걸로 가린다.
+    trait_: Option<String>,
+}
+
+/// syn 측 선언 위치 입력 — 엔진이 vfs 좌표로 변환해 보관한다.
+pub struct Site {
+    /// 선언이 수확된 파일.
+    pub file: PathBuf,
+    /// 아이템 전체의 바이트 범위.
+    pub range: Range<usize>,
+    /// impl 메서드면 소속 impl의 트레이트(해석된 정규 ID 또는
+    /// 외부 트레이트 경로의 마지막 세그먼트).
+    pub trait_: Option<String>,
 }
 
 /// 본문을 가질 수 있는 정의 — fn·const·static.
@@ -122,6 +149,8 @@ struct Index {
     /// 정규 ID → 본문 소유자 정의와 소스 정체 — 같은 ID의 정의가
     /// 여럿일 수 있어 항목은 벡터다.
     defs: BTreeMap<String, Vec<BodyEntry>>,
+    /// 크레이트 스코프 impl 집합 — fn 블록 모듈의 impl은 없다.
+    impls: HashSet<Impl>,
     /// (트레이트 정규 ID, 메서드 이름) → 워크스페이스 impl 후보들.
     matrix: BTreeMap<(String, String), Vec<Candidate>>,
 }
@@ -137,6 +166,9 @@ pub struct OwnerSite<'a> {
     pub file: &'a Path,
     /// 소유 아이템의 바이트 범위.
     pub range: &'a Range<usize>,
+    /// 소유 아이템이 선언된 크레이트 — 같은 파일·범위가 여러 크레이트
+    /// 문맥으로 로드될 때(공유 include!·`#[path]`) 진짜 소유자를 가른다.
+    pub krate: &'a str,
 }
 
 impl Engine {
@@ -148,10 +180,7 @@ impl Engine {
     /// 준비된다. 산출물은 `target/rust-analyzer`에 모아 분석 대상의 target을
     /// 더럽히지 않는다. 로드 실패는 오류 — syn으로 조용히 떨어지면
     /// --semantic이 거짓말이 된다.
-    pub fn load(
-        dir: &Path,
-        sites: &BTreeMap<String, Vec<(PathBuf, Range<usize>)>>,
-    ) -> Result<Engine, String> {
+    pub fn load(dir: &Path, sites: &BTreeMap<String, Vec<Site>>) -> Result<Engine, String> {
         // sysroot 없이는 std 매크로(println! 류)조차 해석되지 않는다 —
         // 확장 실패는 인자 속 호출까지 통째로 잃으므로 반드시 켠다.
         let cargo_config = CargoConfig {
@@ -172,19 +201,24 @@ impl Engine {
             .map_err(|e| format!("semantic engine could not load {}: {e:#}", dir.display()))?;
         // syn 선언 위치를 vfs 좌표로 변환해 둔다 — hir 정의의 원본
         // 파일·범위와 직접 비교해 정점 provenance를 확인한다.
-        let sites: BTreeMap<String, Vec<(FileId, TextRange)>> = sites
+        let sites: BTreeMap<String, Vec<SynSite>> = sites
             .iter()
             .map(|(id, ss)| {
                 let vs = ss
                     .iter()
-                    .filter_map(|(p, r)| {
-                        let (file, _) =
-                            vfs.file_id(&VfsPath::new_real_path(p.to_string_lossy().into_owned()))?;
+                    .filter_map(|s| {
+                        let (file, _) = vfs.file_id(&VfsPath::new_real_path(
+                            s.file.to_string_lossy().into_owned(),
+                        ))?;
                         let range = TextRange::new(
-                            TextSize::from(u32::try_from(r.start).ok()?),
-                            TextSize::from(u32::try_from(r.end).ok()?),
+                            TextSize::from(u32::try_from(s.range.start).ok()?),
+                            TextSize::from(u32::try_from(s.range.end).ok()?),
                         );
-                        Some((file, range))
+                        Some(SynSite {
+                            file,
+                            range,
+                            trait_: s.trait_.clone(),
+                        })
                     })
                     .collect();
                 (id.clone(), vs)
@@ -199,6 +233,7 @@ impl Engine {
             proc_macro,
             defs: index.defs,
             sites,
+            impls: index.impls,
             matrix: index.matrix,
         })
     }
@@ -236,13 +271,12 @@ impl Engine {
         let mut matched = entries
             .iter()
             .filter(|e| e.file == file_id && want.contains_range(e.anchor.unwrap_or(e.range)));
-        // 같은 소스 위치가 여러 크레이트 문맥으로 로드되면(include! 공유)
-        // 크레이트로 가린다 — 크레이트가 안 맞으면 첫 일치로 폴백한다.
-        let krate = site.id.split("::").next();
-        let entry = matched
-            .clone()
-            .find(|e| Some(e.krate.as_str()) == krate)
-            .or_else(|| matched.next())?;
+        // 같은 소스 위치가 여러 크레이트 문맥으로 로드되면(공유 include!·
+        // `#[path]`) 파일·범위만으로는 구분이 안 된다 — ID 접두사가 아니라
+        // 본문을 선언한 크레이트로 골라야 한다. 선언 크레이트의 항목이
+        // 없으면 다른 크레이트 문맥으로 해석된 간선이 이 정점에 귀속될 수
+        // 있으므로 억지로 고르지 않고 syn 폴백으로 돌린다.
+        let entry = matched.find(|e| e.krate == site.krate)?;
         let sema = Semantics::new(&self.db);
         let root = entry.def.body_root(&sema)?;
         // next-solver의 트레이트 해석은 스레드 로컬 attached db를 요구한다 —
@@ -254,6 +288,7 @@ impl Engine {
             ids,
             method_index,
             sites: &self.sites,
+            impls: &self.impls,
             matrix: &self.matrix,
             st,
             edges: Vec::new(),
@@ -267,9 +302,10 @@ impl Engine {
 /// 정점은 syn이 만들었으므로 여기서는 "본문 소유자를 찾는" 매핑만 필요하다.
 /// 모듈은 루트에서 children으로만 걷는다 — `krate.modules()`는 fn 안의
 /// 블록 모듈까지 포함해 정규 경로가 부모 체인과 어긋날 수 있다.
-fn build_index(db: &RootDatabase, sites: &BTreeMap<String, Vec<(FileId, TextRange)>>) -> Index {
+fn build_index(db: &RootDatabase, sites: &BTreeMap<String, Vec<SynSite>>) -> Index {
     let sema = Semantics::new(db);
     let mut defs: BTreeMap<String, Vec<BodyEntry>> = BTreeMap::new();
+    let mut impls: HashSet<Impl> = HashSet::new();
     let mut matrix: BTreeMap<(String, String), Vec<Candidate>> = BTreeMap::new();
     let mut stack: Vec<Module> = Vec::new();
     for krate in Crate::all(db) {
@@ -280,17 +316,17 @@ fn build_index(db: &RootDatabase, sites: &BTreeMap<String, Vec<(FileId, TextRang
         while let Some(module) = stack.pop() {
             for def in module.declarations(db) {
                 match def {
-                    ModuleDef::Function(f) => push_fn(&sema, &mut defs, f),
+                    ModuleDef::Function(f) => push_fn(&sema, &impls, &mut defs, f),
                     ModuleDef::Const(c) => {
                         if let Some(id) = const_id(db, c) {
-                            if let Some(e) = body_entry(&sema, BodyDef::Const(c)) {
+                            if let Some(e) = body_entry(&sema, &impls, BodyDef::Const(c)) {
                                 defs.entry(id).or_default().push(e);
                             }
                         }
                     }
                     ModuleDef::Static(s) => {
                         if let Some(id) = static_id(db, s) {
-                            if let Some(e) = body_entry(&sema, BodyDef::Static(s)) {
+                            if let Some(e) = body_entry(&sema, &impls, BodyDef::Static(s)) {
                                 defs.entry(id).or_default().push(e);
                             }
                         }
@@ -299,7 +335,7 @@ fn build_index(db: &RootDatabase, sites: &BTreeMap<String, Vec<(FileId, TextRang
                         // 트레이트 기본 메서드 — 선언점 메서드 정점의 본문.
                         for item in t.items(db) {
                             if let AssocItem::Function(f) = item {
-                                push_fn(&sema, &mut defs, f);
+                                push_fn(&sema, &impls, &mut defs, f);
                             }
                         }
                     }
@@ -309,7 +345,11 @@ fn build_index(db: &RootDatabase, sites: &BTreeMap<String, Vec<(FileId, TextRang
             stack.extend(module.children(db));
         }
         // impl 블록 메서드 — 선언 모듈이 아니라 self 타입 소속으로 ID를 만든다.
+        // all_in_crate는 익명 const 블록(serde_derive 패턴)까지 따라가지만
+        // fn 본문 안 블록 모듈의 impl은 닿지 않는다 — 이 집합이 "크레이트
+        // 스코프 impl"의 정의가 된다.
         for imp in Impl::all_in_crate(db, krate) {
+            impls.insert(imp);
             // self 타입이 블록 지역인 impl — 정규 ID가 같은 이름의 모듈
             // 정점과 충돌할 수 있다. impl 구문이 const 래퍼·매크로 확장
             // 안에 있어도 self 타입이 모듈 레벨이면 후보는 유효하다.
@@ -333,7 +373,7 @@ fn build_index(db: &RootDatabase, sites: &BTreeMap<String, Vec<(FileId, TextRang
                 let AssocItem::Function(f) = item else {
                     continue;
                 };
-                push_fn(&sema, &mut defs, f);
+                push_fn(&sema, &impls, &mut defs, f);
                 if let Some(tid) = &tid {
                     // 후보 ID는 syn provenance가 확인될 때만 — fn_id는
                     // 문자열이라 생성 메서드가 같은 이름의 진짜 정점과
@@ -341,7 +381,8 @@ fn build_index(db: &RootDatabase, sites: &BTreeMap<String, Vec<(FileId, TextRang
                     // (blanket·원시 타입 impl)도 버리지 않고 남긴다 —
                     // 디스패치 지점에서 external로 세어져야 limitation이
                     // 정직하다.
-                    let method = fn_id(&sema, f).filter(|id| syn_backed(&sema, sites, f, id));
+                    let method =
+                        fn_id(&sema, f).filter(|id| syn_backed(&sema, &impls, sites, f, id));
                     matrix
                         .entry((tid.clone(), f.name(db).as_str().to_string()))
                         .or_default()
@@ -353,7 +394,11 @@ fn build_index(db: &RootDatabase, sites: &BTreeMap<String, Vec<(FileId, TextRang
             }
         }
     }
-    Index { defs, matrix }
+    Index {
+        defs,
+        impls,
+        matrix,
+    }
 }
 
 impl BodyDef {
@@ -371,53 +416,110 @@ impl BodyDef {
 
 /// 정규 ID가 syn이 실제 수확한 선언을 가리키는가 — fn_id는 이름만 보는
 /// 문자열이라 생성 메서드가 같은 이름의 진짜 정점 ID와 충돌할 수 있다.
-/// hir 정의의 원본 소스 위치(파일·바이트 범위)가 syn이 수확한 선언
-/// 위치 중 하나와 일치해야 같은 정의다 — 인덱스 자기 항목과의 비교는
-/// 생성 정의가 자기 자신으로 검증을 통과하는 구멍이 있다.
+/// hir 정의의 원본 소스 위치(파일·이름 앵커)가 syn이 수확한 선언 위치 중
+/// 하나와 일치해야 같은 정의다 — 인덱스 자기 항목과의 비교는 생성 정의가
+/// 자기 자신으로 검증을 통과하는 구멍이 있다.
+/// impl 메서드는 트레이트 정체까지 대조한다 — `quote_spanned!`처럼
+/// 입력 토큰의 위치를 재사용하는 매크로는 생성 메서드의 이름 범위가
+/// 진짜 선언과 겹치고, `a::Tr`/`b::Tr`처럼 마지막 세그먼트가 같은
+/// 트레이트는 정규 ID 문자열도 같아서 위치만으로는 구분이 안 된다.
 fn syn_backed(
     sema: &Semantics<RootDatabase>,
-    sites: &BTreeMap<String, Vec<(FileId, TextRange)>>,
+    impls: &HashSet<Impl>,
+    sites: &BTreeMap<String, Vec<SynSite>>,
     f: Function,
     id: &str,
 ) -> bool {
-    let (Some(ss), Some(b)) = (sites.get(id), body_entry(sema, BodyDef::Fn(f))) else {
+    let (Some(ss), Some(b)) = (sites.get(id), body_entry(sema, impls, BodyDef::Fn(f))) else {
         return false;
     };
     // 아이템 전체 범위가 아니라 이름 토큰 앵커로 대조한다 — ra는 선행
     // 주석을 노드에 붙이고 속성 매크로는 소비된 속성을 확장에서 빼므로,
     // 아이템 범위 동등 비교는 진짜 선언을 거절할 수 있다.
     let anchor = b.anchor.unwrap_or(b.range);
-    ss.iter()
-        .any(|&(file, range)| file == b.file && range.contains_range(anchor))
+    let want_trait = match f.as_assoc_item(sema.db).map(|a| a.container(sema.db)) {
+        Some(AssocItemContainer::Impl(i)) => i.trait_(sema.db).map(|t| trait_id(sema.db, t)),
+        _ => None,
+    };
+    ss.iter().any(|s| {
+        if s.file != b.file || !s.range.contains_range(anchor) {
+            return false;
+        }
+        match (&s.trait_, &want_trait) {
+            (None, None) => true,
+            // syn이 트레이트를 정점까지 해석했으면 정규 ID가 같아야 한다.
+            // 외부 트레이트처럼 해석이 안 됐으면 마지막 세그먼트로 대조한다 —
+            // 정점 ID 자체가 마지막 세그먼트로 지어지므로 그 수준의 정밀도다.
+            (Some(have), Some(want)) => {
+                have == want || have.as_str() == want.rsplit("::").next().unwrap_or(want)
+            }
+            _ => false,
+        }
+    })
 }
 
 /// 정의의 소스 정체를 잡아 인덱스 항목으로 만든다 — 블록(fn 본문) 안에
 /// 선언된 정의와 매크로가 만든 정의(원본 파일 범위가 없는 것)는 인덱스하지
 /// 않는다: 둘 다 정규 ID가 실제 정점과 충돌할 수 있기 때문이다.
-/// 지역성은 확장 인지 조상으로 판정한다 — `mod m { include!("x.rs") }`
-/// 같은 지역 복제본은 원본 범위가 실제 선언과 같아 구분이 안 된다.
-fn body_entry(sema: &Semantics<RootDatabase>, def: BodyDef) -> Option<BodyEntry> {
-    let (node, name_node, module) = match def {
+/// 지역성은 세 층으로 판정한다 — (1) impl 메서드는 소속 impl이
+/// `all_in_crate`에 있어야 한다(fn 본문 안 모듈의 impl은 없고 익명
+/// const 안의 impl은 있다), (2) 그 외 정의는 소속 모듈이 블록 모듈이면
+/// 안 된다(`#[path]`·include!로 같은 파일을 가리키는 지역 모듈은
+/// 구문 조상만으로는 구분이 안 된다), (3) 실제 파일 조상에 BlockExpr가
+/// 있으면 fn 안 선언이다. 확장 파일 내부의 블록(익명 const 래퍼)은
+/// 지역으로 치지 않는다.
+fn body_entry(
+    sema: &Semantics<RootDatabase>,
+    impls: &HashSet<Impl>,
+    def: BodyDef,
+) -> Option<BodyEntry> {
+    let (node, name_node, module, in_scope) = match def {
         BodyDef::Fn(f) => {
-            let v = sema.source(f)?.value;
-            (v.syntax().clone(), v.name(), f.module(sema.db))
+            let s = sema.source(f)?;
+            let in_scope = match f.as_assoc_item(sema.db).map(|a| a.container(sema.db)) {
+                Some(AssocItemContainer::Impl(i)) => impls.contains(&i),
+                _ => f.module(sema.db) == f.module(sema.db).nearest_non_block_module(sema.db),
+            };
+            (
+                InFile::new(s.file_id, s.value.syntax().clone()),
+                s.value.name(),
+                f.module(sema.db),
+                in_scope,
+            )
         }
         BodyDef::Const(c) => {
-            let v = sema.source(c)?.value;
-            (v.syntax().clone(), v.name(), c.module(sema.db))
+            let s = sema.source(c)?;
+            let m = c.module(sema.db);
+            (
+                InFile::new(s.file_id, s.value.syntax().clone()),
+                s.value.name(),
+                m,
+                m == m.nearest_non_block_module(sema.db),
+            )
         }
         BodyDef::Static(s) => {
-            let v = sema.source(s)?.value;
-            (v.syntax().clone(), v.name(), s.module(sema.db))
+            let src = sema.source(s)?;
+            let m = s.module(sema.db);
+            (
+                InFile::new(src.file_id, src.value.syntax().clone()),
+                src.value.name(),
+                m,
+                m == m.nearest_non_block_module(sema.db),
+            )
         }
     };
+    if !in_scope {
+        return None;
+    }
+    // 확장 파일 안의 블록(익명 const 래퍼)은 지역으로 치지 않는다 —
+    // fn 본문 안 선언은 실제 파일 조상에 BlockExpr가 있어야 한다.
     if sema
-        .ancestors_with_macros(node.clone())
-        .any(|a| ast::BlockExpr::cast(a).is_some())
+        .ancestors_with_macros_file(node.clone())
+        .any(|a| !a.file_id.is_macro() && ast::BlockExpr::cast(a.value).is_some())
     {
         return None;
     }
-    let fr = sema.original_range_opt(&node)?;
+    let fr = sema.original_range_opt(&node.value)?;
     let anchor = name_node
         .and_then(|n| sema.original_range_opt(n.syntax()))
         .map(|a| a.range);
@@ -440,17 +542,27 @@ fn impl_is_generated(sema: &Semantics<RootDatabase>, i: Impl) -> bool {
     }
 }
 
-/// hir 정의가 블록 지역 선언인가 — 소스를 얻을 수 없는 정의는 false.
-/// 조상은 확장 인지로 걷는다: 매크로가 함수 안에서 만든 타입은 확장
-/// 구문만 보면 감싼 함수가 안 보이므로, 매크로 호출 지점까지 올라가야
-/// BlockExpr을 만난다.
+/// ADT가 블록 스코프에 사는가 — 직접 fn 안에 선언됐거나 소속 모듈이
+/// fn 안 `#[path] mod` 같은 블록 모듈이면 지역이다. 후자는 같은 원본
+/// 파일을 공유하는 지역 모듈의 타입이 모듈 정점을 훔치는 것을 막는다.
+fn adt_block_local(sema: &Semantics<RootDatabase>, a: Adt) -> bool {
+    block_local_def(sema, a)
+        || a.module(sema.db) != a.module(sema.db).nearest_non_block_module(sema.db)
+}
+
+/// hir 정의가 fn 본문 안의 지역 선언인가 — 소스를 얻을 수 없는 정의는
+/// false. 조상은 확장 인지로 걷되 *실제 파일*의 BlockExpr만 본다 —
+/// 매크로가 함수 안에서 만든 타입은 호출 지점까지 올라가야 fn이 보이고,
+/// 반대로 `const _: () = { impl .. }`(serde_derive 패턴)처럼 확장이
+/// 만든 블록 래퍼는 조상에 있어도 지역이 아니다.
 fn block_local_def<D: ra_ap_hir::HasSource>(sema: &Semantics<RootDatabase>, d: D) -> bool
 where
     D::Ast: AstNode,
 {
     sema.source(d).is_some_and(|s| {
-        sema.ancestors_with_macros(s.value.syntax().clone())
-            .any(|a| ast::BlockExpr::cast(a).is_some())
+        let node = InFile::new(s.file_id, s.value.syntax().clone());
+        sema.ancestors_with_macros_file(node)
+            .any(|a| !a.file_id.is_macro() && ast::BlockExpr::cast(a.value).is_some())
     })
 }
 
@@ -458,11 +570,12 @@ where
 /// db 빌림이 얽혀서 자유 함수다.
 fn push_fn(
     sema: &Semantics<RootDatabase>,
+    impls: &HashSet<Impl>,
     defs: &mut BTreeMap<String, Vec<BodyEntry>>,
     f: Function,
 ) {
     if let Some(id) = fn_id(sema, f) {
-        if let Some(e) = body_entry(sema, BodyDef::Fn(f)) {
+        if let Some(e) = body_entry(sema, impls, BodyDef::Fn(f)) {
             // 같은 ID의 정의가 여럿일 수 있다(`impl S<u8>`/`S<u16>`,
             // cfg 변형) — 덮어쓰지 않고 전부 보관한다.
             defs.entry(id).or_default().push(e);
@@ -609,7 +722,9 @@ struct Walker<'a, 'b> {
     ids: &'a BTreeSet<&'a str>,
     method_index: &'a BTreeMap<String, Vec<String>>,
     /// 정규 ID → syn이 수확한 선언 위치 — 생성·충돌 정의를 가른다.
-    sites: &'a BTreeMap<String, Vec<(FileId, TextRange)>>,
+    sites: &'a BTreeMap<String, Vec<SynSite>>,
+    /// 크레이트 스코프 impl 집합 — fn 블록 모듈의 impl 구분에 쓴다.
+    impls: &'a HashSet<Impl>,
     /// (트레이트 ID, 메서드 이름) → impl 메서드 후보 — 빌드 때 계산됐다.
     matrix: &'a BTreeMap<(String, String), Vec<Candidate>>,
     st: &'b mut Stats,
@@ -752,16 +867,25 @@ impl<'a, 'b> Walker<'a, 'b> {
     fn emit_function(&mut self, f: Function, kind: EdgeKind, un: bool, concrete: bool) {
         let db = self.db();
         // 지역성을 provenance보다 먼저 가린다 — `mod m { include!("x.rs") }`
-        // 같은 지역 복제본은 원본 파일·범위가 모듈 선언과 같아 syn_backed를
-        // 통과하므로, 범위 검사만으로는 모듈 정점을 훔칠 수 있다.
-        // impl 메서드는 익명 const 래퍼(serde_derive 패턴)를 허용하기 위해
-        // self 타입의 지역성으로 판정한다.
+        // 나 fn 안 `#[path]` 모듈 같은 지역 복제본은 원본 파일·범위가 모듈
+        // 선언과 같아 syn_backed를 통과하므로, 범위 검사만으로는 모듈
+        // 정점을 훔칠 수 있다.
+        // impl 메서드는 all_in_crate 멤버십으로 판정한다 — fn 본문 안
+        // 블록의 impl은 거기 없고, 익명 const 래퍼(serde_derive 패턴)의
+        // impl은 있다. 그 외 정의는 소속 모듈이 블록 모듈이면 지역이다 —
+        // fn 안 `#[path] mod`의 아이템은 원본 파일 조상에 BlockExpr가
+        // 없어 구문 검사만으로는 못 잡는다.
         let local = match f.as_assoc_item(db).map(|a| a.container(db)) {
-            Some(AssocItemContainer::Impl(i)) => match i.self_ty(db).as_adt() {
-                Some(a) => block_local_def(self.sema, a),
-                None => block_local_def(self.sema, i),
-            },
-            _ => block_local_def(self.sema, f),
+            Some(AssocItemContainer::Impl(i)) => {
+                !self.impls.contains(&i)
+                    || i.self_ty(db)
+                        .as_adt()
+                        .is_some_and(|a| adt_block_local(self.sema, a))
+            }
+            _ => {
+                let m = f.module(db);
+                block_local_def(self.sema, f) || m != m.nearest_non_block_module(db)
+            }
         };
         if local {
             self.st.external += 1;
@@ -777,7 +901,7 @@ impl<'a, 'b> Walker<'a, 'b> {
         // 문자열이라 생성 메서드가 같은 이름의 진짜 정점과 충돌할 수 있다.
         // 속성 매크로가 감싼 impl의 메서드는 소스 정체가 일치한다.
         if let Some(id) = fn_id(self.sema, f) {
-            if syn_backed(self.sema, self.sites, f, &id)
+            if syn_backed(self.sema, self.impls, self.sites, f, &id)
                 && matches!(
                     self.push(id, kind, false, un),
                     Pushed::Yes | Pushed::SelfEdge
@@ -812,7 +936,7 @@ impl<'a, 'b> Walker<'a, 'b> {
             self.st.external += 1;
             return;
         };
-        if block_local_def(self.sema, adt) {
+        if adt_block_local(self.sema, adt) {
             self.st.external += 1;
             return;
         }
@@ -826,7 +950,7 @@ impl<'a, 'b> Walker<'a, 'b> {
     /// 있어야 확정이다. 정점이 없거나 생성·충돌 정의면 외부다.
     fn emit_fn_vertex(&mut self, f: Function, kind: EdgeKind, un: bool) {
         match fn_id(self.sema, f) {
-            Some(id) if syn_backed(self.sema, self.sites, f, &id) => {
+            Some(id) if syn_backed(self.sema, self.impls, self.sites, f, &id) => {
                 if let Pushed::Miss = self.push(id, kind, false, un) {
                     self.st.external += 1;
                 }
@@ -917,7 +1041,7 @@ impl<'a, 'b> Walker<'a, 'b> {
             }
             ra_ap_hir::CallableKind::TupleStruct(s) => {
                 // 블록 지역 튜플 구조체의 정규 ID는 같은 이름의 정점과 충돌한다.
-                if block_local_def(self.sema, Adt::Struct(s)) {
+                if adt_block_local(self.sema, Adt::Struct(s)) {
                     self.st.external += 1;
                 } else {
                     let id = adt_id(self.db(), Adt::Struct(s));
@@ -927,7 +1051,7 @@ impl<'a, 'b> Walker<'a, 'b> {
                 }
             }
             ra_ap_hir::CallableKind::TupleEnumVariant(v) => {
-                if block_local_def(self.sema, v) {
+                if adt_block_local(self.sema, Adt::Enum(v.parent_enum(self.db()))) {
                     self.st.external += 1;
                 } else {
                     let id = enum_id(self.db(), v.parent_enum(self.db()));
@@ -972,7 +1096,12 @@ impl<'a, 'b> Walker<'a, 'b> {
             // `Self::x` — impl의 self 타입으로의 참조다.
             Some(PathResolution::SelfType(imp)) => {
                 // 블록 지역 impl의 self 타입도 정규 ID 충돌이 가능하다.
-                if block_local_def(self.sema, imp) {
+                if imp
+                    .self_ty(self.db())
+                    .as_adt()
+                    .is_some_and(|a| adt_block_local(self.sema, a))
+                    || block_local_def(self.sema, imp)
+                {
                     self.st.external += 1;
                 } else if let Some(adt) = imp.self_ty(self.db()).as_adt() {
                     let id = adt_id(self.db(), adt);
@@ -1030,11 +1159,13 @@ impl<'a, 'b> Walker<'a, 'b> {
         }
     }
 
-    /// 정의가 본문 안에 선언된 블록 지역 정의인가 — Module은 여러 선언
-    /// 지점이 있어 소스를 하나로 못 잡으므로 false(보수적으로 통과).
+    /// 정의가 블록 스코프에 사는가 — 자기 구문이 fn 본문 안이거나,
+    /// 소속 모듈이 블록 모듈(fn 안 `#[path] mod` 같은)이면 지역이다.
+    /// 후자는 원본 파일을 공유하는 지역 모듈의 아이템이 모듈 레벨 정점을
+    /// 훔치는 것을 막는다.
     fn def_block_local(&self, d: ModuleDef) -> bool {
         let sema = self.sema;
-        match d {
+        let own = match d {
             ModuleDef::Adt(Adt::Struct(x)) => block_local_def(sema, x),
             ModuleDef::Adt(Adt::Enum(x)) => block_local_def(sema, x),
             ModuleDef::Adt(Adt::Union(x)) => block_local_def(sema, x),
@@ -1045,7 +1176,10 @@ impl<'a, 'b> Walker<'a, 'b> {
             ModuleDef::TypeAlias(x) => block_local_def(sema, x),
             ModuleDef::Macro(x) => block_local_def(sema, x),
             _ => false,
-        }
+        };
+        own || d
+            .module(self.db())
+            .is_some_and(|m| m != m.nearest_non_block_module(self.db()))
     }
 
     /// `name!()` — 크레이트 안 매크로면 call 간선, 외부면 실측 생략.

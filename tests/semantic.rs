@@ -405,6 +405,56 @@ fn generated_impl_does_not_steal_sibling_vertex() {
     assert!(call(&d, "fixture_core::dispatch_b", "fixture_core::S::<Tr>::m").is_none());
 }
 
+/// span 보존 생성 메서드 — proc 매크로가 입력 토큰의 위치를 재사용해
+/// 만든 `c::Tr` impl 메서드는 이름 앵커까지 `a::Tr`의 진짜 선언과 겹친다.
+/// 위치만으로는 구분이 안 되므로 트레이트 정체(`a::Tr` vs `c::Tr`)로
+/// 가려야 한다 — `S::<Tr>::m`이 아니라 `S`로 귀속돼야 한다.
+#[test]
+fn span_preserved_generated_method_does_not_steal() {
+    let d = sem_doc();
+    assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S").is_some_and(|e| e.tentative));
+    assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S::<Tr>::m").is_none());
+}
+
+/// 속성 매크로가 익명 const로 감싼 진짜 impl — 확장이 블록을 추가해도
+/// 메서드 정점은 syn provenance가 확인되므로 확정 간선을 유지한다.
+/// 타입 정점으로 떨어지면 지역성 검사가 진짜 선언을 거절한 것이다.
+#[test]
+fn const_wrapped_real_impl_keeps_method_vertex() {
+    let d = sem_doc();
+    let e = call(&d, "fixture_core::wrap_ping", "fixture_core::Cloaked::ping")
+        .expect("call edge to the real method vertex");
+    assert!(!e.tentative);
+    assert!(call(&d, "fixture_core::wrap_ping", "fixture_core::Cloaked").is_none());
+}
+
+/// fn 안 `#[path]` 모듈 — 같은 파일을 가리키는 지역 모듈의 정의는
+/// 원본 위치가 모듈 선언과 같다. 지역 정의가 `fixture_core::shared::*`
+/// 정점으로 귀속되면 모듈 선언을 훔치는 것이다.
+/// 대조군: 모듈 레벨 `shared`의 같은 호출은 정점으로 확정 해석된다 —
+/// 정점이 실재함과 해석이 동작함을 보인다.
+#[test]
+fn fn_local_path_module_does_not_steal() {
+    let d = sem_doc();
+    // 대조군 — 모듈 레벨 shared의 같은 정의들은 정점으로 해석된다.
+    assert!(call(
+        &d,
+        "fixture_core::use_shared",
+        "fixture_core::shared::Shared::val"
+    )
+    .is_some_and(|e| !e.tentative));
+    assert!(call(
+        &d,
+        "fixture_core::use_shared",
+        "fixture_core::shared::helper"
+    )
+    .is_some_and(|e| !e.tentative));
+    // 지역 모듈의 같은 호출은 그 정점으로 가면 안 된다.
+    assert!(!d.edges.iter().any(|e| {
+        e.from == "fixture_core::local_shadowed" && e.to.starts_with("fixture_core::shared")
+    }));
+}
+
 /// `impl Gen<u8>`/`impl Gen<u16>` — 정점 ID는 같고 본문은 다르다.
 /// 인덱스가 한 항목만 저장하면 다른 쪽 본문의 간선이 빠진다.
 /// 메서드 호출의 *확정* 간선으로 검증한다 — syn 폴백은 메서드 호출을

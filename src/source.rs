@@ -175,12 +175,13 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
     let engine = if opts.semantic {
         // syn이 수확한 선언 위치 — 의미 해석 쪽에서 정규 ID 문자열이
         // 가리키는 정점의 provenance 검증에 쓴다(생성 정의 충돌 방지).
-        let mut sites: BTreeMap<String, Vec<(PathBuf, std::ops::Range<usize>)>> = BTreeMap::new();
+        let mut sites: BTreeMap<String, Vec<sem::Site>> = BTreeMap::new();
         for b in &bodies {
-            sites
-                .entry(b.id.clone())
-                .or_default()
-                .push((b.file.clone(), b.range.clone()));
+            sites.entry(b.id.clone()).or_default().push(sem::Site {
+                file: b.file.clone(),
+                range: b.range.clone(),
+                trait_: b.trait_.clone(),
+            });
         }
         Some(sem::Engine::load(&meta.workspace_root, &sites)?)
     } else {
@@ -196,6 +197,9 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
                 cfg: &b.cfg,
                 file: &b.file,
                 range: &b.range,
+                // 소유 크레이트 — 같은 파일을 둘이 넘는 크레이트가 공유해도
+                // 선언 크레이트로 정확한 항목을 고른다.
+                krate: b.module.split("::").next().unwrap_or_default(),
             };
             match eng.body_edges(&site, &ids, &method_index, &mut st) {
                 Some(es) => {
