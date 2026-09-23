@@ -23,6 +23,7 @@ ra_ap_syntax = { version = "=0.0.349", optional = true }
 ra_ap_project_model = { version = "=0.0.349", optional = true }
 ra_ap_vfs = { version = "=0.0.349", optional = true }
 ra_ap_proc_macro_api = { version = "=0.0.349", optional = true }
+ra_ap_hir_expand = { version = "=0.0.349", optional = true }
 
 [features]
 # rust-analyzer(ra_ap_*) 의미 해석 엔진 — 타입 해석된 메서드 호출, 매크로
@@ -36,4 +37,5 @@ semantic = [
     "dep:ra_ap_project_model",
     "dep:ra_ap_vfs",
     "dep:ra_ap_proc_macro_api",
+    "dep:ra_ap_hir_expand",
 ]

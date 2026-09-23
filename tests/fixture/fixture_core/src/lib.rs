@@ -275,6 +275,40 @@ impl a::Tr for S5 {
     }
 }
 
+pub struct S6;
+
+// `forge_via_fn` — `forge_via_attr`와 같은 구조인데 인자를 숨기는
+// 캐리어가 fn이다. 확장 트리에서 fn 아이템의 속성을 건너뛰면
+// (자기 자신을 조상으로 오인) 원본 사본이 안 보인다.
+#[fixture_macros::forge_via_fn]
+impl a::Tr for S6 {
+    fn m(&self) -> u32 {
+        a::probe()
+    }
+}
+
+pub struct S7;
+
+// `forge_via_derive` — 위조 형제가 보이고, derive 출력의 `mod dup_hid`
+// 안 `fn m`이 숨은 후보다. derive 확장을 걷지 않으면 위조가 단독이다.
+#[fixture_macros::forge_via_derive]
+impl a::Tr for S7 {
+    fn m(&self) -> u32 {
+        a::probe()
+    }
+}
+
+pub struct S9;
+
+// `forge_via_cfg` — 죽은 `cfg_attr` 안에 원본 사본이 들어 있다.
+// 미평가 cfg_attr의 안쪽은 검증할 수 없으므로 애매로 빠져야 한다.
+#[fixture_macros::forge_via_cfg]
+impl a::Tr for S9 {
+    fn m(&self) -> u32 {
+        a::probe()
+    }
+}
+
 /// 인라인 조상의 `#[path]`가 자식 모듈의 기준 디렉터리 세그먼트를
 /// 덮어쓴다 — `inner` 대신 `deep`이 들어가 `src/nest/deep/leaf.rs`다.
 pub mod nest {

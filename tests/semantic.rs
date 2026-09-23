@@ -696,6 +696,75 @@ fn syn_mode_still_fans_out() {
     );
 }
 
+/// 확장 트리 안의 fn 아이템에 달린 속성 매크로 — `ancestors()`가 자기
+/// 자신을 포함하면 fn 캐리어가 "fn 본문 안"으로 오인돼 속성이
+/// 건너뛰어진다. 엄밀 조상만 봐야 원본 사본이 보인다.
+#[test]
+fn fn_carrier_attr_macro_still_expands() {
+    let d = sem_doc();
+    assert!(call(
+        &d,
+        "fixture_core::S6::<Tr>::m",
+        "fixture_core::forged_target"
+    )
+    .is_none());
+    assert!(
+        call(&d, "fixture_core::S6::<Tr>::m", "fixture_core::a::probe").is_some(),
+        "real body's call edge must exist"
+    );
+    assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S6::<Tr>::m").is_none());
+    assert!(
+        call(&d, "fixture_core::dispatch_c", "fixture_core::S6").is_some(),
+        "forged impl must fall back to its owner type vertex"
+    );
+}
+
+/// derive 출력(`mod dup_hid` 안의 `fn m`)이 숨은 후보다 — derive를
+/// 확장하지 않으면 위조 형제가 단독 후보로 채택된다. derive 확장이
+/// 두 번째 앵커 후보를 드러내면 소유권은 애매로 빠진다.
+#[test]
+fn derive_hidden_candidate_does_not_steal() {
+    let d = sem_doc();
+    assert!(call(
+        &d,
+        "fixture_core::S7::<Tr>::m",
+        "fixture_core::forged_target"
+    )
+    .is_none());
+    assert!(
+        call(&d, "fixture_core::S7::<Tr>::m", "fixture_core::a::probe").is_some(),
+        "real body's call edge must exist"
+    );
+    assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S7::<Tr>::m").is_none());
+    assert!(
+        call(&d, "fixture_core::dispatch_c", "fixture_core::S7").is_some(),
+        "forged impl must fall back to its owner type vertex"
+    );
+}
+
+/// 죽은 `cfg_attr` 안의 속성 — inert 등록부에는 있지만 안쪽 속성의
+/// 인자 토큰은 평가 없이는 검증할 수 없다. 미평가 cfg_attr를 inert로
+/// 건너뛰면 위조 형제가 단독 후보가 된다.
+#[test]
+fn dormant_cfg_attr_fails_closed() {
+    let d = sem_doc();
+    assert!(call(
+        &d,
+        "fixture_core::S9::<Tr>::m",
+        "fixture_core::forged_target"
+    )
+    .is_none());
+    assert!(
+        call(&d, "fixture_core::S9::<Tr>::m", "fixture_core::a::probe").is_some(),
+        "real body's call edge must exist"
+    );
+    assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S9::<Tr>::m").is_none());
+    assert!(
+        call(&d, "fixture_core::dispatch_c", "fixture_core::S9").is_some(),
+        "forged impl must fall back to its owner type vertex"
+    );
+}
+
 /// 인라인 조상의 `#[path]` 오버라이드 — `mod nest { #[path="deep"]
 /// mod inner { #[path="leaf.rs"] mod leaf; } }`에서 leaf의 기준
 /// 디렉터리는 `src/nest/inner`가 아니라 `src/nest/deep`이다. 조상의

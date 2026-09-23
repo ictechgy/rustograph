@@ -1382,6 +1382,7 @@ version = "0.2.1"
 dependencies = [
  "proc-macro2",
  "ra_ap_hir",
+ "ra_ap_hir_expand",
  "ra_ap_ide_db",
  "ra_ap_load-cargo",
  "ra_ap_proc_macro_api",

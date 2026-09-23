@@ -599,12 +599,14 @@ fn expanded_fn_defs(
 }
 
 /// 확장 트리를 걸어 사본 후보를 모은다 — `expanded_fn_defs`의 재귀
-/// 본체. 세 종류의 숨은 후보원을 함께 연다 — (1) 아이템 위치의 함수형
+/// 본체. 네 종류의 숨은 후보원을 함께 연다 — (1) 아이템 위치의 함수형
 /// 매크로 호출(토큰 트리라 descendants로 안이 안 보임), (2) 아이템에
-/// 달린 속성 매크로(인자 토큰으로 사본을 emit할 수 있음), (3) 사본이
-/// 다시 매크로 입력인 경우. 어느 것이든 확장에 실패하거나 내부 확장
-/// 에러가 있으면 후보 완전성을 증명 못 해 애매로 본다(None). fn 본문
-/// 안의 호출·아이템은 블록 지역이라 정점 소유권과 무관해 건너뛴다.
+/// 달린 속성 매크로(인자 토큰으로 사본을 emit할 수 있음), (3) 아이템의
+/// derive 속성(커스텀 derive가 임의 아이템을 emit할 수 있음), (4) 사본이
+/// 다시 매크로 입력인 경우. 어느 것이든 확장에 실패하거나, 확장·파싱
+/// 에러가 있거나, 정체를 판별할 수 없는 속성이 끼어 있으면 후보 완전성을
+/// 증명 못 해 애매로 본다(None). fn 본문 안의 호출·아이템은 블록 지역이라
+/// 정점 소유권과 무관해 건너뛴다.
 fn walk_expansion(
     sema: &Semantics<RootDatabase>,
     root: &InFile<SyntaxNode>,
@@ -623,6 +625,7 @@ fn walk_expansion(
             .and_then(|fr| (fr.file_id.file_id(sema.db) == file).then_some(fr.range))
     };
     let mut pending: Vec<ast::Item> = Vec::new();
+    let mut derive_roots: Vec<SyntaxNode> = Vec::new();
     for n in root.value.descendants() {
         if let Some(mc) = ast::MacroCall::cast(n.clone()) {
             // fn 본문 안 호출은 블록 지역 아이템만 만들 수 있다 — 정점
@@ -632,8 +635,13 @@ fn walk_expansion(
                 continue;
             }
             // parse_or_expand 계열은 확장 에러를 삼켜 빈 트리를 줄 수
-            // 있으므로 MacroCallId 경로로 err까지 확인한다.
+            // 있으므로 MacroCallId 경로로 err까지 확인한다. 확장 에러와
+            // 별개로 확장 트리의 파싱 에러도 본다 — 깨진 토큰의 부분
+            // 파스는 숨은 후보를 만들 수 있다.
             let call_id: ra_ap_hir::MacroCallId = sema.to_def(&mc)?;
+            if call_id.parse_macro_expansion_error(sema.db).is_some() {
+                return None;
+            }
             let er = sema.expand(call_id);
             if er.err.is_some() {
                 return None;
@@ -649,16 +657,14 @@ fn walk_expansion(
             )?;
             continue;
         }
-        // 아이템 위치의 속성 매크로 — 인자 토큰이 사본을 숨길 수 있어
-        // fn이 보이든 안 보이든 함께 확장한다. `is_attr_macro_call`은
-        // derive·내장 속성을 걸러낸다.
         if let Some(it) = ast::Item::cast(n.clone()) {
-            if it.attrs().next().is_some()
-                && !n.ancestors().any(|a| ast::Fn::cast(a).is_some())
-                && sema.is_attr_macro_call(InFile::new(root.file_id, &it))
-            {
-                pending.push(it);
-                continue;
+            if !n.ancestors().skip(1).any(|a| ast::Fn::cast(a).is_some()) {
+                let (is_macro, roots) = classify_item_attrs(sema, root.file_id, &it)?;
+                derive_roots.extend(roots);
+                if is_macro {
+                    pending.push(it);
+                    continue;
+                }
             }
         }
         let Some(ef) = ast::Fn::cast(n) else {
@@ -705,15 +711,102 @@ fn walk_expansion(
             }
         }
     }
+    // derive 확장 루트 — 베어 노드로 오므로 캐시된 확장의 file_id를
+    // scope로 역산한다. 확인이 안 되면 완전성을 증명 못 해 애매다.
+    for node in derive_roots {
+        let fid = sema.scope(&node)?.file_id();
+        if fid
+            .macro_file()
+            .is_some_and(|id| id.parse_macro_expansion_error(sema.db).is_some())
+        {
+            return None;
+        }
+        walk_expansion(
+            sema,
+            &InFile::new(fid, node),
+            file,
+            site,
+            header,
+            depth + 1,
+            defs,
+        )?;
+    }
     for p in pending {
         // 재귀 깊이 상한은 walk_expansion 입구에서 걸린다.
         let er = sema.expand_attr_macro(&p)?;
         if er.err.is_some() {
             return None;
         }
+        // 속성 매크로 확장도 파싱 에러를 본다 — 확장 파일의
+        // MacroCallId를 역산해 확인한다.
+        if er
+            .value
+            .file_id
+            .macro_file()
+            .is_some_and(|id| id.parse_macro_expansion_error(sema.db).is_some())
+        {
+            return None;
+        }
         walk_expansion(sema, &er.value, file, site, header, depth + 1, defs)?;
     }
     Some(())
+}
+
+/// 아이템에 달린 각 속성을 판별해 (속성 매크로 여부, derive 확장
+/// 루트들)을 돌려준다. inert 내장 속성과 derive는 아이템을 emit하는
+/// 매크로가 아니지만, derive 출력 자체는 숨은 후보원이라 확장해 둔다.
+/// 정체를 판별할 수 없는 속성 — 내장도 매크로 호출도 아닌 것(미해석
+/// proc 매크로·derive 헬퍼 등)과 미평가 `cfg_attr` — 는 인자 토큰에
+/// 사본을 숨길 수 있어 None으로 애매를 유도한다.
+fn classify_item_attrs(
+    sema: &Semantics<RootDatabase>,
+    file_id: ra_ap_hir::HirFileId,
+    it: &ast::Item,
+) -> Option<(bool, Vec<SyntaxNode>)> {
+    let mut is_macro = false;
+    let mut roots = Vec::new();
+    for attr in it.attrs() {
+        // `cfg_attr`는 전용 Meta 변형이라 path()가 None이다 — 이름이
+        // 안 잡히는 속성은 `_` 암에서 매크로 호출 여부로 판별한다
+        // (ra는 cfg_attr를 평가해 안쪽 매크로 호출을 찾는다 — 평가가
+        // 안 된 채 남은 것은 인자를 검증할 수 없어 None).
+        let name = attr
+            .path()
+            .and_then(|p| p.as_single_name_ref())
+            .map(|n| n.text().to_string());
+        match name.as_deref() {
+            Some("derive") | Some("derive_const") => {
+                // derive 호출 하나라도 해석·확장에 실패하면 출력이
+                // 불완전하다 — None/err 모두 애매다.
+                for er in sema.expand_derive_macro(&attr.meta()?)? {
+                    let er = er?;
+                    if er.err.is_some() {
+                        return None;
+                    }
+                    roots.push(er.value);
+                }
+            }
+            // rustc/ra가 inert로 등록한 내장 속성 — 아이템을 emit하지
+            // 않는다.
+            Some(n) if is_inert_attr(n) => {}
+            _ => {
+                // derive 헬퍼·미해석 매크로 등 — 매크로 호출로 확인된
+                // 것만 연다. 아니면 인자 토큰을 검증할 수 없다.
+                if !sema.is_attr_macro_call(InFile::new(file_id, it)) {
+                    return None;
+                }
+                is_macro = true;
+            }
+        }
+    }
+    Some((is_macro, roots))
+}
+
+/// `allow`·`doc` 같은 inert 내장 속성인가 — ra의 등록부를 쓴다.
+fn is_inert_attr(name: &str) -> bool {
+    ra_ap_hir_expand::inert_attr_macro::INERT_ATTRIBUTES
+        .iter()
+        .any(|a| a.name == name)
 }
 
 /// 정의의 소스 정체를 잡아 인덱스 항목으로 만든다 — 블록(fn 본문) 안에

@@ -202,3 +202,78 @@ pub fn forge_via_attr(_attr: TokenStream, item: TokenStream) -> TokenStream {
     out.extend(forged_sibling(&item));
     out
 }
+
+/// `forge_via_attr`의 변형 — 캐리어가 struct가 아니라 fn이다. 확장
+/// 트리 안의 fn 아이템 자신이 "fn 안"으로 오인되면 캐리어의 속성
+/// 매크로가 건너뛰어져 원본 사본이 안 보인다.
+#[proc_macro_attribute]
+pub fn forge_via_fn(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    // #[fixture_macros::emit_args( <item> )] fn carrier6() {}
+    let args = proc_macro::Group::new(proc_macro::Delimiter::Parenthesis, item.clone());
+    let mut attr_body: TokenStream = "fixture_macros::emit_args".parse().unwrap();
+    attr_body.extend(std::iter::once(proc_macro::TokenTree::Group(args)));
+    let bracket = proc_macro::Group::new(proc_macro::Delimiter::Bracket, attr_body);
+    let mut out: TokenStream = "#".parse().unwrap();
+    out.extend(std::iter::once(proc_macro::TokenTree::Group(bracket)));
+    out.extend("fn carrier6() {}".parse::<TokenStream>().unwrap());
+    out.extend(forged_sibling(&item));
+    out
+}
+
+/// derive 입력의 `m` 필드 이름 토큰을 재사용해 `mod dup_hid` 안에
+/// 같은 이름의 자유 fn을 emit한다 — 필드 토큰이 원본 메서드 이름의
+/// span을 물고 있으면 derive 출력의 fn이 원본 범위에 앵커된다.
+#[proc_macro_derive(DupMethod)]
+pub fn dup_method(item: TokenStream) -> TokenStream {
+    let m = find_ident(item, "m").expect("field m");
+    let body = substitute(
+        "pub fn _m() -> u32 { 8 }".parse().unwrap(),
+        "_m",
+        m,
+    );
+    let mut out: TokenStream = "mod dup_hid".parse().unwrap();
+    out.extend(std::iter::once(proc_macro::TokenTree::Group(
+        proc_macro::Group::new(proc_macro::Delimiter::Brace, body),
+    )));
+    out
+}
+
+/// 위조 형제 + derive 캐리어를 emit한다 — 캐리어 필드 이름은 입력
+/// 메서드의 `m` 토큰 사본이라 derive 출력의 `fn m`이 원본 범위에
+/// 앵커되는 숨은 후보가 된다. derive 확장을 걷지 않으면 위조 형제가
+/// 단독 후보다.
+#[proc_macro_attribute]
+pub fn forge_via_derive(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let m = find_ident(item.clone(), "m").expect("method m");
+    let carrier = substitute(
+        "struct D7 { _m: u8 }".parse().unwrap(),
+        "_m",
+        m,
+    );
+    let mut out: TokenStream = "#[derive(fixture_macros::DupMethod)]".parse().unwrap();
+    out.extend(carrier);
+    out.extend(forged_sibling(&item));
+    out
+}
+
+/// 위조 형제 + 죽은 `cfg_attr` 안에 원본을 숨긴 struct를 emit한다 —
+/// 조건이 거짓(`never`)이라 안쪽 속성은 평가되지 않지만, 미평가
+/// cfg_attr는 인자를 검증할 수 없으므로 애매로 빠져야 한다.
+#[proc_macro_attribute]
+pub fn forge_via_cfg(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    // #[cfg_attr(never, fixture_macros::emit_args(<item>))] struct Carrier9;
+    let args = proc_macro::Group::new(proc_macro::Delimiter::Parenthesis, item.clone());
+    let mut inner: TokenStream = "fixture_macros::emit_args".parse().unwrap();
+    inner.extend(std::iter::once(proc_macro::TokenTree::Group(args)));
+    let mut cfg_body: TokenStream = "never,".parse().unwrap();
+    cfg_body.extend(inner);
+    let cfg_paren = proc_macro::Group::new(proc_macro::Delimiter::Parenthesis, cfg_body);
+    let mut attr_body: TokenStream = "cfg_attr".parse().unwrap();
+    attr_body.extend(std::iter::once(proc_macro::TokenTree::Group(cfg_paren)));
+    let bracket = proc_macro::Group::new(proc_macro::Delimiter::Bracket, attr_body);
+    let mut out: TokenStream = "#".parse().unwrap();
+    out.extend(std::iter::once(proc_macro::TokenTree::Group(bracket)));
+    out.extend("struct Carrier9;".parse::<TokenStream>().unwrap());
+    out.extend(forged_sibling(&item));
+    out
+}
