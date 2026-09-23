@@ -1,5 +1,7 @@
 # rustograph
 
+<img src="icon.png" alt="rustograph's bird mascot" width="112" height="112" align="right">
+
 Rust dependency graph tool — read a Cargo workspace, build its dependency
 graph, and run queries on top: cycles, reachability, impact, layer rules.
 

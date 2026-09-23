@@ -1,5 +1,7 @@
 # rustograph
 
+<img src="icon.png" alt="rustograph의 새 마스코트" width="112" height="112" align="right">
+
 Rust 의존성 그래프 도구 — Cargo 워크스페이스를 읽어 의존성 그래프를 만들고,
 그 위에서 순환·도달성·영향 범위·레이어 규칙을 질의합니다.
 
