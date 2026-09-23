@@ -100,6 +100,9 @@ struct SynSite {
     /// 소스에 쓰인 그대로의 트레이트 경로 — 별칭·외부 트레이트처럼
     /// 정규 ID로 못 잡는 경우의 대조 키다.
     trait_written: Option<String>,
+    /// self 타입의 소스 원문 — `S<u8>`/`S<u16>`처럼 정점 ID가 같은
+    /// impl을 가리는 대조 키다.
+    self_written: Option<String>,
 }
 
 /// syn 측 선언 위치 입력 — 엔진이 vfs 좌표로 변환해 보관한다.
@@ -112,6 +115,8 @@ pub struct Site {
     pub trait_: Option<String>,
     /// 소스에 쓰인 그대로의 트레이트 경로(`a::Tr`·`std::fmt::Debug` 류).
     pub trait_written: Option<String>,
+    /// self 타입의 소스 원문(공백 제거).
+    pub self_written: Option<String>,
 }
 
 /// 본문을 가질 수 있는 정의 — fn·const·static.
@@ -142,6 +147,8 @@ struct BodyEntry {
     trait_res: Option<String>,
     /// 소스에 쓰인 그대로의 트레이트 경로 — 외부 트레이트·별칭 대조용.
     trait_written: Option<String>,
+    /// self 타입의 소스 원문 — `S<u8>`/`S<u16>` 대조용.
+    self_written: Option<String>,
 }
 
 /// 디스패치 후보 — 메서드 정점을 우선 쓰고, 정점이 없는 생성 impl이면
@@ -183,6 +190,8 @@ pub struct OwnerSite<'a> {
     pub trait_: Option<&'a str>,
     /// 소스에 쓰인 그대로의 트레이트 경로 — 외부 트레이트·별칭 대조용.
     pub trait_written: Option<&'a str>,
+    /// self 타입의 소스 원문.
+    pub self_written: Option<&'a str>,
 }
 
 impl Engine {
@@ -233,6 +242,7 @@ impl Engine {
                             range,
                             trait_: s.trait_.clone(),
                             trait_written: s.trait_written.clone(),
+                            self_written: s.self_written.clone(),
                         })
                     })
                     .collect();
@@ -293,9 +303,13 @@ impl Engine {
             e.file == file_id
                 && want.contains_range(e.anchor.unwrap_or(e.range))
                 && e.krate == site.krate
-                && trait_match(
-                    (site.trait_, site.trait_written),
-                    (e.trait_res.as_deref(), e.trait_written.as_deref()),
+                && decl_match(
+                    (site.trait_, site.trait_written, site.self_written),
+                    (
+                        e.trait_res.as_deref(),
+                        e.trait_written.as_deref(),
+                        e.self_written.as_deref(),
+                    ),
                 )
         });
         let entry = match (matched.next(), matched.next()) {
@@ -467,24 +481,61 @@ fn syn_backed(
     ss.iter().any(|s| {
         s.file == b.file
             && s.range.contains_range(anchor)
-            && trait_match(
-                (s.trait_.as_deref(), s.trait_written.as_deref()),
-                (b.trait_res.as_deref(), b.trait_written.as_deref()),
+            && decl_match(
+                (
+                    s.trait_.as_deref(),
+                    s.trait_written.as_deref(),
+                    s.self_written.as_deref(),
+                ),
+                (
+                    b.trait_res.as_deref(),
+                    b.trait_written.as_deref(),
+                    b.self_written.as_deref(),
+                ),
             )
     })
 }
 
-/// 트레이트 정체 대조 — (해석된 정규 ID, 소스 표기 경로) 쌍끼리 비교한다.
-/// 양쪽 다 트레이트가 없으면(고유 impl·자유 함수·트레이트 선언) 위치만으로
-/// 충분하다. 한쪽에만 있으면 다른 선언이다. 둘 다 있으면 정규 ID 또는
-/// 소스 표기가 같아야 한다 — 정규 ID 비교는 워크스페이스 트레이트에
-/// 정확하고, 소스 표기 비교는 외부 트레이트·별칭도 구분한다. 두 경로가
-/// 모두 실패하면 다른 트레이트의 같은-이름 메서드다.
-fn trait_match(site: (Option<&str>, Option<&str>), def: (Option<&str>, Option<&str>)) -> bool {
-    if site.0.is_none() && site.1.is_none() && def.0.is_none() && def.1.is_none() {
+/// 선언 정체 대조 — (해석된 트레이트 정규 ID, 소스 표기 트레이트 경로,
+/// 소스 표기 self 타입) 트리플끼리 비교한다.
+///
+/// 규칙:
+/// - 여섯 필드가 전부 없으면(자유 함수·const·static) 위치만으로 충분하다.
+/// - 소스 표기(self·트레이트)는 같은 선언이면 반드시 같다 — 어느 하나라도
+///   다르면 다른 선언이다. `impl Tr for S`의 `Tr`이 use로 `a::Tr`를
+///   가리키는 진짜 선언과, 확장이 `use crate::b::Tr` 뒤 같은 철자
+///   `impl Tr for S`를 뱉은 생성 선언은 표기가 같아도 이 규칙으로는
+///   못 가린다 — 아래 정규 ID 검사가 잡는다.
+/// - 해석된 트레이트 정체가 둘 다 있으면 반드시 같아야 한다 — 소스
+///   표기의 우연 일치가 해석된 모순을 덮지 않는다.
+/// - 한쪽만 해석됐으면(외부 트레이트·별칭) 소스 표기 동등으로 판정한다.
+///   트레이트가 없는 고유 impl이면 self 표기로 판정한다.
+fn decl_match(
+    site: (Option<&str>, Option<&str>, Option<&str>),
+    def: (Option<&str>, Option<&str>, Option<&str>),
+) -> bool {
+    let (sr, sw, ss) = site;
+    let (dr, dw, ds) = def;
+    if [sr, sw, ss, dr, dw, ds].iter().all(Option::is_none) {
         return true;
     }
-    (site.0.is_some() && site.0 == def.0) || (site.1.is_some() && site.1 == def.1)
+    if let (Some(a), Some(b)) = (ss, ds) {
+        if a != b {
+            return false;
+        }
+    }
+    if let (Some(a), Some(b)) = (sw, dw) {
+        if a != b {
+            return false;
+        }
+    }
+    if let (Some(a), Some(b)) = (sr, dr) {
+        return a == b;
+    }
+    if sw.is_some() || dw.is_some() {
+        return sw.is_some() && sw == dw;
+    }
+    ss.is_some() && ss == ds
 }
 
 /// 정의의 소스 정체를 잡아 인덱스 항목으로 만든다 — 블록(fn 본문) 안에
@@ -554,18 +605,22 @@ fn body_entry(
         .map(|a| a.range);
     // impl 메서드는 컨테이너 정체를 함께 둔다 — span을 보존한 생성
     // 메서드는 이름 위치가 진짜 선언과 겹치므로 위치만으로는 부족하다.
-    // 정규 ID(해석된 트레이트)와 소스 표기 경로 둘 다 잡는다 — 정규
-    // ID는 외부 트레이트를 구분하지만 별칭이 무엇을 가리켰는지는 안
-    // 담고, 소스 표기는 별칭도 그대로 보존한다.
-    let (trait_res, trait_written) = match def {
+    // 정규 ID(해석된 트레이트)와 소스 표기 둘 다 잡는다 — 정규 ID는
+    // 외부 트레이트를 구분하지만 별칭이 무엇을 가리켰는지는 안 담고,
+    // 소스 표기는 별칭·제네릭 인자까지 그대로 보존한다.
+    let (trait_res, trait_written, self_written) = match def {
         BodyDef::Fn(f) => match f.as_assoc_item(sema.db).map(|a| a.container(sema.db)) {
-            Some(AssocItemContainer::Impl(i)) => (
-                i.trait_(sema.db).map(|t| trait_id(sema.db, t)),
-                sema.source(i).and_then(|s| impl_trait_written(&s.value)),
-            ),
-            _ => (None, None),
+            Some(AssocItemContainer::Impl(i)) => {
+                let src = sema.source(i);
+                (
+                    i.trait_(sema.db).map(|t| trait_id(sema.db, t)),
+                    src.as_ref().and_then(|s| impl_trait_written(&s.value)),
+                    src.and_then(|s| s.value.self_ty().map(|t| stripped_text(t.syntax()))),
+                )
+            }
+            _ => (None, None, None),
         },
-        _ => (None, None),
+        _ => (None, None, None),
     };
     Some(BodyEntry {
         def,
@@ -575,30 +630,30 @@ fn body_entry(
         anchor,
         trait_res,
         trait_written,
+        self_written,
     })
 }
 
-/// impl 헤더의 트레이트 경로를 소스 표기 그대로 — `a::Tr`·`std::fmt::Debug`
-/// 류. 경로가 아닌 형태(드묾)는 None.
-fn impl_trait_written(imp: &ast::Impl) -> Option<String> {
-    let t = imp.trait_()?;
-    let ast::Type::PathType(pt) = t else {
-        return None;
-    };
-    pt.path().map(|p| written_path(&p))
+/// 노드의 소스 원문에서 공백을 제거해 정규화한다 — syn 측
+/// `written_text`와 같은 규칙이라 표기 차이를 없앤다.
+fn stripped_text(n: &ra_ap_syntax::SyntaxNode) -> String {
+    n.text()
+        .to_string()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
 }
 
-/// 경로를 소스 표기로 직렬화 — `crate::a::Tr`처럼 qualifier도 포함하고
-/// 제네릭 인자는 뺀다(syn의 path_segments와 같은 정규화).
-fn written_path(p: &ast::Path) -> String {
-    let mut out = p
-        .qualifier()
-        .map(|q| format!("{}::", written_path(&q)))
-        .unwrap_or_default();
-    if let Some(n) = p.segment().and_then(|s| s.name_ref()) {
-        out.push_str(n.text());
-    }
-    out
+/// impl 헤더의 트레이트 경로를 소스 표기 그대로 — `a::Tr`·`std::fmt::Debug`
+/// 류. 경로가 아닌 형태(드묾)나 세그먼트가 없는 경로(`<T as Tr>` 형태)는
+/// 비교 키로 못 쓰므로 None.
+fn impl_trait_written(imp: &ast::Impl) -> Option<String> {
+    let ast::Type::PathType(pt) = imp.trait_()? else {
+        return None;
+    };
+    let p = pt.path()?;
+    p.segment().and_then(|s| s.name_ref())?;
+    Some(stripped_text(p.syntax()))
 }
 
 /// impl 블록이 코드 생성물인가 — `#[derive]`가 만드는 builtin impl은 소스가

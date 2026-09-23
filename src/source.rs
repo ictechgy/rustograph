@@ -182,6 +182,7 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
                 range: b.range.clone(),
                 trait_: b.trait_.clone(),
                 trait_written: b.trait_written.clone(),
+                self_written: b.self_written.clone(),
             });
         }
         Some(sem::Engine::load(&meta.workspace_root, &sites)?)
@@ -205,6 +206,7 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
                 // 생성 선언과 진짜 선언을 가른다.
                 trait_: b.trait_.as_deref(),
                 trait_written: b.trait_written.as_deref(),
+                self_written: b.self_written.as_deref(),
             };
             match eng.body_edges(&site, &ids, &method_index, &mut st) {
                 Some(es) => {

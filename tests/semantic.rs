@@ -416,6 +416,41 @@ fn span_preserved_generated_method_does_not_steal() {
     assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S::<Tr>::m").is_none());
 }
 
+/// 같은 소스 표기(`impl Tr for S2`)지만 다른 트레이트를 가리키는 생성
+/// impl — 확장 안의 `use`가 `Tr`을 `b::Tr`로 가린다. 소스 표기 동등이
+/// 해석된 정체의 모순을 덮으면 `S2::<Tr>::m`을 훔친다.
+#[test]
+fn shadowed_written_trait_does_not_steal() {
+    let d = sem_doc();
+    assert!(call(
+        &d,
+        "fixture_core::dispatch_shadow_a",
+        "fixture_core::S2::<Tr>::m"
+    )
+    .is_some_and(|e| !e.tentative));
+    assert!(call(&d, "fixture_core::dispatch_shadow_b", "fixture_core::S2").is_some());
+    assert!(call(
+        &d,
+        "fixture_core::dispatch_shadow_b",
+        "fixture_core::S2::<Tr>::m"
+    )
+    .is_none());
+}
+
+/// 인자만 다른 제네릭 impl — 해석된 트레이트는 같으므로 소스 표기의
+/// 인자 부분으로 가린다. `G<u16>`의 생성 메서드가 `S3::<G>::m`을
+/// 훔치면 안 된다.
+#[test]
+fn generic_arg_written_path_does_not_steal() {
+    let d = sem_doc();
+    assert!(
+        call(&d, "fixture_core::dispatch_g8", "fixture_core::S3::<G>::m")
+            .is_some_and(|e| !e.tentative)
+    );
+    assert!(call(&d, "fixture_core::dispatch_g16", "fixture_core::S3").is_some());
+    assert!(call(&d, "fixture_core::dispatch_g16", "fixture_core::S3::<G>::m").is_none());
+}
+
 /// 속성 매크로가 익명 const로 감싼 진짜 impl — 확장이 블록을 추가해도
 /// 메서드 정점은 syn provenance가 확인되므로 확정 간선을 유지한다.
 /// 타입 정점으로 떨어지면 지역성 검사가 진짜 선언을 거절한 것이다.

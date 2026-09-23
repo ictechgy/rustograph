@@ -52,6 +52,12 @@ pub struct ImplBlock {
     /// impl이 실제로 선언된 파일 — lib/bin 합본 루트는 아이템마다 파일이
     /// 다르므로 모듈의 대표 파일이 아니라 블록 자신의 파일을 들고 다닌다.
     pub file: PathBuf,
+    /// 트레이트 경로의 소스 원문(공백 제거) — `d::G<u8>`처럼 제네릭
+    /// 인자까지 보존한다. 해석된 정체가 같아도 인자가 다르면 다른 impl이다.
+    pub trait_written: Option<String>,
+    /// self 타입의 소스 원문(공백 제거) — `S<u8>`/`S<u16>`처럼 정점 ID가
+    /// 같은 impl을 가리는 대조 키다.
+    pub self_written: Option<String>,
     /// 선언 파일의 생성 코드 마커 — 메서드 정점의 generated 플래그.
     pub generated: bool,
 }
@@ -76,10 +82,22 @@ pub struct BodyItem<'a> {
     /// 밖이면 None. 이름이 같은 다른 트레이트(`a::Tr`/`b::Tr`)는 ID
     /// 문자열이 같아 정체 검증에 이게 필요하다.
     pub trait_: Option<String>,
-    /// 소스에 쓰인 그대로의 트레이트 경로(`a::Tr`, `std::fmt::Debug`).
-    /// 정규 ID와 별도로 보관한다 — 별칭·외부 트레이트도 이 형태에서는
-    /// 구분되고, `use Alias` 같은 우회도 소스 표기가 같으면 같은 선언이다.
+    /// 소스에 쓰인 그대로의 트레이트 경로(`a::Tr`, `std::fmt::Debug`,
+    /// `G<u8>` — 제네릭 인자 포함, 공백 제거). 정규 ID와 별도로 보관한다 —
+    /// 별칭·외부 트레이트도 이 형태에서는 구분되고, `use Alias` 같은
+    /// 우회도 소스 표기가 같으면 같은 선언이다.
     pub trait_written: Option<String>,
+    /// self 타입의 소스 원문(공백 제거) — `S<u8>`/`S<u16>`처럼 정점 ID가
+    /// 같은 impl을 가리는 대조 키다.
+    pub self_written: Option<String>,
+}
+
+/// 구문 요소의 소스 원문을 정규화한다 — span이 가리키는 텍스트에서
+/// 공백을 제거해 `Tr<u8>`/`Tr < u8 >` 표기 차이를 없앤다. span 정보가
+/// 없으면(매크로 파싱 등) None.
+fn written_text(sp: proc_macro2::Span) -> Option<String> {
+    sp.source_text()
+        .map(|t| t.chars().filter(|c| !c.is_whitespace()).collect())
 }
 
 /// 블록 `{ ... }`의 구문들을 표현식 목록으로 펼친다.
@@ -170,6 +188,7 @@ pub fn decls<'a>(
                         range: f.span().byte_range(),
                         trait_: None,
                         trait_written: None,
+                        self_written: None,
                     });
                 }
                 syn::Item::Struct(s) => {
@@ -220,6 +239,7 @@ pub fn decls<'a>(
                                     range: m.span().byte_range(),
                                     trait_: None,
                                     trait_written: None,
+                                    self_written: None,
                                 });
                             }
                         }
@@ -258,6 +278,7 @@ pub fn decls<'a>(
                         range: c.span().byte_range(),
                         trait_: None,
                         trait_written: None,
+                        self_written: None,
                     });
                 }
                 syn::Item::Static(s) => {
@@ -278,6 +299,7 @@ pub fn decls<'a>(
                         range: s.span().byte_range(),
                         trait_: None,
                         trait_written: None,
+                        self_written: None,
                     });
                 }
                 syn::Item::Macro(m) => {
@@ -296,6 +318,11 @@ pub fn decls<'a>(
                     out.impls.push(ImplBlock {
                         self_ty: type_path(&i.self_ty),
                         trait_path: i.trait_.as_ref().map(|(_, p, _)| path_segments(p)),
+                        trait_written: i
+                            .trait_
+                            .as_ref()
+                            .and_then(|(_, p, _)| written_text(p.span())),
+                        self_written: written_text(i.self_ty.span()),
                         methods: i
                             .items
                             .iter()
@@ -386,7 +413,8 @@ pub fn impls<'a>(
                     .trait_path
                     .as_ref()
                     .and_then(|tp| tree.resolve(&b.items_module, tp, &BTreeSet::new())),
-                trait_written: b.trait_path.as_ref().map(|tp| tp.join("::")),
+                trait_written: b.trait_written.clone(),
+                self_written: b.self_written.clone(),
             });
         }
     }

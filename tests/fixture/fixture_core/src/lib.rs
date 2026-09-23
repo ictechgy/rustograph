@@ -259,6 +259,62 @@ pub fn dispatch_b(x: &dyn b::Tr) -> u32 {
     x.m()
 }
 
+// 루트 스코프의 `use` — 아래 `impl Tr for S2`의 `Tr`을 `a::Tr`로
+// 해석시킨다. 생성 impl이 익명 const 안의 `use crate::b::Tr`로 같은
+// 철자를 다른 트레이트에 가린다.
+use a::Tr;
+
+pub struct S2;
+
+// 생성된 형제 impl은 소스 표기가 진짜와 같다(`impl Tr for S2`) — 하지만
+// 확장 안의 `use`로 `Tr`이 `b::Tr`을 가리키므로 해석된 정체가 다르다.
+#[fixture_macros::spawn_shadowed]
+impl Tr for S2 {
+    fn m(&self) -> u32 {
+        1
+    }
+}
+
+/// 진짜 `Tr`(=`a::Tr`) 메서드 — `S2::<Tr>::m` 정점으로 가야 한다.
+pub fn dispatch_shadow_a(x: &S2) -> u32 {
+    x.m()
+}
+
+/// 생성 `Tr`(=`b::Tr`) 메서드 — 정점이 없으니 impl 대상 `S2`로 가야
+/// 하고, 소스 표기가 같아도 `S2::<Tr>::m`을 훔치면 안 된다.
+pub fn dispatch_shadow_b(x: &S2) -> u32 {
+    <S2 as b::Tr>::m(x)
+}
+
+pub mod d {
+    /// 제네릭 트레이트 — 인자만 다른 impl(`G<u8>`/`G<u16>`)은 메서드
+    /// 정점 ID가 같다(`S3::<G>::m`).
+    pub trait G<T> {
+        fn m(&self) -> u32;
+    }
+}
+
+pub struct S3;
+
+// 생성된 형제 impl은 `d::G<u16>` — 해석된 트레이트는 진짜 `d::G<u8>`와
+// 같으므로 소스 표기의 인자 부분으로 가려야 한다.
+#[fixture_macros::spawn_generic_sibling]
+impl d::G<u8> for S3 {
+    fn m(&self) -> u32 {
+        1
+    }
+}
+
+/// 진짜 `G<u8>` 메서드 — `S3::<G>::m` 정점으로.
+pub fn dispatch_g8(x: &S3) -> u32 {
+    <S3 as d::G<u8>>::m(x)
+}
+
+/// 생성 `G<u16>` 메서드 — impl 대상 `S3`으로, `S3::<G>::m`이 아니라.
+pub fn dispatch_g16(x: &S3) -> u32 {
+    <S3 as d::G<u16>>::m(x)
+}
+
 /// `c::Tr` 디스패치 — proc 매크로가 span을 보존해 만든 impl의 메서드는
 /// 이름 위치까지 `a::Tr`의 진짜 선언과 겹친다. 위치만으로는 구분이 안
 /// 되므로 트레이트 정체로 가려야 한다 — `S::<Tr>::m`이 아니라 `S`로.
@@ -345,7 +401,7 @@ pub mod built {
     include!(concat!(env!("OUT_DIR"), "/built_defs.rs"));
 }
 
-/// 크레이트 루트에 직접 include!된 정의 — 소속 모듈이 크레이트 루트다.
+// 크레이트 루트에 직접 include!된 정의 — 소속 모듈이 크레이트 루트다.
 include!(concat!(env!("OUT_DIR"), "/root_defs.rs"));
 
 /// OUT_DIR 생성 정의 참조 — `built` 안의 상수·함수와 루트 상수.

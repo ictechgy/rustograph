@@ -22,47 +22,80 @@ pub fn keep(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
 
+/// 토큰 스트림에서 `name` 식별자를 찾는다 — 원본 span을 그대로 가진다.
+fn find_ident(ts: TokenStream, name: &str) -> Option<proc_macro::Ident> {
+    for tt in ts {
+        match tt {
+            proc_macro::TokenTree::Ident(i) if i.to_string() == name => return Some(i),
+            proc_macro::TokenTree::Group(g) => {
+                if let Some(i) = find_ident(g.stream(), name) {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 플레이스홀더 식별자를 원본 span을 가진 토큰으로 치환한다 —
+/// proc_macro만으로는 토큰 중간에 span을 끼울 수 없다.
+fn substitute(ts: TokenStream, from: &str, to: proc_macro::Ident) -> TokenStream {
+    ts.into_iter()
+        .map(|tt| match tt {
+            proc_macro::TokenTree::Group(g) => proc_macro::TokenTree::Group(
+                proc_macro::Group::new(g.delimiter(), substitute(g.stream(), from, to.clone())),
+            ),
+            proc_macro::TokenTree::Ident(i) if i.to_string() == from => {
+                proc_macro::TokenTree::Ident(to.clone())
+            }
+            other => other,
+        })
+        .collect()
+}
+
 /// 입력 impl을 그대로 다시 emit하면서, 메서드 이름 토큰의 span을 보존한
 /// 채 다른 트레이트(`crate::c::Tr`)의 형제 impl을 추가한다 — 생성
 /// 메서드의 이름 위치가 진짜 선언과 겹치므로(quote_spanned! 패턴)
 /// provenance 검증은 위치만으로는 부족하고 트레이트 정체까지 봐야 한다.
 #[proc_macro_attribute]
 pub fn spawn_sibling(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    fn find_ident(ts: TokenStream, name: &str) -> Option<proc_macro::Ident> {
-        for tt in ts {
-            match tt {
-                proc_macro::TokenTree::Ident(i) if i.to_string() == name => return Some(i),
-                proc_macro::TokenTree::Group(g) => {
-                    if let Some(i) = find_ident(g.stream(), name) {
-                        return Some(i);
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
-    }
     let m = find_ident(item.clone(), "m").expect("method m");
-    // 플레이스홀더 식별자를 파싱한 뒤 원본 span을 가진 토큰으로 치환한다 —
-    // proc_macro만으로는 토큰 중간에 span을 끼울 수 없다.
-    fn substitute(ts: TokenStream, from: &str, to: proc_macro::Ident) -> TokenStream {
-        ts.into_iter()
-            .map(|tt| match tt {
-                proc_macro::TokenTree::Group(g) => proc_macro::TokenTree::Group(
-                    proc_macro::Group::new(g.delimiter(), substitute(g.stream(), from, to.clone())),
-                ),
-                proc_macro::TokenTree::Ident(i) if i.to_string() == from => {
-                    proc_macro::TokenTree::Ident(to.clone())
-                }
-                other => other,
-            })
-            .collect()
-    }
     let sibling: TokenStream = "impl crate::c::Tr for crate::S { fn _m(&self) -> u32 { 3 } }"
         .parse()
         .unwrap();
     let mut out = item;
     out.extend(substitute(sibling, "_m", m));
+    out
+}
+
+/// span을 보존한 채, 같은 소스 표기(`Tr`)지만 다른 트레이트를 가리키는
+/// 형제 impl을 익명 const 안에 추가한다 — const 안의 `use`가 `Tr`을
+/// `crate::b::Tr`로 가려서, 소스 표기만으로는 진짜 `impl Tr for S2`
+/// (`Tr` → `crate::a::Tr`)와 구분이 안 된다. 해석된 정체로 가려야 한다.
+#[proc_macro_attribute]
+pub fn spawn_shadowed(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let m = find_ident(item.clone(), "m").expect("method m");
+    let sib: TokenStream = "const _: () = { use crate::b::Tr; impl Tr for S2 { fn _m(&self) -> u32 { 3 } } };"
+        .parse()
+        .unwrap();
+    let mut out = item;
+    out.extend(substitute(sib, "_m", m));
+    out
+}
+
+/// span을 보존한 채 제네릭 인자만 다른 형제 impl을 추가한다 —
+/// `d::G<u8>`의 진짜 impl과 `d::G<u16>`의 생성 impl은 해석된 트레이트가
+/// 같으므로 소스 표기의 인자 부분으로 가려야 한다.
+#[proc_macro_attribute]
+pub fn spawn_generic_sibling(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let m = find_ident(item.clone(), "m").expect("method m");
+    let sib: TokenStream =
+        "const _: () = { use crate::d; impl d::G<u16> for S3 { fn _m(&self) -> u32 { 3 } } };"
+            .parse()
+            .unwrap();
+    let mut out = item;
+    out.extend(substitute(sib, "_m", m));
     out
 }
 
