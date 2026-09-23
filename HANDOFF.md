@@ -12,8 +12,10 @@ v0.2.0도 배포됐으나 자기 분석에서 cli↔mcp 모듈 순환이 잡혀
 검증 상태: `cargo test` 63개 통과(단위 40 + 통합 23), 커버리지 91.2%
 (게이트 90), clippy 클린, verify-cli-contract OK(mcp 포함),
 자기 분석 `rules --strict` 0 위반 / `cycles --strict` 0.
-`--features semantic` 빌드에서는 +19 semantic 테스트, 자기 분석
-`rules`/`cycles` 동일 0. PR #8(의미 해석) 머지됨 — 70ea82e.
+`--features semantic` 빌드에서는 +47 semantic 테스트, 자기 분석
+`rules`/`cycles` 동일 0(semantic 모드 366 타입 해석 간선).
+PR #8(의미 해석) 머지됨 — 70ea82e. PR #10(의미 하드닝) 머지됨 —
+011c05b.
 
 ## 구조
 
@@ -79,13 +81,20 @@ v0.2.0도 배포됐으나 자기 분석에서 cli↔mcp 모듈 순환이 잡혀
    행렬(tentative 유지 — 실제 impl은 런타임 사실). hir이 모르는 본문은
    syn 폴백 + unmapped 실측. feature 없는 빌드에서 --semantic은
    종료 코드 2 + 빌드 안내(조용한 폴백은 거짓 계약이라 금지).
-   후속 하드닝(semantic-hardening 브랜치): derive 생성 impl 호출을
-   impl 대상 타입 정점으로 귀속, `load_out_dirs_from_check` +
+   후속 하드닝(PR #10, semantic-hardening → 머지됨): derive 생성 impl
+   호출을 impl 대상 타입 정점으로 귀속, `load_out_dirs_from_check` +
    `ProcMacroServerChoice::Sysroot`로 build.rs 산출물·proc 매크로
    확장 로드, include!/생성 정의는 소속 모듈 정점 폴백, 타깃 없는 멤버
    (proc 매크로 크레이트)에 명시 Crate 정점(depends 간선 dangling 치유),
    proc 매크로 호출은 proc_macros 계수 + 서버 부재 시 실측 limitation.
-   로드맵 1~5 모두 완료 — 다음 우선순위는 사용자가 정한다.
+   provenance 폐쇄: site→def 정체·모듈 문맥·소유 범위 대조, 확장 트리의
+   함수형 매크로 인자·attr 인자·derive 출력·`#![inner]`까지 후보원 전수
+   순회, 위조 impl 헤더는 트레이트/self 원본 범위 대조, 호출 속성은
+   Attr+Meta 범위로 개별 확인 후 즉시 중단(뒤 메타는 입력 토큰),
+   derive 인자는 순수 경로 세그먼트만 인정. modtree는 Module::dir
+   실효 디렉터리 모델(rustc 실증: #[path] 로드 파일은 파일 디렉터리
+   소유, 인라인 #[path]는 세그먼트 오버라이드). 각 가드는 뮤테이션으로
+   비공허 검증됨. 로드맵 1~5 모두 완료 — 다음 우선순위는 사용자가 정한다.
 
 ## 막힌 것 / 주의
 
