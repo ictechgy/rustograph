@@ -27,7 +27,7 @@ use ra_ap_syntax::{SyntaxNode, TextRange, TextSize};
 use ra_ap_vfs::{FileId, Vfs, VfsPath};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// 매크로 확장 재귀 한계 — 재귀 매크로(`m!() => { m!() }`류)는 유한해야 한다.
 const MAX_EXPANSION_DEPTH: usize = 16;
@@ -68,8 +68,13 @@ pub struct Engine {
     vfs: Vfs,
     proc_macro: Option<ProcMacroClient>,
     /// 정규 ID → 본문 소유자 정의(fn·const·static)와 소스 정체.
-    /// 워크스페이스 크레이트만, 블록 지역·매크로 생성 정의는 제외.
-    defs: BTreeMap<String, BodyEntry>,
+    /// 워크스페이스 크레이트만, 블록 지역 정의는 제외. 같은 ID의 정의가
+    /// 여럿일 수 있어(`impl S<u8>`/`S<u16>`) 항목은 벡터다.
+    defs: BTreeMap<String, Vec<BodyEntry>>,
+    /// 정규 ID → syn이 수확한 선언 위치들(파일·바이트 범위) — hir 정의의
+    /// 정점 provenance 검증에 쓴다. 문자열 ID만으로는 생성 메서드가
+    /// 같은 이름의 진짜 정점과 충돌하는 것을 구분 못 한다.
+    sites: BTreeMap<String, Vec<(FileId, TextRange)>>,
     /// (트레이트 정규 ID, 메서드 이름) → 워크스페이스 impl 후보들.
     /// 디스패치 지점마다 impl을 다시 훑지 않게 빌드 때 한 번 만든다.
     matrix: BTreeMap<(String, String), Vec<Candidate>>,
@@ -103,8 +108,9 @@ struct Candidate {
 
 /// 빌드 결과 — 본문 소유자 인덱스 + 트레이트 디스패치 후보 표.
 struct Index {
-    /// 정규 ID → 본문 소유자 정의와 소스 정체.
-    defs: BTreeMap<String, BodyEntry>,
+    /// 정규 ID → 본문 소유자 정의와 소스 정체 — 같은 ID의 정의가
+    /// 여럿일 수 있어 항목은 벡터다.
+    defs: BTreeMap<String, Vec<BodyEntry>>,
     /// (트레이트 정규 ID, 메서드 이름) → 워크스페이스 impl 후보들.
     matrix: BTreeMap<(String, String), Vec<Candidate>>,
 }
@@ -124,12 +130,17 @@ pub struct OwnerSite<'a> {
 
 impl Engine {
     /// `dir`의 cargo 워크스페이스를 의미 DB로 로드하고 정의 인덱스를 만든다.
+    /// `sites`는 syn이 수확한 정규 ID → 선언 위치(파일·바이트 범위) —
+    /// 생성 정의의 정점 provenance 검증에 쓴다.
     /// 빌드 스크립트는 `cargo check`로 한 번 실행한다(load_out_dirs_from_check) —
     /// `include!(concat!(env!("OUT_DIR"), ..))`와 proc 매크로 dylib이 여기서
     /// 준비된다. 산출물은 `target/rust-analyzer`에 모아 분석 대상의 target을
     /// 더럽히지 않는다. 로드 실패는 오류 — syn으로 조용히 떨어지면
     /// --semantic이 거짓말이 된다.
-    pub fn load(dir: &Path) -> Result<Engine, String> {
+    pub fn load(
+        dir: &Path,
+        sites: &BTreeMap<String, Vec<(PathBuf, Range<usize>)>>,
+    ) -> Result<Engine, String> {
         // sysroot 없이는 std 매크로(println! 류)조차 해석되지 않는다 —
         // 확장 실패는 인자 속 호출까지 통째로 잃으므로 반드시 켠다.
         let cargo_config = CargoConfig {
@@ -148,14 +159,35 @@ impl Engine {
         };
         let (db, vfs, proc_macro) = load_workspace_at(dir, &cargo_config, &load_config, &|_| {})
             .map_err(|e| format!("semantic engine could not load {}: {e:#}", dir.display()))?;
+        // syn 선언 위치를 vfs 좌표로 변환해 둔다 — hir 정의의 원본
+        // 파일·범위와 직접 비교해 정점 provenance를 확인한다.
+        let sites: BTreeMap<String, Vec<(FileId, TextRange)>> = sites
+            .iter()
+            .map(|(id, ss)| {
+                let vs = ss
+                    .iter()
+                    .filter_map(|(p, r)| {
+                        let (file, _) =
+                            vfs.file_id(&VfsPath::new_real_path(p.to_string_lossy().into_owned()))?;
+                        let range = TextRange::new(
+                            TextSize::from(u32::try_from(r.start).ok()?),
+                            TextSize::from(u32::try_from(r.end).ok()?),
+                        );
+                        Some((file, range))
+                    })
+                    .collect();
+                (id.clone(), vs)
+            })
+            .collect();
         // 타입 소속(self_ty)·트레이트 쿼리는 next-solver의 스레드 로컬
         // attached db를 요구한다 — 인덱스 빌드부터 붙여야 panic이 안 난다.
-        let index = ra_ap_hir::attach_db(&db, || build_index(&db));
+        let index = ra_ap_hir::attach_db(&db, || build_index(&db, &sites));
         Ok(Engine {
             db,
             vfs,
             proc_macro,
             defs: index.defs,
+            sites,
             matrix: index.matrix,
         })
     }
@@ -176,22 +208,22 @@ impl Engine {
         method_index: &BTreeMap<String, Vec<String>>,
         st: &mut Stats,
     ) -> Option<Vec<Edge>> {
-        let entry = self.defs.get(site.id)?;
+        let entries = self.defs.get(site.id)?;
         let (file_id, _) = self.vfs.file_id(&VfsPath::new_real_path(
             site.file.to_string_lossy().into_owned(),
         ))?;
-        if entry.file != file_id {
-            return None;
-        }
         let (Ok(start), Ok(end)) = (
             u32::try_from(site.range.start),
             u32::try_from(site.range.end),
         ) else {
             return None;
         };
-        entry
-            .range
-            .intersect(TextRange::new(TextSize::from(start), TextSize::from(end)))?;
+        let want = TextRange::new(TextSize::from(start), TextSize::from(end));
+        // 같은 ID의 정의가 여럿이면(제네릭 인자가 다른 impl·cfg 변형)
+        // 파일·범위로 진짜 소유자를 고른다.
+        let entry = entries
+            .iter()
+            .find(|e| e.file == file_id && e.range.intersect(want).is_some())?;
         let sema = Semantics::new(&self.db);
         let root = entry.def.body_root(&sema)?;
         // next-solver의 트레이트 해석은 스레드 로컬 attached db를 요구한다 —
@@ -202,7 +234,7 @@ impl Engine {
             cfg: site.cfg,
             ids,
             method_index,
-            defs: &self.defs,
+            sites: &self.sites,
             matrix: &self.matrix,
             st,
             edges: Vec::new(),
@@ -216,9 +248,9 @@ impl Engine {
 /// 정점은 syn이 만들었으므로 여기서는 "본문 소유자를 찾는" 매핑만 필요하다.
 /// 모듈은 루트에서 children으로만 걷는다 — `krate.modules()`는 fn 안의
 /// 블록 모듈까지 포함해 정규 경로가 부모 체인과 어긋날 수 있다.
-fn build_index(db: &RootDatabase) -> Index {
+fn build_index(db: &RootDatabase, sites: &BTreeMap<String, Vec<(FileId, TextRange)>>) -> Index {
     let sema = Semantics::new(db);
-    let mut defs: BTreeMap<String, BodyEntry> = BTreeMap::new();
+    let mut defs: BTreeMap<String, Vec<BodyEntry>> = BTreeMap::new();
     let mut matrix: BTreeMap<(String, String), Vec<Candidate>> = BTreeMap::new();
     let mut stack: Vec<Module> = Vec::new();
     for krate in Crate::all(db) {
@@ -233,14 +265,14 @@ fn build_index(db: &RootDatabase) -> Index {
                     ModuleDef::Const(c) => {
                         if let Some(id) = const_id(db, c) {
                             if let Some(e) = body_entry(&sema, BodyDef::Const(c)) {
-                                defs.insert(id, e);
+                                defs.entry(id).or_default().push(e);
                             }
                         }
                     }
                     ModuleDef::Static(s) => {
                         if let Some(id) = static_id(db, s) {
                             if let Some(e) = body_entry(&sema, BodyDef::Static(s)) {
-                                defs.insert(id, e);
+                                defs.entry(id).or_default().push(e);
                             }
                         }
                     }
@@ -284,12 +316,13 @@ fn build_index(db: &RootDatabase) -> Index {
                 };
                 push_fn(&sema, &mut defs, f);
                 if let Some(tid) = &tid {
-                    // 후보 ID는 정점이 실재할 때만 — fn_id는 문자열이라
-                    // 생성 메서드가 같은 이름의 진짜 정점과 충돌할 수 있다.
-                    let method = fn_id(&sema, f).filter(|id| indexed_def(&sema, &defs, f, id));
-                    if method.is_none() && owner.is_none() {
-                        continue;
-                    }
+                    // 후보 ID는 syn provenance가 확인될 때만 — fn_id는
+                    // 문자열이라 생성 메서드가 같은 이름의 진짜 정점과
+                    // 충돌할 수 있다. 메서드·타깃 둘 다 표현 불가인 후보
+                    // (blanket·원시 타입 impl)도 버리지 않고 남긴다 —
+                    // 디스패치 지점에서 external로 세어져야 limitation이
+                    // 정직하다.
+                    let method = fn_id(&sema, f).filter(|id| syn_backed(&sema, sites, f, id));
                     matrix
                         .entry((tid.clone(), f.name(db).as_str().to_string()))
                         .or_default()
@@ -317,19 +350,22 @@ impl BodyDef {
     }
 }
 
-/// 정규 ID가 이 함수의 실제 선언을 가리키는가 — fn_id는 이름만 보는
+/// 정규 ID가 syn이 실제 수확한 선언을 가리키는가 — fn_id는 이름만 보는
 /// 문자열이라 생성 메서드가 같은 이름의 진짜 정점 ID와 충돌할 수 있다.
-/// 인덱스 항목의 소스 정체(원본 파일·범위)와 일치해야 같은 정의다.
-fn indexed_def(
+/// hir 정의의 원본 소스 위치(파일·바이트 범위)가 syn이 수확한 선언
+/// 위치 중 하나와 일치해야 같은 정의다 — 인덱스 자기 항목과의 비교는
+/// 생성 정의가 자기 자신으로 검증을 통과하는 구멍이 있다.
+fn syn_backed(
     sema: &Semantics<RootDatabase>,
-    defs: &BTreeMap<String, BodyEntry>,
+    sites: &BTreeMap<String, Vec<(FileId, TextRange)>>,
     f: Function,
     id: &str,
 ) -> bool {
-    let (Some(e), Some(b)) = (defs.get(id), body_entry(sema, BodyDef::Fn(f))) else {
+    let (Some(ss), Some(b)) = (sites.get(id), body_entry(sema, BodyDef::Fn(f))) else {
         return false;
     };
-    e.file == b.file && e.range == b.range
+    ss.iter()
+        .any(|&(file, range)| file == b.file && range == b.range)
 }
 
 /// 정의의 소스 정체를 잡아 인덱스 항목으로 만든다 — 블록(fn 본문) 안에
@@ -369,20 +405,31 @@ fn impl_is_generated(sema: &Semantics<RootDatabase>, i: Impl) -> bool {
 }
 
 /// hir 정의가 블록 지역 선언인가 — 소스를 얻을 수 없는 정의는 false.
+/// 조상은 확장 인지로 걷는다: 매크로가 함수 안에서 만든 타입은 확장
+/// 구문만 보면 감싼 함수가 안 보이므로, 매크로 호출 지점까지 올라가야
+/// BlockExpr을 만난다.
 fn block_local_def<D: ra_ap_hir::HasSource>(sema: &Semantics<RootDatabase>, d: D) -> bool
 where
     D::Ast: AstNode,
 {
-    sema.source(d)
-        .is_some_and(|s| block_local(s.value.syntax()))
+    sema.source(d).is_some_and(|s| {
+        sema.ancestors_with_macros(s.value.syntax().clone())
+            .any(|a| ast::BlockExpr::cast(a).is_some())
+    })
 }
 
 /// 함수 한 개를 ID 계산해 entries에 넣는다 — 클로저로 쓰면 entries와
 /// db 빌림이 얽혀서 자유 함수다.
-fn push_fn(sema: &Semantics<RootDatabase>, defs: &mut BTreeMap<String, BodyEntry>, f: Function) {
+fn push_fn(
+    sema: &Semantics<RootDatabase>,
+    defs: &mut BTreeMap<String, Vec<BodyEntry>>,
+    f: Function,
+) {
     if let Some(id) = fn_id(sema, f) {
         if let Some(e) = body_entry(sema, BodyDef::Fn(f)) {
-            defs.insert(id, e);
+            // 같은 ID의 정의가 여럿일 수 있다(`impl S<u8>`/`S<u16>`,
+            // cfg 변형) — 덮어쓰지 않고 전부 보관한다.
+            defs.entry(id).or_default().push(e);
         }
     }
 }
@@ -525,8 +572,8 @@ struct Walker<'a, 'b> {
     cfg: &'a Option<String>,
     ids: &'a BTreeSet<&'a str>,
     method_index: &'a BTreeMap<String, Vec<String>>,
-    /// 정규 ID → 실제 선언의 소스 정체 — 문자열 ID 충돌을 가른다.
-    defs: &'a BTreeMap<String, BodyEntry>,
+    /// 정규 ID → syn이 수확한 선언 위치 — 생성·충돌 정의를 가른다.
+    sites: &'a BTreeMap<String, Vec<(FileId, TextRange)>>,
     /// (트레이트 ID, 메서드 이름) → impl 메서드 후보 — 빌드 때 계산됐다.
     matrix: &'a BTreeMap<(String, String), Vec<Candidate>>,
     st: &'b mut Stats,
@@ -678,7 +725,7 @@ impl<'a, 'b> Walker<'a, 'b> {
         // 문자열이라 생성 메서드가 같은 이름의 진짜 정점과 충돌할 수 있다.
         // 속성 매크로가 감싼 impl의 메서드는 소스 정체가 일치한다.
         if let Some(id) = fn_id(self.sema, f) {
-            if indexed_def(self.sema, self.defs, f, &id)
+            if syn_backed(self.sema, self.sites, f, &id)
                 && matches!(
                     self.push(id, kind, false, un),
                     Pushed::Yes | Pushed::SelfEdge
@@ -732,7 +779,7 @@ impl<'a, 'b> Walker<'a, 'b> {
     /// 있어야 확정이다. 정점이 없거나 생성·충돌 정의면 외부다.
     fn emit_fn_vertex(&mut self, f: Function, kind: EdgeKind, un: bool) {
         match fn_id(self.sema, f) {
-            Some(id) if indexed_def(self.sema, self.defs, f, &id) => {
+            Some(id) if syn_backed(self.sema, self.sites, f, &id) => {
                 if let Pushed::Miss = self.push(id, kind, false, un) {
                     self.st.external += 1;
                 }

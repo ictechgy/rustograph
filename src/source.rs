@@ -173,7 +173,16 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
     // 잡고, 모르는 본문(cfg 비활성·매크로 생성)만 syn 팬아웃으로 돌아간다.
     #[cfg(feature = "semantic")]
     let engine = if opts.semantic {
-        Some(sem::Engine::load(&meta.workspace_root)?)
+        // syn이 수확한 선언 위치 — 의미 해석 쪽에서 정규 ID 문자열이
+        // 가리키는 정점의 provenance 검증에 쓴다(생성 정의 충돌 방지).
+        let mut sites: BTreeMap<String, Vec<(PathBuf, std::ops::Range<usize>)>> = BTreeMap::new();
+        for b in &bodies {
+            sites
+                .entry(b.id.clone())
+                .or_default()
+                .push((b.file.clone(), b.range.clone()));
+        }
+        Some(sem::Engine::load(&meta.workspace_root, &sites)?)
     } else {
         None
     };

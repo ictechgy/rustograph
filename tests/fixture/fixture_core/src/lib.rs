@@ -191,6 +191,125 @@ pub fn local_derived() -> u32 {
     l.clone().0
 }
 
+/// 마지막 세그먼트가 같은 두 트레이트 — `a::Tr`/`b::Tr` 둘 다 메서드
+/// 정점 ID `S::<Tr>::m`을 만든다. syn이 수확하는 것은 `a::Tr` impl뿐이다.
+pub mod a {
+    pub trait Tr {
+        fn m(&self) -> u32;
+    }
+}
+pub mod b {
+    pub trait Tr {
+        fn m(&self) -> u32;
+    }
+}
+
+pub struct S;
+
+impl a::Tr for S {
+    fn m(&self) -> u32 {
+        1
+    }
+}
+
+macro_rules! emit_impl {
+    ($i:item) => {
+        $i
+    };
+}
+
+// 확장 안의 impl — syn은 매크로를 펼치지 않으므로 정점·provenance가 없다.
+// fn_id 문자열은 a::Tr 쪽 정점 `S::<Tr>::m`과 충돌한다.
+emit_impl! {
+    impl b::Tr for S {
+        fn m(&self) -> u32 {
+            2
+        }
+    }
+}
+
+/// `a::Tr` 디스패치 — 진짜 메서드 정점으로 가야 한다.
+pub fn dispatch_a(x: &dyn a::Tr) -> u32 {
+    x.m()
+}
+
+/// `b::Tr` 디스패치 — 확장 안의 메서드는 정점이 없으니 impl 대상 타입으로
+/// 귀속한다. 같은 문자열 ID의 `a::Tr` 정점으로 가면 안 된다.
+pub fn dispatch_b(x: &dyn b::Tr) -> u32 {
+    x.m()
+}
+
+/// 제네릭 타입의 서로 다른 구체 impl — 정점 ID는 둘 다 `Gen::pick`이고
+/// 본문은 각각 다르다. 한 항목만 저장하면 다른 쪽 본문 간선이 빠진다.
+pub struct Gen<T>(pub T);
+
+impl Gen<u8> {
+    pub fn pick(&self) -> u32 {
+        util::helper()
+    }
+}
+
+impl Gen<u16> {
+    pub fn pick(&self) -> u32 {
+        self.0 as u32 + BASE
+    }
+}
+
+macro_rules! emit_wrapped_impl {
+    ($t:ty) => {
+        const _: () = {
+            impl Greet for $t {
+                fn greet(&self) -> u32 {
+                    5
+                }
+            }
+        };
+    };
+}
+
+// serde_derive 패턴 — 익명 const 안의 생성 impl. impl 소스는 확장
+// 안에 있어 블록 조상을 가지지만, self 타입은 모듈 레벨이라 후보다.
+emit_wrapped_impl!(IntOrFloat);
+
+/// 모듈 레벨 `Shadow` — 아래 매크로 생성 지역 타입과 이름이 같다.
+pub struct Shadow;
+
+macro_rules! emit_local_ty {
+    () => {
+        struct Shadow(u32);
+        impl Shadow {
+            fn val(&self) -> u32 {
+                self.0
+            }
+        }
+    };
+}
+
+/// 매크로가 함수 안에서 만든 지역 `Shadow` — `s.val()`의 impl owner가
+/// 모듈 레벨 `Shadow` 정점으로 귀속되면 안 된다. 확장 구문의 조상만
+/// 보면 감싼 함수가 안 보이므로 확장 인지 조상 검사가 필요하다.
+pub fn gen_local() -> u32 {
+    emit_local_ty!();
+    Shadow(5).val()
+}
+
+/// 원시 타입 impl — 메서드 정점도 ADT owner도 없어 그래프로 표현
+/// 불가다. 디스패치 지점에서 external로 세어져야 한다.
+pub trait Primitive {
+    fn hit(&self) -> u32;
+}
+
+impl Primitive for u8 {
+    fn hit(&self) -> u32 {
+        *self as u32
+    }
+}
+
+/// `dyn Primitive` 디스패치 — 유일한 impl 후보가 표현 불가다.
+pub fn prim_dispatch(x: &dyn Primitive) -> u32 {
+    x.hit()
+}
+
 /// build.rs가 OUT_DIR에 쓴 파일 — `load_out_dirs_from_check` 없이는
 /// 해석되지 않는다.
 pub mod built {

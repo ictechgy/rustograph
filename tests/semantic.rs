@@ -388,6 +388,80 @@ fn block_local_ctor_does_not_collide() {
     assert!(call(&d, "fixture_app::local_ctor", "fixture_app::local_scope").is_none());
 }
 
+/// 같은 ID로 충돌하는 두 트레이트 impl — 매크로가 만든 `b::Tr` impl의
+/// 메서드는 `S::<Tr>::m`이라는 같은 문자열 ID를 갖지만 provenance가
+/// 없다. syn이 수확한 `a::Tr` 쪽 정점으로 귀속되면 안 된다.
+#[test]
+fn generated_impl_does_not_steal_sibling_vertex() {
+    let d = sem_doc();
+    // a::Tr 디스패치 — syn이 수확한 진짜 메서드 정점으로 간다.
+    assert!(
+        call(&d, "fixture_core::dispatch_a", "fixture_core::S::<Tr>::m")
+            .is_some_and(|e| e.tentative)
+    );
+    // b::Tr 디스패치 — 확장 안의 메서드는 정점이 없으니 impl 대상 타입으로.
+    assert!(call(&d, "fixture_core::dispatch_b", "fixture_core::S").is_some_and(|e| e.tentative));
+    // 충돌하는 a::Tr 정점으로 가는 간선은 만들어지면 안 된다.
+    assert!(call(&d, "fixture_core::dispatch_b", "fixture_core::S::<Tr>::m").is_none());
+}
+
+/// `impl Gen<u8>`/`impl Gen<u16>` — 정점 ID는 같고 본문은 다르다.
+/// 인덱스가 한 항목만 저장하면 다른 쪽 본문의 간선이 빠진다.
+#[test]
+fn generic_impls_sharing_id_keep_both_bodies() {
+    let d = sem_doc();
+    assert!(
+        call(&d, "fixture_core::Gen::pick", "fixture_core::util::helper")
+            .is_some_and(|e| !e.tentative)
+    );
+    assert!(d.edges.iter().any(|e| e.from == "fixture_core::Gen::pick"
+        && e.to == "fixture_core::BASE"
+        && e.kind == EdgeKind::References));
+}
+
+/// 익명 const 안의 생성 impl(serde_derive 패턴) — self 타입이 모듈
+/// 레벨이면 디스패치 후보로 유효해 impl 대상 타입으로 귀속된다.
+#[test]
+fn const_wrapped_generated_impl_keeps_owner() {
+    let d = sem_doc();
+    assert!(
+        call(&d, "fixture_core::dyn_dispatch", "fixture_core::IntOrFloat")
+            .is_some_and(|e| e.tentative)
+    );
+}
+
+/// 매크로가 함수 안에서 만든 지역 타입 — 확장 구문만으로는 감싼 함수가
+/// 안 보이지만, 호출의 impl owner가 모듈 레벨 같은-이름 정점으로 귀속되면
+/// 안 된다.
+#[test]
+fn macro_generated_local_type_does_not_collide() {
+    let d = sem_doc();
+    // 생성자 참조와 생성 메서드 호출 둘 다 모듈 정점으로 새면 안 된다.
+    assert!(!d
+        .edges
+        .iter()
+        .any(|e| e.from == "fixture_core::gen_local" && e.to.starts_with("fixture_core::Shadow")));
+}
+
+/// 메서드 정점도 ADT owner도 없는 impl(`u8` 원시 타입) — 후보를 조용히
+/// 버리면 limitation이 거짓말을 하므로 external로 세어져야 한다.
+#[test]
+fn unrepresentable_candidate_is_counted() {
+    let d = sem_doc();
+    // 트레이트 선언점에는 추정 간선이 간다.
+    assert!(call(
+        &d,
+        "fixture_core::prim_dispatch",
+        "fixture_core::Primitive::hit"
+    )
+    .is_some_and(|e| e.tentative));
+    // u8 impl 후보는 그래프에 표현 불가 — 간선이 아니라 external 계측.
+    assert!(d
+        .limitations
+        .iter()
+        .any(|l| l.contains("call targets resolved to items outside the graph")));
+}
+
 #[test]
 fn syn_mode_still_fans_out() {
     // 기본 모드 계약은 그대로 — 같은-이름 팬아웃이 추정 간선으로 남는다.
