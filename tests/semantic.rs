@@ -889,3 +889,38 @@ fn path_loaded_file_owns_its_dir() {
     )
     .is_some());
 }
+/// cfg_attr로 활성화된 호출 뒤의 메타는 그 호출의 입력 토큰이다 —
+/// 호출 확인 즉시 중단하지 않으면 뒤 메타를 invoc와 대조해 틀리고
+/// 사이트 전체가 애매로 빠진다.
+#[test]
+fn trailing_meta_after_invoc_stays_input() {
+    let d = sem_doc();
+    let e = call(
+        &d,
+        "fixture_core::S11::<Tr>::m",
+        "fixture_core::S11::probe3",
+    )
+    .expect("real body's call edge must exist");
+    assert!(
+        !e.tentative,
+        "meta after the invocation must be treated as its input"
+    );
+}
+
+/// 인라인 모듈의 `#![cfg_attr]` 안에 숨은 미검증 토큰 — 내부 속성을
+/// 분류하지 않으면 위조 사본이 단독 후보로 스틸한다.
+#[test]
+fn inner_cfg_attr_fails_closed() {
+    let d = sem_doc();
+    assert!(call(
+        &d,
+        "fixture_core::S12::<Tr>::m",
+        "fixture_core::forged_target"
+    )
+    .is_none());
+    assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S12::<Tr>::m").is_none());
+    assert!(
+        call(&d, "fixture_core::dispatch_c", "fixture_core::S12").is_some(),
+        "forged impl must fall back to its owner type vertex"
+    );
+}

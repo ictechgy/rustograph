@@ -340,6 +340,39 @@ impl a::Tr for S10 {
     }
 }
 
+pub struct S11;
+
+impl S11 {
+    pub fn probe3(&self) -> u32 {
+        1
+    }
+}
+
+// cfg_attr로 활성화된 호출 뒤의 메타는 그 호출의 입력 토큰이다 —
+// 호출 확인 즉시 중단하지 않으면 둘째 `keep`을 invoc와 대조해
+// 틀리고 애매로 빠진다. 바깥 `keep`은 to_fn_def 직접 해석을 막아
+// 확장 트리 순회를 강제하는 장치고, `self.probe3()`는 semantic
+// 해석이 필요한 메서드 호출 — 사이트가 풀리면 확정 간선이 나온다.
+#[fixture_macros::keep]
+#[cfg_attr(all(), fixture_macros::keep, fixture_macros::keep)]
+impl a::Tr for S11 {
+    fn m(&self) -> u32 {
+        self.probe3()
+    }
+}
+
+pub struct S12;
+
+// `forge_inner_carrier` — 인라인 모듈의 `#![cfg_attr(never, ..)]` 안에
+// 원본 사본을 숨기고 위조 형제를 emit한다. 내부 속성을 분류하지
+// 않으면 위조가 단독 후보로 스틸한다.
+#[fixture_macros::forge_inner_carrier]
+impl a::Tr for S12 {
+    fn m(&self) -> u32 {
+        a::probe()
+    }
+}
+
 /// 인라인 조상의 `#[path]`가 자식 모듈의 기준 디렉터리 세그먼트를
 /// 덮어쓴다 — `inner` 대신 `deep`이 들어가 `src/nest/deep/leaf.rs`다.
 pub mod nest {

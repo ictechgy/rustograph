@@ -765,9 +765,11 @@ fn classify_item_attrs(
     sema: &Semantics<RootDatabase>,
     it: &ast::Item,
 ) -> Option<(bool, Vec<SyntaxNode>)> {
-    let mut is_macro = false;
     let mut roots = Vec::new();
-    for attr in it.attrs() {
+    // `attrs_including_inner` — 인라인 `mod`의 `#![...]` 내부 속성도
+    // 매크로 호출일 수 있다(ra도 같은 함수로 호출을 찾는다). 바깥 속성이
+    // 먼저 오므로 호출 확인 뒤 남은 내부 속성은 입력 토큰으로 건너뛴다.
+    for attr in ast::attrs_including_inner(it) {
         for meta in attr.skip_cfg_attrs() {
             // `cfg`/`cfg_attr`는 전용 Meta 변형이라 path()가 None이다 —
             // simple_name은 두 변형의 이름도 준다.
@@ -795,7 +797,9 @@ fn classify_item_attrs(
                 Some(n) if is_inert_attr(n) => {}
                 _ => {
                     // derive 헬퍼는 토큰이 derive 매크로 입력으로 들어간다
-                    // — derive 출력은 이미 걷는다.
+                    // — derive 출력은 이미 걷는다. cfg_attr 안쪽 헬퍼는
+                    // derive_helper가 바깥 Attr만 받아 판별하지 못한다 —
+                    // 그 경우 아래 invoc 확인도 실패해 애매로 빠진다.
                     if sema.derive_helper(&attr).is_some() {
                         continue;
                     }
@@ -805,43 +809,47 @@ fn classify_item_attrs(
                     if !is_invoc_attr(sema, it, &attr, &meta)? {
                         return None;
                     }
-                    is_macro = true;
+                    // 호출 확인 — 나머지 속성(같은 cfg_attr의 뒤 메타
+                    // 포함)은 매크로 입력 토큰이다. 출력에서 전부 본다.
+                    return Some((true, roots));
                 }
             }
         }
-        if is_macro {
-            // 호출 속성 이후의 속성은 매크로 입력 토큰이다 — 매크로가
-            // emit하는 것은 확장 출력에서 전부 본다.
-            break;
-        }
     }
-    Some((is_macro, roots))
+    Some((false, roots))
 }
 
 /// derive 인자 목록의 최상위 쉼표 구분 세그먼트 수 — `expand_derive_macro`
-/// 의 호출 수와 대조해 인자 유실을 감지한다. 목록 형태가 아니면 None.
+/// 의 호출 수와 대조해 인자 유실을 감지한다. ra는 malformed 세그먼트를
+/// 버리고 그룹 내부 토큰(`A(숨은 토큰)`)을 무시한 채 바깥 경로만 해석하므로
+/// 세그먼트가 순수 경로(ident·`::` 토큰만)가 아니면 목록을 검증할 수
+/// 없다 — 그 경우 None으로 애매를 유도한다.
 fn derive_arg_count(meta: &ast::Meta) -> Option<usize> {
     let ast::Meta::TokenTreeMeta(tt) = meta else {
         return None;
     };
     let tt = tt.token_tree()?;
     let mut count = 0usize;
-    let mut has_tok = false;
+    let mut has_ident = false;
     for e in tt.syntax().children_with_tokens() {
         match e {
+            // 그룹·경로 구조 노드 — 내부 토큰이 검증 없이 버려질 수 있다.
+            ra_ap_syntax::NodeOrToken::Node(_) => return None,
             ra_ap_syntax::NodeOrToken::Token(t) => match t.kind() {
                 ra_ap_syntax::T![,] => {
-                    count += usize::from(has_tok);
-                    has_tok = false;
+                    count += usize::from(has_ident);
+                    has_ident = false;
                 }
                 k if k.is_trivia() => {}
-                ra_ap_syntax::T!['('] | ra_ap_syntax::T![')'] => {}
-                _ => has_tok = true,
+                ra_ap_syntax::SyntaxKind::IDENT => has_ident = true,
+                ra_ap_syntax::T![::] => {}
+                // `<`·`(`·리터럴 등 경로 아닌 토큰 — 검증 불가.
+                _ => return None,
             },
-            ra_ap_syntax::NodeOrToken::Node(_) => has_tok = true,
         }
     }
-    Some(count + usize::from(has_tok))
+    // ident 하나도 없이 쉼표만 있으면 빈 목록 — ra도 호출 0개로 돌린다.
+    Some(count + usize::from(has_ident))
 }
 
 /// `attr` 안의 `meta`가 이 아이템의 실제 속성 매크로 호출인가 — 호출된

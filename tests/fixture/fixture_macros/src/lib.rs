@@ -304,6 +304,24 @@ pub fn emit_cfg_sibling(_attr: TokenStream, item: TokenStream) -> TokenStream {
     out
 }
 
+/// 인라인 모듈의 `#![cfg_attr]` 안에 원본 impl을 숨긴다 — 내부 속성을
+/// 분류하지 않으면(`it.attrs()`만 보면) 미검증 토큰이 있는 채로
+/// 통과해 위조 사본이 단독 후보가 된다. dormant라 평가되지 않으므로
+/// 호출로 확인도 안 된다 — 검증 불가이므로 애매로 빠져야 한다.
+#[proc_macro_attribute]
+pub fn forge_inner_carrier(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    // mod hid { #![cfg_attr(never, fixture_macros::emit_args(<item>))] }
+    // 숨은 사본은 토큰 캐리어일 뿐 span이 필요 없어 문자열로 조립한다.
+    let mut out: TokenStream = format!(
+        "mod hid {{ #![cfg_attr(never, fixture_macros::emit_args({item}))] }}"
+    )
+    .parse()
+    .unwrap();
+    // 위조 형제 — 원본이 숨은 채면 단독 후보다.
+    out.extend(forged_sibling(&item));
+    out
+}
+
 /// 위조 형제 + 죽은 `cfg_attr` 안에 원본을 숨긴 struct를 emit한다 —
 /// 조건이 거짓(`never`)이라 안쪽 속성은 평가되지 않지만, 미평가
 /// cfg_attr는 인자를 검증할 수 없으므로 애매로 빠져야 한다.
