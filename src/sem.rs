@@ -15,15 +15,15 @@ use crate::cargo_meta::normalize_name;
 use crate::graph::{Edge, EdgeKind};
 use ra_ap_hir::db::HirDatabase;
 use ra_ap_hir::{
-    Adt, AsAssocItem, AssocItem, AssocItemContainer, Const, Crate, DisplayTarget, Enum, Function,
-    HirDisplay, Impl, InFile, Macro, Module, ModuleDef, PathResolution, Semantics, Static, Trait,
-    Type, TypeAlias,
+    Adt, AsAssocItem, AssocItem, AssocItemContainer, Const, Crate, Enum, Function, HirDisplay,
+    Impl, InFile, Macro, Module, ModuleDef, PathResolution, Semantics, Static, Trait, Type,
+    TypeAlias,
 };
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice};
 use ra_ap_proc_macro_api::ProcMacroClient;
 use ra_ap_project_model::{CargoConfig, RustLibSource, TargetDirectoryConfig};
-use ra_ap_syntax::ast::{self, AstNode, HasGenericArgs, HasName};
+use ra_ap_syntax::ast::{self, AstNode, HasName};
 use ra_ap_syntax::{SyntaxNode, TextRange, TextSize};
 use ra_ap_vfs::{FileId, Vfs, VfsPath};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -463,40 +463,67 @@ fn syn_backed(
         .any(|s| s.file == b.file && s.range.contains_range(anchor) && s.sig == b.sig)
 }
 
-/// impl의 정규 서명 — 해석된 트레이트(정규 ID + 타입 인자)와 해석된
-/// self 타입. 소스 표기와 달리 `use` 별칭·외부 트레이트·섀도잉된 타입
-/// 별칭 인자(`type A=u8` vs `type A=u16`)까지 실제 정체로 비교된다.
-/// 해석할 수 없는 부분은 빈 문자열로 둔다 — 정체를 모르면 표기로
-/// 속이는 비교보다 못하다는 판단에 따른 보수적 렌더링이다.
-fn impl_sig(db: &dyn HirDatabase, i: Impl) -> String {
-    let dt = DisplayTarget::from_crate(db, i.module(db).krate(db).into());
-    let self_t = i.self_ty(db).display(db, dt).to_string();
-    let tr = i
-        .trait_ref(db)
-        .map(|tr| {
-            let name = trait_id(db, tr.trait_());
-            // 첫 인자는 Self 타입 — 트레이트 인자는 1부터.
-            // get_type_argument는 타입 인자만 주므로 const/라이프타임
-            // 인자는 비교에 들어가지 않는다 — 남는 구멍으로 기록한다.
-            let args: Vec<String> = (1..=64)
-                .filter_map(|k| tr.get_type_argument(k))
-                .map(|a| a.display(db, dt).to_string())
-                .collect();
-            if args.is_empty() {
-                name
-            } else {
-                format!("{name}<{}>", args.join(","))
+/// impl의 정규 서명 — 해석된 트레이트(정규 경로 + 모든 인자)와 해석된
+/// self 타입을 소스-코드 렌더링으로 적는다. `display_source_code`는
+/// `a::T`/`b::T`처럼 같은 이름의 다른 타입도 정규화된 경로로 구분하고,
+/// const·라이프타임·타입 인자를 전부 렌더링한다. 어느 조각이든 해석
+/// 또는 렌더링에 실패하면 이 impl만의 마커를 돌린다 — 다른 impl과
+/// 절대 같지 않으므로 provenance 대조가 항상 보수적으로 실패한다.
+fn impl_sig(sema: &Semantics<RootDatabase>, i: Impl) -> String {
+    let db = sema.db;
+    let module_id = i.module(db).into();
+    // 미해석 조각을 담은 서명은 다른 미해석 impl과 충돌할 수 있다 —
+    // 정체가 아니므로 이 impl 고유의 마커로 바꾼다.
+    let unknown = |what: &str| format!("\u{0}unresolved {what} {i:?}");
+    // 소스에는 트레이트가 쓰였는데 hir에는 없다 — 미해석 트레이트
+    // 경로가 있는 impl을 hir가 고유 impl로 떨어뜨린 경우다.
+    // `impl Foo for S`(Foo 미해석)가 `impl S`와 같은 서명을 갖는 것을
+    // 막는다.
+    let wants_trait = sema.source(i).is_some_and(|s| s.value.trait_().is_some());
+    let tr = match i.trait_ref(db) {
+        Some(tr) => {
+            let t = tr.trait_();
+            // trait_ref의 렌더링은 짧은 이름 뒤에 전체 인자 목록이 온다 —
+            // `<…>` 꼬리를 떼어 정규 경로에 붙인다.
+            let short = t.name(db).as_str().to_string();
+            match tr.display_source_code(db, module_id, true) {
+                Ok(full) => match full.strip_prefix(short.as_str()) {
+                    Some(args) => format!("{}{args}", trait_id(db, t)),
+                    None => return unknown("trait-args"),
+                },
+                Err(_) => return unknown("trait"),
             }
-        })
-        .unwrap_or_default();
-    format!("{tr} for {self_t}")
+        }
+        None if wants_trait => return unknown("trait"),
+        None => String::new(),
+    };
+    match i.self_ty(db).display_source_code(db, module_id, true) {
+        Ok(self_t) => {
+            let sig = format!("{tr} for {self_t}");
+            if sig.contains("{unknown}") {
+                unknown("type")
+            } else {
+                sig
+            }
+        }
+        Err(_) => unknown("self"),
+    }
 }
 
-/// 사이트 선언이 직속 멤버인 impl의 정규 서명 — 사이트 파일을 ra로
-/// 파싱해 헤더를 *해석*한다. syn은 외부 트레이트·use 별칭을 정점 ID로
-/// 못 잡지만 ra는 해석하므로 양쪽을 같은 정규 형태로 비교할 수 있다.
-/// 사이트 아이템이 impl의 직속 메서드가 아니면(fn 안 지역 함수·자유
-/// 함수·트레이트 선언 메서드) None — 그런 선언은 위치만으로 충분하다.
+/// fn의 소속 impl 정규 서명 — impl의 직속 멤버면 Some, 트레이트 선언
+/// 메서드·자유 함수 등 impl과 무관한 정의면 None.
+fn fn_container_sig(sema: &Semantics<RootDatabase>, f: Function) -> Option<String> {
+    match f.as_assoc_item(sema.db).map(|a| a.container(sema.db)) {
+        Some(AssocItemContainer::Impl(i)) => Some(impl_sig(sema, i)),
+        _ => None,
+    }
+}
+
+/// 사이트 선언이 직속 멤버인 impl의 정규 서명 — 사이트 파일에서 fn을
+/// 찾아 소속 impl의 def를 읽는다. 정의 측과 같은 `impl_sig`를 쓰므로
+/// 렌더링 비대칭이 없다. 사이트 아이템이 impl의 직속 메서드가 아니면
+/// (fn 안 지역 함수·자유 함수·트레이트 선언 메서드·const 안의 중첩
+/// impl) None — 그런 선언은 위치만으로 충분하다.
 fn site_impl_sig(sema: &Semantics<RootDatabase>, file: FileId, range: TextRange) -> Option<String> {
     let parsed = sema.parse(sema.attach_first_edition_opt(file)?);
     // preorder라 바깥쪽 fn이 먼저 온다 — 사이트 범위에 이름이 들어있는
@@ -513,92 +540,82 @@ fn site_impl_sig(sema: &Semantics<RootDatabase>, file: FileId, range: TextRange)
     // 직속 멤버만 — 부모가 아이템 목록이고 그 부모가 impl이어야 한다.
     // 트레이트 선언 메서드·자유 함수·중첩 fn은 여기서 걸러진다.
     let imp = f.syntax().parent()?.parent().and_then(ast::Impl::cast)?;
-    let dt = DisplayTarget::from_crate(sema.db, sema.first_crate(file)?.into());
-    // 속성 매크로가 달린 impl은 파일 파스에서는 매크로 입력 토큰일 뿐이라
-    // 이름 해석이 닿지 않는다 — 확장 안의 노드로 서명을 만든다. 확장에는
-    // 입력 impl의 사본 외에 형제 impl도 있을 수 있으므로, 사이트 범위로
-    // 되돌아가는 메서드를 포함한 impl 중 입력 토큰 위치(self 타입)가
-    // 정확히 일치하는 사본을 고른다.
-    if let Some(er) = sema.expand_attr_macro(&ast::Item::Impl(imp.clone())) {
-        let want_self = imp.self_ty()?.syntax().text_range();
-        // 확장 노드의 원본 범위 — 사이트와 같은 실제 파일 좌표다.
-        let orig_range = |n: &SyntaxNode| {
-            sema.original_range_opt(n)
-                .and_then(|fr| (fr.file_id.file_id(sema.db) == file).then_some(fr.range))
-        };
-        let mut copies = er
-            .value
-            .value
-            .descendants()
-            .filter_map(ast::Impl::cast)
-            .filter(|e| {
-                // 사이트 메서드를 낳은 impl인가 — 확장 안의 fn 이름이
-                // 사이트 범위로 되돌아가야 한다.
-                let has_site_fn = e
-                    .syntax()
-                    .descendants()
-                    .filter_map(ast::Fn::cast)
-                    .any(|ef| {
-                        ef.name()
-                            .and_then(|n| orig_range(n.syntax()))
-                            .is_some_and(|r| range.contains_range(r))
-                    });
-                // 입력 impl의 토큰 사본인가 — call-site span의 형제 impl은
-                // self 타입 위치가 입력과 다르다.
-                let is_copy = e
-                    .self_ty()
-                    .is_some_and(|t| orig_range(t.syntax()) == Some(want_self));
-                has_site_fn && is_copy
-            });
-        return match (copies.next(), copies.next()) {
-            (Some(e), None) => ast_impl_sig(sema, &e, dt),
-            _ => None,
-        };
+    // impl이 블록 안에 중첩됐다면(const 초기값 안의 impl 등) 사이트는
+    // 그 메서드가 아니라 바깥 아이템이다 — 서명을 잘못 붙이면 진짜
+    // 항목이 거절된다.
+    if imp
+        .syntax()
+        .ancestors()
+        .any(|a| ast::BlockExpr::cast(a).is_some())
+    {
+        return None;
     }
-    ast_impl_sig(sema, &imp, dt)
+    // 매크로 입력이 아니면 fn의 def가 곧 정체다.
+    if let Some(fdef) = sema.to_fn_def(&f) {
+        return fn_container_sig(sema, fdef);
+    }
+    // 속성 매크로 입력 토큰은 아이템 트리에 없다 — 확장을 따라가
+    // 사본의 def를 찾는다.
+    expanded_impl_sig(sema, imp, file, range, 0)
 }
 
-/// 구문 impl의 정규 서명 — `impl_sig`와 같은 형태를 소스 노드에서 만든다.
-/// 트레이트 경로와 인자·self 타입을 *사이트의* 스코프에서 해석한다.
-/// 어느 부분이든 해석에 실패하면 None — 빈 조각으로 렌더링하면 양쪽이
-/// 같이 실패할 때 다른 impl이 같은 서명으로 보이는 거짓 동등이 생긴다.
-/// 실패는 호출자가 syn 폴백으로 돌리는 신호다.
-/// 라이프타임·const 인자는 hir 측 get_type_argument와 마찬가지로 건너뛴다
-/// — 양쪽이 같은 조각만 비교해야 일치한다.
-fn ast_impl_sig(
+/// 속성 매크로가 달린 impl의 정규 서명 — 확장 안에서 사이트 메서드의
+/// 사본을 찾아 그 def를 읽는다. 사본 fn의 *전체* 원본 범위가 사이트
+/// 안에 들어가야 한다 — 이름 토큰만 재사용된 형제는 나머지 토큰이
+/// call-site span이라 커버링 범위가 사이트를 넘어 걸러진다. 소속
+/// impl의 self 타입 원본 범위가 입력과 같아야 입력의 토큰 사본이다.
+/// 사본이 다시 매크로 입력이면 확장을 반복한다 — 서로 다른 서명이
+/// 경쟁하거나 하나로 못 좁히면 None(보수적 폴백).
+fn expanded_impl_sig(
     sema: &Semantics<RootDatabase>,
-    imp: &ast::Impl,
-    dt: DisplayTarget,
+    imp: ast::Impl,
+    file: FileId,
+    site: TextRange,
+    depth: usize,
 ) -> Option<String> {
-    let db = sema.db;
-    let self_t = sema
-        .resolve_type(&imp.self_ty()?)
-        .map(|t| t.display(db, dt).to_string())?;
-    let tr = match imp.trait_() {
-        None => String::new(),
-        Some(ast::Type::PathType(pt)) => {
-            let p = pt.path()?;
-            let name = trait_id(db, sema.resolve_trait(&p)?);
-            let mut args: Vec<String> = Vec::new();
-            if let Some(l) = p.segment().and_then(|s| s.generic_arg_list()) {
-                for a in l.generic_args() {
-                    let ast::GenericArg::TypeArg(ta) = a else {
-                        continue;
-                    };
-                    let t = ta.ty()?;
-                    args.push(sema.resolve_type(&t)?.display(db, dt).to_string());
-                }
-            }
-            if args.is_empty() {
-                name
-            } else {
-                format!("{name}<{}>", args.join(","))
-            }
-        }
-        // 경로가 아닌 트레이트 타입(`impl (dyn Tr) for ..` 류)은 정규화 못 함.
-        Some(_) => return None,
+    if depth >= MAX_EXPANSION_DEPTH {
+        return None;
+    }
+    let er = sema.expand_attr_macro(&ast::Item::Impl(imp.clone()))?;
+    let want_self = imp.self_ty()?.syntax().text_range();
+    // 확장 노드의 원본 범위 — 사이트와 같은 실제 파일 좌표다.
+    let orig_range = |n: &SyntaxNode| {
+        sema.original_range_opt(n)
+            .and_then(|fr| (fr.file_id.file_id(sema.db) == file).then_some(fr.range))
     };
-    Some(format!("{tr} for {self_t}"))
+    let mut sigs: BTreeSet<String> = BTreeSet::new();
+    let mut pending: Vec<ast::Impl> = Vec::new();
+    for ef in er.value.value.descendants().filter_map(ast::Fn::cast) {
+        if orig_range(ef.syntax()).is_none_or(|r| !site.contains_range(r)) {
+            continue;
+        }
+        let Some(eimp) = ef
+            .syntax()
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(ast::Impl::cast)
+        else {
+            continue;
+        };
+        if eimp.self_ty().and_then(|t| orig_range(t.syntax())) != Some(want_self) {
+            continue;
+        }
+        match sema.to_fn_def(&ef) {
+            Some(fdef) => sigs.extend(fn_container_sig(sema, fdef)),
+            // 사본이 다시 매크로 입력 — 다음 확장 단계에서 찾는다.
+            None => pending.push(eimp),
+        }
+    }
+    for p in pending {
+        // 후보 사본의 정체를 확립하지 못하면 그것이 다른 impl일 수
+        // 있으므로 애매로 본다.
+        sigs.insert(expanded_impl_sig(sema, p, file, site, depth + 1)?);
+    }
+    if sigs.len() == 1 {
+        sigs.into_iter().next()
+    } else {
+        None
+    }
 }
 
 /// 정의의 소스 정체를 잡아 인덱스 항목으로 만든다 — 블록(fn 본문) 안에
@@ -672,7 +689,7 @@ fn body_entry(
     // 정체로 구분한다.
     let sig = match def {
         BodyDef::Fn(f) => match f.as_assoc_item(sema.db).map(|a| a.container(sema.db)) {
-            Some(AssocItemContainer::Impl(i)) => Some(impl_sig(sema.db, i)),
+            Some(AssocItemContainer::Impl(i)) => Some(impl_sig(sema, i)),
             _ => None,
         },
         _ => None,
