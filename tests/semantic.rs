@@ -274,6 +274,98 @@ fn auto_trait_only_object_stays_open() {
 }
 
 #[test]
+fn derived_method_call_targets_type() {
+    let d = sem_doc();
+    // `u.clone()` — Clone impl은 #[derive]가 만든다 — 생성 메서드는
+    // 정점이 없으니 호출은 impl 대상 타입으로 귀속된다.
+    let e = call(&d, "fixture_core::clone_used", "fixture_core::Used")
+        .expect("derived method call resolves to the impl'd type");
+    assert!(!e.tentative, "concrete receiver stays firm");
+    // 생성 메서드 정점 이름으로 가는 간선은 없어야 한다(유령 정점 금지).
+    assert!(call(
+        &d,
+        "fixture_core::clone_used",
+        "fixture_core::Used::<Clone>::clone"
+    )
+    .is_none());
+}
+
+#[test]
+fn proc_macro_call_keeps_crate_use() {
+    let d = sem_doc();
+    // proc 매크로 크레이트는 정점이 없는 타깃 종류라 선언 대신
+    // 크레이트(루트 모듈) 정점으로 귀속한다.
+    let e = call(&d, "fixture_core::proc_call", "fixture_macros")
+        .expect("proc-macro use edge to the crate vertex");
+    assert!(!e.tentative);
+    // 확장은 proc 매크로 서버가 있을 때만 — 서버가 붙으면 확장 안의
+    // 호출이 확정 간선으로, 없으면 proc-macro 전용 limitation이 실측한다.
+    let expanded = call(&d, "fixture_core::proc_call", "fixture_core::util::helper")
+        .is_some_and(|e| !e.tentative);
+    // 서버 부재 전용 실측 문구만 매칭한다 — 일반 확장 실패 문구("…or
+    // expansion failure")에 "proc-macro"가 들어있어 넓게 매칭하면
+    // 무관한 실패가 이 단언을 통과시킨다.
+    let srv_down = d
+        .limitations
+        .iter()
+        .any(|l| l.contains("proc-macro invocations could not be expanded"));
+    assert!(
+        expanded || srv_down,
+        "firm expansion edge or the proc-macro limitation"
+    );
+}
+
+/// 속성 매크로가 감싼 impl — 메서드 정점이 실재하므로 호출은 타입이
+/// 아니라 그 정점으로 간다.
+#[test]
+fn attr_macro_impl_keeps_method_vertex() {
+    let d = sem_doc();
+    let e = call(&d, "fixture_core::kept_ping", "fixture_core::Kept::ping")
+        .expect("call edge to the real method vertex");
+    assert!(!e.tentative);
+    // 생성 impl 타입 귀속이면 생기는 잘못된 call 간선 — `Kept`는
+    // 생성자 참조(References)로만 가야 한다.
+    assert!(
+        call(&d, "fixture_core::kept_ping", "fixture_core::Kept").is_none(),
+        "call edge must not collapse to the type vertex"
+    );
+}
+
+/// 블록 지역 `#[derive]` 타입의 생성 메서드 호출은 같은 이름의 모듈
+/// 정점으로 귀속되면 안 된다 — 정규 ID 충돌이다.
+#[test]
+fn block_local_derive_does_not_collide() {
+    let d = sem_doc();
+    assert!(call(&d, "fixture_core::local_derived", "fixture_core::Local").is_none());
+}
+
+#[test]
+fn out_dir_defs_resolve_to_module() {
+    let d = sem_doc();
+    // OUT_DIR 산출물 안의 정의들 — 정점은 없지만 소속 모듈 정점으로
+    // 귀속돼야 한다(syn이 모듈 경로로 잡던 것과 같은 표면).
+    // out_dirs 로드가 꺼져 있으면 이 간선은 만들어지지 않는다.
+    let refs = |to: &str, kind: EdgeKind| {
+        d.edges
+            .iter()
+            .any(|e| e.from == "fixture_core::uses_built" && e.to == to && e.kind == kind)
+    };
+    assert!(
+        refs("fixture_core::built", EdgeKind::References),
+        "const ref to module"
+    );
+    assert!(
+        refs("fixture_core::built", EdgeKind::Call),
+        "generated fn call to module"
+    );
+    // 크레이트 루트에 include!된 상수 — 소속 모듈이 크레이트 루트다.
+    assert!(
+        refs("fixture_core", EdgeKind::References),
+        "root-included const"
+    );
+}
+
+#[test]
 fn merged_bin_root_body_uses_its_own_file() {
     let d = sem_doc();
     // lib와 같은 이름의 bin — 루트 합본에서 bin 본문의 파일은
@@ -296,6 +388,298 @@ fn block_local_ctor_does_not_collide() {
     assert!(call(&d, "fixture_app::local_ctor", "fixture_app::local_scope").is_none());
 }
 
+/// 같은 ID로 충돌하는 두 트레이트 impl — 매크로가 만든 `b::Tr` impl의
+/// 메서드는 `S::<Tr>::m`이라는 같은 문자열 ID를 갖지만 provenance가
+/// 없다. syn이 수확한 `a::Tr` 쪽 정점으로 귀속되면 안 된다.
+#[test]
+fn generated_impl_does_not_steal_sibling_vertex() {
+    let d = sem_doc();
+    // a::Tr 디스패치 — syn이 수확한 진짜 메서드 정점으로 간다.
+    assert!(
+        call(&d, "fixture_core::dispatch_a", "fixture_core::S::<Tr>::m")
+            .is_some_and(|e| e.tentative)
+    );
+    // b::Tr 디스패치 — 확장 안의 메서드는 정점이 없으니 impl 대상 타입으로.
+    assert!(call(&d, "fixture_core::dispatch_b", "fixture_core::S").is_some_and(|e| e.tentative));
+    // 충돌하는 a::Tr 정점으로 가는 간선은 만들어지면 안 된다.
+    assert!(call(&d, "fixture_core::dispatch_b", "fixture_core::S::<Tr>::m").is_none());
+}
+
+/// span 보존 생성 메서드 — proc 매크로가 입력 토큰의 위치를 재사용해
+/// 만든 `c::Tr` impl 메서드는 이름 앵커까지 `a::Tr`의 진짜 선언과 겹친다.
+/// 위치만으로는 구분이 안 되므로 트레이트 정체(`a::Tr` vs `c::Tr`)로
+/// 가려야 한다 — `S::<Tr>::m`이 아니라 `S`로 귀속돼야 한다.
+#[test]
+fn span_preserved_generated_method_does_not_steal() {
+    let d = sem_doc();
+    assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S").is_some_and(|e| e.tentative));
+    assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S::<Tr>::m").is_none());
+}
+
+/// 같은 소스 표기(`impl Tr for S2`)지만 다른 트레이트를 가리키는 생성
+/// impl — 확장 안의 `use`가 `Tr`을 `b::Tr`로 가린다. 소스 표기 동등이
+/// 해석된 정체의 모순을 덮으면 `S2::<Tr>::m`을 훔친다.
+#[test]
+fn shadowed_written_trait_does_not_steal() {
+    let d = sem_doc();
+    assert!(call(
+        &d,
+        "fixture_core::dispatch_shadow_a",
+        "fixture_core::S2::<Tr>::m"
+    )
+    .is_some_and(|e| !e.tentative));
+    assert!(call(&d, "fixture_core::dispatch_shadow_b", "fixture_core::S2").is_some());
+    assert!(call(
+        &d,
+        "fixture_core::dispatch_shadow_b",
+        "fixture_core::S2::<Tr>::m"
+    )
+    .is_none());
+}
+
+/// 인자만 다른 제네릭 impl — 해석된 트레이트는 같으므로 소스 표기의
+/// 인자 부분으로 가린다. `G<u16>`의 생성 메서드가 `S3::<G>::m`을
+/// 훔치면 안 된다.
+#[test]
+fn generic_arg_written_path_does_not_steal() {
+    let d = sem_doc();
+    assert!(
+        call(&d, "fixture_core::dispatch_g8", "fixture_core::S3::<G>::m")
+            .is_some_and(|e| !e.tentative)
+    );
+    assert!(call(&d, "fixture_core::dispatch_g16", "fixture_core::S3").is_some());
+    assert!(call(&d, "fixture_core::dispatch_g16", "fixture_core::S3::<G>::m").is_none());
+}
+
+/// 속성 매크로가 익명 const로 감싼 진짜 impl — 확장이 블록을 추가해도
+/// 메서드 정점은 syn provenance가 확인되므로 확정 간선을 유지한다.
+/// 타입 정점으로 떨어지면 지역성 검사가 진짜 선언을 거절한 것이다.
+#[test]
+fn const_wrapped_real_impl_keeps_method_vertex() {
+    let d = sem_doc();
+    let e = call(&d, "fixture_core::wrap_ping", "fixture_core::Cloaked::ping")
+        .expect("call edge to the real method vertex");
+    assert!(!e.tentative);
+    assert!(call(&d, "fixture_core::wrap_ping", "fixture_core::Cloaked").is_none());
+}
+
+/// 같은 물리 파일을 두 모듈이 가리킨다 — `outer_a::duplex`와
+/// `outer_b::inner`가 같은 `duplex.rs`를 가리키고, `super::` 경로는
+/// 문맥마다 다른 정점(`outer_a::probe`/`outer_b::probe`)을 가리킨다.
+/// ra가 사이트 def를 임의의 문맥으로 묶으면(`file_to_def().first()`)
+/// 잘못된 모듈의 본문이 귀속되고 한쪽 `probe` 간선이 빠진다 —
+/// 소유 모듈 대조로 걸러야 한다. 어느 쪽이 먼저 선택되든 두 간선이
+/// 다 있어야 한다.
+#[test]
+fn shared_file_resolves_per_module_context() {
+    let d = sem_doc();
+    assert!(
+        call(
+            &d,
+            "fixture_core::S::<Tr>::m",
+            "fixture_core::outer_a::probe"
+        )
+        .is_some(),
+        "outer_a::duplex 문맥의 본문이 빠졌다 — 잘못된 문맥 귀속"
+    );
+    assert!(
+        call(
+            &d,
+            "fixture_core::S::<Tr>::m",
+            "fixture_core::outer_b::probe"
+        )
+        .is_some(),
+        "outer_b::inner 문맥의 본문이 빠졌다 — 잘못된 문맥 귀속"
+    );
+}
+
+/// 원본 impl이 함수형 매크로 호출(`passthrough!`) 안에 숨겨지고,
+/// 헤더 span을 위조한 형제 impl(`c::Tr`)이 나란히 나오는 경우 — 확장
+/// 트리의 매크로 호출 안을 재귀 확장하지 않으면 위조 사본이 단독 후보로
+/// 채택된다. 정점 `S4::<Tr>::m`은 진짜 `a::Tr` 본문의 간선만 가져야 한다.
+#[test]
+fn hidden_original_forged_sibling_does_not_steal() {
+    let d = sem_doc();
+    // 위조 사본 본문의 호출 — 절대 귀속되면 안 된다.
+    assert!(call(
+        &d,
+        "fixture_core::S4::<Tr>::m",
+        "fixture_core::forged_target"
+    )
+    .is_none());
+    // 진짜 본문의 호출 — syn 폴백이든 정확한 해결이든 있어야 한다
+    // (공허 통과 방지 대조).
+    assert!(
+        call(&d, "fixture_core::S4::<Tr>::m", "fixture_core::a::probe").is_some(),
+        "real body's call edge must exist"
+    );
+    // 위조 사본이 단독 후보로 채택되면 그 def가 사이트에 대입되고,
+    // `syn_backed`를 통과해 `dispatch_c`(dyn c::Tr)에서 진짜 `a::Tr`
+    // 정점 `S4::<Tr>::m`을 훔친다 — 이 간선의 부재가 중첩 확장 재귀를
+    // 실제로 구분한다. 걸러지면 impl 소유 타입 `S4`로 폴백한다.
+    assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S4::<Tr>::m").is_none());
+    assert!(
+        call(&d, "fixture_core::dispatch_c", "fixture_core::S4").is_some(),
+        "forged impl must fall back to its owner type vertex"
+    );
+}
+
+/// 원본 impl이 `#[emit_args(..)]`의 인자 토큰 안에 숨겨지는 변형 —
+/// 확장 트리에서 보이는 fn이 없는 아이템의 속성 매크로도 재귀 확장해야
+/// 후보 집합이 완전하다.
+#[test]
+fn hidden_in_attr_args_forged_sibling_does_not_steal() {
+    let d = sem_doc();
+    assert!(call(
+        &d,
+        "fixture_core::S5::<Tr>::m",
+        "fixture_core::forged_target"
+    )
+    .is_none());
+    assert!(
+        call(&d, "fixture_core::S5::<Tr>::m", "fixture_core::a::probe").is_some(),
+        "real body's call edge must exist"
+    );
+    // 위조 사본이 단독 후보로 채택되면 dyn c::Tr 디스패치가 진짜 정점을
+    // 훔친다 — 부재 단언이 아이템 속성 매크로 재귀를 실제로 구분한다.
+    assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S5::<Tr>::m").is_none());
+    assert!(
+        call(&d, "fixture_core::dispatch_c", "fixture_core::S5").is_some(),
+        "forged impl must fall back to its owner type vertex"
+    );
+}
+
+/// `#[path]`가 비-`mod.rs` 파일(`single.rs`) 안에 있으면 기준은
+/// 파일 디렉터리(`src/`)다 — `module_dir`(`src/single/`)을 쓰면
+/// `sibling.rs`를 못 찾아 `inner` 모듈이 통째로 빠진다.
+#[test]
+fn path_attr_in_non_mod_rs_uses_file_dir() {
+    let d = syn_doc();
+    assert!(
+        d.vertices
+            .iter()
+            .any(|v| v.id == "fixture_core::single::inner::right_file"),
+        "#[path] base dir must be the file's directory"
+    );
+}
+
+/// fn 안 `#[path]` 모듈 — 같은 파일을 가리키는 지역 모듈의 정의는
+/// 원본 위치가 모듈 선언과 같다. 지역 정의가 `fixture_core::shared::*`
+/// 정점으로 귀속되면 모듈 선언을 훔치는 것이다.
+/// 대조군: 모듈 레벨 `shared`의 같은 호출은 정점으로 확정 해석된다 —
+/// 정점이 실재함과 해석이 동작함을 보인다.
+#[test]
+fn fn_local_path_module_does_not_steal() {
+    let d = sem_doc();
+    // 대조군 — 모듈 레벨 shared의 같은 정의들은 정점으로 해석된다.
+    assert!(call(
+        &d,
+        "fixture_core::use_shared",
+        "fixture_core::shared::Shared::val"
+    )
+    .is_some_and(|e| !e.tentative));
+    assert!(call(
+        &d,
+        "fixture_core::use_shared",
+        "fixture_core::shared::helper"
+    )
+    .is_some_and(|e| !e.tentative));
+    // 지역 모듈의 같은 호출은 그 정점으로 가면 안 된다 — 다른 이름
+    // (local_shared)도, 같은 이름(shared — 정규 ID까지 겹침)도 안 된다.
+    for from in [
+        "fixture_core::local_shadowed",
+        "fixture_core::local_shadowed_same_name",
+    ] {
+        assert!(
+            !d.edges
+                .iter()
+                .any(|e| e.from == from && e.to.starts_with("fixture_core::shared")),
+            "block-local module must not steal module vertices ({from})"
+        );
+    }
+}
+
+/// `impl Gen<u8>`/`impl Gen<u16>` — 정점 ID는 같고 본문은 다르다.
+/// 인덱스가 한 항목만 저장하면 다른 쪽 본문의 간선이 빠진다.
+/// 메서드 호출의 *확정* 간선으로 검증한다 — syn 폴백은 메서드 호출을
+/// 추정으로만 만들어 같은 단언을 위조할 수 없다.
+#[test]
+fn generic_impls_sharing_id_keep_both_bodies() {
+    let d = sem_doc();
+    assert!(
+        call(&d, "fixture_core::Gen::pick", "fixture_core::Used::doubled")
+            .is_some_and(|e| !e.tentative)
+    );
+    assert!(call(
+        &d,
+        "fixture_core::Gen::pick",
+        "fixture_core::Used::quadrupled"
+    )
+    .is_some_and(|e| !e.tentative));
+}
+
+/// 익명 const 안의 생성 impl(serde_derive 패턴) — self 타입이 모듈
+/// 레벨이면 디스패치 후보로 유효해 impl 대상 타입으로 귀속된다.
+#[test]
+fn const_wrapped_generated_impl_keeps_owner() {
+    let d = sem_doc();
+    assert!(
+        call(&d, "fixture_core::dyn_dispatch", "fixture_core::IntOrFloat")
+            .is_some_and(|e| e.tentative)
+    );
+}
+
+/// 매크로가 함수 안에서 만든 지역 타입 — 확장 구문만으로는 감싼 함수가
+/// 안 보이지만, 호출의 impl owner가 모듈 레벨 같은-이름 정점으로 귀속되면
+/// 안 된다.
+#[test]
+fn macro_generated_local_type_does_not_collide() {
+    let d = sem_doc();
+    // 생성자 참조와 생성 메서드 호출 둘 다 모듈 정점으로 새면 안 된다.
+    assert!(!d
+        .edges
+        .iter()
+        .any(|e| e.from == "fixture_core::gen_local" && e.to.starts_with("fixture_core::Shadow")));
+}
+
+/// 속성 매크로가 직접 붙은 fn — 확장은 소비된 속성을 빼므로 ra의 아이템
+/// 범위가 syn보다 짧다. provenance 대조는 이름 토큰 앵커여야 한다.
+#[test]
+fn attr_macro_fn_keeps_provenance() {
+    let d = sem_doc();
+    assert!(
+        call(&d, "fixture_core::call_kept", "fixture_core::kept_fn").is_some_and(|e| !e.tentative)
+    );
+}
+
+/// 메서드 정점도 ADT owner도 없는 impl — 후보를 조용히 버리면
+/// limitation이 거짓말을 하므로 디스패치 후보 전용 카운터로 세어져야 한다.
+/// fixture에서 표현 불가 후보는 정확히 하나다: `impl Primitive for u8`.
+/// (`impl<T: ?Sized> Poke for T` 같은 빈 blanket impl은 디스패치가
+/// 트레이트 기본 구현 정점으로 해석되므로 후보가 표현 가능하다.)
+#[test]
+fn unrepresentable_candidate_is_counted() {
+    let d = sem_doc();
+    // 트레이트 선언점에는 추정 간선이 간다.
+    assert!(call(
+        &d,
+        "fixture_core::prim_dispatch",
+        "fixture_core::Primitive::hit"
+    )
+    .is_some_and(|e| e.tentative));
+    // 표현 불가 후보는 간선이 아니라 전용 limitation으로 실측된다 —
+    // 무관한 external 경로가 이 단언을 통과시키지 않게 수치를 고정한다.
+    let n = d
+        .limitations
+        .iter()
+        .find_map(|l| {
+            l.split_once(" trait-dispatch candidates have no graph vertex")
+                .and_then(|(n, _)| n.parse::<usize>().ok())
+        })
+        .expect("unrepresentable-candidate limitation");
+    assert_eq!(n, 1, "u8 primitive impl only");
+}
+
 #[test]
 fn syn_mode_still_fans_out() {
     // 기본 모드 계약은 그대로 — 같은-이름 팬아웃이 추정 간선으로 남는다.
@@ -309,5 +693,234 @@ fn syn_mode_still_fans_out() {
     assert!(e.tentative);
     assert!(
         call(&s, "fixture_app::main", "fixture_core::Other::greet").is_some_and(|e| e.tentative)
+    );
+}
+
+/// 확장 트리 안의 fn 아이템에 달린 속성 매크로 — `ancestors()`가 자기
+/// 자신을 포함하면 fn 캐리어가 "fn 본문 안"으로 오인돼 속성이
+/// 건너뛰어진다. 엄밀 조상만 봐야 원본 사본이 보인다.
+#[test]
+fn fn_carrier_attr_macro_still_expands() {
+    let d = sem_doc();
+    assert!(call(
+        &d,
+        "fixture_core::S6::<Tr>::m",
+        "fixture_core::forged_target"
+    )
+    .is_none());
+    assert!(
+        call(&d, "fixture_core::S6::<Tr>::m", "fixture_core::a::probe").is_some(),
+        "real body's call edge must exist"
+    );
+    assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S6::<Tr>::m").is_none());
+    assert!(
+        call(&d, "fixture_core::dispatch_c", "fixture_core::S6").is_some(),
+        "forged impl must fall back to its owner type vertex"
+    );
+}
+
+/// derive 출력(`mod dup_hid` 안의 `fn m`)이 숨은 후보다 — derive를
+/// 확장하지 않으면 위조 형제가 단독 후보로 채택된다. derive 확장이
+/// 두 번째 앵커 후보를 드러내면 소유권은 애매로 빠진다.
+#[test]
+fn derive_hidden_candidate_does_not_steal() {
+    let d = sem_doc();
+    assert!(call(
+        &d,
+        "fixture_core::S7::<Tr>::m",
+        "fixture_core::forged_target"
+    )
+    .is_none());
+    assert!(
+        call(&d, "fixture_core::S7::<Tr>::m", "fixture_core::a::probe").is_some(),
+        "real body's call edge must exist"
+    );
+    assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S7::<Tr>::m").is_none());
+    assert!(
+        call(&d, "fixture_core::dispatch_c", "fixture_core::S7").is_some(),
+        "forged impl must fall back to its owner type vertex"
+    );
+}
+
+/// 죽은 `cfg_attr` 안의 속성 — inert 등록부에는 있지만 안쪽 속성의
+/// 인자 토큰은 평가 없이는 검증할 수 없다. 미평가 cfg_attr를 inert로
+/// 건너뛰면 위조 형제가 단독 후보가 된다.
+#[test]
+fn dormant_cfg_attr_fails_closed() {
+    let d = sem_doc();
+    assert!(call(
+        &d,
+        "fixture_core::S9::<Tr>::m",
+        "fixture_core::forged_target"
+    )
+    .is_none());
+    assert!(
+        call(&d, "fixture_core::S9::<Tr>::m", "fixture_core::a::probe").is_some(),
+        "real body's call edge must exist"
+    );
+    assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S9::<Tr>::m").is_none());
+    assert!(
+        call(&d, "fixture_core::dispatch_c", "fixture_core::S9").is_some(),
+        "forged impl must fall back to its owner type vertex"
+    );
+}
+
+/// 인라인 조상의 `#[path]` 오버라이드 — `mod nest { #[path="deep"]
+/// mod inner { #[path="leaf.rs"] mod leaf; } }`에서 leaf의 기준
+/// 디렉터리는 `src/nest/inner`가 아니라 `src/nest/deep`이다. 조상의
+/// `#[path]`를 무시하면 leaf 모듈이 통째로 빠진다.
+#[test]
+fn inline_path_attr_overrides_dir() {
+    let d = syn_doc();
+    assert!(
+        d.vertices
+            .iter()
+            .any(|v| v.id == "fixture_core::nest::inner::leaf::leaf_probe"),
+        "inline ancestor's #[path] must override the dir segment"
+    );
+    assert!(call(
+        &d,
+        "fixture_core::call_leaf",
+        "fixture_core::nest::inner::leaf::leaf_probe"
+    )
+    .is_some());
+}
+
+/// 활성 매크로 호출 앞의 미검증 속성 — dormant `cfg_attr` 안에 원본
+/// 사본이 있고 활성 `emit_args`는 위조 형제만 emit한다. 아이템 전체
+/// `is_attr_macro_call`은 true지만 `cfg_attr` 자신은 호출이 아니다 —
+/// 속성 단위 판별 없이는 위조가 단독 후보로 스틸한다.
+#[test]
+fn unverifiable_attr_before_macro_call_fails_closed() {
+    let d = sem_doc();
+    assert!(call(
+        &d,
+        "fixture_core::S8::<Tr>::m",
+        "fixture_core::forged_target"
+    )
+    .is_none());
+    assert!(
+        call(&d, "fixture_core::S8::<Tr>::m", "fixture_core::a::probe").is_some(),
+        "real body's call edge must exist"
+    );
+    assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S8::<Tr>::m").is_none());
+    assert!(
+        call(&d, "fixture_core::dispatch_c", "fixture_core::S8").is_some(),
+        "forged impl must fall back to its owner type vertex"
+    );
+}
+
+/// 확장 출력 안의 `#[cfg]`가 달린 무관한 아이템 — cfg는 inert 내장
+/// 속성인데 전용 Meta 변형이라 path()가 None이다. 정체 불명으로
+/// 오인해 후보 탐색 전체가 애매해지면 안 된다.
+#[test]
+fn cfg_attr_on_sibling_item_is_inert() {
+    let d = sem_doc();
+    // `self.probe2()`는 semantic 해석이 필요한 메서드 호출이다 — cfg가
+    // 오인돼 사이트 해석이 애매해지면 syn 팬아웃의 tentative로 떨어진다.
+    let e = call(
+        &d,
+        "fixture_core::S10::<Tr>::m",
+        "fixture_core::S10::probe2",
+    )
+    .expect("real body's call edge must exist");
+    assert!(
+        !e.tentative,
+        "cfg-annotated sibling must not lose ownership"
+    );
+}
+
+/// 비-mod.rs 파일 안 인라인 조상의 `#[path]` — `single.rs`의
+/// `#[path="pathdir"] mod pin`은 `src/single/pathdir/`가 아니라
+/// `src/pathdir/`를 자식 기준으로 한다(rustc 규칙 — 파일에 직접
+/// 선언된 `#[path]`는 파일 디렉터리 기준).
+#[test]
+fn non_mod_rs_inline_path_attr_uses_file_dir() {
+    let d = syn_doc();
+    assert!(
+        d.vertices
+            .iter()
+            .any(|v| v.id == "fixture_core::single::pin::pin_leaf::pv"),
+        "inline #[path] in non-mod.rs file must resolve at the file's dir"
+    );
+    assert!(call(
+        &d,
+        "fixture_core::single::call_pin",
+        "fixture_core::single::pin::pin_leaf::pv"
+    )
+    .is_some());
+}
+
+/// 인라인 `#[path]` 조상 아래의 일반 파일 자식도 오버라이드된 기준
+/// 디렉터리를 따라간다 — `src/pathdir/pin_plain.rs`다.
+#[test]
+fn plain_child_under_inline_path_attr_uses_overridden_dir() {
+    let d = syn_doc();
+    assert!(
+        d.vertices
+            .iter()
+            .any(|v| v.id == "fixture_core::single::pin::pin_plain::pw"),
+        "plain file child under #[path] inline must use the overridden dir"
+    );
+    assert!(call(
+        &d,
+        "fixture_core::single::call_pin",
+        "fixture_core::single::pin::pin_plain::pw"
+    )
+    .is_some());
+}
+
+/// `#[path]`로 로드된 파일은 자기 디렉터리를 자식 기준으로 소유한다
+/// — `loaded.rs` 안의 `mod inline`은 `src/ploaded/inline/`이지
+/// `src/ploaded/loaded/inline/`이 아니다(rustc 실증).
+#[test]
+fn path_loaded_file_owns_its_dir() {
+    let d = syn_doc();
+    assert!(
+        d.vertices
+            .iter()
+            .any(|v| v.id == "fixture_core::single::pmod::inline::leaf::pl"),
+        "children of a #[path]-loaded file resolve under the file's dir"
+    );
+    assert!(call(
+        &d,
+        "fixture_core::single::call_pin",
+        "fixture_core::single::pmod::call_leaf"
+    )
+    .is_some());
+}
+/// cfg_attr로 활성화된 호출 뒤의 메타는 그 호출의 입력 토큰이다 —
+/// 호출 확인 즉시 중단하지 않으면 뒤 메타를 invoc와 대조해 틀리고
+/// 사이트 전체가 애매로 빠진다.
+#[test]
+fn trailing_meta_after_invoc_stays_input() {
+    let d = sem_doc();
+    let e = call(
+        &d,
+        "fixture_core::S11::<Tr>::m",
+        "fixture_core::S11::probe3",
+    )
+    .expect("real body's call edge must exist");
+    assert!(
+        !e.tentative,
+        "meta after the invocation must be treated as its input"
+    );
+}
+
+/// 인라인 모듈의 `#![cfg_attr]` 안에 숨은 미검증 토큰 — 내부 속성을
+/// 분류하지 않으면 위조 사본이 단독 후보로 스틸한다.
+#[test]
+fn inner_cfg_attr_fails_closed() {
+    let d = sem_doc();
+    assert!(call(
+        &d,
+        "fixture_core::S12::<Tr>::m",
+        "fixture_core::forged_target"
+    )
+    .is_none());
+    assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S12::<Tr>::m").is_none());
+    assert!(
+        call(&d, "fixture_core::dispatch_c", "fixture_core::S12").is_some(),
+        "forged impl must fall back to its owner type vertex"
     );
 }

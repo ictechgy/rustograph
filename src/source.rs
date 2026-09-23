@@ -173,7 +173,17 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
     // 잡고, 모르는 본문(cfg 비활성·매크로 생성)만 syn 팬아웃으로 돌아간다.
     #[cfg(feature = "semantic")]
     let engine = if opts.semantic {
-        Some(sem::Engine::load(&meta.workspace_root)?)
+        // syn이 수확한 선언 위치 — 의미 해석 쪽에서 정규 ID 문자열이
+        // 가리키는 정점의 provenance 검증에 쓴다(생성 정의 충돌 방지).
+        let mut sites: BTreeMap<String, Vec<sem::Site>> = BTreeMap::new();
+        for b in &bodies {
+            sites.entry(b.id.clone()).or_default().push(sem::Site {
+                file: b.file.clone(),
+                range: b.range.clone(),
+                module: b.module.clone(),
+            });
+        }
+        Some(sem::Engine::load(&meta.workspace_root, &sites)?)
     } else {
         None
     };
@@ -187,6 +197,11 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
                 cfg: &b.cfg,
                 file: &b.file,
                 range: &b.range,
+                // 소유 크레이트·모듈 — 같은 파일을 둘이 넘는 문맥이
+                // 공유해도(공유 include!·`#[path]`) 선언 문맥으로 정확한
+                // 항목을 고른다.
+                krate: b.module.split("::").next().unwrap_or_default(),
+                module: &b.module,
             };
             match eng.body_edges(&site, &ids, &method_index, &mut st) {
                 Some(es) => {
@@ -288,6 +303,24 @@ fn emit_crate_level(
         // 충돌한다.
         if p.workspace_member {
             present.insert(p.name.as_str());
+            // lib/bin 타깃이 없는 멤버(proc-macro 크레이트 등)는 겸임할 루트
+            // 모듈이 없다 — depends 간선이 dangling하지 않게 정점을 만든다.
+            if p.targets
+                .iter()
+                .all(|t| !matches!(t.kind.as_str(), "lib" | "bin"))
+            {
+                vertices.push(Vertex {
+                    id: p.name.clone(),
+                    kind: Kind::Crate,
+                    krate: p.name.clone(),
+                    module: p.name.clone(),
+                    position: None,
+                    exported: false,
+                    generated: false,
+                    cfg: None,
+                    unsafe_: false,
+                });
+            }
             continue;
         }
         if !include_deps {
@@ -365,9 +398,8 @@ fn grow_tree(
         let Some(groups) = module_items(tree, arena, &mp) else {
             continue;
         };
-        let dir = modtree::module_dir(&tree.modules[&mp].file);
         for sub in
-            modtree::collect_submodules(&flatten_items(&groups), &mp, &dir, tree, conditional_count)
+            modtree::collect_submodules(&flatten_items(&groups), &mp, tree, conditional_count)
         {
             let file = tree.modules[&sub].file.clone();
             if tree.modules[&sub].file_module {
@@ -640,6 +672,18 @@ fn push_sem_stats(
         limitations.push(format!(
             "{} call targets resolved to items outside the graph (dependencies, std, or macro/derive-generated defs)",
             st.external
+        ));
+    }
+    if st.proc_macros > 0 && !has_proc_macros {
+        limitations.push(format!(
+            "{} proc-macro invocations could not be expanded (proc-macro server unavailable)",
+            st.proc_macros
+        ));
+    }
+    if st.unrepresentable > 0 {
+        limitations.push(format!(
+            "{} trait-dispatch candidates have no graph vertex (blanket, primitive, or generated impls); counted at dispatch sites",
+            st.unrepresentable
         ));
     }
     if st.unexpanded > 0 {

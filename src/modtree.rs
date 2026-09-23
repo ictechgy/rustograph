@@ -33,6 +33,12 @@ pub struct Module {
     pub public: bool,
     /// `#[cfg(...)]` 조건 토큰 — `mod` 선언에 붙은 것만(조상 조건은 조상 정점에).
     pub cfg: Option<String>,
+    /// 이 모듈 안에 선언된 자식 모듈의 기준 디렉터리 — rustc 규칙:
+    /// 루트·`mod.rs`·`#[path]`로 로드된 파일은 파일이 놓인 디렉터리,
+    /// 일반 `name.rs`는 `name/` 디렉터리, 인라인 `mod m {}`은 선언
+    /// 문맥의 기준 디렉터리에 자기 세그먼트(이름 또는 `#[path]` 값)를
+    /// 이어붙인 디렉터리다.
+    pub dir: PathBuf,
     /// 직접 선언된 아이템 이름들(모듈 스코프 해석용).
     pub items: BTreeSet<String>,
     /// `use` 임포트 맵: 마지막 세그먼트(또는 as 이름) → 임포트.
@@ -45,6 +51,7 @@ impl Module {
     /// 새 모듈 항목.
     pub fn new(file: PathBuf, file_module: bool, public: bool) -> Module {
         Module {
+            dir: module_dir(&file),
             file,
             extra_files: Vec::new(),
             file_module,
@@ -197,10 +204,24 @@ impl ModTree {
 pub fn collect_submodules(
     items: &[&syn::Item],
     parent_path: &str,
-    parent_dir: &Path,
     tree: &mut ModTree,
     conditional_count: &mut usize,
 ) -> Vec<String> {
+    // `#[path]` 자식의 기준 디렉터리 — 파일에 직접 선언되면 파일이
+    // 놓인 디렉터리(`outer.rs`면 `src/` — module_dir과 다르다),
+    // 인라인 모듈 안이면 그 모듈의 실효 디렉터리다(rustc 실증).
+    // 일반 자식의 기준은 부모의 실효 디렉터리 `dir`이다 — 인라인
+    // 조상의 세그먼트(이름 또는 `#[path]` 오버라이드)가 이미 누적돼
+    // 있다.
+    let (path_base, child_base, parent_file) = {
+        let parent = &tree.modules[parent_path];
+        let path_base = if parent.file_module {
+            parent.file.parent().unwrap_or(Path::new(".")).to_path_buf()
+        } else {
+            parent.dir.clone()
+        };
+        (path_base, parent.dir.clone(), parent.file.clone())
+    };
     let mut queued = Vec::new();
     for item in items {
         let syn::Item::Mod(m) = item else { continue };
@@ -212,24 +233,57 @@ pub fn collect_submodules(
         if cfg.is_some() && !tree.modules.contains_key(&path) {
             *conditional_count += 1;
         }
-        let (file, is_file_module) = if let Some((_, _)) = &m.content {
-            // 인라인 모듈 — 같은 파일.
-            (tree.modules[parent_path].file.clone(), false)
+        // `#[path = "..."]`는 NameValue 메타다 — `parse_args`는
+        // `#[path("...")]` 문법만 받으므로 값은 nv.value에서 읽는다.
+        // 인라인 모듈에도 달 수 있고, 그 값은 자식의 기준 디렉터리를
+        // 덮어쓴다.
+        let path_attr = m
+            .attrs
+            .iter()
+            .find(|a| a.path().is_ident("path"))
+            .and_then(|a| match &a.meta {
+                syn::Meta::NameValue(nv) => match &nv.value {
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(s),
+                        ..
+                    }) => Some(s.value()),
+                    _ => None,
+                },
+                _ => None,
+            });
+        let (file, is_file_module, dir) = if m.content.is_some() {
+            // 인라인 모듈 — 같은 파일. `#[path]`는 자식의 기준
+            // 디렉터리 세그먼트를 덮어쓴다.
+            let dir = match &path_attr {
+                Some(p) => path_base.join(p),
+                None => child_base.join(&name),
+            };
+            (parent_file.clone(), false, dir)
         } else {
-            let path_attr = m
-                .attrs
-                .iter()
-                .find(|a| a.path().is_ident("path"))
-                .and_then(|a| a.parse_args::<syn::LitStr>().ok())
-                .map(|l| l.value());
-            match mod_file(parent_dir, &name, path_attr.as_deref()) {
-                Some(f) => (f, true),
+            let base = if path_attr.is_some() {
+                &path_base
+            } else {
+                &child_base
+            };
+            match mod_file(base, &name, path_attr.as_deref()) {
+                Some(f) => {
+                    // `#[path]`로 로드된 파일은 자기 디렉터리를 소유한다
+                    // — `loaded.rs`라도 `loaded/` 스템 디렉터리를
+                    // 만들지 않는다(rustc 실증).
+                    let dir = if path_attr.is_some() {
+                        f.parent().unwrap_or(Path::new(".")).to_path_buf()
+                    } else {
+                        module_dir(&f)
+                    };
+                    (f, true, dir)
+                }
                 None => continue, // 파일 없는 mod(조건부·생성) — 정점 없이 limitation만.
             }
         };
         let public = matches!(m.vis, syn::Visibility::Public(_));
         let mut module = Module::new(file, is_file_module, public);
         module.cfg = cfg;
+        module.dir = dir;
         tree.modules.insert(path.clone(), module);
         tree.modules
             .get_mut(parent_path)

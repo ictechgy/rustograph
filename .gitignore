@@ -1,3 +1,4 @@
 /target
+tests/fixture/target/
 .rustograph/
 coverage/

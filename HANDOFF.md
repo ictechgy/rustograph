@@ -12,7 +12,7 @@ v0.2.0도 배포됐으나 자기 분석에서 cli↔mcp 모듈 순환이 잡혀
 검증 상태: `cargo test` 63개 통과(단위 40 + 통합 23), 커버리지 91.2%
 (게이트 90), clippy 클린, verify-cli-contract OK(mcp 포함),
 자기 분석 `rules --strict` 0 위반 / `cycles --strict` 0.
-`--features semantic` 빌드에서는 +16 semantic 테스트, 자기 분석
+`--features semantic` 빌드에서는 +19 semantic 테스트, 자기 분석
 `rules`/`cycles` 동일 0. PR #8(의미 해석) 머지됨 — 70ea82e.
 
 ## 구조
@@ -50,8 +50,9 @@ v0.2.0도 배포됐으나 자기 분석에서 cli↔mcp 모듈 순환이 잡혀
   본문 워커(메서드 타입 해석·경로 해석·매크로 확장·trait impl 행렬),
   Stats 실측. 정점·구조는 syn이 권위 — sem은 본문 간선만 낸다.
   hir이 모르는 본문(cfg 비활성·매크로 생성)은 syn 폴백으로 돌아간다.
-- `tests/fixture/` — 두 멤버 워크스페이스, 모든 아이템 종류+글롭/별칭/
-  cfg/generated/orphan 커버.
+- `tests/fixture/` — 세 멤버 워크스페이스(fixture_macros proc 매크로
+  포함), 모든 아이템 종류+글롭/별칭/cfg/generated/orphan/build.rs
+  OUT_DIR 생성 모듈 커버.
 - `scripts/` — coverage.sh(llvm-cov), verify-cli-contract.sh.
 - `.rustograph.yml` — 자기 계층 규칙(graph 순수 도메인 강제).
 
@@ -78,9 +79,12 @@ v0.2.0도 배포됐으나 자기 분석에서 cli↔mcp 모듈 순환이 잡혀
    행렬(tentative 유지 — 실제 impl은 런타임 사실). hir이 모르는 본문은
    syn 폴백 + unmapped 실측. feature 없는 빌드에서 --semantic은
    종료 코드 2 + 빌드 안내(조용한 폴백은 거짓 계약이라 금지).
-   남은 것: derive 생성 impl, OUT_DIR 빌드 산출물(load_out_dirs_from_check
-   off), proc 매크로 서버(Sysroot 선택 — rustup 구성 없으면
-   unexpanded로 계측), semantic 경로의 대형 레포 성능.
+   후속 하드닝(semantic-hardening 브랜치): derive 생성 impl 호출을
+   impl 대상 타입 정점으로 귀속, `load_out_dirs_from_check` +
+   `ProcMacroServerChoice::Sysroot`로 build.rs 산출물·proc 매크로
+   확장 로드, include!/생성 정의는 소속 모듈 정점 폴백, 타깃 없는 멤버
+   (proc 매크로 크레이트)에 명시 Crate 정점(depends 간선 dangling 치유),
+   proc 매크로 호출은 proc_macros 계수 + 서버 부재 시 실측 limitation.
    로드맵 1~5 모두 완료 — 다음 우선순위는 사용자가 정한다.
 
 ## 막힌 것 / 주의
@@ -101,6 +105,27 @@ v0.2.0도 배포됐으나 자기 분석에서 cli↔mcp 모듈 순환이 잡혀
   블랙리스트는 `dyn Send`처럼 principal 없는 객체(as_dyn_trait → None)와
   `!`(독립 kind, builtin 아님)를 놓쳤다. 모르는 kind는 열림으로 — 불확실성은
   항상 tentative 쪽으로만 새게 하는 계약과 같은 방향.
+- **ra는 매크로 확장 안의 자기 크레이트명 경로를 해석하지 못한다.**
+  proc 매크로가 `mycrate::x()`·`::mycrate::x()`를 emit하면 호출부가 그
+  크레이트 안이어도 resolve_path가 None을 돌려준다(rustc는 받는다).
+  fixture의 proc 매크로는 `crate::util::helper()`를 emit한다 — proc
+  매크로는 `$crate`를 못 쓰므로 `crate::`가 호출부 크레이트를 가리킨다.
+  해석 못한 확장 내 경로는 unresolved 카운터로만 간다.
+- **semantic 경로 성능**(debug 바이너리, 웜 캐시): 자기 분석(29 파일)은
+  syn 0.16s → semantic 29s, 합성 151파일 크레이트는 syn 1.6s → semantic
+  18.7s. 비용은 거의 `load_workspace_at`(cargo check + salsa 크레이트
+  그래프)에 있다 — 본문 워크 자체는 작다. `load_out_dirs_from_check`가
+  `cargo check`를 `target/rust-analyzer` 서브디렉터리로 돌리므로
+  첫 `--semantic` 실행은 전체 의존 트리 check 빌드 시간이 더해진다
+  (rustograph 기준 수 분, 이후 증분). `/target` ignore가 이 서브디렉터리를
+  커버한다.
+- **ra_ap 버전 유지 절차.** bump할 때: (1) `rustc --version`이 대상
+  ra_ap의 rust-version 이상인지 확인(rust-toolchain.toml 없음 —
+  Homebrew rust가 PATH를 잡는다), (2) Cargo.toml의 `=0.0.X` 핀을 올리고
+  `cargo update -p`가 아니라 lockfile 재생성, (3) salsa·salsa-macro-rules·
+  unicode-ident 조합이 ra_ap가 요구하는 정확 버전으로 resolve되는지 확인
+  (어긋나면 수동 pin), (4) `cargo test --features semantic`으로 통과 확인.
+  rustc 1.98+ toolchain이 기본이 되면 0.0.350+로 올릴 수 있다.
 - `cargo metadata`는 비워크스페이스 의존을 패키지로만 준다 — `--deps`는
   정점만 만들고 내부 수확은 안 한다.
 - AST arena는 `Box::leak` — CLI 수명 모델이라 의도적.

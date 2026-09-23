@@ -3,5 +3,8 @@ name = "fixture_core"
 version = "0.0.0"
 edition = "2021"
 
+[dependencies]
+fixture_macros = { path = "../fixture_macros" }
+
 [features]
 never = []
