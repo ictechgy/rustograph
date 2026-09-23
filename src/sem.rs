@@ -202,6 +202,7 @@ impl Engine {
             cfg: site.cfg,
             ids,
             method_index,
+            defs: &self.defs,
             matrix: &self.matrix,
             st,
             edges: Vec::new(),
@@ -258,9 +259,14 @@ fn build_index(db: &RootDatabase) -> Index {
         }
         // impl 블록 메서드 — 선언 모듈이 아니라 self 타입 소속으로 ID를 만든다.
         for imp in Impl::all_in_crate(db, krate) {
-            // 블록 지역 impl은 syn이 정점을 만들지 않는다 — 후보 ID가
-            // 같은 이름의 모듈 정점과 충돌할 수 있으므로 아예 제외한다.
-            if block_local_def(&sema, imp) {
+            // self 타입이 블록 지역인 impl — 정규 ID가 같은 이름의 모듈
+            // 정점과 충돌할 수 있다. impl 구문이 const 래퍼·매크로 확장
+            // 안에 있어도 self 타입이 모듈 레벨이면 후보는 유효하다.
+            if imp
+                .self_ty(db)
+                .as_adt()
+                .is_some_and(|a| block_local_def(&sema, a))
+            {
                 continue;
             }
             // 트레이트 impl이면 디스패치 후보 표에도 넣는다.
@@ -278,11 +284,17 @@ fn build_index(db: &RootDatabase) -> Index {
                 };
                 push_fn(&sema, &mut defs, f);
                 if let Some(tid) = &tid {
+                    // 후보 ID는 정점이 실재할 때만 — fn_id는 문자열이라
+                    // 생성 메서드가 같은 이름의 진짜 정점과 충돌할 수 있다.
+                    let method = fn_id(&sema, f).filter(|id| indexed_def(&sema, &defs, f, id));
+                    if method.is_none() && owner.is_none() {
+                        continue;
+                    }
                     matrix
                         .entry((tid.clone(), f.name(db).as_str().to_string()))
                         .or_default()
                         .push(Candidate {
-                            method: fn_id(&sema, f),
+                            method,
                             owner: owner.clone(),
                         });
                 }
@@ -303,6 +315,21 @@ impl BodyDef {
             BodyDef::Static(s) => Some(sema.source(*s)?.value.body()?.syntax().clone()),
         }
     }
+}
+
+/// 정규 ID가 이 함수의 실제 선언을 가리키는가 — fn_id는 이름만 보는
+/// 문자열이라 생성 메서드가 같은 이름의 진짜 정점 ID와 충돌할 수 있다.
+/// 인덱스 항목의 소스 정체(원본 파일·범위)와 일치해야 같은 정의다.
+fn indexed_def(
+    sema: &Semantics<RootDatabase>,
+    defs: &BTreeMap<String, BodyEntry>,
+    f: Function,
+    id: &str,
+) -> bool {
+    let (Some(e), Some(b)) = (defs.get(id), body_entry(sema, BodyDef::Fn(f))) else {
+        return false;
+    };
+    e.file == b.file && e.range == b.range
 }
 
 /// 정의의 소스 정체를 잡아 인덱스 항목으로 만든다 — 블록(fn 본문) 안에
@@ -498,6 +525,8 @@ struct Walker<'a, 'b> {
     cfg: &'a Option<String>,
     ids: &'a BTreeSet<&'a str>,
     method_index: &'a BTreeMap<String, Vec<String>>,
+    /// 정규 ID → 실제 선언의 소스 정체 — 문자열 ID 충돌을 가른다.
+    defs: &'a BTreeMap<String, BodyEntry>,
     /// (트레이트 ID, 메서드 이름) → impl 메서드 후보 — 빌드 때 계산됐다.
     matrix: &'a BTreeMap<(String, String), Vec<Candidate>>,
     st: &'b mut Stats,
@@ -645,28 +674,32 @@ impl<'a, 'b> Walker<'a, 'b> {
             }
             return self.trait_matrix(t, f, kind, un);
         }
-        // 블록 지역 fn은 정규 ID가 없다 — 같은 이름의 정점으로 보내지 않는다.
-        if block_local_def(self.sema, f) {
-            self.st.external += 1;
-            return;
-        }
-        // 정점으로 직행 — 속성 매크로가 감싼 impl의 메서드처럼 확장 파일
-        // 소스를 가져도 syn이 만든 정점이 실재하면 그 정점을 쓴다.
+        // 정규 ID가 인덱스의 실제 선언과 일치할 때만 정점으로 — fn_id는
+        // 문자열이라 생성 메서드가 같은 이름의 진짜 정점과 충돌할 수 있다.
+        // 속성 매크로가 감싼 impl의 메서드는 소스 정체가 일치한다.
         if let Some(id) = fn_id(self.sema, f) {
-            if matches!(
-                self.push(id, kind, false, un),
-                Pushed::Yes | Pushed::SelfEdge
-            ) {
+            if indexed_def(self.sema, self.defs, f, &id)
+                && matches!(
+                    self.push(id, kind, false, un),
+                    Pushed::Yes | Pushed::SelfEdge
+                )
+            {
                 return;
             }
         }
         // 정점이 없는 정의 — derive·매크로가 만든 impl 메서드면 impl 대상
-        // 타입으로, include!·생성 파일의 정의면 소속 모듈로 귀속한다.
+        // 타입으로 귀속한다(const 래퍼 안의 생성 impl 포함).
         if let Some(AssocItemContainer::Impl(i)) = f.as_assoc_item(db).map(|a| a.container(db)) {
             if impl_is_generated(self.sema, i) {
                 return self.emit_impl_owner(i, kind, un);
             }
         }
+        // 블록 지역 fn은 정규 ID가 없다 — 같은 이름의 정점으로 보내지 않는다.
+        if block_local_def(self.sema, f) {
+            self.st.external += 1;
+            return;
+        }
+        // include!·생성 파일의 자유 정의 — 소속 모듈 정점으로 귀속한다.
         if !matches!(
             self.push(module_path(db, f.module(db)), kind, false, un),
             Pushed::Miss
@@ -695,15 +728,16 @@ impl<'a, 'b> Walker<'a, 'b> {
         }
     }
 
-    /// 함수 정점으로의 확정 간선 — 정점이 없으면 외부 정의다.
+    /// 함수 정점으로의 확정 간선 — 정규 ID가 실제 선언과 일치하고 정점이
+    /// 있어야 확정이다. 정점이 없거나 생성·충돌 정의면 외부다.
     fn emit_fn_vertex(&mut self, f: Function, kind: EdgeKind, un: bool) {
         match fn_id(self.sema, f) {
-            Some(id) => {
+            Some(id) if indexed_def(self.sema, self.defs, f, &id) => {
                 if let Pushed::Miss = self.push(id, kind, false, un) {
                     self.st.external += 1;
                 }
             }
-            None => self.st.external += 1,
+            _ => self.st.external += 1,
         }
     }
 
@@ -725,10 +759,16 @@ impl<'a, 'b> Walker<'a, 'b> {
         };
         for cand in candidates {
             // 메서드 정점이 있으면 그쪽, 없으면(생성 impl) 타입 정점으로.
+            // SelfEdge는 조용히 버려지는 정상 경로다 — 미스로 세지 않는다.
             let hit = [cand.method.as_ref(), cand.owner.as_ref()]
                 .into_iter()
                 .flatten()
-                .any(|id| matches!(self.push(id.clone(), kind, true, un), Pushed::Yes));
+                .any(|id| {
+                    matches!(
+                        self.push(id.clone(), kind, true, un),
+                        Pushed::Yes | Pushed::SelfEdge
+                    )
+                });
             // 둘 다 없으면(cfg·생성) 해석됐지만 그래프 밖이다.
             if !hit {
                 self.st.external += 1;

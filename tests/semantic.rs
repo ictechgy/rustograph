@@ -302,7 +302,13 @@ fn proc_macro_call_keeps_crate_use() {
     // 호출이 확정 간선으로, 없으면 proc-macro 전용 limitation이 실측한다.
     let expanded = call(&d, "fixture_core::proc_call", "fixture_core::util::helper")
         .is_some_and(|e| !e.tentative);
-    let srv_down = d.limitations.iter().any(|l| l.contains("proc-macro"));
+    // 서버 부재 전용 실측 문구만 매칭한다 — 일반 확장 실패 문구("…or
+    // expansion failure")에 "proc-macro"가 들어있어 넓게 매칭하면
+    // 무관한 실패가 이 단언을 통과시킨다.
+    let srv_down = d
+        .limitations
+        .iter()
+        .any(|l| l.contains("proc-macro invocations could not be expanded"));
     assert!(
         expanded || srv_down,
         "firm expansion edge or the proc-macro limitation"
