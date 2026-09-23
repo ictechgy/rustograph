@@ -33,10 +33,12 @@ pub struct Module {
     pub public: bool,
     /// `#[cfg(...)]` 조건 토큰 — `mod` 선언에 붙은 것만(조상 조건은 조상 정점에).
     pub cfg: Option<String>,
-    /// 인라인 모듈의 `#[path]` — 있으면 자식 모듈의 기준 디렉터리에서
-    /// 이 모듈 이름 대신 이 값이 세그먼트가 된다(rustc 규칙). 파일
-    /// 모듈의 `#[path]`는 파일 위치를 가리키므로 여기에는 싣지 않는다.
-    pub path_attr: Option<String>,
+    /// 이 모듈 안에 선언된 자식 모듈의 기준 디렉터리 — rustc 규칙:
+    /// 루트·`mod.rs`·`#[path]`로 로드된 파일은 파일이 놓인 디렉터리,
+    /// 일반 `name.rs`는 `name/` 디렉터리, 인라인 `mod m {}`은 선언
+    /// 문맥의 기준 디렉터리에 자기 세그먼트(이름 또는 `#[path]` 값)를
+    /// 이어붙인 디렉터리다.
+    pub dir: PathBuf,
     /// 직접 선언된 아이템 이름들(모듈 스코프 해석용).
     pub items: BTreeSet<String>,
     /// `use` 임포트 맵: 마지막 세그먼트(또는 as 이름) → 임포트.
@@ -49,12 +51,12 @@ impl Module {
     /// 새 모듈 항목.
     pub fn new(file: PathBuf, file_module: bool, public: bool) -> Module {
         Module {
+            dir: module_dir(&file),
             file,
             extra_files: Vec::new(),
             file_module,
             public,
             cfg: None,
-            path_attr: None,
             items: BTreeSet::new(),
             imports: BTreeMap::new(),
             children: BTreeMap::new(),
@@ -202,10 +204,24 @@ impl ModTree {
 pub fn collect_submodules(
     items: &[&syn::Item],
     parent_path: &str,
-    parent_dir: &Path,
     tree: &mut ModTree,
     conditional_count: &mut usize,
 ) -> Vec<String> {
+    // `#[path]` 자식의 기준 디렉터리 — 파일에 직접 선언되면 파일이
+    // 놓인 디렉터리(`outer.rs`면 `src/` — module_dir과 다르다),
+    // 인라인 모듈 안이면 그 모듈의 실효 디렉터리다(rustc 실증).
+    // 일반 자식의 기준은 부모의 실효 디렉터리 `dir`이다 — 인라인
+    // 조상의 세그먼트(이름 또는 `#[path]` 오버라이드)가 이미 누적돼
+    // 있다.
+    let (path_base, child_base, parent_file) = {
+        let parent = &tree.modules[parent_path];
+        let path_base = if parent.file_module {
+            parent.file.parent().unwrap_or(Path::new(".")).to_path_buf()
+        } else {
+            parent.dir.clone()
+        };
+        (path_base, parent.dir.clone(), parent.file.clone())
+    };
     let mut queued = Vec::new();
     for item in items {
         let syn::Item::Mod(m) = item else { continue };
@@ -235,32 +251,39 @@ pub fn collect_submodules(
                 },
                 _ => None,
             });
-        let (file, is_file_module) = if let Some((_, _)) = &m.content {
-            // 인라인 모듈 — 같은 파일.
-            (tree.modules[parent_path].file.clone(), false)
-        } else {
-            // `#[path]`의 기준 디렉터리는 모듈 파일이 놓인 디렉터리다 —
-            // `mod.rs`는 module_dir과 같지만 `outer.rs` 같은 비-mod.rs
-            // 파일에서는 `src/`(파일의 디렉터리)이고, 인라인 모듈이 끼면
-            // 그 이름(또는 조상의 `#[path]` 오버라이드)이 경로에 이어진다.
-            // 기본 자식 디렉터리(module_dir)와 다른 기준이므로 별도로
-            // 계산한다.
-            let base = if path_attr.is_some() {
-                path_attr_base(parent_path, tree)
-            } else {
-                parent_dir.to_path_buf()
+        let (file, is_file_module, dir) = if m.content.is_some() {
+            // 인라인 모듈 — 같은 파일. `#[path]`는 자식의 기준
+            // 디렉터리 세그먼트를 덮어쓴다.
+            let dir = match &path_attr {
+                Some(p) => path_base.join(p),
+                None => child_base.join(&name),
             };
-            match mod_file(&base, &name, path_attr.as_deref()) {
-                Some(f) => (f, true),
+            (parent_file.clone(), false, dir)
+        } else {
+            let base = if path_attr.is_some() {
+                &path_base
+            } else {
+                &child_base
+            };
+            match mod_file(base, &name, path_attr.as_deref()) {
+                Some(f) => {
+                    // `#[path]`로 로드된 파일은 자기 디렉터리를 소유한다
+                    // — `loaded.rs`라도 `loaded/` 스템 디렉터리를
+                    // 만들지 않는다(rustc 실증).
+                    let dir = if path_attr.is_some() {
+                        f.parent().unwrap_or(Path::new(".")).to_path_buf()
+                    } else {
+                        module_dir(&f)
+                    };
+                    (f, true, dir)
+                }
                 None => continue, // 파일 없는 mod(조건부·생성) — 정점 없이 limitation만.
             }
         };
         let public = matches!(m.vis, syn::Visibility::Public(_));
         let mut module = Module::new(file, is_file_module, public);
         module.cfg = cfg;
-        if !is_file_module {
-            module.path_attr = path_attr;
-        }
+        module.dir = dir;
         tree.modules.insert(path.clone(), module);
         tree.modules
             .get_mut(parent_path)
@@ -270,46 +293,6 @@ pub fn collect_submodules(
         queued.push(path);
     }
     queued
-}
-
-/// `#[path]` 어트리뷰트의 기준 디렉터리 — rustc 규칙: 파일 모듈에
-/// 직접 선언된 mod는 파일이 놓인 디렉터리(`outer.rs`면 `src/`)가
-/// 기준이고, 인라인 모듈 안에 선언된 mod는 `module_dir`(파일 스템
-/// 디렉터리)에 인라인 조상의 세그먼트가 순서대로 이어진 디렉터리가
-/// 기준이다. 인라인 조상 자신이 `#[path]`를 달면 그 값이 이름 대신
-/// 세그먼트가 된다.
-fn path_attr_base(parent_path: &str, tree: &ModTree) -> PathBuf {
-    let parent = &tree.modules[parent_path];
-    // 부모에서 위로 걸어 같은 파일의 비파일(인라인) 조상 세그먼트를
-    // 모은다 — `#[path]`가 달린 조상은 이름 대신 그 값을 쓴다.
-    let mut inline: Vec<(String, Option<String>)> = Vec::new();
-    let mut cur = parent_path.to_string();
-    while let Some(m) = tree.modules.get(&cur) {
-        if m.file_module || m.file != parent.file {
-            break;
-        }
-        let name = cur.rsplit("::").next().unwrap_or(&cur).to_string();
-        inline.push((name, m.path_attr.clone()));
-        match parent_of(&cur) {
-            Some(p) => cur = p,
-            None => break,
-        }
-    }
-    if inline.is_empty() {
-        return parent.file.parent().unwrap_or(Path::new(".")).to_path_buf();
-    }
-    // 최외곽 인라인 조상의 `#[path]`는 파일이 놓인 디렉터리 기준이다 —
-    // 비-mod.rs 파일(`outer.rs`)에서는 module_dir(`src/outer/`)이 아니라
-    // `src/`다(rustc 실증). 그보다 안쪽 조상의 `#[path]`는 이미 누적된
-    // 디렉터리에 이어진다.
-    let mut dir = module_dir(&parent.file);
-    for (i, (name, pattr)) in inline.into_iter().rev().enumerate() {
-        if i == 0 && pattr.is_some() {
-            dir = parent.file.parent().unwrap_or(Path::new(".")).to_path_buf();
-        }
-        dir.push(pattr.unwrap_or(name));
-    }
-    dir
 }
 
 /// `#[cfg]`가 붙어 있으면 조건부로 본다 — 포함은 하되 실측으로 센다.

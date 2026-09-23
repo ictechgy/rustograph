@@ -398,9 +398,8 @@ fn grow_tree(
         let Some(groups) = module_items(tree, arena, &mp) else {
             continue;
         };
-        let dir = modtree::module_dir(&tree.modules[&mp].file);
         for sub in
-            modtree::collect_submodules(&flatten_items(&groups), &mp, &dir, tree, conditional_count)
+            modtree::collect_submodules(&flatten_items(&groups), &mp, tree, conditional_count)
         {
             let file = tree.modules[&sub].file.clone();
             if tree.modules[&sub].file_module {

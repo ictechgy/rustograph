@@ -10,10 +10,19 @@ pub mod inner;
 mod pin {
     #[path = "pin_leaf.rs"]
     pub mod pin_leaf;
+
+    /// 일반 자식도 오버라이드된 기준 디렉터리를 따라간다 —
+    /// `src/single/pin_plain.rs`가 아니라 `src/pathdir/pin_plain.rs`다.
+    pub mod pin_plain;
 }
 
-/// `pin::pin_leaf`의 함수를 호출한다 — 인라인 `#[path]` 기준이
-/// module_dir로 잘못 잡히면 `pin_leaf` 모듈이 통째로 빠진다.
+/// `#[path]`로 로드된 파일은 자기 디렉터리를 소유한다 — `loaded.rs`의
+/// 인라인 자식 기준은 `src/ploaded/loaded/`가 아니라 `src/ploaded/`다.
+#[path = "ploaded/loaded.rs"]
+pub mod pmod;
+
+/// `pin`·`pmod` 아래의 함수를 호출한다 — 인라인 `#[path]` 기준이나
+/// 로드 파일의 디렉터리 소유가 틀리면 이 모듈들이 통째로 빠진다.
 pub fn call_pin() -> u32 {
-    pin::pin_leaf::pv()
+    pin::pin_leaf::pv() + pin::pin_plain::pw() + pmod::call_leaf()
 }

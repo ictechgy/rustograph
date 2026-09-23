@@ -850,3 +850,42 @@ fn non_mod_rs_inline_path_attr_uses_file_dir() {
     )
     .is_some());
 }
+
+/// 인라인 `#[path]` 조상 아래의 일반 파일 자식도 오버라이드된 기준
+/// 디렉터리를 따라간다 — `src/pathdir/pin_plain.rs`다.
+#[test]
+fn plain_child_under_inline_path_attr_uses_overridden_dir() {
+    let d = syn_doc();
+    assert!(
+        d.vertices
+            .iter()
+            .any(|v| v.id == "fixture_core::single::pin::pin_plain::pw"),
+        "plain file child under #[path] inline must use the overridden dir"
+    );
+    assert!(call(
+        &d,
+        "fixture_core::single::call_pin",
+        "fixture_core::single::pin::pin_plain::pw"
+    )
+    .is_some());
+}
+
+/// `#[path]`로 로드된 파일은 자기 디렉터리를 자식 기준으로 소유한다
+/// — `loaded.rs` 안의 `mod inline`은 `src/ploaded/inline/`이지
+/// `src/ploaded/loaded/inline/`이 아니다(rustc 실증).
+#[test]
+fn path_loaded_file_owns_its_dir() {
+    let d = syn_doc();
+    assert!(
+        d.vertices
+            .iter()
+            .any(|v| v.id == "fixture_core::single::pmod::inline::leaf::pl"),
+        "children of a #[path]-loaded file resolve under the file's dir"
+    );
+    assert!(call(
+        &d,
+        "fixture_core::single::call_pin",
+        "fixture_core::single::pmod::call_leaf"
+    )
+    .is_some());
+}
