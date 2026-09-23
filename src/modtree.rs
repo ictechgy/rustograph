@@ -216,12 +216,22 @@ pub fn collect_submodules(
             // 인라인 모듈 — 같은 파일.
             (tree.modules[parent_path].file.clone(), false)
         } else {
-            let path_attr = m
-                .attrs
-                .iter()
-                .find(|a| a.path().is_ident("path"))
-                .and_then(|a| a.parse_args::<syn::LitStr>().ok())
-                .map(|l| l.value());
+            // `#[path = "..."]`는 NameValue 메타다 — `parse_args`는
+            // `#[path("...")]` 문법만 받으므로 값은 nv.value에서 읽는다.
+            let path_attr =
+                m.attrs
+                    .iter()
+                    .find(|a| a.path().is_ident("path"))
+                    .and_then(|a| match &a.meta {
+                        syn::Meta::NameValue(nv) => match &nv.value {
+                            syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Str(s),
+                                ..
+                            }) => Some(s.value()),
+                            _ => None,
+                        },
+                        _ => None,
+                    });
             match mod_file(parent_dir, &name, path_attr.as_deref()) {
                 Some(f) => (f, true),
                 None => continue, // 파일 없는 mod(조건부·생성) — 정점 없이 limitation만.
