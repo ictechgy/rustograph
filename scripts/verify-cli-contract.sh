@@ -60,6 +60,40 @@ check 2 "unknown command"   frobnicate
 check 2 "bad level"         graph --level bogus
 check 2 "bad format"        graph --format xml
 
+# 신규 질의 — paths/search/deps와 문서 필터의 종료 코드 계약.
+check 0 "paths"             paths fixture_app::main fixture_core::entry
+check 2 "paths missing to"  paths fixture_app::main fixture_core::nope
+check 2 "paths one arg"     paths fixture_app::main
+check 2 "paths ambiguous"   paths nest fixture_core::entry
+check 0 "search"            search entry
+check 0 "deps"              deps
+check 0 "deps json"         deps --format json
+check 1 "deps strict"       deps --strict
+check 2 "deps bad format"   deps --format xml
+check 0 "graph focus"       graph --focus fixture_core::t
+check 0 "graph exclude"     graph --exclude-tests
+check 2 "tests xor"         dead --tests --exclude-tests
+check 0 "graph target"      graph --target x86_64-pc-windows-msvc
+
+# rules baseline — 얼리기와 억눌림 계약. app이 core를 참조하지 못하게
+# 거꾸로 선 룰셋으로 위반을 만든다.
+cat > "$FIX/deny.yml" <<'EOF'
+components:
+  app: ["fixture_app/**"]
+  core: ["fixture_core/**"]
+deps:
+  app: []
+  core: []
+EOF
+check 1 "rules deny"        rules --strict --config "$FIX/deny.yml"
+check 0 "baseline write"    rules --config "$FIX/deny.yml" --baseline "$FIX/base.txt" --write-baseline
+check 0 "baseline strict"   rules --strict --config "$FIX/deny.yml" --baseline "$FIX/base.txt"
+check 2 "baseline missing"  rules --config "$FIX/deny.yml" --baseline /nonexistent-xyz.txt
+grep -q "allow|fixture_app" "$FIX/base.txt" || {
+	echo "FAIL baseline file: no violation key written" >&2
+	fails=$((fails+1))
+}
+
 # --semantic — opt-in feature 계약: feature 빌드면 분석 성공(0), 아니면
 # 무엇을 빌드해야 하는지 알려주는 명확한 오류(2)여야 한다. 조용한 syn
 # 폴백은 거짓 계약이라 허용하지 않는다.
@@ -88,7 +122,7 @@ for c in "graph --dir /nonexistent-xyz"; do
 done
 
 # mcp — stdio 서버는 EOF까지 읽는다: initialize+tools/list를 밀어 넣고
-# 정상 종료(0)와 도구 6개가 나오는지 본다.
+# 정상 종료(0)와 도구 9개가 나오는지 본다.
 mcp_out="$(printf '%s\n' \
 	'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
 	'{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
@@ -100,6 +134,12 @@ echo "$mcp_out" | grep -q "rustograph_rules" || {
 	echo "FAIL mcp: tools/list missing rustograph_rules" >&2
 	fails=$((fails+1))
 }
+for tool in rustograph_paths rustograph_search rustograph_deps; do
+	echo "$mcp_out" | grep -q "$tool" || {
+		echo "FAIL mcp: tools/list missing $tool" >&2
+		fails=$((fails+1))
+	}
+done
 
 if [ "$fails" -gt 0 ]; then
 	echo "$fails contract checks failed" >&2

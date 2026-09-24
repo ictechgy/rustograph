@@ -28,6 +28,9 @@ pub struct Options {
     /// ra_ap 의미 해석으로 본문 간선을 보강할지 — `semantic` feature 빌드 필요.
     /// 타입 해석 메서드 호출·매크로 확장·trait impl 행렬이 켜진다.
     pub semantic: bool,
+    /// semantic 수확 결과를 디스크 캐시로 재사용할지 — syn 수확에는 무시된다.
+    /// 캐시는 항상 부가적이다 — 손상·불일치는 조용히 새 수확으로 넘어간다.
+    pub cache: bool,
 }
 
 /// 파싱된 파일 AST 아레나 — 수확이 끝날 때까지 아이템이 살아 있어야 해서
@@ -36,6 +39,8 @@ type Arena = BTreeMap<PathBuf, &'static [syn::Item]>;
 
 /// `dir`의 cargo 워크스페이스를 수확해 문서를 만든다.
 /// 실패는 문자열 오류 — 빈 그래프로 성공한 척하지 않는다.
+/// semantic 모드에서 cache가 켜져 있으면 소스 지문이 같은 이전 수확
+/// 문서를 재사용한다 — ra_ap 로드가 수십 초라 반복 질의의 실제 병목이다.
 pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
     // feature가 꺼진 빌드는 여기서 오류 — 조용히 syn으로 떨어지면
     // --semantic이 받은 결과가 의미 해석이 아니게 되어 거짓이 된다.
@@ -46,22 +51,284 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
         );
     }
     let meta = cargo_meta::load(dir)?;
+    // 캐시 키는 모든 입력의 지문 — 지문을 못 재면 캐시를 끈다(실패는 부가적).
+    let cache = if opts.semantic && opts.cache {
+        fingerprint(dir, &meta, opts).map(|key| (key, cache_path(&meta)))
+    } else {
+        None
+    };
+    if let Some((key, path)) = &cache {
+        if let Some(doc) = read_cache(path, *key, &meta.workspace_root) {
+            return Ok(doc);
+        }
+    }
+    let (doc, uses_include) = harvest(dir, &meta, opts)?;
+    if let Some((key, path)) = &cache {
+        // 지문이 못 보는 입력을 소비한 문서는 캐시에 쓰지 않는다 —
+        // include!/OUT_DIR 생성 파일과 루트 밖 #[path] 파일, 지문이
+        // 건너뛰는 숨김 디렉터리 아래 정점은 stale을 만든다.
+        if !uses_include && !has_uncovered_input(&doc, &meta.workspace_root) {
+            write_cache(path, *key, &doc);
+        }
+    }
+    Ok(doc)
+}
+
+/// `--target`의 cfg 팩트 — `rustc --print cfg` 실측이 권위다.
+/// rustc를 못 쓰거나 트리플을 모르면 트리플 추정으로 폴백한다.
+/// 어느 쪽이든 프로필·feature·커스텀 --cfg 조건은 미지로 남는다.
+pub fn target_facts(triple: &str) -> crate::cfgeval::Facts {
+    if let Some(lines) = cargo_meta::rustc_cfg_lines(triple) {
+        crate::cfgeval::Facts::from_cfg_lines(lines.iter().map(String::as_str))
+    } else {
+        crate::cfgeval::Facts::from_triple(triple)
+    }
+}
+
+/// 문서 정점이 지문이 안 보는 파일을 가리키는가 — `#[path]`로
+/// `../shared.rs`처럼 루트를 벗어난 파일, `OUT_DIR`/`include!`로 로드된
+/// `target/` 아래 생성 파일, 지문 스캔이 건너뛰는 숨김 디렉터리 아래
+/// 파일이면 지문이 바뀌지 않아 캐시가 stale해진다. 그런 문서는 캐시에
+/// 쓰지 않는다 — 쓰기와 읽기 양쪽에서 검사해 구 스키마 엔트리도 걸러낸다.
+fn has_uncovered_input(doc: &Document, root: &Path) -> bool {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    doc.vertices.iter().any(|v| {
+        v.position
+            .as_deref()
+            .and_then(|p| p.rsplit_once(':').map(|(f, _)| PathBuf::from(f)))
+            .is_some_and(|f| !fingerprint_covers(&f, &root))
+    })
+}
+
+/// 지문 스캔이 이 파일을 보는가 — fingerprint()의 순회 규칙과 같다:
+/// 루트 안, target/ 아님, .cargo 외 숨김 디렉터리 아님.
+fn fingerprint_covers(file: &Path, root: &Path) -> bool {
+    let c = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    let Ok(rel) = c.strip_prefix(root) else {
+        return false;
+    };
+    rel.components().all(|comp| {
+        let std::path::Component::Normal(name) = comp else {
+            return true;
+        };
+        let name = name.to_str().unwrap_or("");
+        name != "target" && (!name.starts_with('.') || name == ".cargo")
+    })
+}
+
+/// 캐시 파일 위치 — 워크스페이스 루트의 .rustograph/ 아래(gitignore됨).
+fn cache_path(meta: &Metadata) -> PathBuf {
+    meta.workspace_root.join(".rustograph/semantic-cache.json")
+}
+
+/// 수확 입력의 지문 — FNV-1a로 경로·크기·mtime을 접는다.
+/// 소스 하나라도 바뀌면 키가 달라진다. 지문 재기에 실패하면 None —
+/// 캐시 없이 수확하는 것이 캐시 때문에 실패하는 것보다 항상 낫다.
+fn fingerprint(dir: &Path, meta: &Metadata, opts: &Options) -> Option<u64> {
+    let mut h = 0xcbf29ce484222325u64;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+        }
+    };
+    // 스키마·도구 버전 — 출력 계약이 바뀌면 캐시도 무효다.
+    // v2: 커버리지 규칙 강화(루트 밖·target/·숨김 디렉터리·include!) —
+    // v1 아래 쓰인 엔트리는 새 규칙에서 불법일 수 있어 키가 다르다.
+    feed(b"rustograph-cache-v2");
+    feed(env!("CARGO_PKG_VERSION").as_bytes());
+    feed(&graph::DOCUMENT_VERSION.to_le_bytes());
+    // 툴체인과 빌드 env도 수확 입력이다 — rustc/ra_ap 버전과
+    // RUSTFLAGS가 바뀌면 cfg 평가·의미 해석이 달라진다. 프로브
+    // 실패는 지문 불가 — 캐시 없는 경로로 돌아간다.
+    feed(cargo_meta::rustc_version()?.as_bytes());
+    for var in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"] {
+        feed(var.as_bytes());
+        feed(std::env::var(var).unwrap_or_default().as_bytes());
+    }
+    feed(dir.canonicalize().ok()?.display().to_string().as_bytes());
+    feed(&[
+        opts.symbol_level as u8,
+        opts.include_deps as u8,
+        opts.tests as u8,
+        opts.retain_public as u8,
+    ]);
+    let mut roots = opts.extra_roots.clone();
+    roots.sort();
+    for r in roots {
+        feed(r.as_bytes());
+        feed(&[0]);
+    }
+    // 워크스페이스 아래의 모든 .rs와 매니페스트 — 어느 파일이든 바뀌면
+    // 지문이 달라진다. target/은 산출물이라 건너뛰고 숨김 디렉터리 중
+    // .cargo는 config가 빌드 입력을 바꾸니 포함한다. 디렉터리 항목
+    // 하나라도 못 읽으면 지문이 부분적이니 None — 부분 지문은
+    // stale 캐시를 재사용하는 최악의 경로다.
+    let mut stack = vec![meta.workspace_root.clone()];
+    let mut files: BTreeMap<PathBuf, (u64, u64, u32)> = BTreeMap::new();
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).ok()? {
+            let e = e.ok()?;
+            let p = e.path();
+            // file_type은 심볼릭 링크를 따라가지 않는다 — 링크된 디렉터리를
+            // 걸으면 순환이 무한 루프다. 링크 자체는 건너뛰고, 그 안의
+            // 파일을 쓰는 수확은 정점 위치가 커버리지 검사에 걸려
+            // 캐시를 끈다.
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name != "target" && (!name.starts_with('.') || name == ".cargo") {
+                    stack.push(p);
+                }
+                continue;
+            }
+            // .cargo/config[.toml]도 빌드 입력이다 — RUSTFLAGS·--cfg·
+            // rustflags를 바꾸면 cfg 평가와 수확 결과가 달라진다.
+            let under_cargo_cfg = p
+                .parent()
+                .and_then(|d| d.file_name())
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == ".cargo");
+            let interesting = p.extension().is_some_and(|x| x == "rs")
+                || matches!(
+                    p.file_name().and_then(|n| n.to_str()),
+                    Some("Cargo.toml" | "Cargo.lock")
+                )
+                || (under_cargo_cfg
+                    && matches!(
+                        p.file_name().and_then(|n| n.to_str()),
+                        Some("config.toml" | "config")
+                    ));
+            if !interesting {
+                continue;
+            }
+            let md = e.metadata().ok()?;
+            let mtime = md
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?;
+            files.insert(p, (md.len(), mtime.as_secs(), mtime.subsec_nanos()));
+        }
+    }
+    for (p, (len, secs, nanos)) in files {
+        feed(p.display().to_string().as_bytes());
+        feed(&len.to_le_bytes());
+        feed(&secs.to_le_bytes());
+        feed(&nanos.to_le_bytes());
+    }
+    Some(h)
+}
+
+/// 캐시 파일을 읽는다 — 지문이 다르거나 손상됐으면 None(새 수확).
+/// 읽을 때도 커버리지 규칙을 검사한다 — 예전 스키마로 쓰인 엔트리가
+/// 새 규칙에서 불법일 수 있다(스키마 마커와 이중 방어).
+fn read_cache(path: &Path, key: u64, root: &Path) -> Option<Document> {
+    #[derive(serde::Deserialize)]
+    struct CacheFile {
+        key: String,
+        document: Document,
+    }
+    let src = std::fs::read_to_string(path).ok()?;
+    let cf: CacheFile = serde_json::from_str(&src).ok()?;
+    if cf.key != format!("{key:016x}") || cf.document.version > graph::DOCUMENT_VERSION {
+        return None;
+    }
+    if has_uncovered_input(&cf.document, root) {
+        return None;
+    }
+    Some(cf.document)
+}
+
+/// 캐시를 쓴다 — 실패해도 수확 결과는 유효하니 조용히 넘긴다.
+fn write_cache(path: &Path, key: u64, doc: &Document) {
+    #[derive(serde::Serialize)]
+    struct CacheFile<'a> {
+        key: &'a str,
+        document: &'a Document,
+    }
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    if let Ok(text) = serde_json::to_string(&CacheFile {
+        key: &format!("{key:016x}"),
+        document: doc,
+    }) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// 실제 수확 — 메타데이터 위에서 모듈 트리·간선을 조립한다.
+/// (문서, include! 계열 매크로 사용 여부)를 돌린다 — include!는
+/// 정점 위치에 안 나타나는 입력이라 캐시 판정이 별도로 필요하다.
+fn harvest(dir: &Path, meta: &Metadata, opts: &Options) -> Result<(Document, bool), String> {
     let mut harvest = Harvest::default();
     let mut vertices: Vec<Vertex> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut entry_roots: Vec<String> = Vec::new();
     let mut limitations = meta.limitations.clone();
 
-    // 워크스페이스 외부 크레이트 이름 — resolve에서 "내부 아님" 판별용.
-    let dep_crates: BTreeSet<String> = meta
-        .packages
-        .iter()
-        .filter(|p| !p.workspace_member)
-        .map(|p| p.name.clone())
-        .collect();
+    // 코드가 보는 lib 별칭 → 크레이트 정점. 스코프는 의존을 선언한
+    // 크레이트다 — 같은 별칭을 멤버마다 다른 패키지에 물릴 수 있어
+    // 전역 맵이면 last-wins로 오염된다. 멤버 의존은 붕괴하지 않고
+    // 그 멤버의 루트 정점(타깃 이름)부터 걷는다 — 패키지 이름과
+    // lib 타깃 이름이 다르면 패키지 이름 정점은 없다.
+    // --deps일 때만 채운다 — 정점이 없는데 dep 경로가 해석되면
+    // dangling 간선이 생긴다. 빈 표면 resolve는 옛 동작 그대로다.
+    let dep_crates: modtree::DepCrates = if opts.include_deps {
+        let mut dc = modtree::DepCrates::new();
+        for d in &meta.dep_edges {
+            let Some(&fi) = meta.by_id.get(&d.from) else {
+                continue;
+            };
+            let from_pkg = &meta.packages[fi];
+            if !from_pkg.workspace_member {
+                continue;
+            }
+            let Some(&ti) = meta.by_id.get(&d.to) else {
+                continue;
+            };
+            let to_pkg = &meta.packages[ti];
+            // 멤버는 lib 루트 정점부터 걷는다 — lib 타깃 이름이 정점 ID다.
+            // lib이 없는 멤버(proc-macro 타깃만 있거나 순수 bin 패키지)는
+            // extern crate로 링크할 수 없으니 크레이트 정점으로 붕괴한다 —
+            // bin-only면 bin 루트 정점, lib/bin이 전혀 없으면 패키지 정점.
+            // 외부 패키지 정점은 항상 패키지 이름이다(emit_crate_level).
+            let (vertex, member) = if to_pkg.workspace_member {
+                match to_pkg.targets.iter().find(|t| t.kind == "lib") {
+                    Some(t) => (t.name.clone(), true),
+                    None => (to_pkg.crate_vertex(), false),
+                }
+            } else {
+                (to_pkg.name.clone(), false)
+            };
+            // 의존 선언은 패키지의 수확되는 타깃(lib·bin)에 적용된다.
+            // example/test/bench는 수확 범위 밖이라 스코프를 만들면 같은
+            // 이름의 진짜 루트 스코프를 덮어쓸 수 있다.
+            for t in &from_pkg.targets {
+                if !matches!(t.kind.as_str(), "lib" | "bin") {
+                    continue;
+                }
+                dc.insert(
+                    t.name.clone(),
+                    d.lib_name.clone(),
+                    modtree::DepTarget {
+                        vertex: vertex.clone(),
+                        member,
+                    },
+                );
+            }
+        }
+        dc
+    } else {
+        Default::default()
+    };
+    // 정점으로 존재하는 외부 크레이트 이름 — uses 간선 방출용.
+    let dep_vertices: BTreeSet<String> = dep_crates.external.clone();
 
     emit_crate_level(
-        &meta,
+        meta,
         opts.include_deps,
         &mut vertices,
         &mut edges,
@@ -72,6 +339,7 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
     let mut tree = ModTree::default();
     let mut arena: Arena = BTreeMap::new();
     let mut conditional_mods = 0usize;
+    let mut uses_include = false;
     let mut scan_roots: BTreeSet<PathBuf> = BTreeSet::new();
     for p in meta.packages.iter().filter(|p| p.workspace_member) {
         for t in &p.targets {
@@ -89,6 +357,7 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
                 &t.name,
                 &t.src,
                 &mut conditional_mods,
+                &mut uses_include,
             )?;
             if t.kind == "bin" {
                 entry_roots.push(format!("{}::main", t.name));
@@ -135,22 +404,26 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
     // 1패스: 모듈·아이템 선언 — 정점과 contains/uses/implements 간선.
     let mut bodies: Vec<BodyItem<'_>> = Vec::new();
     let mut impls: Vec<harvest::ImplBlock> = Vec::new();
+    let mut attr_refs: Vec<harvest::AttrRef> = Vec::new();
     let mut test_roots: Vec<String> = Vec::new();
     for mp in tree.modules.keys().cloned().collect::<Vec<_>>() {
-        let mh = harvest_module(&mut tree, &arena, &mp, &mut harvest);
+        let mh = harvest_module(&mut tree, &arena, &mp, &mut harvest, &dep_vertices);
         vertices.push(mh.vertex);
         edges.extend(mh.edges);
         vertices.extend(mh.decls.vertices);
         entry_roots.extend(mh.decls.entry_roots);
         test_roots.extend(mh.decls.test_roots);
         bodies.extend(mh.decls.bodies);
+        attr_refs.extend(mh.decls.attr_refs);
         impls.extend(mh.decls.impls);
     }
     for block in &impls {
         let krate = modtree::crate_of(&block.items_module);
-        let (vs, es, bs) = harvest::impls(std::slice::from_ref(block), &krate, &tree, &mut harvest);
+        let (vs, es, ar, bs) =
+            harvest::impls(std::slice::from_ref(block), &krate, &tree, &mut harvest);
         vertices.extend(vs);
         edges.extend(es);
+        attr_refs.extend(ar);
         bodies.extend(bs);
     }
 
@@ -240,6 +513,15 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
         &mut harvest,
     ));
 
+    // 속성 경로 참조 — 모드와 무관하게 syn이 권위다. `#[dep::attr]`나
+    // `#[derive(dep::X)]`는 의미 해석이 더 잘 아는 것이 없다.
+    edges.extend(harvest::attr_edges(
+        &attr_refs,
+        &tree,
+        &dep_crates,
+        &mut harvest,
+    ));
+
     push_limitations(&harvest, &mut limitations);
 
     // 보존 루트 — 존재하는 정점만 루트가 된다.
@@ -276,14 +558,17 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
     } else {
         Level::Module
     };
-    Ok(graph::document(
-        level,
-        dir.display().to_string(),
-        Some(meta.workspace_root.display().to_string()),
-        root_set.into_iter().collect(),
-        vertices,
-        edges,
-        limitations,
+    Ok((
+        graph::document(
+            level,
+            dir.display().to_string(),
+            Some(meta.workspace_root.display().to_string()),
+            root_set.into_iter().collect(),
+            vertices,
+            edges,
+            limitations,
+        ),
+        uses_include,
     ))
 }
 
@@ -296,13 +581,16 @@ fn emit_crate_level(
     limitations: &mut Vec<String>,
 ) {
     let mut skipped = 0usize;
-    let mut present: BTreeSet<&str> = BTreeSet::new();
+    // depends 간선의 양 끝은 *정점* ID여야 한다 — 멤버의 정점은 lib/bin
+    // 타깃 이름이지 패키지 이름이 아니니, 패키지명→정점 ID를 매핑해 둔다.
+    // 패키지명을 그대로 쓰면 `[lib] name`이 다른 멤버에서 dangling이 생긴다.
+    let mut present: BTreeMap<String, String> = BTreeMap::new();
     for p in &meta.packages {
         // 워크스페이스 멤버는 타깃 루트 모듈이 크레이트 정점을 겸한다 —
         // rustc에서 타깃이 곧 크레이트이고, 별도 정점은 패키지명==타깃명일 때
         // 충돌한다.
         if p.workspace_member {
-            present.insert(p.name.as_str());
+            let vertex = p.crate_vertex();
             // lib/bin 타깃이 없는 멤버(proc-macro 크레이트 등)는 겸임할 루트
             // 모듈이 없다 — depends 간선이 dangling하지 않게 정점을 만든다.
             if p.targets
@@ -310,7 +598,7 @@ fn emit_crate_level(
                 .all(|t| !matches!(t.kind.as_str(), "lib" | "bin"))
             {
                 vertices.push(Vertex {
-                    id: p.name.clone(),
+                    id: vertex.clone(),
                     kind: Kind::Crate,
                     krate: p.name.clone(),
                     module: p.name.clone(),
@@ -321,13 +609,13 @@ fn emit_crate_level(
                     unsafe_: false,
                 });
             }
+            present.insert(p.name.clone(), vertex);
             continue;
         }
         if !include_deps {
             skipped += 1;
             continue;
         }
-        present.insert(p.name.as_str());
         vertices.push(Vertex {
             id: p.name.clone(),
             kind: Kind::Crate,
@@ -339,6 +627,7 @@ fn emit_crate_level(
             cfg: None,
             unsafe_: false,
         });
+        present.insert(p.name.clone(), p.name.clone());
     }
     if skipped > 0 {
         limitations.push(format!(
@@ -351,16 +640,16 @@ fn emit_crate_level(
             continue;
         };
         let (fp, tp) = (
-            meta.packages[*f].name.as_str(),
-            meta.packages[*t].name.as_str(),
+            present.get(meta.packages[*f].name.as_str()),
+            present.get(meta.packages[*t].name.as_str()),
         );
-        if !present.contains(fp) || !present.contains(tp) {
+        let (Some(fp), Some(tp)) = (fp, tp) else {
             continue;
-        }
+        };
         if !d.kind.is_empty() {
             dev_edges += 1;
         }
-        edges.push(Edge::new(fp.to_string(), tp.to_string(), EdgeKind::Depends));
+        edges.push(Edge::new(fp.clone(), tp.clone(), EdgeKind::Depends));
     }
     if dev_edges > 0 {
         limitations.push(format!("{dev_edges} dev/build dependency edges included"));
@@ -368,12 +657,15 @@ fn emit_crate_level(
 }
 
 /// 타깃의 모듈 트리를 키운다 — mod 선언을 따라 파일을 발견한다.
+/// `uses_include`는 수확 파일 중 하나라도 include! 계열 매크로를
+/// 쓰면 true가 된다 — 그 입력은 정점 위치에 안 나타나 지문이 못 본다.
 fn grow_tree(
     tree: &mut ModTree,
     arena: &mut Arena,
     root_path: &str,
     root_file: &Path,
     conditional_count: &mut usize,
+    uses_include: &mut bool,
 ) -> Result<(), String> {
     let root_file = root_file
         .canonicalize()
@@ -388,7 +680,7 @@ fn grow_tree(
             );
         }
     }
-    parse_into(arena, &root_file)?;
+    parse_into(arena, &root_file, uses_include)?;
     let mut queue = vec![root_path.to_string()];
     let mut visited: BTreeSet<String> = BTreeSet::new();
     while let Some(mp) = queue.pop() {
@@ -403,7 +695,7 @@ fn grow_tree(
         {
             let file = tree.modules[&sub].file.clone();
             if tree.modules[&sub].file_module {
-                parse_into(arena, &file)?;
+                parse_into(arena, &file, uses_include)?;
             }
             queue.push(sub);
         }
@@ -420,7 +712,9 @@ fn scan_orphans(dir: &Path, known: &BTreeSet<PathBuf>, tree: &mut ModTree) {
         };
         for e in rd.flatten() {
             let p = e.path();
-            if p.is_dir() {
+            // file_type은 심볼릭 링크를 따라가지 않는다 — 링크된
+            // 디렉터리 순환이 무한 루프를 만든다.
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 stack.push(p);
             } else if p.extension().is_some_and(|x| x == "rs") {
                 if let Ok(c) = p.canonicalize() {
@@ -436,12 +730,21 @@ fn scan_orphans(dir: &Path, known: &BTreeSet<PathBuf>, tree: &mut ModTree) {
 /// 파일을 파싱해 아레나에 넣는다. 파싱 실패는 limitation이 아니라 오류 —
 /// 읽은 파일을 못 읽는 것과 해석 못 하는 것은 다르다…지만 실전에서는
 /// 조건부 생성 파일이 깨진 문법을 가질 수 있어 빈 목록으로 둔다.
-fn parse_into(arena: &mut Arena, file: &Path) -> Result<(), String> {
+fn parse_into(arena: &mut Arena, file: &Path, uses_include: &mut bool) -> Result<(), String> {
     if arena.contains_key(file) {
         return Ok(());
     }
     let src = std::fs::read_to_string(file)
         .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+    // include! 계열은 파일 경로 인자를 받아 별도 입력을 읽는다 —
+    // 그 입력 파일은 정점 위치에 안 나타나 지문 밖이다.
+    if !*uses_include
+        && (src.contains("include!")
+            || src.contains("include_str!")
+            || src.contains("include_bytes!"))
+    {
+        *uses_include = true;
+    }
     match syn::parse_file(&src) {
         Ok(ast) => {
             arena.insert(file.to_path_buf(), Box::leak(ast.items.into_boxed_slice()));
@@ -519,12 +822,15 @@ fn harvest_module<'a>(
     tree: &mut ModTree,
     arena: &'a Arena,
     mp: &str,
-    harvest: &mut Harvest,
+    out: &mut Harvest,
+    dep_vertices: &BTreeSet<String>,
 ) -> ModuleHarvest<'a> {
     let groups = module_items(tree, arena, mp).expect("module items must exist");
     let file = tree.modules[mp].file.clone();
     let krate = modtree::crate_of(mp);
-    let decls = harvest::decls(mp, &krate, &groups, harvest);
+    // 파라미터 이름이 fn harvest와 충돌하면 ident 경로가 함수 정점으로
+    // 해석돼 거짓 간선·사이클이 생긴다 — 지역명은 `out`으로 둔다.
+    let decls = harvest::decls(mp, &krate, &groups, out);
 
     // 모듈 정점 — 타깃 루트는 크레이트 정점을 겸한다(rustc 의미론).
     // 위치는 파일 시작, exported는 `pub mod` 여부를 따른다.
@@ -568,6 +874,9 @@ fn harvest_module<'a>(
     // 간선도 그 조건 아래서만 성립한다.
     for imp in tree.modules[mp].imports.values() {
         let to = if tree.item_exists(&imp.target) {
+            imp.target.clone()
+        } else if dep_vertices.contains(imp.target.as_str()) {
+            // 외부 크레이트 정점 — `use dep::X`는 선언 의존의 실제 사용 증거다.
             imp.target.clone()
         } else {
             match owner_module(tree, &imp.target) {
@@ -653,10 +962,10 @@ fn push_sem_stats(
     st: &sem::Stats,
     has_proc_macros: bool,
     limitations: &mut Vec<String>,
-    harvest: &mut Harvest,
+    out: &mut Harvest,
 ) {
-    harvest.fanned_method_calls += st.fanned;
-    harvest.unresolved_paths += st.unresolved;
+    out.fanned_method_calls += st.fanned;
+    out.unresolved_paths += st.unresolved;
     limitations.push(format!(
         "semantic analysis: {} call/reference edges resolved via types; \
          {} macro expansions walked; {} trait-dispatch sites expanded to candidate impls",
@@ -702,5 +1011,67 @@ fn push_sem_stats(
             "{} bodies invisible to semantic analysis (cfg-disabled or macro-generated); syntactic fan-out used",
             st.unmapped
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cargo_meta::Metadata;
+    use crate::graph::{document, Level};
+
+    /// 캐시 지문의 왕복과 무효화 — 파일 하나라도 바뀌면 키가 달라져야 한다.
+    #[test]
+    fn cache_roundtrip_and_invalidation() {
+        let tmp = std::env::temp_dir().join(format!("rustograph-cache-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("a.rs"), "fn a() {}").unwrap();
+        let meta = Metadata {
+            packages: vec![],
+            by_id: BTreeMap::new(),
+            dep_edges: vec![],
+            workspace_root: tmp.clone(),
+            limitations: vec![],
+        };
+        let opts = Options {
+            semantic: true,
+            cache: true,
+            ..Default::default()
+        };
+        let k1 = fingerprint(&tmp, &meta, &opts).expect("fingerprint");
+        assert_eq!(k1, fingerprint(&tmp, &meta, &opts).unwrap());
+        // 내용이 바뀌면 지문이 달라진다 — 길이도 달라 mtime 세분도와 무관.
+        std::fs::write(tmp.join("a.rs"), "fn a() { let much_longer = 1; }").unwrap();
+        let k2 = fingerprint(&tmp, &meta, &opts).unwrap();
+        assert_ne!(k1, k2);
+        // 수확 옵션도 키에 들어간다 — --deps 문서를 캐시로 속이면 안 된다.
+        let opts_deps = Options {
+            include_deps: true,
+            ..Default::default()
+        };
+        assert_ne!(k2, fingerprint(&tmp, &meta, &opts_deps).unwrap());
+        // 읽기·쓰기 왕복 — 같은 키면 문서가 돌아온다.
+        let doc = document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let path = cache_path(&meta);
+        write_cache(&path, k2, &doc);
+        let got = read_cache(&path, k2, &tmp).expect("cache hit");
+        assert_eq!(got.vertices.len(), doc.vertices.len());
+        // 다른 키와 손상된 파일은 None — 새 수확으로 넘어간다.
+        assert!(read_cache(&path, k1, &tmp).is_none());
+        std::fs::write(&path, "not json").unwrap();
+        assert!(read_cache(&path, k2, &tmp).is_none());
+        // 캐시 파일이 워크스페이스 안에 있어도 지문을 바꾸지 않는다 —
+        // .rustograph는 숨김 디렉터리라 지문 걷기에서 빠진다.
+        assert_eq!(k2, fingerprint(&tmp, &meta, &opts).unwrap());
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

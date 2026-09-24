@@ -37,9 +37,19 @@ impl Args {
 }
 
 const VALUE_FLAGS: &[&str] = &[
-    "dir", "level", "format", "out", "graph", "root", "explain", "config", "depth", "max",
+    "dir", "level", "format", "out", "graph", "root", "explain", "config", "depth", "max", "focus",
+    "target", "budget", "baseline",
 ];
-const BOOL_FLAGS: &[&str] = &["deps", "tests", "retain-public", "strict", "semantic"];
+const BOOL_FLAGS: &[&str] = &[
+    "deps",
+    "tests",
+    "retain-public",
+    "strict",
+    "semantic",
+    "exclude-tests",
+    "no-cache",
+    "write-baseline",
+];
 
 pub(crate) fn parse(args: &[String]) -> Result<Args, String> {
     let Some(cmd) = args.first() else {
@@ -78,22 +88,74 @@ pub(crate) fn parse(args: &[String]) -> Result<Args, String> {
 }
 
 /// 수확 또는 저장 문서 로드 — 모든 명령이 같은 경로로 문서를 얻는다.
+/// --focus/--target/--exclude-tests 필터는 저장 문서에도 같은 순서로
+/// 적용된다 — 필터는 문서 변환이라 수확 방식과 무관하다.
 pub(crate) fn document_for(a: &Args, symbol_level: bool) -> Result<Document, String> {
-    if let Some(f) = a.get("graph") {
-        return export::load_file(Path::new(f));
+    document_impl(a, symbol_level, a.has("deps"), a.has("semantic"))
+}
+
+fn document_impl(
+    a: &Args,
+    symbol_level: bool,
+    include_deps: bool,
+    semantic: bool,
+) -> Result<Document, String> {
+    if a.has("tests") && a.has("exclude-tests") {
+        return Err("--tests and --exclude-tests are mutually exclusive".to_string());
     }
-    let dir = PathBuf::from(a.get("dir").unwrap_or("."));
-    source::load(
-        &dir,
-        &source::Options {
-            symbol_level,
-            include_deps: a.has("deps"),
-            tests: a.has("tests"),
-            retain_public: a.has("retain-public"),
-            extra_roots: a.get_all("root").iter().map(|s| s.to_string()).collect(),
-            semantic: a.has("semantic"),
-        },
-    )
+    // 저장 그래프를 읽으면 수확 옵션은 전부 무효다 — 조용히 무시하면
+    // 사용자가 준 옵션이 적용됐다고 오해한다.
+    if a.get("graph").is_some() {
+        for flag in ["tests", "retain-public", "root", "semantic", "no-cache"] {
+            if a.has(flag) || a.get(flag).is_some() {
+                return Err(format!(
+                    "--{flag} is ignored with --graph — drop one of them"
+                ));
+            }
+        }
+    }
+    let mut doc = if let Some(f) = a.get("graph") {
+        export::load_file(Path::new(f))?
+    } else {
+        let dir = PathBuf::from(a.get("dir").unwrap_or("."));
+        source::load(
+            &dir,
+            &source::Options {
+                symbol_level,
+                include_deps,
+                tests: a.has("tests"),
+                retain_public: a.has("retain-public"),
+                extra_roots: a.get_all("root").iter().map(|s| s.to_string()).collect(),
+                semantic,
+                cache: !a.has("no-cache"),
+            },
+        )?
+    };
+    if a.has("exclude-tests") {
+        doc = doc.without_tests();
+    }
+    if let Some(t) = a.get("target") {
+        // 권위 있는 팩트를 먼저 시도하고 rustc가 없거나 트리플을 모르면
+        // 트리플 추정으로 폴백한다 — 모르는 것은 거짓이 아니라 미지다.
+        doc = doc.for_target(t, &source::target_facts(t));
+    }
+    let focus: Vec<String> = a.get_all("focus").iter().map(|s| s.to_string()).collect();
+    if !focus.is_empty() {
+        doc = doc.focus(&focus);
+    }
+    Ok(doc)
+}
+
+/// 정수 인자 하나를 꺼낸다 — 없으면 기본값, 있으면 반드시 파싱돼야 한다.
+/// `--max abc`나 음수를 조용히 기본값으로 되돌리면 사용자가 준 한계가
+/// 무시된다 — 잘못된 값은 명시적 오류다.
+pub(crate) fn usize_arg(a: &Args, key: &str, default: usize) -> Result<usize, String> {
+    match a.get(key) {
+        Some(s) => s
+            .parse::<usize>()
+            .map_err(|_| format!("invalid --{key} {s:?} — expected a non-negative integer")),
+        None => Ok(default),
+    }
 }
 
 /// `--level` 값을 Level로 변환한다 — 없으면 module이 기본이다.

@@ -5,8 +5,8 @@
 //! 과대 근사한다 — 오탐은 "살아 있다" 쪽으로만 기울게 하는 계약이다.
 
 use crate::graph::{Edge, EdgeKind, Kind, Vertex};
-use crate::modtree::{cfg_of, ModTree};
-use std::collections::{BTreeMap, BTreeSet};
+use crate::modtree::{cfg_of, DepCrates, ModTree};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use syn::parse::Parser;
 use syn::spanned::Spanned;
@@ -32,10 +32,30 @@ pub struct ModuleDecls<'a> {
     pub impls: Vec<ImplBlock>,
     /// fn/method/const/static/macro 본문을 담은 항목(2패스용).
     pub bodies: Vec<BodyItem<'a>>,
+    /// 아이템 속성의 경로 참조 — `#[dep::attr]`, `#[derive(dep::X)]`.
+    /// 해석은 임포트가 채워진 뒤 2패스에서 한다.
+    pub attr_refs: Vec<AttrRef>,
     /// #[no_mangle]·proc_macro 같은 외부 호출 진입점 — 항상 보존 루트.
     pub entry_roots: Vec<String>,
     /// #[test]/#[bench] 진입점 — --tests일 때만 보존 루트가 된다.
     pub test_roots: Vec<String>,
+}
+
+/// 아이템 속성이 담은 경로 참조 하나.
+/// `#[fixture_macros::keep]`나 `#[derive(serde::Serialize)]`는 그 크레이트의
+/// 실제 사용이다 — 모으지 않으면 속성으로만 쓰는 dep이 미사용으로 오보된다.
+pub struct AttrRef {
+    /// 참조를 단 아이템의 정점 ID — 아이템 정점이 없으면 소유 모듈.
+    pub owner: String,
+    /// owner가 `mod x;` 선언인가 — 파일이 없어 모듈이 트리에 없으면
+    /// owner 정점은 존재하지 않으니 선언 모듈로 폴백해야 한다.
+    pub mod_decl: bool,
+    /// 참조를 해석할 모듈 — 임포트는 모듈 스코프에 산다.
+    pub module: String,
+    /// 속성 경로의 세그먼트(`fixture_macros::keep` → ["fixture_macros","keep"]).
+    pub path: Vec<String>,
+    /// `#[cfg_attr(pred, attr)]` 안쪽 속성은 술어 아래서만 성립한다.
+    pub cfg: Option<String>,
 }
 
 /// impl 블록 — self 타입·트레이트·메서드 목록.
@@ -116,6 +136,7 @@ pub fn decls<'a>(
         vertices: Vec::new(),
         impls: Vec::new(),
         bodies: Vec::new(),
+        attr_refs: Vec::new(),
         entry_roots: Vec::new(),
         test_roots: Vec::new(),
     };
@@ -297,30 +318,62 @@ pub fn decls<'a>(
                 }
                 _ => {}
             }
+            // 아이템 속성의 경로 참조 — #[dep::attr]·#[derive(dep::X)]는
+            // 그 크레이트의 실제 사용 증거다. impl 자체의 속성도 여기서 잡되
+            // owner는 모듈이다(self 타입 정점은 아직 해석 전).
+            // `mod x;` 선언은 파일이 없으면 정점이 안 만들어지므로
+            // mod_decl 표시를 남긴다 — attr_edges가 선언 모듈로 폴백한다.
+            let owner = item
+                .ident()
+                .map(|i| format!("{module_path}::{i}"))
+                .unwrap_or_else(|| module_path.to_string());
+            let mod_decl = matches!(item, syn::Item::Mod(m) if m.content.is_none());
+            collect_attr_refs(
+                attrs_of(item),
+                &owner,
+                module_path,
+                mod_decl,
+                &cfg,
+                &mut out.attr_refs,
+            );
+            if let syn::Item::Macro(m) = item {
+                // 아이템 위치의 매크로 호출 — `dep::mac!()` 경로 자체가 참조다.
+                let segs = path_segments(&m.mac.path);
+                if m.ident.is_none() && segs.len() >= 2 {
+                    out.attr_refs.push(AttrRef {
+                        owner: owner.clone(),
+                        mod_decl: false,
+                        module: module_path.to_string(),
+                        path: segs,
+                        cfg: cfg.clone(),
+                    });
+                }
+            }
         }
     }
     out
 }
 
 /// impl 블록들을 정점·간선으로 변환한다(1패스 후속).
-/// 반환: (정점, 간선, 2패스용 본문 목록).
+/// 반환: (정점, 간선, 속성 경로 참조, 2패스용 본문 목록).
 pub fn impls<'a>(
     blocks: &'a [ImplBlock],
     krate: &str,
     tree: &ModTree,
     harvest: &mut Harvest,
-) -> (Vec<Vertex>, Vec<Edge>, Vec<BodyItem<'a>>) {
+) -> (Vec<Vertex>, Vec<Edge>, Vec<AttrRef>, Vec<BodyItem<'a>>) {
     let mut vertices = Vec::new();
     let mut edges = Vec::new();
+    let mut attr_refs = Vec::new();
     let mut bodies = Vec::new();
     for b in blocks {
         // self 타입을 해석한다 — 모듈 로컬이면 정점이 있다.
-        let Some(self_id) = tree.resolve(&b.items_module, &b.self_ty, &BTreeSet::new()) else {
+        let Some(self_id) = tree.resolve(&b.items_module, &b.self_ty, &DepCrates::new()) else {
             harvest.unresolved_paths += 1;
             continue;
         };
         if let Some(tp) = &b.trait_path {
-            if let Some(trait_id) = tree.resolve(&b.items_module, tp, &BTreeSet::new()) {
+            if let Some(trait_id) = tree.resolve(&b.items_module, tp, &DepCrates::new()) {
                 // unsafe impl의 implements는 경계의 일부다.
                 let mut e = Edge::new(self_id.clone(), trait_id.clone(), EdgeKind::Implements);
                 e.cfg = b.cfg.clone();
@@ -357,6 +410,21 @@ pub fn impls<'a>(
             contains.cfg = b.cfg.clone();
             contains.unsafe_ = b.unsafe_;
             edges.push(contains);
+            // 메서드 속성의 경로 참조 — #[dep::attr] fn m()도 사용 증거다.
+            // impl과 메서드 자신의 cfg를 둘 다 물린다 — 둘 다 성립해야
+            // 이 참조가 존재한다.
+            let mcfg = match (&b.cfg, cfg_of(&m.attrs)) {
+                (a, Some(b)) => conjoin(a, b.as_str()),
+                (a, None) => a.clone(),
+            };
+            collect_attr_refs(
+                &m.attrs,
+                &mid,
+                &b.items_module,
+                false,
+                &mcfg,
+                &mut attr_refs,
+            );
             bodies.push(BodyItem {
                 id: mid,
                 module: b.items_module.clone(),
@@ -369,7 +437,7 @@ pub fn impls<'a>(
             });
         }
     }
-    (vertices, edges, bodies)
+    (vertices, edges, attr_refs, bodies)
 }
 
 /// 시그니처 표면(파라미터·반환·where)의 타입 목록.
@@ -386,11 +454,43 @@ fn fn_signature_types(sig: &syn::Signature) -> Vec<&syn::Type> {
     types
 }
 
+/// 모은 속성 경로 참조를 references 간선으로 해석한다(2패스).
+/// 해석 실패는 unresolved_paths로 센다 — 외부 속성 경로는 그 자체로
+/// 미해석 참조다. owner와 목적지가 같으면 자기 참조라 버린다.
+pub fn attr_edges(
+    refs: &[AttrRef],
+    tree: &ModTree,
+    dep_crates: &DepCrates,
+    harvest: &mut Harvest,
+) -> Vec<Edge> {
+    let mut edges = Vec::new();
+    for r in refs {
+        // `mod x;` 선언에 단 속성의 owner는 모듈 정점 — 파일이 없어
+        // 모듈이 트리에 없으면 그 정점은 존재하지 않으니 선언 모듈로
+        // 폴백한다. 없는 정점에서 간선을내면 유령이 된다.
+        let owner = if r.mod_decl && !tree.modules.contains_key(r.owner.as_str()) {
+            r.module.as_str()
+        } else {
+            r.owner.as_str()
+        };
+        match tree.resolve(&r.module, &r.path, dep_crates) {
+            Some(to) if to != owner => {
+                let mut e = Edge::new(owner.to_string(), to, EdgeKind::References);
+                e.cfg = r.cfg.clone();
+                edges.push(e);
+            }
+            Some(_) => {}
+            None => harvest.unresolved_paths += 1,
+        }
+    }
+    edges
+}
+
 /// 본문을 방문해 call/references/매크로 간선을 만든다(2패스).
 pub fn bodies(
     items: &[BodyItem],
     tree: &ModTree,
-    dep_crates: &BTreeSet<String>,
+    dep_crates: &DepCrates,
     method_index: &BTreeMap<String, Vec<String>>,
     harvest: &mut Harvest,
 ) -> Vec<Edge> {
@@ -407,7 +507,7 @@ pub fn bodies(
 pub fn body_edges(
     b: &BodyItem,
     tree: &ModTree,
-    dep_crates: &BTreeSet<String>,
+    dep_crates: &DepCrates,
     method_index: &BTreeMap<String, Vec<String>>,
     harvest: &mut Harvest,
 ) -> Vec<Edge> {
@@ -437,7 +537,7 @@ pub fn body_edges(
 /// 시그니처 표면(파라미터·반환)의 타입 참조를 signature 간선으로 만든다.
 /// semantic 엔진이 본문을 맡을 때도 이 부분은 syn이 권위다 — 두 경로가
 /// 같은 간선을 내므로 엔진 선택과 무관하게 일관된다.
-pub fn signature_edges(b: &BodyItem, tree: &ModTree, dep_crates: &BTreeSet<String>) -> Vec<Edge> {
+pub fn signature_edges(b: &BodyItem, tree: &ModTree, dep_crates: &DepCrates) -> Vec<Edge> {
     let mut edges = Vec::new();
     // 소유 아이템이 cfg면 시그니처 자체가 그 조건 아래 있으니 간선도 물려받는다.
     for t in &b.signature_surface {
@@ -463,7 +563,7 @@ struct BodyVisitor<'a> {
     module: &'a str,
     self_ty: Option<&'a [String]>,
     tree: &'a ModTree,
-    dep_crates: &'a BTreeSet<String>,
+    dep_crates: &'a DepCrates,
     method_index: &'a BTreeMap<String, Vec<String>>,
     /// 소유 아이템의 cfg — 이 본문의 간선은 전부 그 조건 아래 있다.
     edge_cfg: &'a Option<String>,
@@ -477,6 +577,14 @@ struct BodyVisitor<'a> {
 
 impl BodyVisitor<'_> {
     fn push(&mut self, to: String, kind: EdgeKind) {
+        // 외부 크레이트 정점으로의 간선 — 크레이트 안은 안 보이니
+        // `dep::f()`의 call도 실은 "크레이트 경계 참조"다. 멤버 크레이트
+        // 정점은 external에 없다 — 멤버 안은 실제 정점이다.
+        let kind = if self.dep_crates.external.contains(to.as_str()) {
+            EdgeKind::References
+        } else {
+            kind
+        };
         if to != self.owner {
             let mut e = Edge::new(self.owner.to_string(), to, kind);
             e.cfg = self.edge_cfg.clone();
@@ -691,6 +799,164 @@ fn is_pub(v: &syn::Visibility) -> bool {
     matches!(v, syn::Visibility::Public(_))
 }
 
+/// 두 cfg 조건을 `all(...)`로 결합한다 — 둘 다 성립해야 참조가 존재한다.
+fn conjoin(a: &Option<String>, b: &str) -> Option<String> {
+    match a {
+        Some(a) => Some(format!("all({a} , {b})")),
+        None => Some(b.to_string()),
+    }
+}
+
+/// 아이템 속성에서 경로 참조를 모은다 — 해석은 임포트 완성 뒤 2패스에서.
+/// 한 세그먼트 이름(test·cfg·derive·allow...)은 내장이거나 임포트로
+/// 이미 잡히므로 두 세그먼트 이상만 모은다. cfg_attr 안쪽 속성은
+/// 그 술어를 cfg로 물려받는다 — 조건 없이 성립한다고 속이면 안 된다.
+fn collect_attr_refs(
+    attrs: &[syn::Attribute],
+    owner: &str,
+    module: &str,
+    mod_decl: bool,
+    cfg: &Option<String>,
+    out: &mut Vec<AttrRef>,
+) {
+    let push = |segs: Vec<String>, cfg: &Option<String>, out: &mut Vec<AttrRef>| {
+        if segs.len() >= 2
+            // 도구 네임스페이스 속성(rustfmt·clippy·diagnostic)은 크레이트
+            // 참조가 아니다 — 해석은 항상 실패하니 수집하면 미해석
+            // 카운터만 부푼다.
+            && !matches!(
+                segs[0].as_str(),
+                "rustfmt" | "clippy" | "diagnostic"
+            )
+        {
+            out.push(AttrRef {
+                owner: owner.to_string(),
+                mod_decl,
+                module: module.to_string(),
+                path: segs,
+                cfg: cfg.clone(),
+            });
+        }
+    };
+    for a in attrs {
+        if a.path().is_ident("derive") {
+            // #[derive(a::b::C, D)] — 다중 세그먼트 인자만 참조다.
+            let args = a.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+            );
+            if let Ok(paths) = args {
+                for p in paths {
+                    push(path_segments(&p), cfg, out);
+                }
+            }
+        } else if a.path().is_ident("cfg_attr") {
+            // #[cfg_attr(pred, meta, ...)] — 첫 인자는 술어, 나머지는 속성.
+            if let syn::Meta::List(l) = &a.meta {
+                if let Some((pred, metas)) = split_cfg_attr(&l.tokens) {
+                    for m in metas {
+                        collect_meta_refs(&m, owner, module, mod_decl, &pred, cfg, out);
+                    }
+                }
+            }
+        } else {
+            push(path_segments(a.path()), cfg, out);
+        }
+    }
+}
+
+/// cfg_attr 안쪽 메타 하나를 참조로 모은다 — 술어와 아이템 자신의
+/// cfg를 all()로 합성해 단다. `derive(dep::T)` 인자와 중첩 `cfg_attr`도
+/// 재귀로 파낸다 — 그 안의 경로도 실제 참조다.
+fn collect_meta_refs(
+    m: &syn::Meta,
+    owner: &str,
+    module: &str,
+    mod_decl: bool,
+    pred: &str,
+    cfg: &Option<String>,
+    out: &mut Vec<AttrRef>,
+) {
+    // 이 참조가 성립하는 조건 — 아이템 cfg와 cfg_attr 술어의 합성.
+    let cond = conjoin(cfg, pred);
+    match m {
+        // cfg_attr(pred, derive(dep::T)) — derive 인자가 진짜 참조다.
+        syn::Meta::List(l) if l.path.is_ident("derive") => {
+            let args = l.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+            );
+            if let Ok(paths) = args {
+                for p in paths {
+                    let segs = path_segments(&p);
+                    if segs.len() >= 2 {
+                        out.push(AttrRef {
+                            owner: owner.to_string(),
+                            mod_decl,
+                            module: module.to_string(),
+                            path: segs,
+                            cfg: cond.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        // 중첩 cfg_attr — 바깥 술어와 안쪽 술어를 둘 다 성립 조건으로 쌓는다.
+        syn::Meta::List(l) if l.path.is_ident("cfg_attr") => {
+            if let Some((inner_pred, metas)) = split_cfg_attr(&l.tokens) {
+                for m in metas {
+                    collect_meta_refs(&m, owner, module, mod_decl, &inner_pred, &cond, out);
+                }
+            }
+        }
+        _ => {
+            let path = match m {
+                syn::Meta::Path(p) => p,
+                syn::Meta::List(l) => &l.path,
+                syn::Meta::NameValue(nv) => &nv.path,
+            };
+            let segs = path_segments(path);
+            if segs.len() >= 2 {
+                out.push(AttrRef {
+                    owner: owner.to_string(),
+                    mod_decl,
+                    module: module.to_string(),
+                    path: segs,
+                    cfg: cond,
+                });
+            }
+        }
+    }
+}
+
+/// cfg_attr의 인자를 (술어 원문, 적용 메타 목록)으로 쪼갠다.
+/// 첫 최상위 쉼표가 술어와 속성의 경계다. 술어는 토큰 원문 그대로
+/// 간다 — `Meta`로 재파싱해 LitStr의 value()를 다시 따옴표로 감싸면
+/// `\\x6c` 같은 이스케이프가 디코드된 채 남아 거짓 조건이 참으로
+/// 뒤집힌다.
+fn split_cfg_attr(tokens: &proc_macro2::TokenStream) -> Option<(String, Vec<syn::Meta>)> {
+    let mut pred_ts = proc_macro2::TokenStream::new();
+    let mut rest_ts = proc_macro2::TokenStream::new();
+    let mut seen_comma = false;
+    for tt in tokens.clone() {
+        if !seen_comma && matches!(&tt, proc_macro2::TokenTree::Punct(p) if p.as_char() == ',') {
+            seen_comma = true;
+            continue;
+        }
+        if seen_comma {
+            rest_ts.extend(std::iter::once(tt));
+        } else {
+            pred_ts.extend(std::iter::once(tt));
+        }
+    }
+    if !seen_comma {
+        return None;
+    }
+    use syn::parse::Parser;
+    let metas = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+        .parse2(rest_ts)
+        .ok()?;
+    Some((pred_ts.to_string(), metas.into_iter().collect()))
+}
+
 /// `file:line` 위치 — 아이템의 이름 span 줄을 쓴다.
 fn position_of(file: &Path, item: &syn::Item) -> Option<String> {
     let line = item.ident().map(line_of).unwrap_or(0);
@@ -813,4 +1079,32 @@ pub fn is_extern_entry(attrs: &[syn::Attribute]) -> bool {
             )
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// cfg_attr 술어의 문자열 리터럴은 이스케이프 원문 그대로 보존된다 —
+    /// `feature = "a\x62c"`를 Meta로 재파싱해 value()를 다시 감싸면
+    /// "abc"로 바뀌어 거짓 조건이 참으로 평가될 수 있다.
+    #[test]
+    fn split_cfg_attr_preserves_predicate_escapes() {
+        let attr: syn::Attribute =
+            syn::parse_quote!(#[cfg_attr(feature = "a\x62c", derive(Debug))]);
+        let syn::Meta::List(l) = attr.meta else {
+            panic!("cfg_attr is a list meta")
+        };
+        let (pred, metas) = split_cfg_attr(&l.tokens).expect("split");
+        // 원문 이스케이프가 남고 디코드된 값이 섞이지 않아야 한다.
+        assert!(pred.contains("\\x62"), "predicate lost escape: {pred}");
+        assert!(!pred.contains("\"abc\""), "predicate decoded: {pred}");
+        assert_eq!(metas.len(), 1);
+        // 쉼표 없는 cfg_attr는 술어/속성 경계가 없다 — None.
+        let attr2: syn::Attribute = syn::parse_quote!(#[cfg_attr(test)]);
+        let syn::Meta::List(l2) = attr2.meta else {
+            panic!("cfg_attr is a list meta")
+        };
+        assert!(split_cfg_attr(&l2.tokens).is_none());
+    }
 }

@@ -59,8 +59,16 @@ rustograph dead --retain-public --tests
 rustograph dead --explain mycrate::f     # 왜 살아 있나 — 도달 경로
 rustograph rules --strict                # .rustograph.yml 레이어 규칙
 rustograph rules --format sarif          # GitHub 코드 스캐닝용
+rustograph rules --write-baseline        # 기존 위반을 기준선으로 얼림
 rustograph query mycrate::module::f --depth 2
 rustograph impact mycrate::Type --depth 3
+rustograph paths mycrate::a mycrate::b   # 두 정점 사이 제한된 경로 탐색
+rustograph search entry                  # 정확 > 꼬리 > 부분 문자열 순위
+rustograph deps                          # 미사용 의존 + 중복 버전 보고
+rustograph deps --strict                 # 발견이 있으면 종료 코드 1
+rustograph graph --focus mycrate::sub    # 서브트리만 남김
+rustograph dead --exclude-tests          # #[cfg(test)] 서브트리 제외
+rustograph graph --target x86_64-pc-windows-msvc  # cfg(트리플) 평가
 rustograph mcp                           # MCP stdio 서버 — 에이전트가 되묻는 통로
 ```
 
@@ -70,10 +78,15 @@ rustograph mcp                           # MCP stdio 서버 — 에이전트가 
 `unsafe {}` 블록을 품은 정점에 `unsafe: true`, `unsafe {}` 안에서 만든
 간선은 경계 진입 간선입니다.
 
-`rustograph mcp`는 개행 구분 JSON-RPC 2.0을 stdio로 말하고 도구 6종
-(`rustograph_summary`/`_query`/`_impact`/`_cycles`/`_dead`/`_rules`)을
-서빙합니다. 문서는 기동 시 한 번 수확해(또는 `--graph`로 읽어) 같은
-스냅샷 위에서 답합니다.
+`rustograph mcp`는 개행 구분 JSON-RPC 2.0을 stdio로 말하고 도구 9종
+(`rustograph_summary`/`_query`/`_impact`/`_paths`/`_search`/`_cycles`/
+`_dead`/`_rules`/`_deps`)을 서빙합니다. 문서는 기동 시 한 번 수확해
+(또는 `--graph`로 읽어) 같은 스냅샷 위에서 답합니다. 부분 ID는 후보
+목록과 함께 거절됩니다 — `rustograph_search`로 정확한 ID를 찾으세요.
+
+`--semantic` 문서는 `.rustograph/semantic-cache.json`에 캐시됩니다 —
+워크스페이스 소스와 매니페스트 지문이 키라, 오래되거나 깨진 캐시는
+조용히 새 수확으로 돌아갑니다. `--no-cache`로 끌 수 있습니다.
 
 종료 코드: `0` 정상 · `1` strict 위반/발견 · `2` 사용법/분석 오류.
 
