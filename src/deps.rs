@@ -79,7 +79,30 @@ pub fn report_from(meta: &Metadata, doc: &Document) -> DepsReport {
 
     let mut unused = Vec::new();
     let mut build_skipped = 0usize;
+    let mut dev_skipped = 0usize;
+    let mut ambiguous_external = 0usize;
     let mut seen: BTreeSet<(String, String, String)> = BTreeSet::new();
+    // 멤버의 그래프 루트 ID들 — lib/bin 타깃 이름(없으면 패키지 이름).
+    // 외부 패키지명과 충돌하면 사용 증거가 어느 쪽 것인지 문자열로
+    // 구별할 수 없다 — 그 dep은 모호로 센다.
+    let member_roots: BTreeSet<String> = meta
+        .packages
+        .iter()
+        .filter(|p| p.workspace_member)
+        .flat_map(|p| {
+            let names: Vec<String> = p
+                .targets
+                .iter()
+                .filter(|t| matches!(t.kind.as_str(), "lib" | "bin"))
+                .map(|t| t.name.clone())
+                .collect();
+            if names.is_empty() {
+                vec![p.name.clone()]
+            } else {
+                names
+            }
+        })
+        .collect();
     for e in &meta.dep_edges {
         let (Some(from), Some(to)) = (pkg_name(&e.from), pkg_name(&e.to)) else {
             continue;
@@ -94,6 +117,12 @@ pub fn report_from(meta: &Metadata, doc: &Document) -> DepsReport {
         if e.kind == "build" {
             build_skipped += 1;
             continue; // build.rs는 수확 범위 밖 — 판정 불가로 넘긴다.
+        }
+        if e.kind == "dev" {
+            dev_skipped += 1;
+            continue; // tests/examples/benches는 수확 범위 밖 — 사용
+                      // 증거가 원천적으로 불완전해 미사용 판정이 오탐이
+                      // 된다. 판정 불가로 넘기고 limitation에 센다.
         }
         // 멤버의 그래프상 크레이트 이름 — 패키지 이름과 lib/bin 타깃 이름.
         let member_krates: BTreeSet<&str> = std::iter::once(fp.name.as_str())
@@ -118,6 +147,12 @@ pub fn report_from(meta: &Metadata, doc: &Document) -> DepsReport {
                         .map(|t| t.name.as_str()),
                 )
                 .collect()
+        } else if member_roots.contains(tp.name.as_str()) {
+            // 외부 패키지명이 멤버 루트 ID와 같다 — `x::`로의 간선이
+            // 멤버 것인지 이 dep 것인지 구별할 방법이 없다. 멤버
+            // 증거를 외부 dep 사용으로 세지 않고 모호로 남긴다.
+            ambiguous_external += 1;
+            BTreeSet::new()
         } else {
             BTreeSet::from([tp.name.as_str()])
         };
@@ -177,10 +212,14 @@ pub fn report_from(meta: &Metadata, doc: &Document) -> DepsReport {
             "{build_skipped} build-dependencies not checked (build scripts are outside the harvested graph)"
         ));
     }
-    let dev_findings = unused.iter().filter(|u| u.kind == "dev").count();
-    if dev_findings > 0 {
+    if dev_skipped > 0 {
         limitations.push(format!(
-            "{dev_findings} findings are dev-dependencies — test/example targets are not harvested, so their usage is invisible"
+            "{dev_skipped} dev-dependencies not checked (test/example/bench targets are not harvested, so their usage is invisible)"
+        ));
+    }
+    if ambiguous_external > 0 {
+        limitations.push(format!(
+            "{ambiguous_external} external dependencies share a name with a member crate root — usage evidence is ambiguous"
         ));
     }
     if !unused.is_empty() {
