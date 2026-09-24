@@ -87,10 +87,25 @@ rustograph dead --explain mycrate::f      # why alive? show a reachability path
 # Check layer rules from .rustograph.yml
 rustograph rules --strict
 rustograph rules --format sarif           # GitHub code scanning ready
+rustograph rules --write-baseline         # freeze current violations
+rustograph rules --baseline base.txt      # only *new* violations fail
 
 # Ask about one symbol (agent-oriented JSON)
 rustograph query mycrate::module::f --depth 2
 rustograph impact mycrate::Type --depth 3  # reverse transitive closure
+rustograph paths mycrate::a mycrate::b    # bounded paths between two ids
+rustograph search entry                   # exact > suffix > substring
+#   partial ids are refused with candidates — retry with an exact id
+
+# Crate-level dependency health (declared vs actually referenced)
+rustograph deps                           # unused deps + duplicate versions
+rustograph deps --strict                  # exit 1 when findings exist
+
+# Trim the document before analysis
+rustograph graph --focus mycrate::sub     # keep one subtree only
+rustograph dead --exclude-tests           # drop #[cfg(test)] subtrees
+rustograph graph --target x86_64-pc-windows-msvc  # evaluate cfg(triple)
+rustograph dead --semantic --no-cache     # bypass the semantic cache
 
 # Serve the graph over MCP (stdio JSON-RPC) for coding agents
 rustograph mcp                            # harvests once, serves a snapshot
@@ -124,10 +139,16 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
 ## MCP server
 
 `rustograph mcp` speaks newline-delimited JSON-RPC 2.0 on stdio and serves
-six tools — `rustograph_summary`, `rustograph_query`, `rustograph_impact`,
-`rustograph_cycles`, `rustograph_dead`, `rustograph_rules`. The document is
+nine tools — `rustograph_summary`, `rustograph_query`, `rustograph_impact`,
+`rustograph_paths`, `rustograph_search`, `rustograph_cycles`,
+`rustograph_dead`, `rustograph_rules`, `rustograph_deps`. The document is
 harvested once at startup (or loaded via `--graph`), so every call answers
-over the same snapshot.
+over the same snapshot. Partial ids are refused with a candidate list —
+call `rustograph_search` or retry with an exact id.
+
+Semantic-mode documents are cached under `.rustograph/semantic-cache.json`,
+keyed by a fingerprint of workspace sources and manifests — a stale or
+corrupt cache silently falls back to a fresh harvest.
 
 ## Rules — .rustograph.yml
 
@@ -142,9 +163,16 @@ deny:
   core: [ui]          # deny beats allow
 signature:
   ui: [ui, core]      # exported API signatures may only mention these
+baseline: .rustograph/rules-baseline.txt  # frozen violations (optional)
 ```
 
 Unmapped modules are reported separately — a rule's blind spot is not a pass.
+
+A baseline file freezes violations that existed when the rules were adopted:
+`rules --write-baseline` records the current set (one `rule|from|to|kind`
+key per line, `#` comments allowed), and later runs suppress matching
+violations while still reporting `baselined`/`stale_baseline` counts —
+stale entries mean the code improved and the file can be regenerated.
 
 ## Agent output contract
 
