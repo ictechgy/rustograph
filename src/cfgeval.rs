@@ -61,6 +61,27 @@ const VOLATILE: &[&str] = &[
 /// 거짓으로 증명할 수 있다. 커스텀 --cfg 플래그는 여기 없으니 미지로 남는다.
 const KNOWN_FLAGS: &[&str] = &["unix", "windows", "test", "doc", "doctest", "proc_macro"];
 
+/// rustc --print cfg가 출력하는 내장 target_* 키 — 닫힌 집합이라 실측
+/// 팩트에서 부재면 거짓이다. 커스텀 `--cfg target_foo`나 미래의 새 키는
+/// 여기 없으니 미지로 남는다 — 접두사로 닫으면 RUSTFLAGS로 주입된
+/// target_* 조건이 오삭제된다.
+const TARGET_KEYS: &[&str] = &[
+    "target_abi",
+    "target_arch",
+    "target_endian",
+    "target_env",
+    "target_family",
+    "target_feature",
+    "target_has_atomic",
+    "target_has_atomic_equal_alignment",
+    "target_has_atomic_load_store",
+    "target_os",
+    "target_pointer_width",
+    "target_thread_local",
+    "target_vendor",
+    "target_wasix",
+];
+
 impl Facts {
     /// `rustc --print cfg --target` 출력 한 줄씩을 팩트로 적재한다.
     /// `name = "value"`와 bare 조건 두 형태다. platform+rustc=true —
@@ -542,7 +563,7 @@ fn fact_eq(name: &str, val: &str, f: &Facts) -> Option<bool> {
     if let Some(vals) = f.pairs.get(name) {
         return Some(vals.contains(val));
     }
-    if f.rustc && name.starts_with("target_") {
+    if f.rustc && TARGET_KEYS.contains(&name) {
         return Some(false);
     }
     None
