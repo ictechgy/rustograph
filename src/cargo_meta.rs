@@ -148,6 +148,17 @@ pub fn rustc_cfg_lines(triple: &str) -> Option<Vec<String>> {
     )
 }
 
+/// `rustc -vV`의 원시 출력 — 툴체인 버전은 수확 결과를 바꾸는
+/// 빌드 입력이라 캐시 지문에 넣는다. rustc가 없으면 None — 호출자는
+/// 지문을 만들 수 없으니 캐시를 쓰지 않는다.
+pub fn rustc_version() -> Option<String> {
+    let out = Command::new("rustc").arg("-vV").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
 /// `cargo metadata`를 실행해 워크스페이스 사실을 읽는다.
 /// dir이 cargo 프로젝트가 아니면 오류 — 빈 그래프로 속이지 않는다.
 pub fn load(dir: &Path) -> Result<Metadata, String> {

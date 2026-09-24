@@ -137,6 +137,14 @@ fn fingerprint(dir: &Path, meta: &Metadata, opts: &Options) -> Option<u64> {
     feed(b"rustograph-cache-v2");
     feed(env!("CARGO_PKG_VERSION").as_bytes());
     feed(&graph::DOCUMENT_VERSION.to_le_bytes());
+    // 툴체인과 빌드 env도 수확 입력이다 — rustc/ra_ap 버전과
+    // RUSTFLAGS가 바뀌면 cfg 평가·의미 해석이 달라진다. 프로브
+    // 실패는 지문 불가 — 캐시 없는 경로로 돌아간다.
+    feed(cargo_meta::rustc_version()?.as_bytes());
+    for var in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"] {
+        feed(var.as_bytes());
+        feed(std::env::var(var).unwrap_or_default().as_bytes());
+    }
     feed(dir.canonicalize().ok()?.display().to_string().as_bytes());
     feed(&[
         opts.symbol_level as u8,
@@ -161,7 +169,11 @@ fn fingerprint(dir: &Path, meta: &Metadata, opts: &Options) -> Option<u64> {
         for e in std::fs::read_dir(&d).ok()? {
             let e = e.ok()?;
             let p = e.path();
-            if p.is_dir() {
+            // file_type은 심볼릭 링크를 따라가지 않는다 — 링크된 디렉터리를
+            // 걸으면 순환이 무한 루프다. 링크 자체는 건너뛰고, 그 안의
+            // 파일을 쓰는 수확은 정점 위치가 커버리지 검사에 걸려
+            // 캐시를 끈다.
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if name != "target" && (!name.starts_with('.') || name == ".cargo") {
                     stack.push(p);
@@ -700,7 +712,9 @@ fn scan_orphans(dir: &Path, known: &BTreeSet<PathBuf>, tree: &mut ModTree) {
         };
         for e in rd.flatten() {
             let p = e.path();
-            if p.is_dir() {
+            // file_type은 심볼릭 링크를 따라가지 않는다 — 링크된
+            // 디렉터리 순환이 무한 루프를 만든다.
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 stack.push(p);
             } else if p.extension().is_some_and(|x| x == "rs") {
                 if let Ok(c) = p.canonicalize() {
