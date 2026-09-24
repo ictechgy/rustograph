@@ -7,7 +7,7 @@
 
 use crate::cli_args::{self, Args};
 use crate::graph::{Document, Level};
-use crate::{analysis, config, export, rules};
+use crate::{analysis, config, deps, export, rules};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -43,6 +43,8 @@ struct RpcError {
 /// 수확된 문서 하나를 서빙하는 서버 상태.
 pub struct Server {
     doc: Document,
+    /// deps 도구가 cargo metadata를 읽을 워크스페이스 디렉터리.
+    dir: PathBuf,
     /// rules 도구가 읽을 설정 파일 — 없으면 rules 호출이 isError로 답한다.
     cfg_path: Option<PathBuf>,
     /// 핸드셰이크로 합의한 프로토콜 버전.
@@ -65,6 +67,7 @@ pub(crate) fn cmd(
     };
     let srv = Server {
         doc,
+        dir,
         cfg_path,
         protocol: "2024-11-05".to_string(),
     };
@@ -211,12 +214,16 @@ impl Server {
             }))),
             "rustograph_query" => {
                 let id = arg_str(args, "id").ok_or("query needs an \"id\" argument")?;
+                let id = self.require_id(id)?;
                 let depth = arg_usize(args, "depth").unwrap_or(1);
                 let max = arg_usize(args, "max").unwrap_or(200);
-                Ok(export::to_json(&analysis::query(&self.doc, id, depth, max)))
+                Ok(export::to_json(&analysis::query(
+                    &self.doc, &id, depth, max,
+                )))
             }
             "rustograph_impact" => {
                 let id = arg_str(args, "id").ok_or("impact needs an \"id\" argument")?;
+                let id = self.require_id(id)?;
                 // depth 0은 "전체 전이 클로저" — 내부에서는 무제한으로 바꾸되
                 // 보고에는 요청값을 싣는다(usize::MAX는 계약이 아니다).
                 let requested = arg_usize(args, "depth").unwrap_or(0);
@@ -226,10 +233,27 @@ impl Server {
                     requested
                 };
                 let max = arg_usize(args, "max").unwrap_or(200);
-                let mut r = analysis::impact(&self.doc, id, effective, max);
+                let mut r = analysis::impact(&self.doc, &id, effective, max);
                 r.depth = requested;
                 Ok(export::to_json(&r))
             }
+            "rustograph_paths" => {
+                let from = arg_str(args, "from").ok_or("paths needs \"from\" and \"to\"")?;
+                let to = arg_str(args, "to").ok_or("paths needs \"from\" and \"to\"")?;
+                let from = self.require_id(from)?;
+                let to = self.require_id(to)?;
+                let max = arg_usize(args, "max").unwrap_or(10);
+                let budget = arg_usize(args, "budget").unwrap_or(50_000);
+                Ok(export::to_json(&analysis::paths(
+                    &self.doc, &from, &to, max, budget,
+                )))
+            }
+            "rustograph_search" => {
+                let q = arg_str(args, "q").ok_or("search needs a \"q\" argument")?;
+                let max = arg_usize(args, "max").unwrap_or(20);
+                Ok(export::to_json(&analysis::search(&self.doc, q, max)))
+            }
+            "rustograph_deps" => Ok(export::to_json(&deps::report(&self.dir, &self.doc)?)),
             "rustograph_cycles" => {
                 let level = match arg_str(args, "level") {
                     Some(l) => Level::parse(l)
@@ -284,10 +308,32 @@ impl Server {
                     .map_err(|e| format!("cannot read {}: {e}", cfg_path.display()))?;
                 let cfg: config::Config = serde_yml::from_str(&src)
                     .map_err(|e| format!("bad {}: {e}", cfg_path.display()))?;
-                Ok(export::to_json(&rules::check(&self.doc, &cfg)))
+                let mut rep = rules::check(&self.doc, &cfg);
+                // 설정에 선언된 기준선을 적용한다 — CLI rules와 같은 계약.
+                // 없는 파일은 아직 도입 전이라 조용히 넘긴다.
+                if let Some(b) = &cfg.baseline {
+                    let path = cfg_path.parent().unwrap_or(self.dir.as_path()).join(b);
+                    if let Ok(src) = std::fs::read_to_string(&path) {
+                        rules::apply_baseline(&mut rep, &rules::Baseline::parse(&src));
+                    }
+                }
+                Ok(export::to_json(&rep))
             }
             other => Err(format!("unknown tool {other:?} — see tools/list")),
         }
+    }
+
+    /// 정점 ID를 정확히 해석한다 — 부분 문자열을 조용히 맞추지 않고
+    /// 후보를 담은 isError로 돌려준다. 에이전트는 rustograph_search로
+    /// 후보를 찾은 뒤 정확한 ID로 다시 호출해야 한다.
+    fn require_id(&self, id: &str) -> Result<String, String> {
+        analysis::resolve_id(&self.doc, id).map_err(|cands| {
+            if cands.is_empty() {
+                format!("vertex {id} not found")
+            } else {
+                format!("vertex {id} not found — candidates: {}", cands.join(", "))
+            }
+        })
     }
 }
 
@@ -347,6 +393,37 @@ fn tool_list() -> serde_json::Value {
             },
         },
         {
+            "name": "rustograph_paths",
+            "description": "Shortest-first dependency paths between two vertices (bounded BFS)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from": {"type": "string", "description": "start vertex ID"},
+                    "to": {"type": "string", "description": "goal vertex ID"},
+                    "max": {"type": "integer", "description": "max paths (default 10)"},
+                    "budget": {"type": "integer", "description": "max vertex expansions (default 50000)"},
+                },
+                "required": ["from", "to"],
+            },
+        },
+        {
+            "name": "rustograph_search",
+            "description": "Find vertices by ID — exact first, then suffix, then substring. Use before query/impact when unsure of an ID",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "q": {"type": "string", "description": "query string"},
+                    "max": {"type": "integer", "description": "max hits (default 20)"},
+                },
+                "required": ["q"],
+            },
+        },
+        {
+            "name": "rustograph_deps",
+            "description": "Cargo dependency report: unused declared deps (observed via graph) and duplicate versions. Needs --deps harvest for usage evidence",
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
             "name": "rustograph_rules",
             "description": "Check layer rules from .rustograph.yml; returns violations and unmapped vertices",
             "inputSchema": {"type": "object", "properties": {}},
@@ -404,6 +481,7 @@ mod tests {
                 vec![Edge::new("c::a".into(), "c::b".into(), EdgeKind::Call)],
                 vec![],
             ),
+            dir: PathBuf::from("."),
             cfg_path: None,
             protocol: "2024-11-05".to_string(),
         }
@@ -437,7 +515,7 @@ mod tests {
         // 알림은 응답을 만들지 않는다.
         assert_eq!(res.len(), 2);
         assert_eq!(res[0]["result"]["protocolVersion"], "2025-06-18");
-        assert_eq!(res[1]["result"]["tools"].as_array().unwrap().len(), 6);
+        assert_eq!(res[1]["result"]["tools"].as_array().unwrap().len(), 9);
     }
 
     #[test]
