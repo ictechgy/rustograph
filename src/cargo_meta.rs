@@ -13,6 +13,8 @@ use std::process::Command;
 pub struct Package {
     /// 크레이트 이름(`-`는 `_`로 정규화해 모듈 경로와 맞춘다).
     pub name: String,
+    /// 패키지 버전 — 중복 버전 탐지에 쓴다.
+    pub version: String,
     /// lib/bin 타깃의 엔트리 파일들.
     pub targets: Vec<Target>,
     /// 이 패키지가 워크스페이스 멤버인가.
@@ -37,6 +39,9 @@ pub struct DepEdge {
     pub to: String,
     /// ""(normal) | "dev" | "build".
     pub kind: String,
+    /// 코드가 실제로 쓰는 라이브러리 이름 — `foo = { package = "real" }`의
+    /// rename을 거친 이름이라 use 경로의 첫 세그먼트와 같다.
+    pub lib_name: String,
 }
 
 /// 수확에 필요한 메타데이터 전부.
@@ -64,6 +69,7 @@ struct RawMetadata {
 struct RawPackage {
     id: String,
     name: String,
+    version: String,
     targets: Vec<RawTarget>,
 }
 
@@ -88,6 +94,8 @@ struct RawNode {
 #[derive(Deserialize)]
 struct RawDep {
     pkg: String,
+    /// 코드에서 보이는 라이브러리 이름 — rename을 반영한다.
+    name: Option<String>,
     dep_kinds: Vec<RawDepKind>,
 }
 
@@ -125,6 +133,12 @@ fn parse(bytes: &[u8]) -> Result<Metadata, String> {
         serde_json::from_slice(bytes).map_err(|e| format!("bad cargo metadata JSON: {e}"))?;
     let members: std::collections::BTreeSet<&str> =
         raw.workspace_members.iter().map(|s| s.as_str()).collect();
+    // deps[].name이 없을 때의 폴백용 — packages를 소비하기 전에 뺀다.
+    let raw_names: BTreeMap<String, String> = raw
+        .packages
+        .iter()
+        .map(|p| (p.id.clone(), p.name.clone()))
+        .collect();
     let mut by_id = BTreeMap::new();
     let mut packages = Vec::new();
     for p in raw.packages {
@@ -132,6 +146,7 @@ fn parse(bytes: &[u8]) -> Result<Metadata, String> {
         packages.push(Package {
             workspace_member: members.contains(p.id.as_str()),
             name: normalize_name(&p.name),
+            version: p.version,
             targets: p
                 .targets
                 .into_iter()
@@ -154,11 +169,18 @@ fn parse(bytes: &[u8]) -> Result<Metadata, String> {
         Some(resolve) => {
             for n in resolve.nodes {
                 for d in n.deps {
+                    // deps[].name이 없으면 패키지 이름이 곧 lib 이름이다.
+                    let lib = d
+                        .name
+                        .clone()
+                        .or_else(|| raw_names.get(&d.pkg).cloned())
+                        .unwrap_or_default();
                     for k in d.dep_kinds {
                         dep_edges.push(DepEdge {
                             from: n.id.clone(),
                             to: d.pkg.clone(),
                             kind: k.kind.unwrap_or_default(),
+                            lib_name: normalize_name(&lib),
                         });
                     }
                 }

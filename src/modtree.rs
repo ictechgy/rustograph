@@ -7,6 +7,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+/// 외부 크레이트 해석 표 — 코드가 보는 라이브러리 이름 → 정점 ID.
+/// `foo = { package = "real" }` rename이면 `foo → real`이다.
+/// 값이 크레이트 정점 ID와 같아야 dep 경로가 실제 정점으로 붕괴한다.
+/// 호출자가 빈 맵을 넘기면 외부 경로는 전부 미해석이다(기본 동작).
+pub type DepCrates = BTreeMap<String, String>;
+
 /// `use` 임포트 하나 — 해석된 정규 경로와 `#[cfg]` 조건.
 /// 조건이 있으면 그 빌드에서만 존재하는 임포트다 — 간선도 조건을 물려받는다.
 #[derive(Debug, Clone)]
@@ -116,14 +122,12 @@ pub fn module_dir(file: &Path) -> PathBuf {
 
 impl ModTree {
     /// 모듈 경로에서 시작해 `use` 세그먼트를 해석한다.
-    /// 반환값은 정규 ID. 해석 불가(외부 크레이트·prelude·매크로 생성 이름)면 None —
-    /// 유령 정점을 만들지 않는 것이 계약이다.
-    pub fn resolve(
-        &self,
-        from: &str,
-        segs: &[String],
-        dep_crates: &BTreeSet<String>,
-    ) -> Option<String> {
+    /// 반환값은 정규 ID. 해석 불가(prelude·매크로 생성 이름)면 None —
+    /// 유령 정점을 만들지 않는 것이 계약이다. 외부 크레이트 경로는
+    /// dep_crates가 비어 있지 않으면 크레이트 정점 ID로 붕괴한다 —
+    /// `serde::de::X`는 `serde`다. 크레이트 안은 못 보지만 경계까지는
+    /// 사실이다.
+    pub fn resolve(&self, from: &str, segs: &[String], dep_crates: &DepCrates) -> Option<String> {
         if segs.is_empty() {
             return None;
         }
@@ -153,14 +157,20 @@ impl ModTree {
                     } else if self.modules.contains_key(first) {
                         // 같은 워크스페이스의 다른 크레이트 루트 모듈.
                         return self.walk(first, &segs[1..]);
-                    } else if dep_crates.contains(first) {
-                        return None; // 외부 크레이트 — 정점을 만들지 않는다.
+                    } else if let Some(pkg) = dep_crates.get(first) {
+                        // 외부 크레이트 — `dep::x::y`는 dep 정점으로 붕괴한다.
+                        return Some(pkg.clone());
                     } else {
                         return None;
                     }
                 }
             }
         };
+        // `use serde::Deserialize`가 만든 임포트처럼 시작점 자체가 외부
+        // 크레이트를 가리키면 그 정점이다 — walk은 외부 안을 못 본다.
+        if let Some(pkg) = dep_crates.get(start.as_str()) {
+            return Some(pkg.clone());
+        }
         self.walk(&start, &segs[i..])
     }
 
@@ -367,12 +377,7 @@ pub fn fill_items(tree: &mut ModTree, path: &str, items: &[&syn::Item]) {
 }
 
 /// 모듈의 `use` 임포트 맵을 해석해 채운다(2단계 — 전 모듈의 fill_items 이후).
-pub fn fill_imports(
-    tree: &mut ModTree,
-    path: &str,
-    items: &[&syn::Item],
-    dep_crates: &BTreeSet<String>,
-) {
+pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_crates: &DepCrates) {
     let mut uses: Vec<(Vec<String>, Option<String>)> = Vec::new();
     for item in items {
         if let syn::Item::Use(u) = item {
@@ -503,7 +508,7 @@ mod tests {
     #[test]
     fn resolve_crate_self_super_and_items() {
         let t = tree();
-        let none = BTreeSet::new();
+        let none = DepCrates::new();
         // crate:: 접두사.
         assert_eq!(
             t.resolve("c::m", &["crate".into(), "f".into()], &none),
@@ -529,7 +534,7 @@ mod tests {
     #[test]
     fn resolve_uses_imports_and_nested_paths() {
         let t = tree();
-        let none = BTreeSet::new();
+        let none = DepCrates::new();
         // use 별칭 → 임포트 대상.
         assert_eq!(
             t.resolve("c::m", &["h".into()], &none),
@@ -549,20 +554,35 @@ mod tests {
                     Module::new(PathBuf::from("o.rs"), true, true),
                 );
                 drop(t2);
-                BTreeSet::new()
+                DepCrates::new()
             }),
             None // other 크레이트는 modules에 없으니 None.
         );
     }
 
     #[test]
-    fn resolve_rejects_external_and_unknown() {
+    fn resolve_collapses_external_to_crate_vertex() {
         let t = tree();
-        let deps = BTreeSet::from(["serde".to_string()]);
-        // 외부 크레이트 — 정점을 만들지 않는다.
-        assert_eq!(t.resolve("c", &["serde".into(), "de".into()], &deps), None);
-        // 아무 것도 아닌 이름.
-        assert_eq!(t.resolve("c", &["nope".into()], &BTreeSet::new()), None);
+        // 지역 이름이 crate::deps 모듈과 충돌하면 거짓 참조 간선이 생긴다.
+        let dep_map = DepCrates::from([("serde".to_string(), "serde".to_string())]);
+        // 외부 크레이트 경로는 크레이트 정점으로 붕괴한다 — 안은 못 본다.
+        assert_eq!(
+            t.resolve("c", &["serde".into(), "de".into()], &dep_map),
+            Some("serde".to_string())
+        );
+        // rename된 의존은 코드상 이름으로 들어와 정점 이름으로 나간다.
+        let renamed = DepCrates::from([("foo".to_string(), "real_pkg".to_string())]);
+        assert_eq!(
+            t.resolve("c", &["foo".into(), "x".into()], &renamed),
+            Some("real_pkg".to_string())
+        );
+        // 빈 dep 표를 넘기면 옛 동작 — 미해석.
+        assert_eq!(
+            t.resolve("c", &["serde".into(), "de".into()], &DepCrates::new()),
+            None
+        );
+        // 아무 것도 아닌 이름은 여전히 미해석.
+        assert_eq!(t.resolve("c", &["nope".into()], &DepCrates::new()), None);
     }
 
     #[test]

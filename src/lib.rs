@@ -10,6 +10,7 @@ pub mod cfgeval;
 pub mod cli;
 pub(crate) mod cli_args;
 pub mod config;
+pub mod deps;
 pub mod export;
 pub mod graph;
 pub mod harvest;

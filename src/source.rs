@@ -46,22 +46,43 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
         );
     }
     let meta = cargo_meta::load(dir)?;
+    harvest(dir, &meta, opts)
+}
+
+/// 실제 수확 — 메타데이터 위에서 모듈 트리·간선을 조립한다.
+fn harvest(dir: &Path, meta: &Metadata, opts: &Options) -> Result<Document, String> {
     let mut harvest = Harvest::default();
     let mut vertices: Vec<Vertex> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut entry_roots: Vec<String> = Vec::new();
     let mut limitations = meta.limitations.clone();
 
-    // 워크스페이스 외부 크레이트 이름 — resolve에서 "내부 아님" 판별용.
-    let dep_crates: BTreeSet<String> = meta
-        .packages
-        .iter()
-        .filter(|p| !p.workspace_member)
-        .map(|p| p.name.clone())
-        .collect();
+    // 코드가 보는 lib 이름 → 외부 크레이트 정점 ID(패키지 이름).
+    // --deps일 때만 채운다 — 정점이 없는데 dep 경로가 해석되면
+    // dangling 간선이 생긴다. 빈 맵이면 resolve는 외부를 미해석으로
+    // 처리하는 옛 동작 그대로다.
+    let dep_crates: modtree::DepCrates = if opts.include_deps {
+        meta.dep_edges
+            .iter()
+            .filter(|d| {
+                meta.by_id
+                    .get(&d.from)
+                    .is_some_and(|i| meta.packages[*i].workspace_member)
+            })
+            .filter_map(|d| {
+                meta.by_id
+                    .get(&d.to)
+                    .map(|i| (d.lib_name.clone(), meta.packages[*i].name.clone()))
+            })
+            .collect()
+    } else {
+        Default::default()
+    };
+    // 정점으로 존재하는 외부 크레이트 이름 — uses 간선 방출용.
+    let dep_vertices: BTreeSet<String> = dep_crates.values().cloned().collect();
 
     emit_crate_level(
-        &meta,
+        meta,
         opts.include_deps,
         &mut vertices,
         &mut edges,
@@ -135,22 +156,26 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
     // 1패스: 모듈·아이템 선언 — 정점과 contains/uses/implements 간선.
     let mut bodies: Vec<BodyItem<'_>> = Vec::new();
     let mut impls: Vec<harvest::ImplBlock> = Vec::new();
+    let mut attr_refs: Vec<harvest::AttrRef> = Vec::new();
     let mut test_roots: Vec<String> = Vec::new();
     for mp in tree.modules.keys().cloned().collect::<Vec<_>>() {
-        let mh = harvest_module(&mut tree, &arena, &mp, &mut harvest);
+        let mh = harvest_module(&mut tree, &arena, &mp, &mut harvest, &dep_vertices);
         vertices.push(mh.vertex);
         edges.extend(mh.edges);
         vertices.extend(mh.decls.vertices);
         entry_roots.extend(mh.decls.entry_roots);
         test_roots.extend(mh.decls.test_roots);
         bodies.extend(mh.decls.bodies);
+        attr_refs.extend(mh.decls.attr_refs);
         impls.extend(mh.decls.impls);
     }
     for block in &impls {
         let krate = modtree::crate_of(&block.items_module);
-        let (vs, es, bs) = harvest::impls(std::slice::from_ref(block), &krate, &tree, &mut harvest);
+        let (vs, es, ar, bs) =
+            harvest::impls(std::slice::from_ref(block), &krate, &tree, &mut harvest);
         vertices.extend(vs);
         edges.extend(es);
+        attr_refs.extend(ar);
         bodies.extend(bs);
     }
 
@@ -237,6 +262,15 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
         &tree,
         &dep_crates,
         &method_index,
+        &mut harvest,
+    ));
+
+    // 속성 경로 참조 — 모드와 무관하게 syn이 권위다. `#[dep::attr]`나
+    // `#[derive(dep::X)]`는 의미 해석이 더 잘 아는 것이 없다.
+    edges.extend(harvest::attr_edges(
+        &attr_refs,
+        &tree,
+        &dep_crates,
         &mut harvest,
     ));
 
@@ -519,12 +553,15 @@ fn harvest_module<'a>(
     tree: &mut ModTree,
     arena: &'a Arena,
     mp: &str,
-    harvest: &mut Harvest,
+    out: &mut Harvest,
+    dep_vertices: &BTreeSet<String>,
 ) -> ModuleHarvest<'a> {
     let groups = module_items(tree, arena, mp).expect("module items must exist");
     let file = tree.modules[mp].file.clone();
     let krate = modtree::crate_of(mp);
-    let decls = harvest::decls(mp, &krate, &groups, harvest);
+    // 파라미터 이름이 fn harvest와 충돌하면 ident 경로가 함수 정점으로
+    // 해석돼 거짓 간선·사이클이 생긴다 — 지역명은 `out`으로 둔다.
+    let decls = harvest::decls(mp, &krate, &groups, out);
 
     // 모듈 정점 — 타깃 루트는 크레이트 정점을 겸한다(rustc 의미론).
     // 위치는 파일 시작, exported는 `pub mod` 여부를 따른다.
@@ -568,6 +605,9 @@ fn harvest_module<'a>(
     // 간선도 그 조건 아래서만 성립한다.
     for imp in tree.modules[mp].imports.values() {
         let to = if tree.item_exists(&imp.target) {
+            imp.target.clone()
+        } else if dep_vertices.contains(imp.target.as_str()) {
+            // 외부 크레이트 정점 — `use dep::X`는 선언 의존의 실제 사용 증거다.
             imp.target.clone()
         } else {
             match owner_module(tree, &imp.target) {
@@ -653,10 +693,10 @@ fn push_sem_stats(
     st: &sem::Stats,
     has_proc_macros: bool,
     limitations: &mut Vec<String>,
-    harvest: &mut Harvest,
+    out: &mut Harvest,
 ) {
-    harvest.fanned_method_calls += st.fanned;
-    harvest.unresolved_paths += st.unresolved;
+    out.fanned_method_calls += st.fanned;
+    out.unresolved_paths += st.unresolved;
     limitations.push(format!(
         "semantic analysis: {} call/reference edges resolved via types; \
          {} macro expansions walked; {} trait-dispatch sites expanded to candidate impls",
