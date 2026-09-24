@@ -104,6 +104,23 @@ pub fn report_from(meta: &Metadata, doc: &Document) -> DepsReport {
                     .map(|t| t.name.as_str()),
             )
             .collect();
+        // 사용 쪽도 정점 ID로 맞춘다 — 멤버 의존은 lib 타깃 이름으로
+        // 해석되지 패키지 이름으로 해석되지 않는다(`[lib] name`이 다른
+        // 패키지는 패키지명 정점이 없다). 외부는 패키지명이 정점이다 —
+        // 외부 패키지의 타깃 이름까지 넣으면 동명 멤버 정점과 오매칭된다.
+        let tp = &meta.packages[meta.by_id[&e.to]];
+        let to_vertices: BTreeSet<&str> = if tp.workspace_member {
+            std::iter::once(tp.name.as_str())
+                .chain(
+                    tp.targets
+                        .iter()
+                        .filter(|t| matches!(t.kind.as_str(), "lib" | "bin"))
+                        .map(|t| t.name.as_str()),
+                )
+                .collect()
+        } else {
+            BTreeSet::from([tp.name.as_str()])
+        };
         // 사용 증거: dep 정점(또는 dep::* 경로)으로 들어오는 확정
         // 비-depends 간선 중 이 멤버의 크레이트가 보낸 것. tentative
         // 팬아웃은 "이 중 하나일 수 있다"는 추정이라 증거가 아니다 —
@@ -111,7 +128,9 @@ pub fn report_from(meta: &Metadata, doc: &Document) -> DepsReport {
         let used = doc.edges.iter().any(|e2| {
             e2.kind != EdgeKind::Depends
                 && !e2.tentative
-                && (e2.to == to || e2.to.starts_with(&format!("{to}::")))
+                && to_vertices
+                    .iter()
+                    .any(|v| e2.to == *v || e2.to.starts_with(&format!("{v}::")))
                 && krate_of
                     .get(e2.from.as_str())
                     .is_some_and(|k| member_krates.contains(k))
@@ -344,6 +363,78 @@ mod tests {
         let rep = report_from(&meta, &doc);
         assert_eq!(rep.unused.len(), 1);
         assert_eq!(rep.unused[0].dep, "unused_dep");
+    }
+
+    #[test]
+    fn renamed_member_lib_matches_target_vertex() {
+        // 패키지명 real_pkg, [lib] name = "real_lib" — 그래프 정점은
+        // real_lib다. 패키지명으로만 찾으면 사용 중인 dep이 미사용으로
+        // 보고된다.
+        let mut packages = Vec::new();
+        let mut by_id = BTreeMap::new();
+        by_id.insert("p_app".to_string(), 0);
+        packages.push(Package {
+            name: "app".into(),
+            version: "0.1.0".into(),
+            workspace_member: true,
+            proc_macro: false,
+            targets: vec![crate::cargo_meta::Target {
+                name: "app".into(),
+                kind: "bin".into(),
+                src: PathBuf::from("x.rs"),
+            }],
+        });
+        by_id.insert("p_real".to_string(), 1);
+        packages.push(Package {
+            name: "real_pkg".into(),
+            version: "0.1.0".into(),
+            workspace_member: true,
+            proc_macro: false,
+            targets: vec![crate::cargo_meta::Target {
+                name: "real_lib".into(), // [lib] name ≠ package name
+                kind: "lib".into(),
+                src: PathBuf::from("x.rs"),
+            }],
+        });
+        let meta = Metadata {
+            packages,
+            by_id,
+            dep_edges: vec![DepEdge {
+                from: "p_app".into(),
+                to: "p_real".into(),
+                kind: String::new(),
+                lib_name: "real_lib".into(),
+            }],
+            workspace_root: PathBuf::from("."),
+            limitations: vec![],
+        };
+        let doc = document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec![],
+            vec![
+                v("app", Kind::Crate),
+                v("app::main", Kind::Fn),
+                v("real_lib", Kind::Crate),
+                v("real_lib::helper", Kind::Fn),
+            ],
+            vec![
+                Edge::new("app".into(), "real_lib".into(), EdgeKind::Depends),
+                Edge::new(
+                    "app::main".into(),
+                    "real_lib::helper".into(),
+                    EdgeKind::Call,
+                ),
+            ],
+            vec![],
+        );
+        let rep = report_from(&meta, &doc);
+        assert!(
+            rep.unused.is_empty(),
+            "renamed member lib must match by target name: {:?}",
+            rep.unused
+        );
     }
 
     #[test]

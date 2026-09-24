@@ -25,6 +25,21 @@ pub struct Package {
     pub proc_macro: bool,
 }
 
+impl Package {
+    /// 이 패키지의 그래프상 크레이트 정점 ID. 워크스페이스 멤버는
+    /// lib/bin 타깃의 루트 모듈이 크레이트 정점을 겸하니 타깃 이름이
+    /// ID다 — 패키지 이름은 `[lib] name`이 다르면 정점이 아니다.
+    /// 외부 패키지는 이름이 곧 정점이다.
+    pub fn crate_vertex(&self) -> String {
+        self.targets
+            .iter()
+            .find(|t| t.kind == "lib")
+            .or_else(|| self.targets.iter().find(|t| t.kind == "bin"))
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| self.name.clone())
+    }
+}
+
 /// lib/bin 타깃 하나 — 모듈 트리의 루트가 된다.
 #[derive(Debug)]
 pub struct Target {
