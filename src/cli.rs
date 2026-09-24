@@ -4,7 +4,7 @@
 //! 플래그 파서는 외부 크레이트 없이 직접 만든다 — 명령이 적고 계약이 단순해서다.
 
 use crate::cli_args::{self, Args};
-use crate::{analysis, config, export, mcp, rules, sarif};
+use crate::{analysis, config, export, mcp, rules, sarif, source};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -23,6 +23,7 @@ usage:
   rustograph query ID [--depth N] [--max N]
   rustograph impact ID [--depth N] [--max N]
   rustograph mcp [--dir DIR] [--graph FILE] [--config FILE] [--deps] [--tests]
+  rustograph schema [--dir DIR] [--out FILE]
   rustograph version
 
 shared flags: --deps --tests --retain-public --semantic
@@ -56,6 +57,7 @@ fn run_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Resul
         "rules" => cmd_rules(&a, out),
         "query" => cmd_query(&a, out, false),
         "impact" => cmd_query(&a, out, true),
+        "schema" => cmd_schema(&a, out),
         "mcp" => mcp::cmd(&a, &mut std::io::stdin().lock(), out, err),
         "-h" | "--help" | "help" => {
             writeln!(out, "{USAGE}").ok();
@@ -63,6 +65,24 @@ fn run_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Resul
         }
         other => Err(format!("unknown command {other}\n{USAGE}")),
     }
+}
+
+/// `schema` — isthmus persistence 도메인의 bridge-facts 문서를 낸다.
+/// 그래프 문서가 아니라 교환 문서라 export 직렬화만 재사용한다.
+fn cmd_schema(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    let dir = PathBuf::from(a.get("dir").unwrap_or("."));
+    let doc = source::schema::facts(&dir, VERSION)?;
+    let text = export::to_json(&doc);
+    match a.get("out") {
+        Some(p) => {
+            std::fs::write(p, &text).map_err(|e| format!("cannot write {p}: {e}"))?;
+            writeln!(out, "wrote {p}").ok();
+        }
+        None => {
+            write!(out, "{text}").ok();
+        }
+    }
+    Ok(0)
 }
 
 fn cmd_graph(a: &Args, out: &mut dyn Write) -> Result<i32, String> {

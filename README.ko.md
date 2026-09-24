@@ -62,6 +62,7 @@ rustograph rules --format sarif          # GitHub 코드 스캐닝용
 rustograph query mycrate::module::f --depth 2
 rustograph impact mycrate::Type --depth 3
 rustograph mcp                           # MCP stdio 서버 — 에이전트가 되묻는 통로
+rustograph schema --dir . --out schema-facts.json  # isthmus persistence 사실
 ```
 
 `#[cfg]` 조건은 메타데이터로 그래프에 실립니다 — 정점의 `cfg`는 자기
@@ -76,6 +77,32 @@ rustograph mcp                           # MCP stdio 서버 — 에이전트가 
 스냅샷 위에서 답합니다.
 
 종료 코드: `0` 정상 · `1` strict 위반/발견 · `2` 사용법/분석 오류.
+
+## persistence 사실 — `schema`
+
+`rustograph schema`는 코드가 SQL 관계를 어떻게 참조하는지 담은 isthmus
+`bridge-facts` v1 문서(`platform: "rust"`, `target: "persistence"`)를
+냅니다 — isthmus가 `schemagraph facts` 출력과 조인해 미선언·미사용
+스키마 객체와 컬럼 드리프트를 보고합니다. 읽어내는 참조:
+
+- 어디에든 있는 SQL 형태의 문자열 리터럴(`format!` 계열 매크로 안
+  포함) — `FROM`/`JOIN`/`INTO`/`UPDATE`/`TABLE`/`TRUNCATE` 뒤의 관계,
+  `schema.table` 한정과 인용 식별자 보존
+- `sqlx::query*` 매크로·함수(`query!`, `query_as!`, `query_scalar!` …)
+  — 리터럴은 스캔하고 비리터럴 인자는 `dynamic` 사실로 보존해
+  isthmus가 공백을 셀 수 있게 합니다
+- `sqlx::query*_file!` — SQL이 파일에 있으므로 `dynamic`으로 보고
+- `diesel::table!` / `table!` 매크로 본문 — 관계 + 컬럼 사용
+- `#[diesel(table_name = …)]`·`#[sea_orm(table_name = "…")]` 구조체와
+  필드/`column_name`/`sqlx::rename` 컬럼
+- diesel DSL 경로 — `users::table`, `users::dsl::id`,
+  `users::columns::name`
+
+비한정 이름(`query!`, `sql_query`)은 그 파일이 sqlx/diesel에서 import할
+때만 인정합니다. 파싱 실패 파일·문법이 다른 `table!`·테이블 바인딩 없는
+컬럼 어트리뷰트는 조용히 넘기지 않고 `limitations`로 셉니다. 이름 기반
+스캔은 추측하지 않습니다 — 정적으로 해석할 수 없는 것은 지어내지 않고
+센 것입니다.
 
 ## 개발
 

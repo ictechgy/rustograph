@@ -95,6 +95,9 @@ rustograph impact mycrate::Type --depth 3  # reverse transitive closure
 # Serve the graph over MCP (stdio JSON-RPC) for coding agents
 rustograph mcp                            # harvests once, serves a snapshot
 rustograph mcp --graph .rustograph/graph.json
+
+# Emit bridge-facts for isthmus' persistence join (SQL relation uses)
+rustograph schema --dir . --out schema-facts.json
 ```
 
 Exit codes: `0` ok · `1` strict violation/finding · `2` usage or analysis
@@ -145,6 +148,33 @@ signature:
 ```
 
 Unmapped modules are reported separately — a rule's blind spot is not a pass.
+
+## Persistence facts — `schema`
+
+`rustograph schema` emits an isthmus `bridge-facts` v1 document
+(`platform: "rust"`, `target: "persistence"`) describing how the code
+references SQL relations — isthmus joins it with `schemagraph facts`
+output to report missing/unused schema objects and column drift.
+Extracted references:
+
+- SQL-looking string literals anywhere (also inside `format!`-style
+  macros), scanned for `FROM`/`JOIN`/`INTO`/`UPDATE`/`TABLE`/`TRUNCATE`
+  relations — `schema.table` qualifiers and quoted identifiers preserved
+- `sqlx::query*` macros and functions (`query!`, `query_as!`,
+  `query_scalar!`, …) — literal SQL scanned, non-literal arguments kept
+  as `dynamic` facts so isthmus can count the gap
+- `sqlx::query*_file!` — SQL lives in a file, reported as `dynamic`
+- `diesel::table!` / `table!` macro bodies — relation plus column uses
+- `#[diesel(table_name = …)]`, `#[sea_orm(table_name = "…")]` structs and
+  their field/`column_name`/`sqlx::rename` columns
+- diesel DSL paths — `users::table`, `users::dsl::id`,
+  `users::columns::name`
+
+Unqualified names (`query!`, `sql_query`) count only when the file imports
+them from `sqlx`/`diesel`. Unparseable files, off-grammar `table!` bodies,
+and column attributes without a table binding surface as `limitations`,
+not silence. The name-based scan never guesses: what cannot be resolved
+statically is counted, not invented.
 
 ## Agent output contract
 
