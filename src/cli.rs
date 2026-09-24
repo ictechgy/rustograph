@@ -4,7 +4,7 @@
 //! 플래그 파서는 외부 크레이트 없이 직접 만든다 — 명령이 적고 계약이 단순해서다.
 
 use crate::cli_args::{self, Args};
-use crate::{analysis, config, export, mcp, rules, sarif};
+use crate::{analysis, config, deps, export, mcp, rules, sarif};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -20,14 +20,20 @@ usage:
   rustograph cycles [--level L] [--strict] [--format text|json]
   rustograph dead [--strict] [--explain ID] [--root ID] [--retain-public] [--tests]
   rustograph rules [--strict] [--format text|json|sarif] [--config FILE]
+                   [--baseline FILE] [--write-baseline]
+  rustograph deps [--strict] [--format text|json]
   rustograph query ID [--depth N] [--max N]
   rustograph impact ID [--depth N] [--max N]
+  rustograph paths FROM TO [--max N] [--budget N]
+  rustograph search QUERY [--max N]
   rustograph mcp [--dir DIR] [--graph FILE] [--config FILE] [--deps] [--tests]
   rustograph version
 
-shared flags: --deps --tests --retain-public --semantic
+shared flags: --deps --tests --retain-public --semantic --no-cache
+  --focus PATH --target TRIPLE --exclude-tests
   --semantic resolves method calls and macro expansions with rust-analyzer
-  semantics (requires a build with `--features semantic`)
+  semantics (requires a build with `--features semantic`; results cached
+  in .rustograph/semantic-cache.json unless --no-cache)
 
 exit codes: 0 ok · 1 strict violation found · 2 usage/analysis error";
 
@@ -54,8 +60,11 @@ fn run_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Resul
         "cycles" => cmd_cycles(&a, out),
         "dead" => cmd_dead(&a, out),
         "rules" => cmd_rules(&a, out),
+        "deps" => cmd_deps(&a, out),
         "query" => cmd_query(&a, out, false),
         "impact" => cmd_query(&a, out, true),
+        "paths" => cmd_paths(&a, out),
+        "search" => cmd_search(&a, out),
         "mcp" => mcp::cmd(&a, &mut std::io::stdin().lock(), out, err),
         "-h" | "--help" | "help" => {
             writeln!(out, "{USAGE}").ok();
@@ -128,7 +137,8 @@ fn cmd_dead(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     // dead는 항상 심볼 레벨 — 도달성은 심볼에서만 의미 있다.
     let doc = cli_args::document_for(a, true)?;
     if let Some(target) = a.get("explain") {
-        match analysis::explain_path(&doc, target) {
+        let target = require_id(&doc, target)?;
+        match analysis::explain_path(&doc, &target) {
             Some(path) => {
                 writeln!(out, "{}", path.join(" -> ")).ok();
                 return Ok(0);
@@ -170,7 +180,12 @@ fn cmd_dead(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
 
 fn cmd_rules(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     let dir = PathBuf::from(a.get("dir").unwrap_or("."));
-    let cfg = match a.get("config") {
+    // --config이 주어지면 기준선 상대 경로의 기준은 그 파일의 디렉터리다.
+    let cfg_dir = a
+        .get("config")
+        .map(|f| Path::new(f).parent().unwrap_or(dir.as_path()).to_path_buf())
+        .unwrap_or_else(|| dir.clone());
+    let cfg: config::Config = match a.get("config") {
         Some(f) => {
             let src = std::fs::read_to_string(f).map_err(|e| format!("cannot read {f}: {e}"))?;
             serde_yml::from_str(&src).map_err(|e| format!("bad {f}: {e}"))?
@@ -181,7 +196,44 @@ fn cmd_rules(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
         },
     };
     let doc = cli_args::document_for(a, true)?;
-    let report = rules::check(&doc, &cfg);
+    let mut report = rules::check(&doc, &cfg);
+    // 기준선 경로 — --baseline이 cfg.baseline을 이긴다.
+    let baseline_path = a
+        .get("baseline")
+        .map(PathBuf::from)
+        .or_else(|| cfg.baseline.as_ref().map(|b| cfg_dir.join(b)));
+    // --write-baseline: 현재 위반을 기준선으로 기록하고 끝낸다 —
+    // 레거시 도입의 첫 단계는 "기존 위반을 얼리는 것"이다.
+    if a.has("write-baseline") {
+        let Some(path) = &baseline_path else {
+            return Err(
+                "--write-baseline needs a baseline path — set `baseline:` in .rustograph.yml \
+                 or pass --baseline FILE"
+                    .to_string(),
+            );
+        };
+        std::fs::write(path, rules::Baseline::render(&report.violations))
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        writeln!(
+            out,
+            "wrote baseline {} ({} violations)",
+            path.display(),
+            report.violations.len()
+        )
+        .ok();
+        return Ok(0);
+    }
+    if let Some(path) = &baseline_path {
+        match std::fs::read_to_string(path) {
+            Ok(src) => rules::apply_baseline(&mut report, &rules::Baseline::parse(&src)),
+            // 명시 --baseline은 없는 파일을 가리키면 오타일 가능성이 높다 — 오류.
+            // cfg.baseline이 가리키는 파일이 없으면 아직 도입 전 — 조용히 넘긴다.
+            Err(e) if a.get("baseline").is_some() => {
+                return Err(format!("cannot read baseline {}: {e}", path.display()))
+            }
+            Err(_) => {}
+        }
+    }
     match a.get("format").unwrap_or("text") {
         "json" => write!(out, "{}", export::to_json(&report)).ok(),
         "sarif" => write!(out, "{}", sarif::rules_sarif(&doc, &report.violations)).ok(),
@@ -195,6 +247,22 @@ fn cmd_rules(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
                 .ok();
             }
             writeln!(out, "{} violations", report.violations.len()).ok();
+            if report.baselined > 0 {
+                writeln!(
+                    out,
+                    "{} violations suppressed by baseline",
+                    report.baselined
+                )
+                .ok();
+            }
+            if report.stale_baseline > 0 {
+                writeln!(
+                    out,
+                    "{} baseline entries no longer violate — regenerate the baseline",
+                    report.stale_baseline
+                )
+                .ok();
+            }
             if report.skipped_tentative > 0 {
                 writeln!(
                     out,
@@ -220,6 +288,100 @@ fn cmd_rules(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     })
 }
 
+/// 정점 ID를 정확히 해석한다 — 애매한 문자열을 조용히 맞추지 않고
+/// 후보를 열거해 사용자가 다시 지정하게 한다(에이전트 오용 방지).
+fn require_id(doc: &crate::graph::Document, id: &str) -> Result<String, String> {
+    analysis::resolve_id(doc, id).map_err(|cands| {
+        if cands.is_empty() {
+            format!("vertex {id} not found")
+        } else {
+            format!(
+                "vertex {id} not found — did you mean:\n  {}",
+                cands.join("\n  ")
+            )
+        }
+    })
+}
+
+fn cmd_paths(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    let Some(from) = a.positional.first() else {
+        return Err("usage: paths FROM TO".to_string());
+    };
+    let Some(to) = a.positional.get(1) else {
+        return Err("usage: paths FROM TO".to_string());
+    };
+    let max: usize = a.get("max").and_then(|s| s.parse().ok()).unwrap_or(10);
+    let budget: usize = a
+        .get("budget")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50_000);
+    let doc = cli_args::document_for(a, true)?;
+    let from = require_id(&doc, from)?;
+    let to = require_id(&doc, to)?;
+    let report = analysis::paths(&doc, &from, &to, max, budget);
+    write!(out, "{}", export::to_json(&report)).ok();
+    Ok(0)
+}
+
+fn cmd_search(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    let Some(q) = a.positional.first() else {
+        return Err("usage: search QUERY".to_string());
+    };
+    let max: usize = a.get("max").and_then(|s| s.parse().ok()).unwrap_or(20);
+    let doc = cli_args::document_for(a, true)?;
+    write!(out, "{}", export::to_json(&analysis::search(&doc, q, max))).ok();
+    Ok(0)
+}
+
+fn cmd_deps(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    let dir = PathBuf::from(a.get("dir").unwrap_or("."));
+    let doc = cli_args::deps_document_for(a)?;
+    let report = deps::report(&dir, &doc)?;
+    match a.get("format").unwrap_or("text") {
+        "json" => write!(out, "{}", export::to_json(&report)).ok(),
+        "text" => {
+            for u in &report.unused {
+                writeln!(
+                    out,
+                    "unused: {} -> {} (kind: {}{})",
+                    u.package,
+                    u.dep,
+                    u.kind,
+                    if u.proc_macro { ", proc-macro" } else { "" }
+                )
+                .ok();
+            }
+            for d in &report.duplicates {
+                writeln!(
+                    out,
+                    "duplicate: {} has versions {}",
+                    d.name,
+                    d.versions.join(", ")
+                )
+                .ok();
+            }
+            for l in &report.limitations {
+                writeln!(out, "limitation: {l}").ok();
+            }
+            writeln!(
+                out,
+                "{} unused, {} duplicated",
+                report.unused.len(),
+                report.duplicates.len()
+            )
+            .ok()
+        }
+        f => return Err(format!("unknown --format {f}")),
+    };
+    Ok(
+        if a.has("strict") && (!report.unused.is_empty() || !report.duplicates.is_empty()) {
+            1
+        } else {
+            0
+        },
+    )
+}
+
 fn cmd_query(a: &Args, out: &mut dyn Write, reverse: bool) -> Result<i32, String> {
     let Some(id) = a.positional.first() else {
         return Err("query/impact needs a vertex ID".to_string());
@@ -227,15 +389,12 @@ fn cmd_query(a: &Args, out: &mut dyn Write, reverse: bool) -> Result<i32, String
     let depth: usize = a.get("depth").and_then(|s| s.parse().ok()).unwrap_or(1);
     let max: usize = a.get("max").and_then(|s| s.parse().ok()).unwrap_or(200);
     let doc = cli_args::document_for(a, true)?;
-    let exists = doc.vertex_ids().contains(id.as_str());
-    if !exists {
-        return Err(format!("vertex {id} not found"));
-    }
+    let id = require_id(&doc, id)?;
     if reverse {
-        let r = analysis::impact(&doc, id, depth, max);
+        let r = analysis::impact(&doc, &id, depth, max);
         write!(out, "{}", export::to_json(&r)).ok();
     } else {
-        let r = analysis::query(&doc, id, depth, max);
+        let r = analysis::query(&doc, &id, depth, max);
         write!(out, "{}", export::to_json(&r)).ok();
     }
     Ok(0)

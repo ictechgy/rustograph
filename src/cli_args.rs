@@ -37,9 +37,18 @@ impl Args {
 }
 
 const VALUE_FLAGS: &[&str] = &[
-    "dir", "level", "format", "out", "graph", "root", "explain", "config", "depth", "max",
+    "dir", "level", "format", "out", "graph", "root", "explain", "config", "depth", "max", "focus",
+    "target", "budget", "baseline",
 ];
-const BOOL_FLAGS: &[&str] = &["deps", "tests", "retain-public", "strict", "semantic"];
+const BOOL_FLAGS: &[&str] = &[
+    "deps",
+    "tests",
+    "retain-public",
+    "strict",
+    "semantic",
+    "exclude-tests",
+    "write-baseline",
+];
 
 pub(crate) fn parse(args: &[String]) -> Result<Args, String> {
     let Some(cmd) = args.first() else {
@@ -78,22 +87,55 @@ pub(crate) fn parse(args: &[String]) -> Result<Args, String> {
 }
 
 /// 수확 또는 저장 문서 로드 — 모든 명령이 같은 경로로 문서를 얻는다.
+/// --focus/--target/--exclude-tests 필터는 저장 문서에도 같은 순서로
+/// 적용된다 — 필터는 문서 변환이라 수확 방식과 무관하다.
 pub(crate) fn document_for(a: &Args, symbol_level: bool) -> Result<Document, String> {
-    if let Some(f) = a.get("graph") {
-        return export::load_file(Path::new(f));
+    document_impl(a, symbol_level, a.has("deps"), a.has("semantic"))
+}
+
+/// deps 보고서용 문서 — 외부 크레이트 정점이 증거라 항상 --deps로 수확한다.
+/// syn 모드를 강제한다 — 의미 해석은 외부 크레이트 안을 못 보고 외부 경로를
+/// 간선 대신 external 카운터로 세서, dep 사용 증거가 syn보다 적다.
+pub(crate) fn deps_document_for(a: &Args) -> Result<Document, String> {
+    document_impl(a, true, true, false)
+}
+
+fn document_impl(
+    a: &Args,
+    symbol_level: bool,
+    include_deps: bool,
+    semantic: bool,
+) -> Result<Document, String> {
+    if a.has("tests") && a.has("exclude-tests") {
+        return Err("--tests and --exclude-tests are mutually exclusive".to_string());
     }
-    let dir = PathBuf::from(a.get("dir").unwrap_or("."));
-    source::load(
-        &dir,
-        &source::Options {
-            symbol_level,
-            include_deps: a.has("deps"),
-            tests: a.has("tests"),
-            retain_public: a.has("retain-public"),
-            extra_roots: a.get_all("root").iter().map(|s| s.to_string()).collect(),
-            semantic: a.has("semantic"),
-        },
-    )
+    let mut doc = if let Some(f) = a.get("graph") {
+        export::load_file(Path::new(f))?
+    } else {
+        let dir = PathBuf::from(a.get("dir").unwrap_or("."));
+        source::load(
+            &dir,
+            &source::Options {
+                symbol_level,
+                include_deps,
+                tests: a.has("tests"),
+                retain_public: a.has("retain-public"),
+                extra_roots: a.get_all("root").iter().map(|s| s.to_string()).collect(),
+                semantic,
+            },
+        )?
+    };
+    if a.has("exclude-tests") {
+        doc = doc.without_tests();
+    }
+    if let Some(t) = a.get("target") {
+        doc = doc.for_target(t);
+    }
+    let focus: Vec<String> = a.get_all("focus").iter().map(|s| s.to_string()).collect();
+    if !focus.is_empty() {
+        doc = doc.focus(&focus);
+    }
+    Ok(doc)
 }
 
 /// `--level` 값을 Level로 변환한다 — 없으면 module이 기본이다.
