@@ -227,8 +227,9 @@ fn cmd_rules(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
         match std::fs::read_to_string(path) {
             Ok(src) => rules::apply_baseline(&mut report, &rules::Baseline::parse(&src)),
             // 명시 --baseline은 없는 파일을 가리키면 오타일 가능성이 높다 — 오류.
-            // cfg.baseline이 가리키는 파일이 없으면 아직 도입 전 — 조용히 넘긴다.
-            Err(e) if a.get("baseline").is_some() => {
+            // cfg.baseline은 NotFound만 도입 전으로 본다 — 권한 오류나
+            // 디렉터리를 조용히 넘기면 억제가 안 먹힌 채로 지나간다.
+            Err(e) if a.get("baseline").is_some() || e.kind() != std::io::ErrorKind::NotFound => {
                 return Err(format!("cannot read baseline {}: {e}", path.display()))
             }
             Err(_) => {}
@@ -310,11 +311,8 @@ fn cmd_paths(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     let Some(to) = a.positional.get(1) else {
         return Err("usage: paths FROM TO".to_string());
     };
-    let max: usize = a.get("max").and_then(|s| s.parse().ok()).unwrap_or(10);
-    let budget: usize = a
-        .get("budget")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50_000);
+    let max = cli_args::usize_arg(a, "max", 10)?;
+    let budget = cli_args::usize_arg(a, "budget", 50_000)?;
     let doc = cli_args::document_for(a, true)?;
     let from = require_id(&doc, from)?;
     let to = require_id(&doc, to)?;
@@ -327,16 +325,34 @@ fn cmd_search(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     let Some(q) = a.positional.first() else {
         return Err("usage: search QUERY".to_string());
     };
-    let max: usize = a.get("max").and_then(|s| s.parse().ok()).unwrap_or(20);
+    let max = cli_args::usize_arg(a, "max", 20)?;
     let doc = cli_args::document_for(a, true)?;
     write!(out, "{}", export::to_json(&analysis::search(&doc, q, max))).ok();
     Ok(0)
 }
 
 fn cmd_deps(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    // deps는 자체 syn 수확으로 문서를 만든다 — 문서 필터나 저장
+    // 그래프를 받으면 사용 증거가 지워져 거짓 미사용이 나온다.
+    for flag in [
+        "graph",
+        "focus",
+        "target",
+        "exclude-tests",
+        "tests",
+        "retain-public",
+        "root",
+        "semantic",
+        "no-cache",
+    ] {
+        if a.get(flag).is_some() || a.has(flag) {
+            return Err(format!(
+                "deps needs the complete workspace graph — --{flag} is not supported"
+            ));
+        }
+    }
     let dir = PathBuf::from(a.get("dir").unwrap_or("."));
-    let doc = cli_args::deps_document_for(a)?;
-    let report = deps::report(&dir, &doc)?;
+    let report = deps::report(&dir)?;
     match a.get("format").unwrap_or("text") {
         "json" => write!(out, "{}", export::to_json(&report)).ok(),
         "text" => {
@@ -386,8 +402,8 @@ fn cmd_query(a: &Args, out: &mut dyn Write, reverse: bool) -> Result<i32, String
     let Some(id) = a.positional.first() else {
         return Err("query/impact needs a vertex ID".to_string());
     };
-    let depth: usize = a.get("depth").and_then(|s| s.parse().ok()).unwrap_or(1);
-    let max: usize = a.get("max").and_then(|s| s.parse().ok()).unwrap_or(200);
+    let depth = cli_args::usize_arg(a, "depth", 1)?;
+    let max = cli_args::usize_arg(a, "max", 200)?;
     let doc = cli_args::document_for(a, true)?;
     let id = require_id(&doc, id)?;
     if reverse {

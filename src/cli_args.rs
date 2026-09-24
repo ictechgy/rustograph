@@ -94,13 +94,6 @@ pub(crate) fn document_for(a: &Args, symbol_level: bool) -> Result<Document, Str
     document_impl(a, symbol_level, a.has("deps"), a.has("semantic"))
 }
 
-/// deps 보고서용 문서 — 외부 크레이트 정점이 증거라 항상 --deps로 수확한다.
-/// syn 모드를 강제한다 — 의미 해석은 외부 크레이트 안을 못 보고 외부 경로를
-/// 간선 대신 external 카운터로 세서, dep 사용 증거가 syn보다 적다.
-pub(crate) fn deps_document_for(a: &Args) -> Result<Document, String> {
-    document_impl(a, true, true, false)
-}
-
 fn document_impl(
     a: &Args,
     symbol_level: bool,
@@ -131,13 +124,27 @@ fn document_impl(
         doc = doc.without_tests();
     }
     if let Some(t) = a.get("target") {
-        doc = doc.for_target(t);
+        // 권위 있는 팩트를 먼저 시도하고 rustc가 없거나 트리플을 모르면
+        // 트리플 추정으로 폴백한다 — 모르는 것은 거짓이 아니라 미지다.
+        doc = doc.for_target(t, &source::target_facts(t));
     }
     let focus: Vec<String> = a.get_all("focus").iter().map(|s| s.to_string()).collect();
     if !focus.is_empty() {
         doc = doc.focus(&focus);
     }
     Ok(doc)
+}
+
+/// 정수 인자 하나를 꺼낸다 — 없으면 기본값, 있으면 반드시 파싱돼야 한다.
+/// `--max abc`나 음수를 조용히 기본값으로 되돌리면 사용자가 준 한계가
+/// 무시된다 — 잘못된 값은 명시적 오류다.
+pub(crate) fn usize_arg(a: &Args, key: &str, default: usize) -> Result<usize, String> {
+    match a.get(key) {
+        Some(s) => s
+            .parse::<usize>()
+            .map_err(|_| format!("invalid --{key} {s:?} — expected a non-negative integer")),
+        None => Ok(default),
+    }
 }
 
 /// `--level` 값을 Level로 변환한다 — 없으면 module이 기본이다.

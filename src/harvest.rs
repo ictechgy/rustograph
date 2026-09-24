@@ -47,6 +47,9 @@ pub struct ModuleDecls<'a> {
 pub struct AttrRef {
     /// 참조를 단 아이템의 정점 ID — 아이템 정점이 없으면 소유 모듈.
     pub owner: String,
+    /// owner가 `mod x;` 선언인가 — 파일이 없어 모듈이 트리에 없으면
+    /// owner 정점은 존재하지 않으니 선언 모듈로 폴백해야 한다.
+    pub mod_decl: bool,
     /// 참조를 해석할 모듈 — 임포트는 모듈 스코프에 산다.
     pub module: String,
     /// 속성 경로의 세그먼트(`fixture_macros::keep` → ["fixture_macros","keep"]).
@@ -318,14 +321,18 @@ pub fn decls<'a>(
             // 아이템 속성의 경로 참조 — #[dep::attr]·#[derive(dep::X)]는
             // 그 크레이트의 실제 사용 증거다. impl 자체의 속성도 여기서 잡되
             // owner는 모듈이다(self 타입 정점은 아직 해석 전).
+            // `mod x;` 선언은 파일이 없으면 정점이 안 만들어지므로
+            // mod_decl 표시를 남긴다 — attr_edges가 선언 모듈로 폴백한다.
             let owner = item
                 .ident()
                 .map(|i| format!("{module_path}::{i}"))
                 .unwrap_or_else(|| module_path.to_string());
+            let mod_decl = matches!(item, syn::Item::Mod(m) if m.content.is_none());
             collect_attr_refs(
                 attrs_of(item),
                 &owner,
                 module_path,
+                mod_decl,
                 &cfg,
                 &mut out.attr_refs,
             );
@@ -335,6 +342,7 @@ pub fn decls<'a>(
                 if m.ident.is_none() && segs.len() >= 2 {
                     out.attr_refs.push(AttrRef {
                         owner: owner.clone(),
+                        mod_decl: false,
                         module: module_path.to_string(),
                         path: segs,
                         cfg: cfg.clone(),
@@ -403,7 +411,20 @@ pub fn impls<'a>(
             contains.unsafe_ = b.unsafe_;
             edges.push(contains);
             // 메서드 속성의 경로 참조 — #[dep::attr] fn m()도 사용 증거다.
-            collect_attr_refs(&m.attrs, &mid, &b.items_module, &b.cfg, &mut attr_refs);
+            // impl과 메서드 자신의 cfg를 둘 다 물린다 — 둘 다 성립해야
+            // 이 참조가 존재한다.
+            let mcfg = match (&b.cfg, cfg_of(&m.attrs)) {
+                (a, Some(b)) => conjoin(a, b.as_str()),
+                (a, None) => a.clone(),
+            };
+            collect_attr_refs(
+                &m.attrs,
+                &mid,
+                &b.items_module,
+                false,
+                &mcfg,
+                &mut attr_refs,
+            );
             bodies.push(BodyItem {
                 id: mid,
                 module: b.items_module.clone(),
@@ -444,9 +465,17 @@ pub fn attr_edges(
 ) -> Vec<Edge> {
     let mut edges = Vec::new();
     for r in refs {
+        // `mod x;` 선언에 단 속성의 owner는 모듈 정점 — 파일이 없어
+        // 모듈이 트리에 없으면 그 정점은 존재하지 않으니 선언 모듈로
+        // 폴백한다. 없는 정점에서 간선을내면 유령이 된다.
+        let owner = if r.mod_decl && !tree.modules.contains_key(r.owner.as_str()) {
+            r.module.as_str()
+        } else {
+            r.owner.as_str()
+        };
         match tree.resolve(&r.module, &r.path, dep_crates) {
-            Some(to) if to != r.owner => {
-                let mut e = Edge::new(r.owner.clone(), to, EdgeKind::References);
+            Some(to) if to != owner => {
+                let mut e = Edge::new(owner.to_string(), to, EdgeKind::References);
                 e.cfg = r.cfg.clone();
                 edges.push(e);
             }
@@ -549,8 +578,9 @@ struct BodyVisitor<'a> {
 impl BodyVisitor<'_> {
     fn push(&mut self, to: String, kind: EdgeKind) {
         // 외부 크레이트 정점으로의 간선 — 크레이트 안은 안 보이니
-        // `dep::f()`의 call도 실은 "크레이트 경계 참조"다.
-        let kind = if self.dep_crates.values().any(|p| *p == to) {
+        // `dep::f()`의 call도 실은 "크레이트 경계 참조"다. 멤버 크레이트
+        // 정점은 external에 없다 — 멤버 안은 실제 정점이다.
+        let kind = if self.dep_crates.external.contains(to.as_str()) {
             EdgeKind::References
         } else {
             kind
@@ -769,6 +799,14 @@ fn is_pub(v: &syn::Visibility) -> bool {
     matches!(v, syn::Visibility::Public(_))
 }
 
+/// 두 cfg 조건을 `all(...)`로 결합한다 — 둘 다 성립해야 참조가 존재한다.
+fn conjoin(a: &Option<String>, b: &str) -> Option<String> {
+    match a {
+        Some(a) => Some(format!("all({a} , {b})")),
+        None => Some(b.to_string()),
+    }
+}
+
 /// 아이템 속성에서 경로 참조를 모은다 — 해석은 임포트 완성 뒤 2패스에서.
 /// 한 세그먼트 이름(test·cfg·derive·allow...)은 내장이거나 임포트로
 /// 이미 잡히므로 두 세그먼트 이상만 모은다. cfg_attr 안쪽 속성은
@@ -777,9 +815,21 @@ fn collect_attr_refs(
     attrs: &[syn::Attribute],
     owner: &str,
     module: &str,
+    mod_decl: bool,
     cfg: &Option<String>,
     out: &mut Vec<AttrRef>,
 ) {
+    let push = |segs: Vec<String>, cfg: &Option<String>, out: &mut Vec<AttrRef>| {
+        if segs.len() >= 2 {
+            out.push(AttrRef {
+                owner: owner.to_string(),
+                mod_decl,
+                module: module.to_string(),
+                path: segs,
+                cfg: cfg.clone(),
+            });
+        }
+    };
     for a in attrs {
         if a.path().is_ident("derive") {
             // #[derive(a::b::C, D)] — 다중 세그먼트 인자만 참조다.
@@ -788,15 +838,7 @@ fn collect_attr_refs(
             );
             if let Ok(paths) = args {
                 for p in paths {
-                    let segs = path_segments(&p);
-                    if segs.len() >= 2 {
-                        out.push(AttrRef {
-                            owner: owner.to_string(),
-                            module: module.to_string(),
-                            path: segs,
-                            cfg: cfg.clone(),
-                        });
-                    }
+                    push(path_segments(&p), cfg, out);
                 }
             }
         } else if a.path().is_ident("cfg_attr") {
@@ -809,39 +851,83 @@ fn collect_attr_refs(
                 if let Some(pred) = it.next() {
                     let pred = meta_pred_string(&pred);
                     for m in it {
-                        collect_meta_refs(&m, owner, module, &pred, out);
+                        collect_meta_refs(&m, owner, module, mod_decl, &pred, cfg, out);
                     }
                 }
             }
         } else {
-            let segs = path_segments(a.path());
-            if segs.len() >= 2 {
-                out.push(AttrRef {
-                    owner: owner.to_string(),
-                    module: module.to_string(),
-                    path: segs,
-                    cfg: cfg.clone(),
-                });
-            }
+            push(path_segments(a.path()), cfg, out);
         }
     }
 }
 
-/// cfg_attr 안쪽 메타 하나를 참조로 모은다 — 술어를 cfg로 단다.
-fn collect_meta_refs(m: &syn::Meta, owner: &str, module: &str, pred: &str, out: &mut Vec<AttrRef>) {
-    let path = match m {
-        syn::Meta::Path(p) => p,
-        syn::Meta::List(l) => &l.path,
-        syn::Meta::NameValue(nv) => &nv.path,
-    };
-    let segs = path_segments(path);
-    if segs.len() >= 2 {
-        out.push(AttrRef {
-            owner: owner.to_string(),
-            module: module.to_string(),
-            path: segs,
-            cfg: Some(pred.to_string()),
-        });
+/// cfg_attr 안쪽 메타 하나를 참조로 모은다 — 술어와 아이템 자신의
+/// cfg를 all()로 합성해 단다. `derive(dep::T)` 인자와 중첩 `cfg_attr`도
+/// 재귀로 파낸다 — 그 안의 경로도 실제 참조다.
+fn collect_meta_refs(
+    m: &syn::Meta,
+    owner: &str,
+    module: &str,
+    mod_decl: bool,
+    pred: &str,
+    cfg: &Option<String>,
+    out: &mut Vec<AttrRef>,
+) {
+    // 이 참조가 성립하는 조건 — 아이템 cfg와 cfg_attr 술어의 합성.
+    let cond = conjoin(cfg, pred);
+    match m {
+        // cfg_attr(pred, derive(dep::T)) — derive 인자가 진짜 참조다.
+        syn::Meta::List(l) if l.path.is_ident("derive") => {
+            let args = l.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+            );
+            if let Ok(paths) = args {
+                for p in paths {
+                    let segs = path_segments(&p);
+                    if segs.len() >= 2 {
+                        out.push(AttrRef {
+                            owner: owner.to_string(),
+                            mod_decl,
+                            module: module.to_string(),
+                            path: segs,
+                            cfg: cond.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        // 중첩 cfg_attr — 바깥 술어와 안쪽 술어를 둘 다 성립 조건으로 쌓는다.
+        syn::Meta::List(l) if l.path.is_ident("cfg_attr") => {
+            let args = l.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            );
+            if let Ok(metas) = args {
+                let mut it = metas.into_iter();
+                if let Some(inner) = it.next() {
+                    let inner_pred = meta_pred_string(&inner);
+                    for m in it {
+                        collect_meta_refs(&m, owner, module, mod_decl, &inner_pred, &cond, out);
+                    }
+                }
+            }
+        }
+        _ => {
+            let path = match m {
+                syn::Meta::Path(p) => p,
+                syn::Meta::List(l) => &l.path,
+                syn::Meta::NameValue(nv) => &nv.path,
+            };
+            let segs = path_segments(path);
+            if segs.len() >= 2 {
+                out.push(AttrRef {
+                    owner: owner.to_string(),
+                    mod_decl,
+                    module: module.to_string(),
+                    path: segs,
+                    cfg: cond,
+                });
+            }
+        }
     }
 }
 

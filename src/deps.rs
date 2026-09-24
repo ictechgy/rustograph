@@ -42,12 +42,22 @@ pub struct DepsReport {
     pub limitations: Vec<String>,
 }
 
-/// `dir`의 cargo 메타데이터와 문서로 deps 보고서를 만든다.
-/// 문서는 `--deps`로 수확된 것이어야 한다 — 외부 크레이트 정점이 없으면
-/// 사용 증거가 될 간선이 아예 없어 전부 미사용으로 보이는 함정이다.
-pub fn report(dir: &Path, doc: &Document) -> Result<DepsReport, String> {
+/// `dir`의 deps 보고서를 만든다 — 메타데이터와 문서를 직접 수확한다.
+/// 사용 증거는 syn 문서가 완전하다 — semantic 문서는 외부 경로를
+/// `external` 카운터로만 세서 미사용 오탐이 생기고, 호출자 문서를
+/// 받으면 focus/target 필터가 증거를 지워 거짓 미사용이 된다.
+/// 그래서 deps는 항상 자체 syn 수확으로 만든다.
+pub fn report(dir: &Path) -> Result<DepsReport, String> {
     let meta = cargo_meta::load(dir)?;
-    Ok(report_from(&meta, doc))
+    let doc = crate::source::load(
+        dir,
+        &crate::source::Options {
+            symbol_level: true,
+            include_deps: true,
+            ..Default::default()
+        },
+    )?;
+    Ok(report_from(&meta, &doc))
 }
 
 /// 이미 로드된 메타데이터와 문서로 보고서를 만든다 — 캐시·테스트용.
@@ -94,20 +104,20 @@ pub fn report_from(meta: &Metadata, doc: &Document) -> DepsReport {
                     .map(|t| t.name.as_str()),
             )
             .collect();
-        // 사용 증거: dep 정점(또는 dep::* 경로)으로 들어오는 비-depends 간선 중
-        // 이 멤버의 크레이트가 보낸 것.
+        // 사용 증거: dep 정점(또는 dep::* 경로)으로 들어오는 확정
+        // 비-depends 간선 중 이 멤버의 크레이트가 보낸 것. tentative
+        // 팬아웃은 "이 중 하나일 수 있다"는 추정이라 증거가 아니다 —
+        // 추정을 증거로 쓰면 미사용 의존이 우연히 숨겨진다.
         let used = doc.edges.iter().any(|e2| {
             e2.kind != EdgeKind::Depends
+                && !e2.tentative
                 && (e2.to == to || e2.to.starts_with(&format!("{to}::")))
                 && krate_of
                     .get(e2.from.as_str())
                     .is_some_and(|k| member_krates.contains(k))
         });
         if !used {
-            let proc_macro = meta.packages[meta.by_id[&e.to]]
-                .targets
-                .iter()
-                .any(|t| t.kind == "proc-macro");
+            let proc_macro = meta.packages[meta.by_id[&e.to]].proc_macro;
             unused.push(UnusedDep {
                 package: from.to_string(),
                 dep: to.to_string(),
@@ -207,6 +217,7 @@ mod tests {
                 name: name.to_string(),
                 version: ver.to_string(),
                 workspace_member: *member,
+                proc_macro: *name == "tool",
                 targets: kinds
                     .iter()
                     .map(|k| crate::cargo_meta::Target {
@@ -291,6 +302,48 @@ mod tests {
         // dup은 버전이 2개라 보고된다.
         assert_eq!(rep.duplicates.len(), 1);
         assert_eq!(rep.duplicates[0].versions, vec!["1.0.0", "2.0.0"]);
+    }
+
+    #[test]
+    fn tentative_edges_are_not_usage_evidence() {
+        // 메서드 팬아웃의 tentative 간선은 "이 중 하나일 수 있다"는
+        // 추정이다 — 사용 증거로 세면 미사용 의존이 숨겨진다.
+        let meta = meta();
+        let mut e = Edge::new("app::main".into(), "unused_dep".into(), EdgeKind::Call);
+        e.tentative = true;
+        let doc = document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec![],
+            vec![
+                v("app", Kind::Crate),
+                v("app::main", Kind::Fn),
+                Vertex {
+                    position: None,
+                    ..v("serde", Kind::Crate)
+                },
+                Vertex {
+                    position: None,
+                    ..v("unused_dep", Kind::Crate)
+                },
+                Vertex {
+                    position: None,
+                    ..v("dup", Kind::Crate)
+                },
+            ],
+            vec![
+                Edge::new("app".into(), "serde".into(), EdgeKind::Depends),
+                Edge::new("app".into(), "unused_dep".into(), EdgeKind::Depends),
+                Edge::new("app".into(), "dup".into(), EdgeKind::Depends),
+                Edge::new("app::main".into(), "serde".into(), EdgeKind::References),
+                e,
+            ],
+            vec![],
+        );
+        let rep = report_from(&meta, &doc);
+        assert_eq!(rep.unused.len(), 1);
+        assert_eq!(rep.unused[0].dep, "unused_dep");
     }
 
     #[test]

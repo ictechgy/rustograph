@@ -7,11 +7,53 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// 외부 크레이트 해석 표 — 코드가 보는 라이브러리 이름 → 정점 ID.
-/// `foo = { package = "real" }` rename이면 `foo → real`이다.
-/// 값이 크레이트 정점 ID와 같아야 dep 경로가 실제 정점으로 붕괴한다.
-/// 호출자가 빈 맵을 넘기면 외부 경로는 전부 미해석이다(기본 동작).
-pub type DepCrates = BTreeMap<String, String>;
+/// 의존 해석 표 — 코드가 보는 라이브러리 이름을 크레이트 정점으로 연결한다.
+/// 스코프는 의존을 선언한 크레이트(타깃 이름)다 — 같은 별칭을 멤버마다
+/// 다른 패키지에 물릴 수 있어 전역 맵이면 last-wins로 오염된다.
+/// 호출자가 빈 표를 넘기면 외부 경로는 전부 미해석이다(기본 동작).
+#[derive(Debug, Default)]
+pub struct DepCrates {
+    /// 선언 크레이트(타깃 이름) → lib 별칭 → 타깃.
+    scoped: BTreeMap<String, BTreeMap<String, DepTarget>>,
+    /// 정점으로 존재하는 외부 크레이트 정점 ID — `use` 임포트가 외부
+    /// 정점을 가리킬 때 후속 경로를 그 정점으로 붕괴하는 데 쓴다.
+    /// 멤버 크레이트는 없다 — 멤버 안은 실제 정점으로 걸을 수 있다.
+    pub external: BTreeSet<String>,
+}
+
+/// 별칭이 가리키는 것 — 외부 크레이트 정점 또는 멤버 크레이트 루트.
+#[derive(Debug)]
+pub struct DepTarget {
+    /// 정점 ID — 외부는 패키지 이름, 멤버는 루트 모듈(타깃 이름).
+    /// 패키지 이름과 lib 타깃 이름이 다른 멤버도 있으므로 패키지
+    /// 이름을 그대로 쓰지 않는다 — 루트 정점이 기준이다.
+    pub vertex: String,
+    /// 워크스페이스 멤버면 true — 붕괴하지 않고 루트부터 계속 걷는다.
+    pub member: bool,
+}
+
+impl DepCrates {
+    /// 새 빈 표.
+    pub fn new() -> DepCrates {
+        DepCrates::default()
+    }
+
+    /// 선언 크레이트의 스코프에 별칭을 심는다. 외부 타깃은 external
+    /// 집합에도 들어간다 — 임포트 붕괴 후속 해석이 그 집합을 본다.
+    pub fn insert(&mut self, scope: String, alias: String, target: DepTarget) {
+        if !target.member {
+            self.external.insert(target.vertex.clone());
+        }
+        self.scoped.entry(scope).or_default().insert(alias, target);
+    }
+
+    /// `from`이 속한 크레이트가 선언한 별칭을 찾는다.
+    fn lookup(&self, from: &str, alias: &str) -> Option<&DepTarget> {
+        self.scoped
+            .get(crate_of(from).as_str())
+            .and_then(|m| m.get(alias))
+    }
+}
 
 /// `use` 임포트 하나 — 해석된 정규 경로와 `#[cfg]` 조건.
 /// 조건이 있으면 그 빌드에서만 존재하는 임포트다 — 간선도 조건을 물려받는다.
@@ -126,7 +168,8 @@ impl ModTree {
     /// 유령 정점을 만들지 않는 것이 계약이다. 외부 크레이트 경로는
     /// dep_crates가 비어 있지 않으면 크레이트 정점 ID로 붕괴한다 —
     /// `serde::de::X`는 `serde`다. 크레이트 안은 못 보지만 경계까지는
-    /// 사실이다.
+    /// 사실이다. 워크스페이스 멤버 별칭은 붕괴하지 않고 그 멤버의
+    /// 실제 루트부터 걷는다 — 나머지 세그먼트가 진짜 정점이다.
     pub fn resolve(&self, from: &str, segs: &[String], dep_crates: &DepCrates) -> Option<String> {
         if segs.is_empty() {
             return None;
@@ -157,9 +200,15 @@ impl ModTree {
                     } else if self.modules.contains_key(first) {
                         // 같은 워크스페이스의 다른 크레이트 루트 모듈.
                         return self.walk(first, &segs[1..]);
-                    } else if let Some(pkg) = dep_crates.get(first) {
-                        // 외부 크레이트 — `dep::x::y`는 dep 정점으로 붕괴한다.
-                        return Some(pkg.clone());
+                    } else if let Some(t) = dep_crates.lookup(from, first) {
+                        // 외부는 크레이트 정점으로 붕괴한다. 멤버 별칭은
+                        // 그 멤버의 루트 정점으로 재작성해 계속 걷는다 —
+                        // 패키지 이름과 타깃(루트) 이름이 다를 수 있다.
+                        return if t.member {
+                            self.walk(&t.vertex, &segs[1..])
+                        } else {
+                            Some(t.vertex.clone())
+                        };
                     } else {
                         return None;
                     }
@@ -167,9 +216,10 @@ impl ModTree {
             }
         };
         // `use serde::Deserialize`가 만든 임포트처럼 시작점 자체가 외부
-        // 크레이트를 가리키면 그 정점이다 — walk은 외부 안을 못 본다.
-        if let Some(pkg) = dep_crates.get(start.as_str()) {
-            return Some(pkg.clone());
+        // 크레이트 정점이면 그 정점이다 — walk은 외부 안을 못 본다.
+        // 멤버 정점은 여기 오지 않는다 — 멤버 안은 실제 정점으로 걷는다.
+        if dep_crates.external.contains(start.as_str()) {
+            return Some(start);
         }
         self.walk(&start, &segs[i..])
     }
@@ -560,18 +610,31 @@ mod tests {
         );
     }
 
+    /// 크레이트 c 스코프에 별칭 하나를 심은 dep 표를 만든다.
+    fn dep_scope(alias: &str, vertex: &str, member: bool) -> DepCrates {
+        let mut d = DepCrates::new();
+        d.insert(
+            "c".to_string(),
+            alias.to_string(),
+            DepTarget {
+                vertex: vertex.to_string(),
+                member,
+            },
+        );
+        d
+    }
+
     #[test]
     fn resolve_collapses_external_to_crate_vertex() {
         let t = tree();
-        // 지역 이름이 crate::deps 모듈과 충돌하면 거짓 참조 간선이 생긴다.
-        let dep_map = DepCrates::from([("serde".to_string(), "serde".to_string())]);
         // 외부 크레이트 경로는 크레이트 정점으로 붕괴한다 — 안은 못 본다.
+        let dep_map = dep_scope("serde", "serde", false);
         assert_eq!(
             t.resolve("c", &["serde".into(), "de".into()], &dep_map),
             Some("serde".to_string())
         );
         // rename된 의존은 코드상 이름으로 들어와 정점 이름으로 나간다.
-        let renamed = DepCrates::from([("foo".to_string(), "real_pkg".to_string())]);
+        let renamed = dep_scope("foo", "real_pkg", false);
         assert_eq!(
             t.resolve("c", &["foo".into(), "x".into()], &renamed),
             Some("real_pkg".to_string())
@@ -583,6 +646,74 @@ mod tests {
         );
         // 아무 것도 아닌 이름은 여전히 미해석.
         assert_eq!(t.resolve("c", &["nope".into()], &DepCrates::new()), None);
+    }
+
+    #[test]
+    fn dep_alias_is_scoped_per_declaring_crate() {
+        // 같은 별칭을 다른 크레이트가 다른 패키지에 물릴 수 있다 —
+        // 스코프 밖 크레이트에서 쓴 별칭은 미해석이어야 한다.
+        let mut t = tree();
+        t.modules.insert(
+            "other".to_string(),
+            Module::new(PathBuf::from("o.rs"), true, true),
+        );
+        let map = dep_scope("foo", "real_pkg", false);
+        // c는 foo를 선언했고 other는 안 했다 — other에서 foo는 미지다.
+        assert_eq!(t.resolve("other", &["foo".into(), "x".into()], &map), None);
+        assert_eq!(
+            t.resolve("c", &["foo".into(), "x".into()], &map),
+            Some("real_pkg".to_string())
+        );
+    }
+
+    #[test]
+    fn member_alias_walks_into_real_root() {
+        // 멤버 별칭은 붕괴하지 않고 멤버의 실제 루트 정점부터 걷는다 —
+        // 패키지 이름과 lib 타깃 이름이 다를 수 있기 때문이다.
+        let mut t = tree();
+        t.modules.insert(
+            "real_lib".to_string(),
+            Module::new(PathBuf::from("lib.rs"), true, true),
+        );
+        t.modules
+            .get_mut("real_lib")
+            .unwrap()
+            .items
+            .insert("f".to_string());
+        let map = dep_scope("alias", "real_lib", true);
+        assert_eq!(
+            t.resolve("c", &["alias".into(), "f".into()], &map),
+            Some("real_lib::f".to_string())
+        );
+        // 멤버 정점은 external이 아니다 — 임포트 후속 해석도 걷는다.
+        assert!(!map.external.contains("real_lib"));
+    }
+
+    #[test]
+    fn renamed_external_import_resolves_to_vertex() {
+        // `use foo::make` (foo → real_pkg)가 만든 임포트의 후속 경로는
+        // real_pkg 정점으로 붕괴한다 — 별칭 foo는 스코프 키이지
+        // 정점 이름이 아니다.
+        let mut t = tree();
+        let map = dep_scope("foo", "real_pkg", false);
+        // use 해석 자체 — 별칭이 정점 이름으로 붕괴한다.
+        assert_eq!(
+            t.resolve("c", &["foo".into(), "make".into()], &map),
+            Some("real_pkg".to_string())
+        );
+        // 임포트 `make → real_pkg`를 심고 `make::x`를 해석한다 —
+        // 임포트가 가리키는 외부 정점이 external 집합에 있어야 한다.
+        t.modules.get_mut("c").unwrap().imports.insert(
+            "make".to_string(),
+            Import {
+                target: "real_pkg".to_string(),
+                cfg: None,
+            },
+        );
+        assert_eq!(
+            t.resolve("c", &["make".into(), "x".into()], &map),
+            Some("real_pkg".to_string())
+        );
     }
 
     #[test]

@@ -215,8 +215,8 @@ impl Server {
             "rustograph_query" => {
                 let id = arg_str(args, "id").ok_or("query needs an \"id\" argument")?;
                 let id = self.require_id(id)?;
-                let depth = arg_usize(args, "depth").unwrap_or(1);
-                let max = arg_usize(args, "max").unwrap_or(200);
+                let depth = arg_usize(args, "depth")?.unwrap_or(1);
+                let max = arg_usize(args, "max")?.unwrap_or(200);
                 Ok(export::to_json(&analysis::query(
                     &self.doc, &id, depth, max,
                 )))
@@ -226,13 +226,13 @@ impl Server {
                 let id = self.require_id(id)?;
                 // depth 0은 "전체 전이 클로저" — 내부에서는 무제한으로 바꾸되
                 // 보고에는 요청값을 싣는다(usize::MAX는 계약이 아니다).
-                let requested = arg_usize(args, "depth").unwrap_or(0);
+                let requested = arg_usize(args, "depth")?.unwrap_or(0);
                 let effective = if requested == 0 {
                     usize::MAX
                 } else {
                     requested
                 };
-                let max = arg_usize(args, "max").unwrap_or(200);
+                let max = arg_usize(args, "max")?.unwrap_or(200);
                 let mut r = analysis::impact(&self.doc, &id, effective, max);
                 r.depth = requested;
                 Ok(export::to_json(&r))
@@ -242,18 +242,21 @@ impl Server {
                 let to = arg_str(args, "to").ok_or("paths needs \"from\" and \"to\"")?;
                 let from = self.require_id(from)?;
                 let to = self.require_id(to)?;
-                let max = arg_usize(args, "max").unwrap_or(10);
-                let budget = arg_usize(args, "budget").unwrap_or(50_000);
+                let max = arg_usize(args, "max")?.unwrap_or(10);
+                let budget = arg_usize(args, "budget")?.unwrap_or(50_000);
                 Ok(export::to_json(&analysis::paths(
                     &self.doc, &from, &to, max, budget,
                 )))
             }
             "rustograph_search" => {
                 let q = arg_str(args, "q").ok_or("search needs a \"q\" argument")?;
-                let max = arg_usize(args, "max").unwrap_or(20);
+                let max = arg_usize(args, "max")?.unwrap_or(20);
                 Ok(export::to_json(&analysis::search(&self.doc, q, max)))
             }
-            "rustograph_deps" => Ok(export::to_json(&deps::report(&self.dir, &self.doc)?)),
+            // deps는 자체 syn 수확으로 문서를 만든다 — 시작 시점의
+            // 공유 문서는 외부 정점이 없거나 필터됐을 수 있어 사용
+            // 증거로 쓸 수 없다.
+            "rustograph_deps" => Ok(export::to_json(&deps::report(&self.dir)?)),
             "rustograph_cycles" => {
                 let level = match arg_str(args, "level") {
                     Some(l) => Level::parse(l)
@@ -310,11 +313,16 @@ impl Server {
                     .map_err(|e| format!("bad {}: {e}", cfg_path.display()))?;
                 let mut rep = rules::check(&self.doc, &cfg);
                 // 설정에 선언된 기준선을 적용한다 — CLI rules와 같은 계약.
-                // 없는 파일은 아직 도입 전이라 조용히 넘긴다.
+                // NotFound만 도입 전으로 본다 — 권한 오류나 깨진 파일을
+                // 조용히 넘기면 억제가 안 먹힌 채로 지나간다.
                 if let Some(b) = &cfg.baseline {
                     let path = cfg_path.parent().unwrap_or(self.dir.as_path()).join(b);
-                    if let Ok(src) = std::fs::read_to_string(&path) {
-                        rules::apply_baseline(&mut rep, &rules::Baseline::parse(&src));
+                    match std::fs::read_to_string(&path) {
+                        Ok(src) => rules::apply_baseline(&mut rep, &rules::Baseline::parse(&src)),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            return Err(format!("cannot read baseline {}: {e}", path.display()))
+                        }
                     }
                 }
                 Ok(export::to_json(&rep))
@@ -436,9 +444,17 @@ fn arg_str<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(|v| v.as_str())
 }
 
-/// 정수 인자 하나를 꺼낸다.
-fn arg_usize(args: &serde_json::Value, key: &str) -> Option<usize> {
-    args.get(key).and_then(|v| v.as_u64()).map(|n| n as usize)
+/// 정수 인자 하나를 꺼낸다 — 없으면 None, 있으면 반드시 부호 없는
+/// 정수여야 한다. 문자열이나 음수를 조용히 버리면 호출자가 준 한계가
+/// 무시된다 — 잘못된 값은 도구 오류다.
+fn arg_usize(args: &serde_json::Value, key: &str) -> Result<Option<usize>, String> {
+    match args.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .map(|n| Some(n as usize))
+            .ok_or_else(|| format!("invalid {key} {v} — expected a non-negative integer")),
+    }
 }
 
 /// 불리언 인자 하나를 꺼낸다(없으면 false).

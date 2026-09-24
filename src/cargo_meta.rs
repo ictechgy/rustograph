@@ -19,6 +19,10 @@ pub struct Package {
     pub targets: Vec<Target>,
     /// 이 패키지가 워크스페이스 멤버인가.
     pub workspace_member: bool,
+    /// proc-macro 크레이트인가 — 사용 증거가 derive/속성 경로라 호출
+    /// 그래프에 안 잡힐 수 있어 deps 보고서가 약한 증거로 표시한다.
+    /// targets에서 proc-macro 타깃을 걸러내기 전에 따로 잡아야 한다.
+    pub proc_macro: bool,
 }
 
 /// lib/bin 타깃 하나 — 모듈 트리의 루트가 된다.
@@ -109,6 +113,26 @@ pub fn normalize_name(name: &str) -> String {
     name.replace('-', "_")
 }
 
+/// `rustc --print cfg --target`의 원시 출력 — 타깃의 권위 있는 cfg
+/// 팩트다. rustc가 없거나 트리플을 모르면 None — 호출자가 트리플
+/// 추정으로 폴백한다. 반환값은 해석하지 않은 줄 목록이다 — 파싱은
+/// 순수 도메인(cfgeval)의 일이라 여기선 그대로 넘긴다.
+pub fn rustc_cfg_lines(triple: &str) -> Option<Vec<String>> {
+    let out = Command::new("rustc")
+        .args(["--print", "cfg", "--target", triple])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
 /// `cargo metadata`를 실행해 워크스페이스 사실을 읽는다.
 /// dir이 cargo 프로젝트가 아니면 오류 — 빈 그래프로 속이지 않는다.
 pub fn load(dir: &Path) -> Result<Metadata, String> {
@@ -143,10 +167,17 @@ fn parse(bytes: &[u8]) -> Result<Metadata, String> {
     let mut packages = Vec::new();
     for p in raw.packages {
         by_id.insert(p.id.clone(), packages.len());
+        // proc-macro 타깃은 아래 필터에서 버려진다 — 걸러내기 전에
+        // 패키지 수준 플래그로 따로 잡는다.
+        let proc_macro = p
+            .targets
+            .iter()
+            .any(|t| t.kind.iter().any(|k| k == "proc-macro"));
         packages.push(Package {
             workspace_member: members.contains(p.id.as_str()),
             name: normalize_name(&p.name),
             version: p.version,
+            proc_macro,
             targets: p
                 .targets
                 .into_iter()

@@ -64,9 +64,42 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
     }
     let doc = harvest(dir, &meta, opts)?;
     if let Some((key, path)) = &cache {
-        write_cache(path, *key, &doc);
+        // `#[path]`가 워크스페이스 밖 파일을 로드하면 그 파일은 지문에
+        // 없어 캐시가 stale해진다 — 그런 문서는 캐시에 쓰지 않는다.
+        if !touches_outside(&doc, &meta.workspace_root) {
+            write_cache(path, *key, &doc);
+        }
     }
     Ok(doc)
+}
+
+/// `--target`의 cfg 팩트 — `rustc --print cfg` 실측이 권위다.
+/// rustc를 못 쓰거나 트리플을 모르면 트리플 추정으로 폴백한다 —
+/// 부분 팩트는 complete=false라 모르는 조건은 미지로 남는다.
+pub fn target_facts(triple: &str) -> crate::cfgeval::Facts {
+    if let Some(lines) = cargo_meta::rustc_cfg_lines(triple) {
+        crate::cfgeval::Facts::from_cfg_lines(lines.iter().map(String::as_str))
+    } else {
+        crate::cfgeval::Facts::from_triple(triple)
+    }
+}
+
+/// 문서 정점이 지문이 안 보는 파일을 가리키는가 — `#[path]`로
+/// `../shared.rs`처럼 루트를 벗어난 파일이나, `include!`/`OUT_DIR`로
+/// 로드된 `target/` 아래 생성 파일은 지문에 없어 캐시가 stale해진다.
+/// 그런 문서는 캐시에 쓰지 않는다.
+fn touches_outside(doc: &Document, root: &Path) -> bool {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let target = root.join("target");
+    doc.vertices.iter().any(|v| {
+        v.position
+            .as_deref()
+            .and_then(|p| p.rsplit_once(':').map(|(f, _)| PathBuf::from(f)))
+            .is_some_and(|f| {
+                let c = f.canonicalize().unwrap_or(f);
+                !c.starts_with(&root) || c.starts_with(&target)
+            })
+    })
 }
 
 /// 캐시 파일 위치 — 워크스페이스 루트의 .rustograph/ 아래(gitignore됨).
@@ -102,15 +135,19 @@ fn fingerprint(dir: &Path, meta: &Metadata, opts: &Options) -> Option<u64> {
         feed(&[0]);
     }
     // 워크스페이스 아래의 모든 .rs와 매니페스트 — 어느 파일이든 바뀌면
-    // 지문이 달라진다. target/과 숨김 디렉터리는 산출물이라 건너뛴다.
+    // 지문이 달라진다. target/은 산출물이라 건너뛰고 숨김 디렉터리 중
+    // .cargo는 config가 빌드 입력을 바꾸니 포함한다. 디렉터리 항목
+    // 하나라도 못 읽으면 지문이 부분적이니 None — 부분 지문은
+    // stale 캐시를 재사용하는 최악의 경로다.
     let mut stack = vec![meta.workspace_root.clone()];
     let mut files: BTreeMap<PathBuf, (u64, u64, u32)> = BTreeMap::new();
     while let Some(d) = stack.pop() {
-        for e in std::fs::read_dir(&d).ok()?.flatten() {
+        for e in std::fs::read_dir(&d).ok()? {
+            let e = e.ok()?;
             let p = e.path();
             if p.is_dir() {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name != "target" && !name.starts_with('.') {
+                if name != "target" && (!name.starts_with('.') || name == ".cargo") {
                     stack.push(p);
                 }
                 continue;
@@ -185,29 +222,57 @@ fn harvest(dir: &Path, meta: &Metadata, opts: &Options) -> Result<Document, Stri
     let mut entry_roots: Vec<String> = Vec::new();
     let mut limitations = meta.limitations.clone();
 
-    // 코드가 보는 lib 이름 → 외부 크레이트 정점 ID(패키지 이름).
+    // 코드가 보는 lib 별칭 → 크레이트 정점. 스코프는 의존을 선언한
+    // 크레이트다 — 같은 별칭을 멤버마다 다른 패키지에 물릴 수 있어
+    // 전역 맵이면 last-wins로 오염된다. 멤버 의존은 붕괴하지 않고
+    // 그 멤버의 루트 정점(타깃 이름)부터 걷는다 — 패키지 이름과
+    // lib 타깃 이름이 다르면 패키지 이름 정점은 없다.
     // --deps일 때만 채운다 — 정점이 없는데 dep 경로가 해석되면
-    // dangling 간선이 생긴다. 빈 맵이면 resolve는 외부를 미해석으로
-    // 처리하는 옛 동작 그대로다.
+    // dangling 간선이 생긴다. 빈 표면 resolve는 옛 동작 그대로다.
     let dep_crates: modtree::DepCrates = if opts.include_deps {
-        meta.dep_edges
-            .iter()
-            .filter(|d| {
-                meta.by_id
-                    .get(&d.from)
-                    .is_some_and(|i| meta.packages[*i].workspace_member)
-            })
-            .filter_map(|d| {
-                meta.by_id
-                    .get(&d.to)
-                    .map(|i| (d.lib_name.clone(), meta.packages[*i].name.clone()))
-            })
-            .collect()
+        let mut dc = modtree::DepCrates::new();
+        for d in &meta.dep_edges {
+            let Some(&fi) = meta.by_id.get(&d.from) else {
+                continue;
+            };
+            let from_pkg = &meta.packages[fi];
+            if !from_pkg.workspace_member {
+                continue;
+            }
+            let Some(&ti) = meta.by_id.get(&d.to) else {
+                continue;
+            };
+            let to_pkg = &meta.packages[ti];
+            // 멤버는 루트 모듈 정점 — lib 타깃 이름이 정점 ID다.
+            // lib이 없는 멤버(proc-macro 타깃만 있거나 순수 bin 패키지)는
+            // 걸을 모듈 트리가 없으니 패키지 정점으로 붕괴한다.
+            let lib_root = to_pkg
+                .targets
+                .iter()
+                .find(|t| t.kind == "lib")
+                .map(|t| t.name.clone());
+            let (vertex, member) = match lib_root {
+                Some(root) if to_pkg.workspace_member => (root, true),
+                _ => (to_pkg.name.clone(), false),
+            };
+            // 의존 선언은 패키지의 모든 타깃(lib·bin 전부)에 적용된다.
+            for t in &from_pkg.targets {
+                dc.insert(
+                    t.name.clone(),
+                    d.lib_name.clone(),
+                    modtree::DepTarget {
+                        vertex: vertex.clone(),
+                        member,
+                    },
+                );
+            }
+        }
+        dc
     } else {
         Default::default()
     };
     // 정점으로 존재하는 외부 크레이트 이름 — uses 간선 방출용.
-    let dep_vertices: BTreeSet<String> = dep_crates.values().cloned().collect();
+    let dep_vertices: BTreeSet<String> = dep_crates.external.clone();
 
     emit_crate_level(
         meta,
