@@ -192,16 +192,15 @@ pub fn paths(doc: &Document, from: &str, to: &str, max_paths: usize, budget: usi
         tentative: false,
     }]);
     while let Some(s) = queue.pop_front() {
-        // 경로 수 한계가 찼으면 남은 큐는 전부 보고 못 한 경로 후보다 —
-        // 상태가 목적지인지 따지기 전에 잘렸다고 표시하고 멈춘다.
-        if report.paths.len() >= max_paths {
-            report.truncated = true;
-            break;
-        }
         let cur = s.vertices.last().expect("state is never empty").clone();
         // 목적지 확인이 예산 검사보다 먼저다 — 대기 중인 완성 경로는
-        // 예산을 쓰지 않고 수확한다.
+        // 예산을 쓰지 않고 수확한다. 경로 수 상한을 넘는 하나가 더
+        // 보이면 잘림이 확정이다 — 더 찾지 않고 멈춘다.
         if cur == to {
+            if report.paths.len() >= max_paths {
+                report.truncated = true;
+                break;
+            }
             report.paths.push(Path {
                 vertices: s.vertices,
                 edges: s.edges,
@@ -209,11 +208,11 @@ pub fn paths(doc: &Document, from: &str, to: &str, max_paths: usize, budget: usi
             });
             continue; // 목적지 도달 — 그 너머는 같은 경로의 연장일 뿐이다.
         }
-        // 확장 예산은 후속을 펼칠 때만 쓴다 — 목적지 상태가 큐에
-        // 있는데 예산이 찼다고 버리면 있는 경로를 놓친다.
+        // 확장 예산이 찼으면 큐를 펼치지 않고 비우며 목적지만 거둔다 —
+        // 비목적지 상태 뒤에 대기 중인 완성 경로가 버려지면 안 된다.
         if report.expanded >= budget {
             report.truncated = true;
-            break;
+            continue;
         }
         report.expanded += 1;
         for (nbr, kind, tent) in adj.get(cur.as_str()).into_iter().flatten() {
@@ -748,6 +747,23 @@ mod tests {
             r.paths[0].vertices,
             vec!["c::a".to_string(), "c::b".to_string()]
         );
+    }
+
+    #[test]
+    fn paths_drains_queued_destination_after_budget() {
+        // a->b, a->x에 예산 1 — a를 펼치면 큐는 [b, x]. 예산이 찼다고
+        // 멈추면 비목적지 b 뒤에 대기 중인 완성 경로 x를 버린다.
+        // 큐를 비우며 목적지만 거둬야 한다 — b의 미확장은 truncated로.
+        let mut d = doc();
+        d.edges
+            .push(Edge::new("c::a".into(), "c::x".into(), EdgeKind::Call));
+        let r = paths(&d, "c::a", "c::x", 10, 1);
+        assert!(r.found);
+        assert_eq!(
+            r.paths[0].vertices,
+            vec!["c::a".to_string(), "c::x".to_string()]
+        );
+        assert!(r.truncated); // b를 펼치지 못했다 — 그 너머 경로는 모른다.
     }
 
     #[test]
