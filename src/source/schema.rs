@@ -1565,14 +1565,12 @@ fn sql_relations(text: &str) -> (Vec<String>, bool) {
         }
         if buffered_grant {
             // 피연산자 뒤가 GRANT 종결자가 아니면 산문이다 — 버퍼를 버린다.
+            // `WITH GRANT OPTION`은 피연산자가 아니라 피부여자 뒤에 오고,
+            // `)`는 GRANT가 중첩되지 않아 종결자가 아니다 — 둘 다 산문만 허용한다.
             let term_ok = match tokens.get(end_pos) {
                 None => true,
                 Some(t) => {
-                    !t.quoted
-                        && matches!(
-                            t.text.to_ascii_lowercase().as_str(),
-                            "to" | "from" | "with" | ";" | ")"
-                        )
+                    !t.quoted && matches!(t.text.to_ascii_lowercase().as_str(), "to" | "from" | ";")
                 }
             };
             if term_ok {
