@@ -164,14 +164,16 @@ Extracted references:
   `query_scalar!`, …) — literal SQL scanned, non-literal arguments kept
   as `dynamic` facts so isthmus can count the gap
 - `sqlx::query*_file!` — SQL lives in a file, reported as `dynamic`
-- `diesel::table!` / `table!` macro bodies — relation plus column uses
+- `diesel::table!` macro bodies — relation plus column uses
 - `#[diesel(table_name = …)]`, `#[sea_orm(table_name = "…")]` structs and
   their field/`column_name`/`sqlx::rename` columns
 - diesel DSL paths — `users::table`, `users::dsl::id`,
-  `users::columns::name`
+  `users::columns::name` — matched against the workspace's declared
+  `table!` names; same-shaped paths that match nothing stay `dynamic`
 
-Unqualified names (`query!`, `sql_query`) count only when the file imports
-them from `sqlx`/`diesel`. Unparseable files, off-grammar `table!` bodies,
+Unqualified names (`query!`, `sql_query`, `table!`) count only when the
+file imports them from `sqlx`/`diesel`. Unparseable files, off-grammar
+`table!` bodies,
 and column attributes without a table binding surface as `limitations`,
 not silence. The name-based scan never guesses: what cannot be resolved
 statically is counted, not invented.

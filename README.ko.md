@@ -92,14 +92,16 @@ rustograph schema --dir . --out schema-facts.json  # isthmus persistence 사실
   — 리터럴은 스캔하고 비리터럴 인자는 `dynamic` 사실로 보존해
   isthmus가 공백을 셀 수 있게 합니다
 - `sqlx::query*_file!` — SQL이 파일에 있으므로 `dynamic`으로 보고
-- `diesel::table!` / `table!` 매크로 본문 — 관계 + 컬럼 사용
+- `diesel::table!` 매크로 본문 — 관계 + 컬럼 사용
 - `#[diesel(table_name = …)]`·`#[sea_orm(table_name = "…")]` 구조체와
   필드/`column_name`/`sqlx::rename` 컬럼
 - diesel DSL 경로 — `users::table`, `users::dsl::id`,
-  `users::columns::name`
+  `users::columns::name` — 워크스페이스에 선언된 `table!` 이름과
+  맞물릴 때만 정적으로 인정하고, 안 맞는 같은 모양 경로는 `dynamic`
 
-비한정 이름(`query!`, `sql_query`)은 그 파일이 sqlx/diesel에서 import할
-때만 인정합니다. 파싱 실패 파일·문법이 다른 `table!`·테이블 바인딩 없는
+비한정 이름(`query!`, `sql_query`, `table!`)은 그 파일이 sqlx/diesel에서
+import할 때만 인정합니다. 파싱 실패 파일·문법이 다른 `table!`·테이블
+바인딩 없는
 컬럼 어트리뷰트는 조용히 넘기지 않고 `limitations`로 셉니다. 이름 기반
 스캔은 추측하지 않습니다 — 정적으로 해석할 수 없는 것은 지어내지 않고
 센 것입니다.

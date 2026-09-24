@@ -71,13 +71,22 @@ pub fn dsl_refs() {
     let _ = insert_into(users::table);
     let _ = users::dsl::id;
     let _ = audit_log::columns::message;
+    // 선언된 table! 이름과 맞지 않는 같은 모양의 경로는 동적 근거다.
+    let _ = config::table;
+}
+
+/// format! 템플릿의 관계 자리 플레이스홀더는 동적 사실로 남는다.
+pub fn templated(name: &str) {
+    let _ = format!("DELETE FROM {} WHERE id = 1", name);
 }
 
 /// 변수에 담긴 리터럴도 관계 참조다.
 pub const LIST_SQL: &str = "SELECT * FROM public.members";
 
-/// SQL이 아닌 문자열은 걸리지 않는다.
+/// SQL이 아닌 문자열은 걸리지 않는다 — 산문 속 키워드 모양 포함.
 pub const PROSE: &str = "from the beginning of the report";
+pub const PROSE_UPDATE: &str = "please update the config file";
+pub const PROSE_INTO: &str = "merged the branch into main";
 
 /// sqlx를 import하지 않은 비한정 매크로는 다른 크레이트의 것일 수 있다.
 pub mod unimported {

@@ -103,10 +103,40 @@ fn non_literal_args_become_dynamic_facts() {
     assert!(has_fact(&d, "text.to_string()", None, true));
     // query_file!의 SQL은 파일에 있어 dynamic이다.
     assert!(has_fact(&d, "\"queries/top.sql\"", None, true));
+    // format! 템플릿의 플레이스홀더 관계 자리도 동적 근거다.
+    assert!(has_fact(&d, "DELETE FROM {} WHERE id = 1", None, true));
     let lim = d["limitations"].as_array().unwrap();
     assert!(lim.iter().any(|l| l
         .as_str()
-        .is_some_and(|s| s.starts_with("unjoined-dynamic-relations: 3"))));
+        .is_some_and(|s| s.starts_with("unjoined-dynamic-relations: 5"))));
+}
+
+#[test]
+fn unknown_diesel_dsl_paths_are_dynamic_not_static() {
+    let d = doc();
+    // 선언된 table! 이름이 아닌 `x::table` 경로는 정적 사실이 되지 않는다 —
+    // 동적 근거로만 남고 limitation으로 센다.
+    assert!(has_fact(&d, "config::table", None, true));
+    assert!(
+        !has_fact(&d, "config", None, false),
+        "undeclared diesel path must not become a relation fact"
+    );
+    let lim = d["limitations"].as_array().unwrap();
+    assert!(lim.iter().any(|l| l
+        .as_str()
+        .is_some_and(|s| s.starts_with("unresolved-diesel-paths: 1"))));
+}
+
+#[test]
+fn prose_strings_are_not_scanned() {
+    // 산문 속 키워드 모양("update the ..", "into main")은 사실이 되지 않는다.
+    let d = doc();
+    for ch in ["beginning", "the", "main", "config", "file", "report"] {
+        assert!(
+            !has_fact(&d, ch, None, false) && !has_fact(&d, ch, None, true),
+            "prose leaked as fact: {ch}"
+        );
+    }
 }
 
 #[test]

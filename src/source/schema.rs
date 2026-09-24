@@ -12,18 +12,21 @@
 //!   - diesel `table!` 매크로의 관계·컬럼 선언 참조
 //!   - `#[diesel(table_name = ..)]`·`#[sea_orm(table_name = "..")]` 구조체와
 //!     그 필드(또는 `column_name`/`sqlx::rename` 재명명)의 컬럼 참조
-//!   - diesel DSL 경로 — `x::table`, `x::dsl::y`, `x::columns::y` 꼴
+//!   - diesel DSL 경로 — `x::table`, `x::dsl::y`, `x::columns::y` 꼴.
+//!     x가 워크스페이스의 `table!`·`table_name` 선언 이름과 맞을 때만
+//!     정적 사실로 읽고, 아니면 동적 사실로 남긴다
 //!
-//! 한정되지 않은 이름(`query!`, `sql_query`, `update` 등)은 그 파일이
-//! sqlx·diesel에서 해당 이름을 import할 때만 인정한다 — 이름만 같은
-//! 다른 크레이트 API를 관계 참조로 오독하지 않기 위해서다.
+//! 한정되지 않은 이름(`query!`, `sql_query` 등)은 그 파일이 같은 크레이트에서
+//! 해당 이름을 import할 때만 인정한다 — 이름만 같은 다른 크레이트 API를
+//! 관계 참조로 오독하지 않기 위해서다. 산문 속 "update the .."·"into main"
+//! 같은 키워드 모양은 문맥 규칙으로 걸러낸다.
 //! 리터럴로 읽히지 않는 SQL 인자는 버리지 않고 dynamic 사실로 보존한다 —
 //! 조인하지 못하는 이유를 소비자가 셀 수 있어야 한다.
 
 use crate::cargo_meta;
 use proc_macro2::{Span, TokenStream, TokenTree};
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
@@ -89,6 +92,7 @@ pub fn facts(dir: &Path, tool_version: &str) -> Result<BridgeFactsDocument, Stri
         ..Default::default()
     };
     scan.limitations.extend(meta.limitations.iter().cloned());
+    let mut files: Vec<(PathBuf, String, syn::File)> = Vec::new();
     for file in workspace_rs_files(&meta) {
         let Ok(src) = std::fs::read_to_string(&file) else {
             scan.unparsed += 1;
@@ -100,9 +104,18 @@ pub fn facts(dir: &Path, tool_version: &str) -> Result<BridgeFactsDocument, Stri
             }
         }
         match syn::parse_file(&src) {
-            Ok(ast) => scan_file(&mut scan, &file, &src, &ast),
+            Ok(ast) => files.push((file, src, ast)),
             Err(_) => scan.unparsed += 1,
         }
+    }
+    // 0패스: 워크스페이스 전체의 diesel `table!`·`table_name` 선언 이름을
+    // 모은다 — `x::table`·`x::dsl::y` 경로의 x를 이 목록으로만 관계에
+    // 귀속해 같은 모양의 비diesel 경로를 정적 사실로 오독하지 않는다.
+    for (_, _, ast) in &files {
+        collect_diesel_names(ast, &mut scan.diesel_tables);
+    }
+    for (file, src, ast) in &files {
+        scan_file(&mut scan, file, src, ast);
     }
     let mut facts = std::mem::take(&mut scan.list);
     facts.sort_by(fact_cmp);
@@ -225,7 +238,10 @@ struct SchemaScan {
     unparsed: usize,                       // 파싱·읽기에 실패한 .rs 수
     unparsed_table_macros: usize,          // table! 문법에 맞지 않은 매크로 수
     unattributed: usize,                   // 관계를 알 수 없는 컬럼 어트리뷰트 수
+    unresolved_diesel: usize,              // 선언 이름과 맞지 않는 DSL 모양 경로 수
+    unlocated: usize,                      // span을 위치로 변환하지 못해 버린 사실 수
     dynamic: usize,                        // 리터럴로 읽히지 않아 조인 불가한 SQL 인자 수
+    diesel_tables: BTreeSet<String>,       // 워크스페이스의 diesel 선언 이름
     latest: Option<std::time::SystemTime>, // 읽은 소스의 최신 mtime
     seen: BTreeSet<String>,
 }
@@ -237,9 +253,9 @@ fn scan_file(scan: &mut SchemaScan, file: &Path, src: &str, ast: &syn::File) {
         scan,
         src,
         file,
-        imported: BTreeSet::new(),
-        renamed: std::collections::BTreeMap::new(),
-        glob: BTreeSet::new(),
+        db_imports: BTreeMap::new(),
+        sqlx_glob: false,
+        diesel_glob: false,
         pass_two: false,
     };
     ctx.visit_file(ast); // 1패스: use 수집
@@ -252,11 +268,12 @@ struct FileCtx<'a> {
     scan: &'a mut SchemaScan,
     src: &'a str,
     file: &'a Path,
-    imported: BTreeSet<String>, // `use sqlx::query` 같은 이름 바인딩
-    /// `use sqlx::query as q` — 바인딩 이름 → 원래 이름. 매크로 규칙은
-    /// 원래 이름으로 찾아야 `query as q`도 query의 인자 규칙을 따른다.
-    renamed: std::collections::BTreeMap<String, String>,
-    glob: BTreeSet<String>, // `use sqlx::*` 같은 크레이트 글롭
+    /// `use sqlx::x`·`use diesel::x`의 바인딩 → (크레이트, 원래 이름).
+    /// `as` 별칭은 키가 별칭이고 값은 원래 이름이다 — 매크로·함수 규칙은
+    /// 원래 이름으로 찾아야 `use sqlx::query as q`도 query의 규칙을 따른다.
+    db_imports: BTreeMap<String, (&'static str, String)>,
+    sqlx_glob: bool,   // `use sqlx::...::*`
+    diesel_glob: bool, // `use diesel::...::*`
     pass_two: bool,
 }
 
@@ -266,9 +283,9 @@ impl<'ast> Visit<'ast> for FileCtx<'ast> {
         collect_use(
             &node.tree,
             &mut prefix,
-            &mut self.imported,
-            &mut self.renamed,
-            &mut self.glob,
+            &mut self.db_imports,
+            &mut self.sqlx_glob,
+            &mut self.diesel_glob,
         );
     }
 
@@ -314,53 +331,88 @@ impl<'ast> Visit<'ast> for FileCtx<'ast> {
     }
 }
 
-/// `use` 트리를 걸어 sqlx·diesel이보낸 이름 바인딩을 모은다.
-/// 첫 세그먼트가 sqlx/diesel일 때만 마지막 세그먼트를 기록한다 —
-/// 이름 충돌 판별에 크레이트 출처가 필요해서다.
+/// `use` 트리를 걸어 sqlx·diesel에서 온 이름 바인딩을 모은다.
+/// 첫 세그먼트가 sqlx/diesel일 때만 기록한다 — 이름 충돌 판별에 크레이트
+/// 출처가 필요해서다. `use sqlx::prelude::*` 같은 중첩 글롭도 첫 세그먼트로
+/// 귀속된다.
 fn collect_use(
     tree: &syn::UseTree,
     prefix: &mut Vec<String>,
-    imported: &mut BTreeSet<String>,
-    renamed: &mut std::collections::BTreeMap<String, String>,
-    glob: &mut BTreeSet<String>,
+    db_imports: &mut BTreeMap<String, (&'static str, String)>,
+    sqlx_glob: &mut bool,
+    diesel_glob: &mut bool,
 ) {
-    let from_db = || matches!(prefix.first().map(String::as_str), Some("sqlx" | "diesel"));
+    let krate = db_crate(prefix.first().map(String::as_str));
     match tree {
         syn::UseTree::Path(p) => {
             prefix.push(p.ident.to_string());
-            collect_use(&p.tree, prefix, imported, renamed, glob);
+            collect_use(&p.tree, prefix, db_imports, sqlx_glob, diesel_glob);
             prefix.pop();
         }
         syn::UseTree::Name(n) => {
-            if from_db() {
-                imported.insert(n.ident.to_string());
+            if let Some(k) = krate {
+                let name = n.ident.to_string();
+                db_imports.insert(name.clone(), (k, name));
             }
         }
         syn::UseTree::Rename(r) => {
-            if from_db() {
-                imported.insert(r.rename.to_string());
-                renamed.insert(r.rename.to_string(), r.ident.to_string());
+            if let Some(k) = krate {
+                db_imports.insert(r.rename.to_string(), (k, r.ident.to_string()));
             }
         }
-        syn::UseTree::Glob(_) => {
-            if let Some(krate) = prefix.first() {
-                if matches!(krate.as_str(), "sqlx" | "diesel") {
-                    glob.insert(krate.clone());
-                }
-            }
-        }
+        syn::UseTree::Glob(_) => match krate {
+            Some("sqlx") => *sqlx_glob = true,
+            Some("diesel") => *diesel_glob = true,
+            _ => {}
+        },
         syn::UseTree::Group(g) => {
             for t in &g.items {
-                collect_use(t, prefix, imported, renamed, glob);
+                collect_use(t, prefix, db_imports, sqlx_glob, diesel_glob);
             }
         }
     }
 }
 
+/// use 첫 세그먼트를 크레이트 이름으로 정규화한다 — sqlx·diesel만 안다.
+fn db_crate(first: Option<&str>) -> Option<&'static str> {
+    match first {
+        Some("sqlx") => Some("sqlx"),
+        Some("diesel") => Some("diesel"),
+        _ => None,
+    }
+}
+
 impl<'ast> FileCtx<'ast> {
-    /// 비한정 이름이 sqlx·diesel에서 온 것인지 본다.
-    fn imported_from_db(&self, name: &str) -> bool {
-        self.imported.contains(name) || !self.glob.is_empty()
+    /// 비한정 매크로 이름을 (크레이트, 원래 이름)으로 푼다.
+    /// 글롭은 그 크레이트가 실제로 가진 이름일 때만 근거가 된다 —
+    /// `use diesel::*`가 sqlx 매크로 이름을 열어주지 않게 한다.
+    fn resolve_macro(&self, name: &str) -> Option<(&'static str, String)> {
+        if let Some((k, orig)) = self.db_imports.get(name) {
+            return Some((*k, orig.clone()));
+        }
+        if self.sqlx_glob && (sqlx_macro_arg(name).is_some() || sqlx_file_macro_arg(name).is_some())
+        {
+            return Some(("sqlx", name.to_string()));
+        }
+        if self.diesel_glob && name == "table" {
+            return Some(("diesel", name.to_string()));
+        }
+        None
+    }
+
+    /// 비한정 함수 이름을 (크레이트, 원래 이름)으로 푼다 — 글롭은 그
+    /// 크레이트의 SQL 함수 목록에 있는 이름에만 적용된다.
+    fn resolve_fn(&self, name: &str) -> Option<(&'static str, String)> {
+        if let Some((k, orig)) = self.db_imports.get(name) {
+            return Some((*k, orig.clone()));
+        }
+        if self.sqlx_glob && SQLX_SQL_FNS.contains(&name) {
+            return Some(("sqlx", name.to_string()));
+        }
+        if self.diesel_glob && DIESEL_SQL_FNS.contains(&name) {
+            return Some(("diesel", name.to_string()));
+        }
+        None
     }
 
     /// `table!`/`diesel::table!` 매크로를 읽는다. 처리한 매크로면 true다.
@@ -387,10 +439,13 @@ impl<'ast> FileCtx<'ast> {
         match parse_table_macro(&m.tokens) {
             Some((relation, columns)) => {
                 let loc = self.scan_locate(m.path.segments.last().unwrap().ident.span());
-                // 위치가 확보된 사실만 낸다 — 위치 없는 사실은 push가 걸러준다.
+                // 위치 없는 사실은 조인기가 쓸 수 없다 — 버린 만큼 센다.
                 let loc = match loc {
                     Some(l) => l,
-                    None => return true,
+                    None => {
+                        self.scan.unlocated += 1 + columns.len();
+                        return true;
+                    }
                 };
                 self.scan.push(RelationFact {
                     kind: "relation-use",
@@ -400,14 +455,15 @@ impl<'ast> FileCtx<'ast> {
                     location: loc.clone(),
                 });
                 for (col, span) in columns {
-                    if let Some(cloc) = self.scan_locate(span) {
-                        self.scan.push(RelationFact {
+                    match self.scan_locate(span) {
+                        Some(cloc) => self.scan.push(RelationFact {
                             kind: "relation-use",
                             channel: escape_qualified(&relation),
                             method: Some(col),
                             dynamic: false,
                             location: cloc,
-                        });
+                        }),
+                        None => self.scan.unlocated += 1,
                     }
                 }
             }
@@ -424,26 +480,22 @@ impl<'ast> FileCtx<'ast> {
             .iter()
             .map(|s| s.ident.to_string())
             .collect();
-        let Some(last) = segs.last() else {
-            return false;
-        };
-        // rename 바인딩은 원래 매크로 이름으로 규칙을 찾는다 —
-        // `use sqlx::query as q`의 q!는 query!의 인자 규칙을 따른다.
-        let name = self
-            .renamed
-            .get(last.as_str())
-            .map(String::as_str)
-            .unwrap_or(last.as_str());
-        let owned = match segs.as_slice() {
-            [single] => self.imported_from_db(single),
-            [krate, _leaf] => krate == "sqlx",
-            _ => false,
-        };
-        if !owned {
+        if segs.is_empty() {
             return false;
         }
-        let file_arg = sqlx_file_macro_arg(name);
-        let sql_arg = sqlx_macro_arg(name);
+        // 비한정·별칭 매크로는 바인딩의 크레이트가 sqlx일 때만 sqlx 규칙을
+        // 적용한다 — `use diesel::x as q`의 q!는 sqlx가 아니다. 한정 경로의
+        // 끝 이름은 바인딩 없이 `sqlx::` 접두로 인정한다.
+        let name = match segs.as_slice() {
+            [single] => match self.resolve_macro(single) {
+                Some(("sqlx", orig)) => orig,
+                _ => return false,
+            },
+            [krate, leaf] if krate == "sqlx" => leaf.clone(),
+            _ => return false,
+        };
+        let file_arg = sqlx_file_macro_arg(&name);
+        let sql_arg = sqlx_macro_arg(&name);
         if file_arg.is_none() && sql_arg.is_none() {
             return false;
         }
@@ -501,15 +553,14 @@ impl<'ast> FileCtx<'ast> {
         if segs.is_empty() {
             return;
         }
-        // 비한정 이름은 rename 바인딩의 원래 이름으로 규칙을 찾는다.
-        let resolve =
-            |n: &String| -> String { self.renamed.get(n).cloned().unwrap_or_else(|| n.clone()) };
+        // 비한정 이름은 바인딩의 크레이트로 규칙을 고른다 — sqlx로 확인된
+        // 이름은 sqlx 함수 표를, diesel로 확인된 이름은 diesel 표를 본다.
         let owned = match segs.as_slice() {
-            [name] => {
-                self.imported_from_db(name)
-                    && (SQLX_SQL_FNS.contains(&resolve(name).as_str())
-                        || DIESEL_SQL_FNS.contains(&resolve(name).as_str()))
-            }
+            [name] => match self.resolve_fn(name) {
+                Some(("sqlx", orig)) => SQLX_SQL_FNS.contains(&orig.as_str()),
+                Some(("diesel", orig)) => DIESEL_SQL_FNS.contains(&orig.as_str()),
+                _ => false,
+            },
             [krate, name] => {
                 (krate == "sqlx" && SQLX_SQL_FNS.contains(&name.as_str()))
                     || (krate == "diesel" && DIESEL_SQL_FNS.contains(&name.as_str()))
@@ -542,37 +593,42 @@ impl<'ast> FileCtx<'ast> {
             self.scan
                 .locate(self.src, path.segments[i].ident.span(), self.file)
         };
-        match segs.as_slice() {
-            [.., table, last] if last == "table" => {
-                if let Some(l) = loc_of(segs.len() - 1) {
-                    self.scan.push(RelationFact {
-                        kind: "relation-use",
-                        channel: escape_qualified(table),
-                        method: None,
-                        dynamic: false,
-                        location: l,
-                    });
-                }
+        // `x::dsl::table`처럼 dsl·columns 아래의 `table`은 컬럼 이름이다 —
+        // 끝 세그먼트가 table인 팔보다 이 팔을 먼저 맞춰야 한다.
+        let (table, column, loc_idx) = match segs.as_slice() {
+            [.., table, middle, col] if middle == "dsl" || middle == "columns" => {
+                (table, Some(col.clone()), segs.len() - 2)
             }
-            [.., table, middle, last] if middle == "dsl" || middle == "columns" => {
-                if let Some(l) = loc_of(segs.len() - 2) {
-                    self.scan.push(RelationFact {
-                        kind: "relation-use",
-                        channel: escape_qualified(table),
-                        method: None,
-                        dynamic: false,
-                        location: l.clone(),
-                    });
-                    self.scan.push(RelationFact {
-                        kind: "relation-use",
-                        channel: escape_qualified(table),
-                        method: Some(last.clone()),
-                        dynamic: false,
-                        location: l,
-                    });
-                }
-            }
-            _ => {}
+            [.., table, tail] if tail == "table" => (table, None, segs.len() - 1),
+            _ => return,
+        };
+        let Some(loc) = loc_of(loc_idx) else {
+            self.scan.unlocated += 1;
+            return;
+        };
+        if !self.scan.diesel_tables.contains(table) {
+            // 선언된 table! 이름과 맞지 않는 같은 모양의 경로는 관계를
+            // 확정하지 않고 동적 근거로만 남긴다 — 모듈이 다른 크레이트나
+            // 매크로 생성물에서 왔을 수 있다.
+            self.scan.unresolved_diesel += 1;
+            self.scan.push_dynamic_str(&segs.join("::"), loc);
+            return;
+        }
+        self.scan.push(RelationFact {
+            kind: "relation-use",
+            channel: escape_name(table),
+            method: None,
+            dynamic: false,
+            location: loc.clone(),
+        });
+        if let Some(col) = column {
+            self.scan.push(RelationFact {
+                kind: "relation-use",
+                channel: escape_name(table),
+                method: Some(col),
+                dynamic: false,
+                location: loc,
+            });
         }
     }
 
@@ -580,13 +636,13 @@ impl<'ast> FileCtx<'ast> {
     /// 읽어 관계 참조와 필드별 컬럼 참조를 낸다.
     /// 관계 바인딩 없는 `column_name`/`sqlx::rename`은 귀속 불가 수로 센다.
     fn scan_model_struct(&mut self, st: &syn::ItemStruct) {
-        let mut table: Option<(String, Span)> = None;
+        let mut table: Option<MetaVal> = None;
         for attr in &st.attrs {
             if let Some(v) = meta_name_value(attr, &["diesel", "sea_orm"], "table_name") {
                 table = Some(v);
             }
         }
-        let Some((name, span)) = table else {
+        let Some(table) = table else {
             // 바인딩 없는 컬럼 어트리뷰트만 세어 둔다.
             for f in &st.fields {
                 let col = f.attrs.iter().any(|a| {
@@ -600,12 +656,23 @@ impl<'ast> FileCtx<'ast> {
             return;
         };
         let Some(rloc) = self
-            .scan_locate(span)
+            .scan_locate(table.span)
             .or_else(|| self.scan_locate(st.ident.span()))
         else {
+            self.scan.unlocated += 1;
             return;
         };
-        let channel = escape_qualified(&name);
+        // 문자열 table_name은 이름 그 자체다 — `table_name = "a.b"`는 한
+        // 식별자지 한정자가 아니라 세그먼트 전체를 escape한다. 경로값
+        // (`table_name = schema::name`)만 한정 이름으로 읽는다.
+        let channel = if table.literal {
+            escape_name(&table.text)
+        } else {
+            escape_qualified(&table.text)
+        };
+        // sea-orm은 어트리뷰트 없는 필드를 snake_case 컬럼으로 매핑하고,
+        // diesel은 필드 이름을 그대로 컬럼으로 쓴다 — 규약이 다르다.
+        let sea_orm = table.krate == "sea_orm";
         self.scan.push(RelationFact {
             kind: "relation-use",
             channel: channel.clone(),
@@ -614,28 +681,39 @@ impl<'ast> FileCtx<'ast> {
             location: rloc,
         });
         for f in &st.fields {
-            let mut col: Option<String> = None;
-            let mut col_span = f.ident.as_ref().map(|i| i.span());
+            let mut col: Option<MetaVal> = None;
             for attr in &f.attrs {
-                if let Some((v, sp)) = meta_name_value(attr, &["diesel", "sea_orm"], "column_name")
+                if let Some(v) = meta_name_value(attr, &["diesel", "sea_orm"], "column_name")
                     .or_else(|| meta_name_value(attr, &["sqlx"], "rename"))
                 {
                     col = Some(v);
-                    col_span = Some(sp);
                 }
             }
-            let column = match col.or_else(|| f.ident.as_ref().map(|i| i.to_string())) {
-                Some(c) if !c.is_empty() => c.trim_start_matches("r#").to_string(),
-                _ => continue,
+            let (column, col_span) = match col {
+                Some(v) => (v.text, Some(v.span)),
+                None => match &f.ident {
+                    Some(i) => {
+                        let raw = i.to_string().trim_start_matches("r#").to_string();
+                        (
+                            if sea_orm { to_snake_case(&raw) } else { raw },
+                            Some(i.span()),
+                        )
+                    }
+                    None => continue,
+                },
             };
-            if let Some(cloc) = col_span.and_then(|s| self.scan_locate(s)) {
-                self.scan.push(RelationFact {
+            if column.is_empty() {
+                continue;
+            }
+            match col_span.and_then(|s| self.scan_locate(s)) {
+                Some(cloc) => self.scan.push(RelationFact {
                     kind: "relation-use",
                     channel: channel.clone(),
                     method: Some(column),
                     dynamic: false,
                     location: cloc,
-                });
+                }),
+                None => self.scan.unlocated += 1,
             }
         }
     }
@@ -647,13 +725,22 @@ impl<'ast> FileCtx<'ast> {
     }
 }
 
+/// `#[krate(key = value)]` 메타에서 읽은 값이다.
+struct MetaVal {
+    text: String,
+    span: Span,
+    /// 문자열 리터럴이면 true — 경로값(`schema::name`)과 escape 규칙이
+    /// 다르다: 문자열은 이름 그 자체, 경로는 한정 이름이다.
+    literal: bool,
+    /// 값을 실은 어트리뷰트의 크레이트 — sea_orm은 컬럼 명명 규약이 다르다.
+    krate: &'static str,
+}
+
 /// `#[krate(key = value)]` 형태의 중첩 메타에서 값을 읽는다.
-/// 반환은 (값 문자열, 값 span) — 식별자·경로·문자열 모두 받는다.
-fn meta_name_value(attr: &syn::Attribute, crates: &[&str], key: &str) -> Option<(String, Span)> {
-    let krate = attr.path().segments.first()?.ident.to_string();
-    if !crates.contains(&krate.as_str()) {
-        return None;
-    }
+/// 식별자·경로·문자열 모두 받는다.
+fn meta_name_value(attr: &syn::Attribute, crates: &[&'static str], key: &str) -> Option<MetaVal> {
+    let seg = attr.path().segments.first()?.ident.to_string();
+    let krate = *crates.iter().find(|k| **k == seg)?;
     let Meta::List(list) = &attr.meta else {
         return None;
     };
@@ -669,7 +756,12 @@ fn meta_name_value(attr: &syn::Attribute, crates: &[&str], key: &str) -> Option<
         }
         return match &nv.value {
             Expr::Lit(el) => match &el.lit {
-                syn::Lit::Str(s) => Some((s.value(), s.span())),
+                syn::Lit::Str(s) => Some(MetaVal {
+                    text: s.value(),
+                    span: s.span(),
+                    literal: true,
+                    krate,
+                }),
                 _ => None,
             },
             Expr::Path(p) => {
@@ -680,12 +772,57 @@ fn meta_name_value(attr: &syn::Attribute, crates: &[&str], key: &str) -> Option<
                     .map(|s| s.ident.to_string().trim_start_matches("r#").to_string())
                     .collect::<Vec<_>>()
                     .join(".");
-                Some((name, p.path.segments.last()?.ident.span()))
+                Some(MetaVal {
+                    text: name,
+                    span: p.path.segments.last()?.ident.span(),
+                    literal: false,
+                    krate,
+                })
             }
             _ => None,
         };
     }
     None
+}
+
+/// 워크스페이스 파일에서 diesel 관계 선언 이름을 모은다 — `table!`의
+/// 마지막 세그먼트(dsl 모듈 이름)와 `table_name` 어트리뷰트 값이
+/// `x::table`·`x::dsl::y` 경로의 귀속 목록이다.
+fn collect_diesel_names(ast: &syn::File, out: &mut BTreeSet<String>) {
+    struct Names<'a> {
+        out: &'a mut BTreeSet<String>,
+    }
+    impl<'ast> Visit<'ast> for Names<'_> {
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            let segs: Vec<String> = m
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            let owned = matches!(segs.as_slice(), [n] if n == "table")
+                || matches!(segs.as_slice(), [k, n] if k == "diesel" && n == "table");
+            if owned {
+                if let Some((rel, _)) = parse_table_macro(&m.tokens) {
+                    if let Some(last) = rel.rsplit('.').next() {
+                        self.out.insert(last.to_string());
+                    }
+                }
+            }
+            syn::visit::visit_macro(self, m);
+        }
+        fn visit_item_struct(&mut self, st: &'ast syn::ItemStruct) {
+            for attr in &st.attrs {
+                if let Some(v) = meta_name_value(attr, &["diesel", "sea_orm"], "table_name") {
+                    if let Some(last) = v.text.rsplit('.').next() {
+                        self.out.insert(last.to_string());
+                    }
+                }
+            }
+            syn::visit::visit_item_struct(self, st);
+        }
+    }
+    Names { out }.visit_file(ast);
 }
 
 /// diesel `table!` 매크로 본문을 읽어 (관계 이름, [(컬럼, span)])을 돌려준다.
@@ -819,6 +956,8 @@ fn scan_macro_literals(scan: &mut SchemaScan, m: &syn::Macro, src: &str, file: &
 
 impl SchemaScan {
     /// SQL 형태의 리터럴에서 관계 이름을 읽어 사실로 낸다.
+    /// 관계 자리에 플레이스홀더 같은 비리터럴 피연산자가 오면 관계 참조가
+    /// 있었다는 근거를 동적 사실로 남긴다 — 조용히 버리지 않는다.
     fn push_sql_literal(&mut self, loc: Option<BridgeLocation>, text: &str) {
         let Some(loc) = loc else {
             return;
@@ -826,7 +965,8 @@ impl SchemaScan {
         if !looks_like_sql(text) {
             return;
         }
-        for name in sql_relations(text) {
+        let (names, unresolved) = sql_relations(text);
+        for name in names {
             self.push(RelationFact {
                 kind: "relation-use",
                 channel: name,
@@ -834,6 +974,9 @@ impl SchemaScan {
                 dynamic: false,
                 location: loc.clone(),
             });
+        }
+        if unresolved {
+            self.push_dynamic_str(text, loc);
         }
     }
 
@@ -854,14 +997,17 @@ impl SchemaScan {
 
     /// dynamic 사실 공통 경로 — 원문은 120자로 자른다.
     fn push_dynamic_str(&mut self, text: &str, loc: BridgeLocation) {
-        let text: String = text.chars().take(120).collect();
+        // 문자·바이트 단위를 섞지 않는다 — 실제로 잘렸을 때만 ...를 붙인다.
+        let mut chars = text.chars();
+        let head: String = chars.by_ref().take(120).collect();
+        let channel = if chars.next().is_some() {
+            format!("{}...", head.trim_end())
+        } else {
+            head
+        };
         self.push(RelationFact {
             kind: "relation-use",
-            channel: if text.len() < 120 {
-                text
-            } else {
-                format!("{}...", text.trim_end())
-            },
+            channel,
             dynamic: true,
             method: None,
             location: loc,
@@ -898,10 +1044,18 @@ impl SchemaScan {
         }
         let rel = file.strip_prefix(&self.root).ok()?;
         let line_text = src.lines().nth(start.line - 1)?;
+        // 열이 바이트 오프셋이 아니거나 문자 경계와 어긋나면 문자 수로
+        // 재해석한다 — 실패 시 0 대신 그만큼의 문자열을 센 값을 쓴다.
         let column = line_text
             .get(..start.column)
             .map(|s| s.chars().map(|c| c.len_utf16() as u32).sum::<u32>())
-            .unwrap_or(0)
+            .unwrap_or_else(|| {
+                line_text
+                    .chars()
+                    .take(start.column)
+                    .map(|c| c.len_utf16() as u32)
+                    .sum()
+            })
             + 1;
         Some(BridgeLocation {
             path: rel.to_string_lossy().replace('\\', "/"),
@@ -931,11 +1085,23 @@ impl SchemaScan {
                 self.unattributed
             ));
         }
+        if self.unresolved_diesel > 0 {
+            out.push(format!(
+                "unresolved-diesel-paths: {} diesel-DSL-shaped path(s) matched no declared table name; kept as dynamic",
+                self.unresolved_diesel
+            ));
+        }
+        if self.unlocated > 0 {
+            out.push(format!(
+                "unlocated-references: {} extracted reference(s) had no resolvable source span",
+                self.unlocated
+            ));
+        }
         if self.dynamic > 0 {
             // isthmus가 미사용 진단을 unverified로 내리는 근거다 — 접두사를
             // 바꾸면 조인기의 severity 계산이 새로 인식하지 못한다.
             out.push(format!(
-                "unjoined-dynamic-relations: {} SQL argument(s) were not literals; their relations are uncounted",
+                "unjoined-dynamic-relations: {} SQL argument(s) or relation operand(s) were not statically readable; their relations are uncounted",
                 self.dynamic
             ));
         }
@@ -966,49 +1132,74 @@ fn fact_cmp(a: &RelationFact, b: &RelationFact) -> std::cmp::Ordering {
 }
 
 /// 표현식의 원문을 span 범위로 잘라낸다 — 토큰 재조합보다 소스 그대로가
-/// 진단 단서로 정확하다.
+/// 진단 단서로 정확하다. 줄 오프셋은 실제 바이트로 계산해 CRLF에서도
+/// 어긋나지 않는다.
 fn expr_text(src: &str, expr: &Expr) -> String {
     let span = expr.span();
     let (s, e) = (span.start(), span.end());
     if s.line == 0 || e.line == 0 {
         return "<dynamic expression>".to_string();
     }
-    let mut starts = Vec::new();
-    let mut off = 0usize;
-    for line in src.lines() {
-        starts.push(off);
-        off += line.len() + 1;
+    let mut starts = vec![0usize];
+    for (i, b) in src.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
     }
+    // 열이 문자 경계와 어긋나면 경계까지 보정한다.
     let get = |line: usize, col: usize| -> usize {
-        starts.get(line - 1).copied().unwrap_or(src.len()) + col
+        let mut p = starts.get(line - 1).copied().unwrap_or(src.len()) + col;
+        while p < src.len() && !src.is_char_boundary(p) {
+            p += 1;
+        }
+        p.min(src.len())
     };
     let (a, b) = (get(s.line, s.column), get(e.line, e.column));
     src.get(a..b).unwrap_or("<dynamic expression>").to_string()
 }
 
-/// 문자열이 SQL로 보이는지 본다 — 동사가 없는 리터럴은 스캔하지 않아
-/// 산문 속 "from" 같은 오탐을 막는다.
+/// 문자열이 SQL로 보이는지 본다 — 강한 동사가 없고 문장 머리가
+/// UPDATE·TRUNCATE도 아닌 리터럴은 스캔하지 않아 산문 속
+/// "from"·"update"·"into" 같은 오탐을 막는다.
 fn looks_like_sql(text: &str) -> bool {
-    lex_sql(text)
-        .iter()
-        .any(|t| !t.quoted && is_sql_verb(&t.text))
+    let mut head = true;
+    for t in lex_sql(text) {
+        if !is_name_token(&t) {
+            continue;
+        }
+        if is_sql_verb(&t.text) {
+            return true;
+        }
+        if head {
+            head = false;
+            if t.text.eq_ignore_ascii_case("update") || t.text.eq_ignore_ascii_case("truncate") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
-/// SQL 동사 표다 — 이 단어들이 있어야 문자열을 SQL로 읽는다.
-/// gartograph와 같은 표다 — `WITH` 절은 SELECT를 동반하므로 빠진다.
+/// SQL 문을 여는 강한 동사 표다 — 관계 키워드와 겹치는 update·truncate는
+/// 뺀다(문장 머리 규칙이 따로 있다). WITH는 SELECT를 동반하므로 없다.
 fn is_sql_verb(word: &str) -> bool {
     matches!(
         word.to_ascii_lowercase().as_str(),
         "select"
             | "insert"
-            | "update"
             | "delete"
             | "create"
             | "alter"
             | "drop"
-            | "truncate"
             | "replace"
             | "merge"
+            | "lock"
+            | "unlock"
+            | "rename"
+            | "describe"
+            | "desc"
+            | "analyze"
+            | "vacuum"
     )
 }
 
@@ -1029,14 +1220,43 @@ fn is_relation_keyword(word: &str) -> bool {
 /// SQL 텍스트에서 관계 이름을 읽는다.
 /// 한정 이름(`schema.table`)은 그대로 두고, 이름 자체에 점이 있는 인용
 /// 식별자("a.b")는 한 세그먼트로 읽는다 — escape는 사실 기록 시에 한다.
-fn sql_relations(text: &str) -> Vec<String> {
+/// 두 번째 반환은 관계 자리의 피연산자를 읽지 못했음을 뜻한다 —
+/// `FROM {}` 같은 플레이스홀더를 사실 없이 조용히 넘기지 않기 위해서다.
+fn sql_relations(text: &str) -> (Vec<String>, bool) {
     let tokens = lex_sql(text);
     let mut out = Vec::new();
-    let mut seen = BTreeSet::new(); // TRUNCATE TABLE처럼 겹치는 키워드 창의 중복을 막는다
-    let mut consumed = vec![false; tokens.len()]; // 이름·수식어로 소비된 토큰
+    let mut seen = BTreeSet::new(); // 겹치는 키워드 창의 중복을 막는다
+    let mut consumed = vec![false; tokens.len()]; // 이름·별칭·수식어로 소비된 토큰
+    let mut unresolved = false;
+    // 문장 머리 식별자 위치 — update·truncate는 여기서만 관계 키워드로 연다.
+    let head = tokens.iter().position(is_name_token);
     for i in 0..tokens.len() {
         let tok = &tokens[i];
         if consumed[i] || tok.quoted || !is_relation_keyword(&tok.text) {
+            continue;
+        }
+        let word = tok.text.to_ascii_lowercase();
+        let fires = match word.as_str() {
+            // 산문 속 "update the .."·upsert의 `DO UPDATE SET`을 막기 위해
+            // update는 문장 머리이고 뒤에 SET이 있을 때만 연다.
+            "update" => Some(i) == head && has_word(&tokens[i + 1..], "set"),
+            // truncate는 항상 문장 머리 동사다 — 산문 중간의 "truncate"는 무시.
+            "truncate" => Some(i) == head,
+            // into는 INSERT·SELECT·MERGE·REPLACE가 앞선 문맥에서만 연다 —
+            // "merge the branch into main" 같은 산문을 막는다.
+            "into" => tokens[..i].iter().any(|t| {
+                !t.quoted
+                    && matches!(
+                        t.text.to_ascii_lowercase().as_str(),
+                        "insert" | "select" | "merge" | "replace"
+                    )
+            }),
+            // table은 직전 식별자가 DDL 동사일 때만 키워드다 — 산문의
+            // "the table"이나 다른 절의 단어는 읽지 않는다.
+            "table" => table_keyword_context(&tokens, i),
+            _ => true, // from·join — 게이트가 강한 동사를 요구했으므로 연다.
+        };
+        if !fires {
             continue;
         }
         let mut j = i + 1;
@@ -1044,37 +1264,203 @@ fn sql_relations(text: &str) -> Vec<String> {
         // 수식어일 때만 건너뛴다 — UPDATE table 같은 문에서 table이 진짜
         // 관계 이름일 수 있고, 억지로 건너뛰면 SET 같은 다음 단어가
         // 관계명으로 읽힌다.
-        let head_is_truncate = tok.text.eq_ignore_ascii_case("truncate");
+        let head_is_truncate = word == "truncate";
         while j < tokens.len()
             && !tokens[j].quoted
-            && (tokens[j].text.eq_ignore_ascii_case("only")
-                || tokens[j].text.eq_ignore_ascii_case("if")
-                || tokens[j].text.eq_ignore_ascii_case("not")
-                || tokens[j].text.eq_ignore_ascii_case("exists")
-                || (head_is_truncate && tokens[j].text.eq_ignore_ascii_case("table")))
+            && is_name_modifier(&tokens[j].text, head_is_truncate)
         {
             consumed[j] = true;
             j += 1;
         }
-        // 쉼표로 이어지는 목록(`FROM a, b`)을 읽는다.
+        if j >= tokens.len() {
+            unresolved = true; // 이름이 없는 키워드 — "SELECT ... FROM" 꼴.
+            continue;
+        }
+        // 쉼표로 이어지는 목록(`FROM a, b`)을 읽는다 — 괄호 피연산자는
+        // 통째로 건너뛰고(안쪽 관계는 그 안의 키워드가 읽는다) 별칭은 삼킨다.
         while j < tokens.len() {
-            let Some((name, next)) = read_qualified_name(&tokens, j) else {
-                break;
+            // 괄호 안의 토큰은 소비 표시를 하지 않는다 — 서브쿼리 안의
+            // FROM 같은 키워드가 바깥 스캔에서 읽혀야 한다.
+            let operand_end = if tokens[j].text == "(" && !tokens[j].quoted {
+                match skip_parens(&tokens, j) {
+                    Some(next) => next,
+                    None => {
+                        unresolved = true; // 닫히지 않은 괄호.
+                        break;
+                    }
+                }
+            } else {
+                match read_qualified_name(&tokens, j) {
+                    Some((name, next)) => {
+                        if seen.insert(name.clone()) {
+                            out.push(name);
+                        }
+                        for c in consumed.iter_mut().take(next).skip(j) {
+                            *c = true;
+                        }
+                        next
+                    }
+                    None => {
+                        // `DO UPDATE SET`처럼 이름 자리에 절 키워드가 오는
+                        // 정상 형태는 넘기고, 플레이스홀더 등 읽히지 않는
+                        // 피연산자만 미해석으로 센다.
+                        let clause_next = tokens
+                            .get(j)
+                            .is_some_and(|t| is_name_token(t) && is_clause_word(&t.text));
+                        if !(word == "update" && clause_next) {
+                            unresolved = true;
+                        }
+                        break;
+                    }
+                }
             };
-            if seen.insert(name.clone()) {
-                out.push(name);
+            // `AS alias` 또는 쉼표 직전 별칭(`FROM users u, ..`)을 건너뛴다.
+            let mut k = operand_end;
+            if tokens
+                .get(k)
+                .is_some_and(|t| !t.quoted && t.text.eq_ignore_ascii_case("as"))
+                && tokens.get(k + 1).is_some_and(is_name_token)
+            {
+                k += 2;
+            } else if tokens.get(k).is_some_and(is_name_token)
+                && tokens
+                    .get(k + 1)
+                    .is_some_and(|t| !t.quoted && t.text == ",")
+            {
+                k += 1;
             }
-            for c in consumed.iter_mut().take(next).skip(j) {
+            for c in consumed.iter_mut().take(k).skip(operand_end) {
                 *c = true;
             }
-            if next < tokens.len() && tokens[next].text == "," {
-                j = next + 1;
+            if tokens.get(k).is_some_and(|t| !t.quoted && t.text == ",") {
+                j = k + 1;
                 continue;
             }
             break;
         }
     }
-    out
+    (out, unresolved)
+}
+
+/// 뒤쪽 토큰에 해당 단어가 있는지 본다 — `UPDATE`의 SET 동반 확인용이다.
+fn has_word(tokens: &[SqlToken], word: &str) -> bool {
+    tokens
+        .iter()
+        .any(|t| !t.quoted && t.text.eq_ignore_ascii_case(word))
+}
+
+/// `table` 토큰이 관계 키워드로 발화하는 문맥인지 본다 — 직전 비인용
+/// 식별자가 DDL 동사(ALTER·DROP·CREATE·TRUNCATE·RENAME·LOCK 등)일 때만이다.
+fn table_keyword_context(tokens: &[SqlToken], i: usize) -> bool {
+    (0..i)
+        .rev()
+        .find(|&k| is_name_token(&tokens[k]))
+        .is_some_and(|k| {
+            matches!(
+                tokens[k].text.to_ascii_lowercase().as_str(),
+                "alter"
+                    | "drop"
+                    | "create"
+                    | "truncate"
+                    | "rename"
+                    | "lock"
+                    | "unlock"
+                    | "describe"
+                    | "desc"
+                    | "analyze"
+                    | "vacuum"
+            )
+        })
+}
+
+/// 관계 키워드와 이름 사이에 올 수 있는 수식어다 — `table`은 TRUNCATE
+/// 뒤에서만 수식어다.
+fn is_name_modifier(word: &str, after_truncate: bool) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "only" | "if" | "not" | "exists"
+    ) || (after_truncate && word.eq_ignore_ascii_case("table"))
+}
+
+/// `(` 토큰부터 짝이 맞는 `)` 다음 위치를 돌려준다 — 닫히지 않으면 None.
+fn skip_parens(tokens: &[SqlToken], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (k, t) in tokens.iter().enumerate().skip(start) {
+        if t.quoted {
+            continue;
+        }
+        if t.text == "(" {
+            depth += 1;
+        } else if t.text == ")" {
+            depth -= 1;
+            if depth == 0 {
+                return Some(k + 1);
+            }
+        }
+    }
+    None
+}
+
+/// 관계 이름 위치에 올 수 없는 SQL 절 키워드다 — `FROM {} WHERE` 템플릿의
+/// 빈 플레이스홀더 뒤 토큰이 관계명으로 오독되지 않게 한다.
+/// (`table`은 이름으로 읽어야 해서 제외한다 — `UPDATE table SET` 참조.)
+fn is_clause_word(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "where"
+            | "set"
+            | "on"
+            | "group"
+            | "order"
+            | "by"
+            | "having"
+            | "limit"
+            | "offset"
+            | "union"
+            | "intersect"
+            | "except"
+            | "values"
+            | "returning"
+            | "as"
+            | "left"
+            | "right"
+            | "inner"
+            | "outer"
+            | "full"
+            | "cross"
+            | "natural"
+            | "lateral"
+            | "using"
+            | "and"
+            | "or"
+            | "not"
+            | "null"
+            | "select"
+            | "insert"
+            | "delete"
+            | "from"
+            | "join"
+            | "into"
+            | "update"
+            | "truncate"
+            | "with"
+            | "for"
+            | "in"
+            | "is"
+            | "case"
+            | "when"
+            | "then"
+            | "else"
+            | "end"
+            | "distinct"
+            | "asc"
+            | "desc"
+            | "if"
+            | "exists"
+            | "only"
+            | "between"
+            | "like"
+    )
 }
 
 /// SQL 텍스트를 어휘로 나눈다 — 인용 식별자는 내용을 보존하고
@@ -1161,14 +1547,16 @@ fn read_qualified_name(tokens: &[SqlToken], start: usize) -> Option<(String, usi
         if first.text.is_empty() {
             return None;
         }
-    } else if !is_name_token(first) {
+    } else if !is_name_token(first) || is_clause_word(&first.text) {
+        // 절 키워드(WHERE·SET·AS …)는 이름이 아니다 — `FROM {} WHERE`의
+        // where 같은 토큰이 관계명으로 읽히지 않게 한다.
         return None;
     }
     let mut name = escape_segment(first);
     let mut i = start + 1;
     while i + 1 < tokens.len() && tokens[i].text == "." && !tokens[i].quoted {
         let next = &tokens[i + 1];
-        if !next.quoted && !is_name_token(next) {
+        if !next.quoted && (!is_name_token(next) || is_clause_word(&next.text)) {
             break;
         }
         name.push('.');
@@ -1196,6 +1584,31 @@ fn escape_qualified(name: &str) -> String {
         .map(|seg| seg.replace('%', "%25").replace('.', "%2E"))
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// 이름 문자열 그대로를 한 세그먼트로 escape한다 — `table_name = "a.b"`
+/// 같은 문자열 값은 한정자가 아니라 한 식별자다.
+fn escape_name(name: &str) -> String {
+    name.replace('%', "%25").replace('.', "%2E")
+}
+
+/// snake_case 변환이다 — sea-orm이 어트리뷰트 없는 필드를 컬럼으로
+/// 매핑하는 규약과 맞춘다(연속 대문자는 한 단어로 묶는다).
+fn to_snake_case(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    let mut out = String::new();
+    for (i, c) in chars.iter().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            let after_lower = chars[i - 1].is_lowercase() || chars[i - 1].is_ascii_digit();
+            let word_start =
+                chars[i - 1].is_uppercase() && chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+            if after_lower || word_start {
+                out.push('_');
+            }
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
 }
 
 /// 비인용 토큰이 식별자인지 본다 — 기호·빈 문자열은 아니다.
@@ -1272,6 +1685,16 @@ mod tests {
             ("UPDATE sessions SET seen = 1", &["sessions"]),
             ("DELETE FROM audit_log", &["audit_log"]),
             ("FROM a, b, c.x", &["a", "b", "c.x"]),
+            // 별칭이 붙은 쉼표 목록도 모두 읽는다.
+            ("FROM users u, orders o", &["users", "orders"]),
+            ("FROM a AS x, b", &["a", "b"]),
+            // 서브쿼리 안쪽은 그 안의 키워드가 읽고 목록은 이어진다 —
+            // 안쪽 이름이 스캔 순서상 뒤에 나온다(최종 출력은 위치·이름으로 정렬).
+            ("FROM (SELECT * FROM a) t, b", &["b", "a"]),
+            (
+                "FROM a JOIN (SELECT 1) x ON x.i = a.i JOIN b ON true",
+                &["a", "b"],
+            ),
             // 인용 식별자는 한 세그먼트 — 점을 담으면 escape된다.
             (r#"FROM "a.b"."c""#, &["a%2Eb.c"]),
             (r#"FROM `schema`.`table`"#, &["schema.table"]),
@@ -1285,6 +1708,10 @@ mod tests {
             // UPDATE 문의 table은 진짜 관계 이름일 수 있다.
             ("UPDATE table SET x = 1", &["table"]),
             ("SELECT set FROM table", &["table"]),
+            // 산문 속 키워드 모양은 관계가 아니다.
+            ("please update the config", &[]),
+            ("merged the branch into main", &[]),
+            ("upsert ... on conflict do update set x = 1", &[]),
             // 수식어 건너뛰기.
             ("SELECT * FROM ONLY users", &["users"]),
             ("DROP TABLE IF EXISTS legacy", &["legacy"]),
@@ -1294,16 +1721,43 @@ mod tests {
             ("VALUES (1, 2)", &[]),
         ];
         for (sql, want) in cases {
-            assert_eq!(&sql_relations(sql), want, "sql: {sql}");
+            assert_eq!(&sql_relations(sql).0, want, "sql: {sql}");
         }
+    }
+
+    /// 관계 자리가 비리터럴(플레이스홀더)이면 미해석으로 센다 —
+    /// 사실 없이 조용히 넘기면 isthmus가 "참조 없음"으로 읽는다.
+    #[test]
+    fn sql_relations_flags_unresolved_operands() {
+        assert_eq!(
+            sql_relations("DELETE FROM {} WHERE id = $1"),
+            (vec![], true)
+        );
+        assert_eq!(sql_relations("INSERT INTO {} VALUES (1)"), (vec![], true));
+        // 괄호 피연산자(서브쿼리)는 미해석이 아니다 — 안쪽은 따로 읽힌다.
+        assert_eq!(
+            sql_relations("FROM (SELECT * FROM a) t"),
+            (vec!["a".to_string()], false)
+        );
     }
 
     #[test]
     fn looks_like_sql_gates_on_verbs() {
         assert!(looks_like_sql("select 1"));
         assert!(looks_like_sql("WITH x AS (SELECT 1) DELETE FROM t"));
+        assert!(looks_like_sql("UPDATE t SET x = 1"));
+        assert!(looks_like_sql("TRUNCATE t"));
         assert!(!looks_like_sql("from the beginning"));
+        // 산문 속 "update"는 문장 머리가 아니면 SQL로 보지 않는다.
+        assert!(!looks_like_sql("please update the config"));
         assert!(!looks_like_sql(""));
+    }
+
+    #[test]
+    fn snake_case_matches_sea_orm_convention() {
+        assert_eq!(to_snake_case("userId"), "user_id");
+        assert_eq!(to_snake_case("id"), "id");
+        assert_eq!(to_snake_case("HTTPReq"), "http_req");
     }
 
     #[test]
@@ -1353,16 +1807,16 @@ mod tests {
     fn meta_name_value_reads_diesel_and_sea_orm() {
         let attr: syn::Attribute = syn::parse_quote!(#[diesel(table_name = users)]);
         assert_eq!(
-            meta_name_value(&attr, &["diesel"], "table_name").unwrap().0,
+            meta_name_value(&attr, &["diesel"], "table_name")
+                .unwrap()
+                .text,
             "users"
         );
         let attr: syn::Attribute = syn::parse_quote!(#[sea_orm(table_name = "audit_log")]);
-        assert_eq!(
-            meta_name_value(&attr, &["sea_orm"], "table_name")
-                .unwrap()
-                .0,
-            "audit_log"
-        );
+        let v = meta_name_value(&attr, &["sea_orm"], "table_name").unwrap();
+        assert_eq!(v.text, "audit_log");
+        assert!(v.literal);
+        assert_eq!(v.krate, "sea_orm");
         // 다른 크레이트 어트리뷰트나 없는 키는 None이다.
         let attr: syn::Attribute = syn::parse_quote!(#[serde(rename = "x")]);
         assert!(meta_name_value(&attr, &["diesel"], "rename").is_none());
