@@ -20,10 +20,10 @@ v0.2.0도 배포됐으나 자기 분석에서 cli↔mcp 모듈 순환이 잡혀
 인자 파서를 cli_args로 분리한 0.2.1이 최신이다. PR #1~#6 머지됨.
 
 검증 상태: `cargo test` 130개 통과(단위 87 + 통합 29 + schema 14) +
-semantic feature 47개, 커버리지 92.95%(게이트 90, PR #14 시점),
-clippy 클린, verify-cli-contract OK(mcp 9도구 포함), 자기 분석
-`rules --strict` 0 위반 / `cycles --strict` 0 — semantic 모드도
-동일 0.
+semantic feature 47개, 커버리지 92.57%(게이트 90, PR #15 머지
+트리 기준), clippy 클린, verify-cli-contract OK(mcp 9도구 포함 —
+`schema` 명령은 아직 계약 미커버), 자기 분석 `rules --strict` 0 위반 /
+`cycles --strict` 0 — semantic 모드도 동일 0.
 PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
 #13(gitignore) a04c270, a4b576a · **#14(경쟁툴 보완 팩) 머지됨 —
 941da08.** PR #14는 Codex 2라운드 + GLM 1라운드 독립 리뷰를 거쳤고
@@ -90,7 +90,9 @@ PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
   --exclude-tests → --target → --focus 순으로 수확·로드 문서 모두에 적용.
 - `src/mcp.rs` — MCP stdio 서버(NDJSON JSON-RPC 2.0). 기동 시 문서 1회
   수확 후 스냅샷 서빙. 도구 9종: rustograph_summary/query/impact/paths/
-  search/cycles/dead/rules/deps. deps 보고서는 OnceLock lazy-once
+  search/cycles/dead/rules/deps. deps 보고서는 자체 syn 수확이
+  필요해(호출자 문서는 필터로 증거가 지워짐) 스냅샷 밖에서
+  OnceLock lazy-once
   (요청마다 수확하면 Box::leak AST가 누수). 숫자 인자는 usize::try_from
   검증. stdin을 파라미터로 받아 테스트 가능.
 - `src/sem.rs` — ra_ap_* 의미 해석 엔진(`semantic` feature, opt-in).
@@ -156,10 +158,10 @@ PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
    `source/schema.rs` 신규 + `rustograph schema` 명령으로 isthmus
    persistence 도메인의 bridge-facts v1을 낸다. GLM 리뷰 3라운드 반영.
    상세는 위 "현재 상태" 첫 단락 참고.
-8. 다음 우선순위는 사용자가 정한다. 보류 중인 알려진 LOW:
-   `split_cfg_attr` 속성 목록 파싱 실패 시 unresolved_paths 미계수
-   (카운터 배선 비용 대비 미미). Codex 3차 리뷰는 사용량 한도로
-   보류됐다 — GLM 리뷰가 역할을 대신했다.
+8. 다음 우선순위는 사용자가 정한다. 알려진 보류 항목은 아래
+   "막힌 것 / 주의"의 LOW들 참고 — `split_cfg_attr` 미계수,
+   verify-cli-contract의 `schema` 미커버, Codex 3차 리뷰
+   (사용량 한도 — GLM 리뷰가 역할을 대신했다).
 
 ## 막힌 것 / 주의
 
