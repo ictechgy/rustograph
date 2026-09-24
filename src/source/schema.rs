@@ -1371,7 +1371,9 @@ fn sql_relations(text: &str) -> (Vec<String>, bool) {
             // truncate는 항상 문장 머리 동사다 — 산문 중간의 "truncate"는 무시.
             "truncate" => stmt_head[i],
             // into는 같은 문장에 INSERT·SELECT·MERGE·REPLACE가 앞선 문맥에서만
-            // 연다 — "merge the branch into main" 같은 산문을 막는다.
+            // 연다 — "merged the branch into main" 같은 산문을 막는다.
+            // 단, 문장이 "merge"로 시작하는 산문은 SQL `MERGE INTO`와 어휘가
+            // 같아 구분 못 한다 — 남은 오탐 여지로 둔다.
             "into" => segment_before(i).any(|t| {
                 !t.quoted
                     && matches!(
@@ -1393,7 +1395,9 @@ fn sql_relations(text: &str) -> (Vec<String>, bool) {
                         !t.quoted
                             && matches!(
                                 t.text.to_ascii_lowercase().as_str(),
-                                "index" | "trigger" | "rule" | "policy"
+                                // `rule`은 제외 — CREATE RULE의 ON은 이벤트
+                                // 자리(`ON INSERT TO t`)라 관계가 아니다.
+                                "index" | "trigger" | "policy"
                             )
                     });
                 grant_on || create_on
@@ -1452,19 +1456,29 @@ fn sql_relations(text: &str) -> (Vec<String>, bool) {
                     | "configuration",
                 ) => {
                     // 비테이블 권한 객체 — 이름·한정자·인자 괄호까지 삼키고
-                    // 사실은 내지 않는다(미해석도 아니다 — 정상 문법이다).
+                    // 사실은 내지 않는다(미해석도 아닌 정상 문법이다).
                     let mut k = j;
                     while k < tokens.len() {
                         let t = &tokens[k];
                         if !t.quoted && t.text == "(" {
                             match skip_parens(&tokens, k) {
                                 Some(next) => k = next,
-                                None => break,
+                                None => {
+                                    unresolved = true; // 닫히지 않은 괄호.
+                                    break;
+                                }
                             }
                         } else if is_name_token(t) || (!t.quoted && t.text == ".") {
                             consumed[k] = true;
                             k += 1;
                         } else {
+                            // 플레이스홀더 피연산자(`ON SEQUENCE {s}`)는
+                            // 읽히지 않은 근거다 — 미해석으로 센다.
+                            if !t.quoted
+                                && matches!(t.text.as_str(), "{" | "}" | "$" | "?" | ":" | "@")
+                            {
+                                unresolved = true;
+                            }
                             break;
                         }
                     }
@@ -1477,6 +1491,13 @@ fn sql_relations(text: &str) -> (Vec<String>, bool) {
             unresolved = true; // 이름이 없는 키워드 — "SELECT ... FROM" 꼴.
             continue;
         }
+        // GRANT/REVOKE의 ON은 형태 검증을 거친다 — name (, name)* 뒤에
+        // TO·FROM·WITH·`;`·끝이 와야 한다. "grant select on the report"
+        // 같은 산문은 이름이 쉼표 없이 이어져 형태가 성립하지 않으므로
+        // 이름을 버퍼에 모았다가 형태가 맞을 때만 방출한다.
+        let buffered_grant = word == "on" && grant_stmt;
+        let mut buf: Vec<String> = Vec::new();
+        let mut end_pos = j;
         // 쉼표로 이어지는 목록(`FROM a, b`)을 읽는다 — 괄호 피연산자는
         // 통째로 건너뛰고(안쪽 관계는 그 안의 키워드가 읽는다) 별칭은 삼킨다.
         while j < tokens.len() {
@@ -1493,7 +1514,9 @@ fn sql_relations(text: &str) -> (Vec<String>, bool) {
             } else {
                 match read_qualified_name(&tokens, j) {
                     Some((name, next)) => {
-                        if seen.insert(name.clone()) {
+                        if buffered_grant {
+                            buf.push(name);
+                        } else if seen.insert(name.clone()) {
                             out.push(name);
                         }
                         for c in consumed.iter_mut().take(next).skip(j) {
@@ -1533,11 +1556,32 @@ fn sql_relations(text: &str) -> (Vec<String>, bool) {
             for c in consumed.iter_mut().take(k).skip(operand_end) {
                 *c = true;
             }
+            end_pos = k;
             if tokens.get(k).is_some_and(|t| !t.quoted && t.text == ",") {
                 j = k + 1;
                 continue;
             }
             break;
+        }
+        if buffered_grant {
+            // 피연산자 뒤가 GRANT 종결자가 아니면 산문이다 — 버퍼를 버린다.
+            let term_ok = match tokens.get(end_pos) {
+                None => true,
+                Some(t) => {
+                    !t.quoted
+                        && matches!(
+                            t.text.to_ascii_lowercase().as_str(),
+                            "to" | "from" | "with" | ";" | ")"
+                        )
+                }
+            };
+            if term_ok {
+                for name in buf {
+                    if seen.insert(name.clone()) {
+                        out.push(name);
+                    }
+                }
+            }
         }
     }
     (out, unresolved)
@@ -1964,9 +2008,20 @@ mod tests {
             // 권한 단어 없는 산문의 grant/on은 관계가 아니다.
             ("grant access on staging-db to the intern", &[]),
             ("revoke permission on friday", &[]),
-            // CREATE INDEX·TRIGGER의 ON 대상도 관계다.
+            // 권한 단어가 있어도 피연산자 뒤에 TO/FROM/WITH/;/끝이 없으면
+            // 산문이다 — "on the report"는 이름이 쉼표 없이 이어진다.
+            ("grant select on the report to auditors", &[]),
+            ("grant select on staging to the team", &["staging"]),
+            (
+                "revoke insert on public.sessions from r",
+                &["public.sessions"],
+            ),
+            // CREATE INDEX·TRIGGER·POLICY의 ON 대상도 관계다 — RULE의
+            // ON은 이벤트 자리라 관계가 아니다.
             ("CREATE UNIQUE INDEX i ON users (email)", &["users"]),
             ("CREATE TRIGGER tr ON audit AFTER UPDATE", &["audit"]),
+            ("CREATE POLICY p ON orders", &["orders"]),
+            ("CREATE RULE r AS ON INSERT TO emp DO INSTEAD NOTHING", &[]),
             // 다른 문장의 ON은 조인 조건이다 — 관계가 아니다.
             ("SELECT * FROM a ON CONFLICT DO NOTHING", &["a"]),
             // `;` 너머의 단어를 앞 문장의 근거로 쓰지 않는다.

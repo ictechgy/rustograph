@@ -2,7 +2,16 @@
 
 세션을 이어받는 에이전트가 먼저 읽는 문서입니다.
 
-## 현재 상태 (2026-09-22)
+## 현재 상태 (2026-09-24)
+
+**feature/schema-facts 진행 중 — PR #15.** isthmus persistence 도메인의
+두 번째 코드 생산자로 `rustograph schema`를 추가했다: bridge-facts v1,
+`platform: "rust"` + `target: "persistence"`(사실 없으면 `target: null`),
+SQL 문자열·sqlx 매크로/함수·diesel `table!`·DSL 경로·sea_orm 어트리뷰트에서
+relation-use 사실 수확. GLM 리뷰 3라운드 반영 — 산문 오탐 게이트,
+별칭·서브쿼리·`;` 다중 문장·GRANT/REVOKE 객체 종류어, 미해석·unlocated
+계수, DSL 경로는 선언된 table! 이름으로만 정적화. isthmus 쪽 계약 확장은
+PR #110(rust 플랫폼 + relation-use 허용, bridge 구성과 격리).
 
 **v0.2.1 배포 완료.** https://github.com/ictechgy/rustograph (public),
 `brew install ictechgy/tap/rustograph`로 설치 가능(brew test 통과).
