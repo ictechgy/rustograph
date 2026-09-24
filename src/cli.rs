@@ -344,6 +344,8 @@ fn cmd_deps(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
         "root",
         "semantic",
         "no-cache",
+        "level",
+        "depth",
     ] {
         if a.get(flag).is_some() || a.has(flag) {
             return Err(format!(

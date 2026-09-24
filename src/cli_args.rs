@@ -103,6 +103,17 @@ fn document_impl(
     if a.has("tests") && a.has("exclude-tests") {
         return Err("--tests and --exclude-tests are mutually exclusive".to_string());
     }
+    // 저장 그래프를 읽으면 수확 옵션은 전부 무효다 — 조용히 무시하면
+    // 사용자가 준 옵션이 적용됐다고 오해한다.
+    if a.get("graph").is_some() {
+        for flag in ["tests", "retain-public", "root", "semantic", "no-cache"] {
+            if a.has(flag) || a.get(flag).is_some() {
+                return Err(format!(
+                    "--{flag} is ignored with --graph — drop one of them"
+                ));
+            }
+        }
+    }
     let mut doc = if let Some(f) = a.get("graph") {
         export::load_file(Path::new(f))?
     } else {
