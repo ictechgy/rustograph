@@ -47,6 +47,7 @@ const BOOL_FLAGS: &[&str] = &[
     "strict",
     "semantic",
     "exclude-tests",
+    "no-cache",
     "write-baseline",
 ];
 
@@ -122,6 +123,7 @@ fn document_impl(
                 retain_public: a.has("retain-public"),
                 extra_roots: a.get_all("root").iter().map(|s| s.to_string()).collect(),
                 semantic,
+                cache: !a.has("no-cache"),
             },
         )?
     };

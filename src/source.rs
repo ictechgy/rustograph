@@ -28,6 +28,9 @@ pub struct Options {
     /// ra_ap 의미 해석으로 본문 간선을 보강할지 — `semantic` feature 빌드 필요.
     /// 타입 해석 메서드 호출·매크로 확장·trait impl 행렬이 켜진다.
     pub semantic: bool,
+    /// semantic 수확 결과를 디스크 캐시로 재사용할지 — syn 수확에는 무시된다.
+    /// 캐시는 항상 부가적이다 — 손상·불일치는 조용히 새 수확으로 넘어간다.
+    pub cache: bool,
 }
 
 /// 파싱된 파일 AST 아레나 — 수확이 끝날 때까지 아이템이 살아 있어야 해서
@@ -36,6 +39,8 @@ type Arena = BTreeMap<PathBuf, &'static [syn::Item]>;
 
 /// `dir`의 cargo 워크스페이스를 수확해 문서를 만든다.
 /// 실패는 문자열 오류 — 빈 그래프로 성공한 척하지 않는다.
+/// semantic 모드에서 cache가 켜져 있으면 소스 지문이 같은 이전 수확
+/// 문서를 재사용한다 — ra_ap 로드가 수십 초라 반복 질의의 실제 병목이다.
 pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
     // feature가 꺼진 빌드는 여기서 오류 — 조용히 syn으로 떨어지면
     // --semantic이 받은 결과가 의미 해석이 아니게 되어 거짓이 된다.
@@ -46,7 +51,130 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
         );
     }
     let meta = cargo_meta::load(dir)?;
-    harvest(dir, &meta, opts)
+    // 캐시 키는 모든 입력의 지문 — 지문을 못 재면 캐시를 끈다(실패는 부가적).
+    let cache = if opts.semantic && opts.cache {
+        fingerprint(dir, &meta, opts).map(|key| (key, cache_path(&meta)))
+    } else {
+        None
+    };
+    if let Some((key, path)) = &cache {
+        if let Some(doc) = read_cache(path, *key) {
+            return Ok(doc);
+        }
+    }
+    let doc = harvest(dir, &meta, opts)?;
+    if let Some((key, path)) = &cache {
+        write_cache(path, *key, &doc);
+    }
+    Ok(doc)
+}
+
+/// 캐시 파일 위치 — 워크스페이스 루트의 .rustograph/ 아래(gitignore됨).
+fn cache_path(meta: &Metadata) -> PathBuf {
+    meta.workspace_root.join(".rustograph/semantic-cache.json")
+}
+
+/// 수확 입력의 지문 — FNV-1a로 경로·크기·mtime을 접는다.
+/// 소스 하나라도 바뀌면 키가 달라진다. 지문 재기에 실패하면 None —
+/// 캐시 없이 수확하는 것이 캐시 때문에 실패하는 것보다 항상 낫다.
+fn fingerprint(dir: &Path, meta: &Metadata, opts: &Options) -> Option<u64> {
+    let mut h = 0xcbf29ce484222325u64;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+        }
+    };
+    // 스키마·도구 버전 — 출력 계약이 바뀌면 캐시도 무효다.
+    feed(b"rustograph-cache-v1");
+    feed(env!("CARGO_PKG_VERSION").as_bytes());
+    feed(&graph::DOCUMENT_VERSION.to_le_bytes());
+    feed(dir.canonicalize().ok()?.display().to_string().as_bytes());
+    feed(&[
+        opts.symbol_level as u8,
+        opts.include_deps as u8,
+        opts.tests as u8,
+        opts.retain_public as u8,
+    ]);
+    let mut roots = opts.extra_roots.clone();
+    roots.sort();
+    for r in roots {
+        feed(r.as_bytes());
+        feed(&[0]);
+    }
+    // 워크스페이스 아래의 모든 .rs와 매니페스트 — 어느 파일이든 바뀌면
+    // 지문이 달라진다. target/과 숨김 디렉터리는 산출물이라 건너뛴다.
+    let mut stack = vec![meta.workspace_root.clone()];
+    let mut files: BTreeMap<PathBuf, (u64, u64, u32)> = BTreeMap::new();
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).ok()?.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name != "target" && !name.starts_with('.') {
+                    stack.push(p);
+                }
+                continue;
+            }
+            let interesting = p.extension().is_some_and(|x| x == "rs")
+                || matches!(
+                    p.file_name().and_then(|n| n.to_str()),
+                    Some("Cargo.toml" | "Cargo.lock")
+                );
+            if !interesting {
+                continue;
+            }
+            let md = e.metadata().ok()?;
+            let mtime = md
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?;
+            files.insert(p, (md.len(), mtime.as_secs(), mtime.subsec_nanos()));
+        }
+    }
+    for (p, (len, secs, nanos)) in files {
+        feed(p.display().to_string().as_bytes());
+        feed(&len.to_le_bytes());
+        feed(&secs.to_le_bytes());
+        feed(&nanos.to_le_bytes());
+    }
+    Some(h)
+}
+
+/// 캐시 파일을 읽는다 — 지문이 다르거나 손상됐으면 None(새 수확).
+fn read_cache(path: &Path, key: u64) -> Option<Document> {
+    #[derive(serde::Deserialize)]
+    struct CacheFile {
+        key: String,
+        document: Document,
+    }
+    let src = std::fs::read_to_string(path).ok()?;
+    let cf: CacheFile = serde_json::from_str(&src).ok()?;
+    if cf.key != format!("{key:016x}") || cf.document.version > graph::DOCUMENT_VERSION {
+        return None;
+    }
+    Some(cf.document)
+}
+
+/// 캐시를 쓴다 — 실패해도 수확 결과는 유효하니 조용히 넘긴다.
+fn write_cache(path: &Path, key: u64, doc: &Document) {
+    #[derive(serde::Serialize)]
+    struct CacheFile<'a> {
+        key: &'a str,
+        document: &'a Document,
+    }
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    if let Ok(text) = serde_json::to_string(&CacheFile {
+        key: &format!("{key:016x}"),
+        document: doc,
+    }) {
+        let _ = std::fs::write(path, text);
+    }
 }
 
 /// 실제 수확 — 메타데이터 위에서 모듈 트리·간선을 조립한다.
@@ -742,5 +870,67 @@ fn push_sem_stats(
             "{} bodies invisible to semantic analysis (cfg-disabled or macro-generated); syntactic fan-out used",
             st.unmapped
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cargo_meta::Metadata;
+    use crate::graph::{document, Level};
+
+    /// 캐시 지문의 왕복과 무효화 — 파일 하나라도 바뀌면 키가 달라져야 한다.
+    #[test]
+    fn cache_roundtrip_and_invalidation() {
+        let tmp = std::env::temp_dir().join(format!("rustograph-cache-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("a.rs"), "fn a() {}").unwrap();
+        let meta = Metadata {
+            packages: vec![],
+            by_id: BTreeMap::new(),
+            dep_edges: vec![],
+            workspace_root: tmp.clone(),
+            limitations: vec![],
+        };
+        let opts = Options {
+            semantic: true,
+            cache: true,
+            ..Default::default()
+        };
+        let k1 = fingerprint(&tmp, &meta, &opts).expect("fingerprint");
+        assert_eq!(k1, fingerprint(&tmp, &meta, &opts).unwrap());
+        // 내용이 바뀌면 지문이 달라진다 — 길이도 달라 mtime 세분도와 무관.
+        std::fs::write(tmp.join("a.rs"), "fn a() { let much_longer = 1; }").unwrap();
+        let k2 = fingerprint(&tmp, &meta, &opts).unwrap();
+        assert_ne!(k1, k2);
+        // 수확 옵션도 키에 들어간다 — --deps 문서를 캐시로 속이면 안 된다.
+        let opts_deps = Options {
+            include_deps: true,
+            ..Default::default()
+        };
+        assert_ne!(k2, fingerprint(&tmp, &meta, &opts_deps).unwrap());
+        // 읽기·쓰기 왕복 — 같은 키면 문서가 돌아온다.
+        let doc = document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let path = cache_path(&meta);
+        write_cache(&path, k2, &doc);
+        let got = read_cache(&path, k2).expect("cache hit");
+        assert_eq!(got.vertices.len(), doc.vertices.len());
+        // 다른 키와 손상된 파일은 None — 새 수확으로 넘어간다.
+        assert!(read_cache(&path, k1).is_none());
+        std::fs::write(&path, "not json").unwrap();
+        assert!(read_cache(&path, k2).is_none());
+        // 캐시 파일이 워크스페이스 안에 있어도 지문을 바꾸지 않는다 —
+        // .rustograph는 숨김 디렉터리라 지문 걷기에서 빠진다.
+        assert_eq!(k2, fingerprint(&tmp, &meta, &opts).unwrap());
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
