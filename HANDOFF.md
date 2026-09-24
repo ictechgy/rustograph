@@ -18,44 +18,56 @@ PR #110(rust 플랫폼 + relation-use 허용, bridge 구성과 격리).
 v0.2.0도 배포됐으나 자기 분석에서 cli↔mcp 모듈 순환이 잡혀
 인자 파서를 cli_args로 분리한 0.2.1이 최신이다. PR #1~#6 머지됨.
 
-검증 상태: `cargo test` 63개 통과(단위 40 + 통합 23), 커버리지 91.2%
-(게이트 90), clippy 클린, verify-cli-contract OK(mcp 포함),
-자기 분석 `rules --strict` 0 위반 / `cycles --strict` 0.
-`--features semantic` 빌드에서는 +47 semantic 테스트, 자기 분석
-`rules`/`cycles` 동일 0(semantic 모드 366 타입 해석 간선).
+검증 상태: `cargo test` 84개 통과(단위 57 + 통합 27), 커버리지 93.06%
+(게이트 90), clippy 클린, verify-cli-contract OK(mcp 9도구 포함),
+자기 분석 `rules --strict` 0 위반 / `cycles --strict` 0 — semantic
+모드도 동일 0.
 PR #8(의미 해석) 머지됨 — 70ea82e. PR #10(의미 하드닝) 머지됨 —
-011c05b.
+011c05b. PR #12(handoff)·#13(gitignore) 머지됨 — a04c270, a4b576a.
+브랜치 `feature/tool-parity`에 경쟁툴 보완 팩 7종이 올라 있다(paths·
+search·deps·baseline·캐시·필터·애매 거부).
 
 ## 구조
 
 - `src/graph.rs` — 순수 도메인(Document/Vertex/Edge/Level), 결정적 정렬,
   `Edge.tentative` + 투영 병합. `Vertex.cfg`/`unsafe` + `Edge.cfg`/`unsafe`
-  메타데이터. 외부 의존 0(serde만).
-- `src/cargo_meta.rs` — `cargo metadata` → 패키지/타깃/depends 간선.
+  메타데이터. 문서 필터 focus/without_tests/for_target. 외부 의존 0(serde만).
+- `src/cfgeval.rs` — 타깃 트리플→팩트 파서 + cfg 표현식 삼값 평가
+  (Some/None — 미지 조건은 보존). 순수 도메인.
+- `src/cargo_meta.rs` — `cargo metadata` → 패키지(version/lib_name)/
+  타깃/depends 간선. lib_name은 `package = "real"` rename의 코드상 이름.
 - `src/modtree.rs` — `mod` 선언만으로 모듈 트리(`x.rs`|`x/mod.rs`|
   `#[path]`|인라인), orphan .rs 계수, 2단계 스코프(fill_items→fill_imports,
-  글롭 확장 포함), 경로 해석.
+  글롭 확장 포함), 경로 해석. DepCrates(lib→pkg 맵)가 주어지면 외부
+  크레이트 경로를 크레이트 정점으로 붕괴.
 - `src/harvest.rs` — syn 방문자. 아이템→정점, impl→메서드+implements,
   본문→call/references, 시그니처→signature, 매크로 인자·포맷 캡처,
-  `#[cfg]` 추출(cfg_of), unsafe 감지(unsafety/unsafe 블록/unsafe impl).
+  `#[cfg]` 추출(cfg_of), unsafe 감지(unsafety/unsafe 블록/unsafe impl),
+  속성 경로 수확(#[dep::attr]·derive(dep::X)·cfg_attr — dep 사용 증거).
 - `src/source.rs` — 오케스트레이터. AST arena('static 누수), 루트 병합
   (lib/bin 같은 이름 → extra_files), 보존 루트(main/#[no_mangle]/
-  --tests/--retain-public).
+  --tests/--retain-public), load(캐시)/harvest 분리, semantic 캐시
+  (.rustograph/semantic-cache.json, 소스+매니페스트 FNV 지문).
 - `src/analysis.rs` — Tarjan SCC(tentative 제외), dead(BFS+explain),
-  query/impact(전이 클로저).
+  query/impact(전이 클로저), paths(bounded BFS+예산), search(정확>
+  꼬리>부분 순위), resolve_id(정확만 즉시, 애매는 후보 Err).
 - `src/rules.rs` — allowlist+deny+signature 규칙, unmapped 보고,
-  skipped_tentative 계수.
+  skipped_tentative 계수, Baseline(`rule|from|to|kind` 키 — 기존 위반
+  얼리기, baselined/stale_baseline 계수).
+- `src/deps.rs` — 미사용 의존 + 중복 버전 보고(선언 대비 실참조).
+  빌드 의존·외부 정점 부재는 limitation으로 정직 계수.
 - `src/export.rs` — 결정적 JSON + mermaid + save/load.
 - `src/sarif.rs` — SARIF 2.1.0(`rustograph/deny` 등 ruleId).
-- `src/config.rs` — `.rustograph.yml` 파싱(serde_yml 격리).
-- `src/cli.rs` — graph/cycles/dead/rules/query/impact/mcp/version,
-  종료 코드 0/1/2.
+- `src/config.rs` — `.rustograph.yml` 파싱(serde_yml 격리), baseline 키.
+- `src/cli.rs` — graph/cycles/dead/rules/query/impact/paths/search/deps/
+  mcp/version, 종료 코드 0/1/2.
 - `src/cli_args.rs` — cli/mcp 공유 인자 파서(최하층, 순환 방지).
   이름이 args가 아닌 이유는 파일 헤더 주석 참고 — 지역 변수 `args`가
-  이름 해석으로 모듈을 가리키는 가짜 참조를 피한다.
+  이름 해석으로 모듈을 가리키는 가짜 참조를 피한다. 문서 필터는
+  --exclude-tests → --target → --focus 순으로 수확·로드 문서 모두에 적용.
 - `src/mcp.rs` — MCP stdio 서버(NDJSON JSON-RPC 2.0). 기동 시 문서 1회
-  수확 후 스냅샷 서빙. 도구: rustograph_summary/query/impact/cycles/
-  dead/rules. stdin을 파라미터로 받아 테스트 가능.
+  수확 후 스냅샷 서빙. 도구 9종: rustograph_summary/query/impact/paths/
+  search/cycles/dead/rules/deps. stdin을 파라미터로 받아 테스트 가능.
 - `src/sem.rs` — ra_ap_* 의미 해석 엔진(`semantic` feature, opt-in).
   `Engine::load`(load_workspace_at+attach_db), 정규 ID↔hir 인덱스,
   본문 워커(메서드 타입 해석·경로 해석·매크로 확장·trait impl 행렬),
@@ -103,7 +115,16 @@ PR #8(의미 해석) 머지됨 — 70ea82e. PR #10(의미 하드닝) 머지됨 �
    derive 인자는 순수 경로 세그먼트만 인정. modtree는 Module::dir
    실효 디렉터리 모델(rustc 실증: #[path] 로드 파일은 파일 디렉터리
    소유, 인라인 #[path]는 세그먼트 오버라이드). 각 가드는 뮤테이션으로
-   비공허 검증됨. 로드맵 1~5 모두 완료 — 다음 우선순위는 사용자가 정한다.
+   비공허 검증됨.
+6. ~~경쟁툴 보완 팩~~ — 완료(feature/tool-parity). cargo-modules·
+   cargo-callgraph·arch 계열·machete/udeps·depgraph와 비교해 벤치마크한
+   7종: paths(도달 경로 BFS+예산), rules baseline(레거시 도입),
+   deps(미사용+중복 버전 — 속성 경로 수확으로 proc-macro 의존 오탐 방지),
+   search+애매 ID 거부(후보 열거), semantic 캐시(지문 키),
+   focus/exclude-tests/target 필터(cfgeval 삼값 — 미지 조건 보존).
+   deps는 syn 수확을 쓴다 — 의미 해석은 외부 크레이트 내부를 안 봐서
+   증거가 아니라 오탐이다.
+   다음 우선순위는 사용자가 정한다.
 
 ## 막힌 것 / 주의
 

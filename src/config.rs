@@ -8,6 +8,7 @@ use std::path::Path;
 
 /// 규칙 파일. `components`는 경로 패턴 → 컴포넌트, `deps`는 허용 목록,
 /// `deny`는 무조건 금지(deps를 이긴다), `signature`는 공개 API 타입 누출 제한.
+/// `baseline`은 기존 위반을 얼린 파일의 경로 — 설정 파일 기준 상대 경로다.
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -18,6 +19,10 @@ pub struct Config {
     pub deny: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub signature: BTreeMap<String, Vec<String>>,
+    /// 기준선 파일 경로 — 레거시 도입 시 기존 위반을 얼려 새 위반만
+    /// 실패하게 하는 장치. 파일이 없으면 조용히 무시한다.
+    #[serde(default)]
+    pub baseline: Option<String>,
 }
 
 /// 설정 파일을 읽는다. 파일이 없으면 None — 규칙 없는 프로젝트는 오류가 아니다.

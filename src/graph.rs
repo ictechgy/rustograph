@@ -357,6 +357,189 @@ impl Document {
             }
         }
     }
+
+    /// 부분 그래프 — keep_vertex가 참인 정점만 남기고, 간선은 양 끝이 살아
+    /// 있고 keep_edge를 통과한 것만 남는다. dangling 간선은 절대 안 생긴다.
+    /// 정점을 먼저 걸러야 한다 — 같은 ID를 공유하는 cfg 변형 선언
+    /// (`#[cfg(unix)] fn f` / `#[cfg(windows)] fn f`)은 ID로 재필터하면
+    /// 버린 변형까지 부활한다. cfg 맵은 ID당 변형 목록 전부를 담는다 —
+    /// 한 변형의 조건만 남기면 조상 판정이 선언 순서에 따라 달라진다.
+    fn filtered(
+        &self,
+        keep_vertex: impl Fn(&Vertex, &BTreeMap<&str, Vec<Option<&str>>>) -> bool,
+        keep_edge: impl Fn(&Edge) -> bool,
+    ) -> Document {
+        let mut cfg_of: BTreeMap<&str, Vec<Option<&str>>> = BTreeMap::new();
+        for v in &self.vertices {
+            cfg_of
+                .entry(v.id.as_str())
+                .or_default()
+                .push(v.cfg.as_deref());
+        }
+        let mut d = self.clone();
+        d.vertices.retain(|v| keep_vertex(v, &cfg_of));
+        let kept: BTreeSet<&str> = d.vertices.iter().map(|v| v.id.as_str()).collect();
+        d.edges.retain(|e| {
+            keep_edge(e) && kept.contains(e.from.as_str()) && kept.contains(e.to.as_str())
+        });
+        d.roots.retain(|r| kept.contains(r.as_str()));
+        d
+    }
+
+    /// `--focus` — 주어진 경로 아래의 부분 트리만 남긴다.
+    /// `c::a::b`를 포커스하면 `c::a::b`와 그 후손만 남는다. 조상은
+    /// 남기지 않는다 — 포커스는 "이 서브트리만 보겠다"는 의미다.
+    pub fn focus(&self, prefixes: &[String]) -> Document {
+        self.filtered(
+            |v, _| {
+                prefixes
+                    .iter()
+                    .any(|p| v.id == *p || v.id.starts_with(&format!("{p}::")))
+            },
+            |_| true,
+        )
+    }
+
+    /// `--exclude-tests` — `cfg(test)` 없이는 성립하지 않는 코드를 지운다.
+    /// test=false 팩트로 평가해 확실히 거짓인 조건만 지운다 — 토큰 매칭이
+    /// 아니라 평가라 `not(test)`·`any(test, unix)`·`feature = "test"`는
+    /// 남는다. 정점 자신 또는 조상 모듈의 사슬이 거짓이면 테스트 코드다.
+    pub fn without_tests(&self) -> Document {
+        let facts = crate::cfgeval::Facts::test_off();
+        self.filtered(
+            |v, cfg_of| !chain_dropped(v, cfg_of, &facts),
+            |e| {
+                e.cfg
+                    .as_deref()
+                    .is_none_or(|c| crate::cfgeval::eval(c, &facts) != Some(false))
+            },
+        )
+    }
+
+    /// `--target` — 타깃의 cfg 팩트로 조건을 평가해 확실히 거짓인
+    /// 정점·간선을 지운다. 평가 불가(feature·test 등)는 keep하고
+    /// limitation에 그 수를 센다 — 모르는 것을 지우면 거짓 그래프다.
+    /// 팩트는 호출자가 만든다 — rustc --print cfg 실측 또는 트리플 추정.
+    pub fn for_target(&self, label: &str, facts: &crate::cfgeval::Facts) -> Document {
+        let mut d = self.filtered(
+            |v, cfg_of| !chain_dropped(v, cfg_of, facts),
+            |e| {
+                e.cfg
+                    .as_deref()
+                    .is_none_or(|c| crate::cfgeval::eval(c, facts) != Some(false))
+            },
+        );
+        let dropped = self.vertices.len() - d.vertices.len();
+        // 미지 조건을 품고 살아남은 정점 수 — 사슬에 미지가 하나라도 있으면.
+        let mut cfg_of: BTreeMap<&str, Vec<Option<&str>>> = BTreeMap::new();
+        for v in &d.vertices {
+            cfg_of
+                .entry(v.id.as_str())
+                .or_default()
+                .push(v.cfg.as_deref());
+        }
+        let unevaluated = d
+            .vertices
+            .iter()
+            .filter(|v| chain_unknown(v, &cfg_of, facts))
+            .count();
+        // 정점이 무조건인데 간선만 cfg-gated인 경우도 센다 — 그 간선은
+        // 조건 해석 없이 남아 있으므로 정직하게 보고한다.
+        let edges_unknown = d
+            .edges
+            .iter()
+            .filter(|e| {
+                e.cfg
+                    .as_deref()
+                    .is_some_and(|c| crate::cfgeval::eval(c, facts).is_none())
+            })
+            .count();
+        if dropped > 0 {
+            d.limitations.push(format!(
+                "{dropped} cfg-gated vertices excluded for target {label}"
+            ));
+        }
+        if unevaluated > 0 {
+            d.limitations.push(format!(
+                "{unevaluated} cfg-gated vertices kept — condition not decidable for target {label}"
+            ));
+        }
+        if edges_unknown > 0 {
+            d.limitations.push(format!(
+                "{edges_unknown} cfg-gated edges kept — condition not decidable for target {label}"
+            ));
+        }
+        d
+    }
+}
+
+/// 같은 ID의 cfg 변형 목록을 하나의 판정으로 합친다 — 모듈은
+/// `#[cfg(unix)] mod m` / `#[cfg(windows)] mod m`처럼 변형 선언이
+/// 가능하고, 자식 정점이 어느 변형의 파일에서 왔는지 ID로는 못 가른다.
+/// 참 변형이 하나면 조상은 성립(Some(true)), 전부 거짓이어야 거짓
+/// (Some(false)), 그 사이(미지 섞임)는 미지다.
+fn variant_eval(vars: &[Option<&str>], facts: &crate::cfgeval::Facts) -> Option<bool> {
+    let mut saw_unknown = false;
+    for c in vars {
+        // 조건 없는 변형(cfg=None)은 무조건 성립하는 변형이다.
+        match crate::cfgeval::eval_opt(*c, facts) {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => saw_unknown = true,
+        }
+    }
+    if saw_unknown {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+/// 정점의 조상 모듈 ID들 — 안쪽에서 바깥(크레이트 루트)까지.
+fn ancestor_ids(module: &str) -> impl Iterator<Item = &str> {
+    let mut cur = module;
+    std::iter::from_fn(move || {
+        if cur.is_empty() {
+            return None;
+        }
+        let id = cur;
+        cur = cur.rfind("::").map(|i| &cur[..i]).unwrap_or("");
+        Some(id)
+    })
+}
+
+/// 이 정점이 "거짓 확정"인가 — 자신의 조건이 거짓이거나, 조상 모듈
+/// ID의 *모든* 선언 변형이 거짓일 때만이다.
+fn chain_dropped(
+    v: &Vertex,
+    cfg_of: &BTreeMap<&str, Vec<Option<&str>>>,
+    facts: &crate::cfgeval::Facts,
+) -> bool {
+    if crate::cfgeval::eval_opt(v.cfg.as_deref(), facts) == Some(false) {
+        return true;
+    }
+    ancestor_ids(&v.module).any(|id| {
+        cfg_of
+            .get(id)
+            .is_some_and(|vars| variant_eval(vars, facts) == Some(false))
+    })
+}
+
+/// 살아남은 정점이 미지 조건을 품는가 — 자신 또는 조상 변형의 평가가
+/// 미지(참 확정도 거짓 확정도 아님)일 때. limitation 계수용이다.
+fn chain_unknown(
+    v: &Vertex,
+    cfg_of: &BTreeMap<&str, Vec<Option<&str>>>,
+    facts: &crate::cfgeval::Facts,
+) -> bool {
+    if crate::cfgeval::eval_opt(v.cfg.as_deref(), facts).is_none() {
+        return true;
+    }
+    ancestor_ids(&v.module).any(|id| {
+        cfg_of
+            .get(id)
+            .is_some_and(|vars| variant_eval(vars, facts).is_none())
+    })
 }
 
 /// 정렬·중복 제거된 최종 문서를 만든다.
@@ -481,5 +664,231 @@ mod tests {
         let d: Document = serde_json::from_str(j).unwrap();
         assert!(!d.edges[0].tentative);
         assert!(!d.vertices[0].exported);
+    }
+
+    /// module·cfg를 지정하는 헬퍼 — 필터 테스트는 cfg 사슬이 필요하다.
+    fn vm(id: &str, kind: Kind, module: &str, cfg: Option<&str>) -> Vertex {
+        Vertex {
+            module: module.to_string(),
+            cfg: cfg.map(|s| s.to_string()),
+            ..v(id, kind)
+        }
+    }
+
+    /// cfg 게이트가 섞인 문서 — tests(test), win(windows), feat(feature).
+    fn cfg_doc() -> Document {
+        document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec!["c::a::f".into()],
+            vec![
+                vm("c", Kind::Crate, "c", None),
+                vm("c::a", Kind::Module, "c", None),
+                vm("c::a::f", Kind::Fn, "c::a", None),
+                vm("c::tests", Kind::Module, "c", Some("test")),
+                vm("c::tests::helper", Kind::Fn, "c::tests", None),
+                vm("c::win", Kind::Module, "c", Some("target_os = \"windows\"")),
+                vm("c::win::g", Kind::Fn, "c::win", None),
+                vm("c::feat", Kind::Module, "c", Some("feature = \"x\"")),
+                vm("c::feat::h", Kind::Fn, "c::feat", None),
+            ],
+            vec![
+                Edge::new("c::a::f".into(), "c::tests::helper".into(), EdgeKind::Call),
+                Edge::new("c::a::f".into(), "c::win::g".into(), EdgeKind::Call),
+                Edge::new("c::a::f".into(), "c::feat::h".into(), EdgeKind::Call),
+            ],
+            vec![],
+        )
+    }
+
+    /// dangling 간선이 없다는 불변 — 필터가 어떻게 잘라도 성립해야 한다.
+    fn no_dangling(d: &Document) -> bool {
+        let ids = d.vertex_ids();
+        d.edges
+            .iter()
+            .all(|e| ids.contains(e.from.as_str()) && ids.contains(e.to.as_str()))
+    }
+
+    #[test]
+    fn focus_keeps_subtree_drops_ancestors_and_roots() {
+        let d = doc().focus(&["c::b".to_string()]);
+        let ids = d.vertex_ids();
+        assert!(ids.contains("c::b") && ids.contains("c::b::T") && ids.contains("c::b::T::m"));
+        // 조상·형제·루트는 포커스 밖 — 간선은 양끝이 없으니 전부 사라진다.
+        assert!(!ids.contains("c") && !ids.contains("c::a") && !ids.contains("c::a::f"));
+        assert!(d.edges.is_empty());
+        assert!(d.roots.is_empty());
+        assert!(no_dangling(&d));
+    }
+
+    #[test]
+    fn without_tests_drops_cfg_test_chain_and_edges() {
+        let d = cfg_doc().without_tests();
+        let ids = d.vertex_ids();
+        assert!(!ids.contains("c::tests"));
+        // 자신의 cfg는 없어도 조상의 test 조건을 물려받는다.
+        assert!(!ids.contains("c::tests::helper"));
+        assert!(ids.contains("c::a::f") && ids.contains("c::win::g") && ids.contains("c::feat::h"));
+        assert!(no_dangling(&d));
+    }
+
+    #[test]
+    fn without_tests_keeps_survivable_conditions() {
+        // 토큰 매칭이 아니라 평가다 — `not(test)`는 test 없이도 성립하고,
+        // `any(test, unix)`는 test 없이 unix만으로 성립할 수 있으며,
+        // `feature = "test"`는 cfg(test)와 무관하다. 전부 남아야 한다.
+        let d = document(
+            Level::Symbol,
+            "c".into(),
+            None,
+            vec!["c::a".into()],
+            vec![
+                vm("c", Kind::Crate, "c", None),
+                vm("c::a", Kind::Module, "c", None),
+                vm("c::a::kept1", Kind::Fn, "c::a", Some("not(test)")),
+                vm("c::a::kept2", Kind::Fn, "c::a", Some("any(test , unix)")),
+                vm("c::a::kept3", Kind::Fn, "c::a", Some("feature = \"test\"")),
+                vm("c::a::gone", Kind::Fn, "c::a", Some("all(test , unix)")),
+            ],
+            vec![],
+            vec![],
+        )
+        .without_tests();
+        let ids = d.vertex_ids();
+        assert!(ids.contains("c::a::kept1"));
+        assert!(ids.contains("c::a::kept2"));
+        assert!(ids.contains("c::a::kept3"));
+        assert!(!ids.contains("c::a::gone"));
+    }
+
+    #[test]
+    fn filtered_keeps_only_matching_cfg_variant() {
+        // 같은 ID를 공유하는 cfg 변형 선언 — unix 변형만 살아야 한다.
+        // ID로 재필터하면 windows 변형도 부활하는 버그가 있었다.
+        let d = document(
+            Level::Symbol,
+            "c".into(),
+            None,
+            vec!["c::a".into()],
+            vec![
+                vm("c", Kind::Crate, "c", None),
+                vm("c::a", Kind::Module, "c", None),
+                vm("c::a::f", Kind::Fn, "c::a", Some("unix")),
+                vm("c::a::f", Kind::Fn, "c::a", Some("windows")),
+            ],
+            vec![],
+            vec![],
+        );
+        let facts = crate::cfgeval::Facts::from_triple("aarch64-apple-darwin");
+        let d = d.for_target("aarch64-apple-darwin", &facts);
+        let ids: Vec<_> = d.vertices.iter().filter(|v| v.id == "c::a::f").collect();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].cfg.as_deref(), Some("unix"));
+    }
+
+    #[test]
+    fn for_target_counts_edge_only_unknown_cfg() {
+        // 정점은 무조건인데 간선만 feature 게이트된 경우 — 간선의 미지
+        // 조건도 limitation에 센다.
+        let mut e = Edge::new("c::a::f".into(), "c::a::g".into(), EdgeKind::Call);
+        e.cfg = Some("feature = \"x\"".into());
+        let d = document(
+            Level::Symbol,
+            "c".into(),
+            None,
+            vec!["c::a".into()],
+            vec![
+                vm("c", Kind::Crate, "c", None),
+                vm("c::a", Kind::Module, "c", None),
+                vm("c::a::f", Kind::Fn, "c::a", None),
+                vm("c::a::g", Kind::Fn, "c::a", None),
+            ],
+            vec![e],
+            vec![],
+        );
+        let facts = crate::cfgeval::Facts::from_triple("aarch64-apple-darwin");
+        let d = d.for_target("aarch64-apple-darwin", &facts);
+        assert!(d
+            .limitations
+            .iter()
+            .any(|l| l.contains("1 cfg-gated edges kept")));
+    }
+
+    #[test]
+    fn for_target_drops_proven_false_keeps_unknown() {
+        let facts = crate::cfgeval::Facts::from_triple("aarch64-apple-darwin");
+        let d = cfg_doc().for_target("aarch64-apple-darwin", &facts);
+        let ids = d.vertex_ids();
+        // target_os = "windows"는 darwin에서 확정 거짓 — 정점과 후손이 빠진다.
+        assert!(!ids.contains("c::win") && !ids.contains("c::win::g"));
+        // test는 빌드가 켜지 않는 빌트인 — cargo build --target에는
+        // 테스트 코드가 없으니 tests 모듈도 함께 빠진다.
+        assert!(!ids.contains("c::tests") && !ids.contains("c::tests::helper"));
+        // feature는 Cargo가 정한다 — 미지라 keep하고 limitation에 센다.
+        assert!(ids.contains("c::feat::h"));
+        assert!(d
+            .limitations
+            .iter()
+            .any(|l| l.contains("4 cfg-gated vertices excluded")));
+        // feat 모듈+h — 미지 조건을 품은 정점 2개.
+        assert!(d
+            .limitations
+            .iter()
+            .any(|l| l.contains("2 cfg-gated vertices kept")));
+        assert!(no_dangling(&d));
+        // windows 타깃에서는 win이 산다.
+        let facts = crate::cfgeval::Facts::from_triple("x86_64-pc-windows-msvc");
+        let w = cfg_doc().for_target("x86_64-pc-windows-msvc", &facts);
+        assert!(w.vertex_ids().contains("c::win::g"));
+    }
+
+    #[test]
+    fn for_target_keeps_children_until_all_module_variants_false() {
+        // 같은 ID의 cfg 변형 모듈 — unix 변형이 살아남는 한 자식은
+        // 남는다. 어느 변형의 파일에서 왔는지 ID로는 못 가르니
+        // last-wins로 windows 조건만 보면 unix 자식까지 지워진다.
+        let d = document(
+            Level::Symbol,
+            "c".into(),
+            None,
+            vec!["c".into()],
+            vec![
+                vm("c", Kind::Crate, "", None),
+                // windows 변형이 먼저, unix 변형이 나중 — last-wins면
+                // unix 변형만 남는다고 읽히지만 실제론 반대도 마찬가지다.
+                vm("c::m", Kind::Module, "c", Some("windows")),
+                vm("c::m", Kind::Module, "c", Some("unix")),
+                vm("c::m::f", Kind::Fn, "c::m", None),
+            ],
+            vec![],
+            vec![],
+        );
+        let facts = crate::cfgeval::Facts::from_triple("aarch64-apple-darwin");
+        let d = d.for_target("aarch64-apple-darwin", &facts);
+        let ids = d.vertex_ids();
+        assert!(ids.contains("c::m::f"), "unix 변형이 있으니 자식은 남는다");
+        // windows 타깃에서도 마찬가지로 자식은 남는다.
+        let facts = crate::cfgeval::Facts::from_triple("x86_64-pc-windows-msvc");
+        let d = cfg_doc_for_variants().for_target("x86_64-pc-windows-msvc", &facts);
+        assert!(d.vertex_ids().contains("c::m::f"));
+    }
+
+    /// 변형 순서를 바꾼 문서 — 선언 순서에 결과가 의존하면 안 된다.
+    fn cfg_doc_for_variants() -> Document {
+        document(
+            Level::Symbol,
+            "c".into(),
+            None,
+            vec!["c".into()],
+            vec![
+                vm("c", Kind::Crate, "", None),
+                vm("c::m", Kind::Module, "c", Some("unix")),
+                vm("c::m", Kind::Module, "c", Some("windows")),
+                vm("c::m::f", Kind::Fn, "c::m", None),
+            ],
+            vec![],
+            vec![],
+        )
     }
 }

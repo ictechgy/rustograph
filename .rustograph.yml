@@ -1,9 +1,9 @@
 # rustograph 자기 분석 규칙 — 계층을 한 방향으로 유지한다.
 #
-#   graph (순수 도메인)
+#   graph · cfgeval (순수 도메인)
 #     ↑ modtree · cargo_meta · harvest (수확 경계 — syn/cargo는 여기만)
 #     ↑ source (오케스트레이터)
-#     ↑ analysis · rules · export · sarif · config (질의/출력)
+#     ↑ analysis · rules · export · sarif · config · deps_report (질의/출력)
 #     ↑ cli · app (진입점)
 #
 # deps에 없는 컴포넌트로의 의존은 위반이다. deny가 deps를 이긴다.
@@ -23,12 +23,14 @@ components:
   config: ["rustograph::config/**"]
   mcp: ["rustograph::mcp/**"]
   sem: ["rustograph::sem/**"]
+  cfgeval: ["rustograph::cfgeval/**"]
+  deps_report: ["rustograph::deps/**"]
 deps:
   app: [cli]
-  cli: [source, analysis, rules, export, sarif, config, graph, mcp, cli_args]
-  mcp: [cli_args, analysis, rules, export, config, graph]
+  cli: [source, analysis, rules, export, sarif, config, graph, mcp, cli_args, deps_report]
+  mcp: [cli_args, analysis, rules, export, config, graph, deps_report]
   cli_args: [source, export, graph]
-  source: [graph, harvest, modtree, cargo_meta, sem]
+  source: [graph, harvest, modtree, cargo_meta, sem, cfgeval]
   # sem은 ra_ap 경계 — source만 호출하고, syn 경계·도메인 위층은 모른다.
   sem: [graph, cargo_meta]
   harvest: [graph, modtree]
@@ -38,7 +40,12 @@ deps:
   sarif: [graph, rules]
   cargo_meta: []
   modtree: []
-  graph: []
+  # cfgeval은 순수 평가기 — graph의 타깃 필터가 쓰는 유일한 소비자다.
+  cfgeval: []
+  graph: [cfgeval]
+  # deps 보고서는 cargo 메타데이터와 수확 그래프를 맞대조한다 —
+  # 호출자 문서를 받지 않고 자체 syn 수확을 쓰니 source를 거른다.
+  deps_report: [graph, cargo_meta, source]
   config: []
 deny:
   # 도메인은 수확 경계와 CLI를 절대 모른다 — 순수성이 테스트 가능성이다.

@@ -1,0 +1,8 @@
+[package]
+name = "fixture_unused"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# 워크스페이스 멤버가 아니다 — fixture_app이 선언만 하고 아무것도
+# 참조하지 않는 의존성으로, `deps` 보고서의 미사용 판정 검증용이다.

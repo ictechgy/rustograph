@@ -1,3 +1,6 @@
 [workspace]
 members = ["fixture_core", "fixture_app", "fixture_macros"]
+# fixture_unused는 멤버가 아니라 선언만 되는 의존성이다 — deps 보고서가
+# 미사용 의존을 잡는지 검증하기 위한 fixture다.
+exclude = ["fixture_unused"]
 resolver = "2"
