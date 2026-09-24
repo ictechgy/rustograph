@@ -246,6 +246,21 @@ struct SchemaScan {
     seen: BTreeSet<String>,
 }
 
+/// `use` 트리에서 모은 sqlx·diesel 바인딩 집합이다.
+#[derive(Default)]
+struct UseBindings {
+    /// `use sqlx::x`·`use diesel::x`의 바인딩 → (크레이트, 원래 이름).
+    /// `as` 별칭은 키가 별칭이고 값은 원래 이름이다 — 매크로·함수 규칙은
+    /// 원래 이름으로 찾아야 `use sqlx::query as q`도 query의 규칙을 따른다.
+    db_imports: BTreeMap<String, (&'static str, String)>,
+    /// `use sqlx as db` 같은 크레이트 별칭 → 크레이트 이름.
+    /// 한정 경로의 첫 세그먼트를 정규화할 때만 쓰고, 별칭 자체를
+    /// 매크로·함수 이름으로 풀지는 않는다.
+    crate_aliases: BTreeMap<String, &'static str>,
+    sqlx_glob: bool,   // `use sqlx::...::*`
+    diesel_glob: bool, // `use diesel::...::*`
+}
+
 /// 한 파일의 사실을 모은다 — import 집합을 먼저 채우고(1패스) 사실을
 /// 읽는다(2패스). 본문 안의 `use`도 뒤의 사용처를 위해 미리 모은다.
 fn scan_file(scan: &mut SchemaScan, file: &Path, src: &str, ast: &syn::File) {
@@ -253,9 +268,7 @@ fn scan_file(scan: &mut SchemaScan, file: &Path, src: &str, ast: &syn::File) {
         scan,
         src,
         file,
-        db_imports: BTreeMap::new(),
-        sqlx_glob: false,
-        diesel_glob: false,
+        binds: UseBindings::default(),
         pass_two: false,
     };
     ctx.visit_file(ast); // 1패스: use 수집
@@ -268,25 +281,14 @@ struct FileCtx<'a> {
     scan: &'a mut SchemaScan,
     src: &'a str,
     file: &'a Path,
-    /// `use sqlx::x`·`use diesel::x`의 바인딩 → (크레이트, 원래 이름).
-    /// `as` 별칭은 키가 별칭이고 값은 원래 이름이다 — 매크로·함수 규칙은
-    /// 원래 이름으로 찾아야 `use sqlx::query as q`도 query의 규칙을 따른다.
-    db_imports: BTreeMap<String, (&'static str, String)>,
-    sqlx_glob: bool,   // `use sqlx::...::*`
-    diesel_glob: bool, // `use diesel::...::*`
+    binds: UseBindings,
     pass_two: bool,
 }
 
 impl<'ast> Visit<'ast> for FileCtx<'ast> {
     fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
         let mut prefix = Vec::new();
-        collect_use(
-            &node.tree,
-            &mut prefix,
-            &mut self.db_imports,
-            &mut self.sqlx_glob,
-            &mut self.diesel_glob,
-        );
+        collect_use(&node.tree, &mut prefix, &mut self.binds);
     }
 
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
@@ -315,6 +317,15 @@ impl<'ast> Visit<'ast> for FileCtx<'ast> {
         syn::visit::visit_expr_path(self, node);
     }
 
+    fn visit_type_path(&mut self, node: &'ast syn::TypePath) {
+        // diesel의 생성 타입 경로(`Select<users::table>` 안의 users::table)도
+        // 같은 DSL 모양이다 — 식 위치와 같은 규칙으로 읽는다.
+        if self.pass_two {
+            self.scan_diesel_path(&node.path);
+        }
+        syn::visit::visit_type_path(self, node);
+    }
+
     fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
         if self.pass_two {
             self.scan_model_struct(node);
@@ -324,8 +335,9 @@ impl<'ast> Visit<'ast> for FileCtx<'ast> {
 
     fn visit_lit_str(&mut self, node: &'ast LitStr) {
         if self.pass_two {
+            // 맥락 없는 리터럴은 산문 오탐을 막는 동사 게이트를 적용한다.
             self.scan
-                .push_sql_literal(self.scan_locate(node.span()), &node.value());
+                .push_sql_literal(self.scan_locate(node.span()), &node.value(), false);
         }
         syn::visit::visit_lit_str(self, node);
     }
@@ -334,40 +346,41 @@ impl<'ast> Visit<'ast> for FileCtx<'ast> {
 /// `use` 트리를 걸어 sqlx·diesel에서 온 이름 바인딩을 모은다.
 /// 첫 세그먼트가 sqlx/diesel일 때만 기록한다 — 이름 충돌 판별에 크레이트
 /// 출처가 필요해서다. `use sqlx::prelude::*` 같은 중첩 글롭도 첫 세그먼트로
-/// 귀속된다.
-fn collect_use(
-    tree: &syn::UseTree,
-    prefix: &mut Vec<String>,
-    db_imports: &mut BTreeMap<String, (&'static str, String)>,
-    sqlx_glob: &mut bool,
-    diesel_glob: &mut bool,
-) {
+/// 귀속된다. `use sqlx as db` 같은 최상위 별칭은 크레이트 별칭으로 모은다.
+fn collect_use(tree: &syn::UseTree, prefix: &mut Vec<String>, binds: &mut UseBindings) {
     let krate = db_crate(prefix.first().map(String::as_str));
     match tree {
         syn::UseTree::Path(p) => {
             prefix.push(p.ident.to_string());
-            collect_use(&p.tree, prefix, db_imports, sqlx_glob, diesel_glob);
+            collect_use(&p.tree, prefix, binds);
             prefix.pop();
         }
         syn::UseTree::Name(n) => {
             if let Some(k) = krate {
                 let name = n.ident.to_string();
-                db_imports.insert(name.clone(), (k, name));
+                binds.db_imports.insert(name.clone(), (k, name));
             }
         }
         syn::UseTree::Rename(r) => {
-            if let Some(k) = krate {
-                db_imports.insert(r.rename.to_string(), (k, r.ident.to_string()));
+            if prefix.is_empty() {
+                // `use sqlx as db` — 첫 세그먼트 자체가 별칭이 된다.
+                if let Some(k) = db_crate(Some(r.ident.to_string().as_str())) {
+                    binds.crate_aliases.insert(r.rename.to_string(), k);
+                }
+            } else if let Some(k) = krate {
+                binds
+                    .db_imports
+                    .insert(r.rename.to_string(), (k, r.ident.to_string()));
             }
         }
         syn::UseTree::Glob(_) => match krate {
-            Some("sqlx") => *sqlx_glob = true,
-            Some("diesel") => *diesel_glob = true,
+            Some("sqlx") => binds.sqlx_glob = true,
+            Some("diesel") => binds.diesel_glob = true,
             _ => {}
         },
         syn::UseTree::Group(g) => {
             for t in &g.items {
-                collect_use(t, prefix, db_imports, sqlx_glob, diesel_glob);
+                collect_use(t, prefix, binds);
             }
         }
     }
@@ -382,37 +395,57 @@ fn db_crate(first: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// 비한정 이름을 바인딩으로 푼다 — `kind`가 "macro"면 매크로 표,
+/// "fn"이면 함수 표로 글롭 근거를 가른다.
+fn resolve_use_name(
+    name: &str,
+    binds: &UseBindings,
+    macro_position: bool,
+) -> Option<(&'static str, String)> {
+    if let Some((k, orig)) = binds.db_imports.get(name) {
+        return Some((*k, orig.clone()));
+    }
+    if binds.sqlx_glob {
+        let known = if macro_position {
+            sqlx_macro_arg(name).is_some() || sqlx_file_macro_arg(name).is_some()
+        } else {
+            SQLX_SQL_FNS.contains(&name)
+        };
+        if known {
+            return Some(("sqlx", name.to_string()));
+        }
+    }
+    if binds.diesel_glob {
+        let known = if macro_position {
+            name == "table"
+        } else {
+            DIESEL_SQL_FNS.contains(&name)
+        };
+        if known {
+            return Some(("diesel", name.to_string()));
+        }
+    }
+    None
+}
+
+/// 한정 경로의 첫 세그먼트를 크레이트 이름으로 정규화한다 —
+/// `use sqlx as db` 별칭만 바꾸고 나머지는 그대로 둔다.
+fn crate_name<'a>(seg: &'a str, binds: &UseBindings) -> &'a str {
+    binds.crate_aliases.get(seg).copied().unwrap_or(seg)
+}
+
 impl<'ast> FileCtx<'ast> {
     /// 비한정 매크로 이름을 (크레이트, 원래 이름)으로 푼다.
     /// 글롭은 그 크레이트가 실제로 가진 이름일 때만 근거가 된다 —
     /// `use diesel::*`가 sqlx 매크로 이름을 열어주지 않게 한다.
     fn resolve_macro(&self, name: &str) -> Option<(&'static str, String)> {
-        if let Some((k, orig)) = self.db_imports.get(name) {
-            return Some((*k, orig.clone()));
-        }
-        if self.sqlx_glob && (sqlx_macro_arg(name).is_some() || sqlx_file_macro_arg(name).is_some())
-        {
-            return Some(("sqlx", name.to_string()));
-        }
-        if self.diesel_glob && name == "table" {
-            return Some(("diesel", name.to_string()));
-        }
-        None
+        resolve_use_name(name, &self.binds, true)
     }
 
     /// 비한정 함수 이름을 (크레이트, 원래 이름)으로 푼다 — 글롭은 그
     /// 크레이트의 SQL 함수 목록에 있는 이름에만 적용된다.
     fn resolve_fn(&self, name: &str) -> Option<(&'static str, String)> {
-        if let Some((k, orig)) = self.db_imports.get(name) {
-            return Some((*k, orig.clone()));
-        }
-        if self.sqlx_glob && SQLX_SQL_FNS.contains(&name) {
-            return Some(("sqlx", name.to_string()));
-        }
-        if self.diesel_glob && DIESEL_SQL_FNS.contains(&name) {
-            return Some(("diesel", name.to_string()));
-        }
-        None
+        resolve_use_name(name, &self.binds, false)
     }
 
     /// `table!`/`diesel::table!` 매크로를 읽는다. 처리한 매크로면 true다.
@@ -426,11 +459,15 @@ impl<'ast> FileCtx<'ast> {
         if segs.is_empty() {
             return false;
         }
-        // 비한정 `table!`도 받는다 — 그 이름의 매크로는 diesel이 사실상
-        // 유일하고, 문법이 맞지 않으면 unparsed-table-macros로 센다.
+        // 비한정 `table!`도 받되 바인딩이 diesel을 가리킬 때만이다 —
+        // `use diesel::table`·`use diesel::*`·`use diesel::table as t`
+        // 모두 여기로 온다. 출처를 모르는 같은 이름의 매크로는 건드리지
+        // 않는다.
         let owned = match segs.as_slice() {
-            [name] => name == "table",
-            [krate, name] => krate == "diesel" && name == "table",
+            [name] => {
+                matches!(self.resolve_macro(name), Some(("diesel", orig)) if orig == "table")
+            }
+            [krate, name] => crate_name(krate, &self.binds) == "diesel" && name == "table",
             _ => false,
         };
         if !owned {
@@ -485,13 +522,13 @@ impl<'ast> FileCtx<'ast> {
         }
         // 비한정·별칭 매크로는 바인딩의 크레이트가 sqlx일 때만 sqlx 규칙을
         // 적용한다 — `use diesel::x as q`의 q!는 sqlx가 아니다. 한정 경로의
-        // 끝 이름은 바인딩 없이 `sqlx::` 접두로 인정한다.
+        // 첫 세그먼트는 크레이트 별칭(`use sqlx as db`)을 풀어 판정한다.
         let name = match segs.as_slice() {
             [single] => match self.resolve_macro(single) {
                 Some(("sqlx", orig)) => orig,
                 _ => return false,
             },
-            [krate, leaf] if krate == "sqlx" => leaf.clone(),
+            [krate, leaf] if crate_name(krate, &self.binds) == "sqlx" => leaf.clone(),
             _ => return false,
         };
         let file_arg = sqlx_file_macro_arg(&name);
@@ -513,26 +550,29 @@ impl<'ast> FileCtx<'ast> {
             // 파일 매크로는 SQL이 파일에 있으므로 항상 dynamic이다 — 채널에는
             // 경로 리터럴의 원문을 실어 어느 호출인지 남긴다.
             (true, Some(e)) => self.scan.push_dynamic(self.src, &e, loc, self.file),
-            (true, None) => {
-                if let Some(l) = loc {
-                    self.scan.push_dynamic_text(self.src, l, self.file)
-                }
-            }
+            (true, None) => match loc {
+                Some(l) => self.scan.push_dynamic_text(l),
+                None => self.scan.unlocated += 1,
+            },
             (false, Some(Expr::Lit(el))) => {
                 if let syn::Lit::Str(lit) = &el.lit {
-                    self.scan
-                        .push_sql_literal(self.scan_locate(lit.span()).or(loc), &lit.value());
+                    // 확인된 sqlx 인자 자리의 리터럴은 SQL 컨텍스트가
+                    // 확정됐다 — 동사 게이트를 건너뛴다.
+                    self.scan.push_sql_literal(
+                        self.scan_locate(lit.span()).or(loc),
+                        &lit.value(),
+                        true,
+                    );
                 } else {
                     self.scan
                         .push_dynamic(self.src, &Expr::Lit(el.clone()), loc, self.file);
                 }
             }
             (false, Some(e)) => self.scan.push_dynamic(self.src, &e, loc, self.file),
-            (false, None) => {
-                if let Some(l) = loc {
-                    self.scan.push_dynamic_text(self.src, l, self.file)
-                }
-            }
+            (false, None) => match loc {
+                Some(l) => self.scan.push_dynamic_text(l),
+                None => self.scan.unlocated += 1,
+            },
         }
         true
     }
@@ -555,6 +595,7 @@ impl<'ast> FileCtx<'ast> {
         }
         // 비한정 이름은 바인딩의 크레이트로 규칙을 고른다 — sqlx로 확인된
         // 이름은 sqlx 함수 표를, diesel로 확인된 이름은 diesel 표를 본다.
+        // 한정 경로의 첫 세그먼트는 크레이트 별칭을 풀어 판정한다.
         let owned = match segs.as_slice() {
             [name] => match self.resolve_fn(name) {
                 Some(("sqlx", orig)) => SQLX_SQL_FNS.contains(&orig.as_str()),
@@ -562,6 +603,7 @@ impl<'ast> FileCtx<'ast> {
                 _ => false,
             },
             [krate, name] => {
+                let krate = crate_name(krate, &self.binds);
                 (krate == "sqlx" && SQLX_SQL_FNS.contains(&name.as_str()))
                     || (krate == "diesel" && DIESEL_SQL_FNS.contains(&name.as_str()))
             }
@@ -571,18 +613,29 @@ impl<'ast> FileCtx<'ast> {
             return;
         }
         if let Some(arg) = call.args.first() {
-            let is_lit = matches!(arg, Expr::Lit(el) if matches!(el.lit, syn::Lit::Str(_)));
-            if !is_lit {
-                let loc = self.scan_locate(fp.path.span());
-                self.scan.push_dynamic(self.src, arg, loc, self.file);
+            match arg {
+                // 확인된 SQL 인자 자리의 리터럴은 동사 게이트를 건너뛴다 —
+                // SET·GRANT 같은 비관계 동사 구문도 스캔 대상이다.
+                Expr::Lit(el) => {
+                    if let syn::Lit::Str(lit) = &el.lit {
+                        let loc = self
+                            .scan_locate(lit.span())
+                            .or_else(|| self.scan_locate(fp.path.span()));
+                        self.scan.push_sql_literal(loc, &lit.value(), true);
+                    }
+                    // 비문자열 리터럴(`query(1)`)은 SQL 근거가 아니다 — 버린다.
+                }
+                e => {
+                    let loc = self.scan_locate(fp.path.span());
+                    self.scan.push_dynamic(self.src, e, loc, self.file);
+                }
             }
         }
     }
 
     /// diesel DSL 모양의 경로를 읽는다 — `x::table`은 관계 x,
-    /// `x::dsl::y`·`x::columns::y`는 관계 x의 컬럼 y다. 경로는 식
-    /// 위치에서만 본다 — 타입 위치의 `users::table`은 diesel의 생성 타입
-    /// 경로라 같은 규칙으로 읽힌다.
+    /// `x::dsl::y`·`x::columns::y`는 관계 x의 컬럼 y다. 식 위치와 타입
+    /// 위치(`Select<users::table>` 같은) 모두 같은 규칙으로 읽는다.
     fn scan_diesel_path(&mut self, path: &syn::Path) {
         let segs: Vec<String> = path
             .segments
@@ -636,6 +689,8 @@ impl<'ast> FileCtx<'ast> {
     /// 읽어 관계 참조와 필드별 컬럼 참조를 낸다.
     /// 관계 바인딩 없는 `column_name`/`sqlx::rename`은 귀속 불가 수로 센다.
     fn scan_model_struct(&mut self, st: &syn::ItemStruct) {
+        // diesel·sea_orm 어트리뷰트가 한 구조체에 섞이면 마지막 것이
+        // 이긴다 — 실제로는 한 ORM만 쓰는 것이 관례라 별도 귀속은 하지 않는다.
         let mut table: Option<MetaVal> = None;
         for attr in &st.attrs {
             if let Some(v) = meta_name_value(attr, &["diesel", "sea_orm"], "table_name") {
@@ -786,43 +841,68 @@ fn meta_name_value(attr: &syn::Attribute, crates: &[&'static str], key: &str) ->
 }
 
 /// 워크스페이스 파일에서 diesel 관계 선언 이름을 모은다 — `table!`의
-/// 마지막 세그먼트(dsl 모듈 이름)와 `table_name` 어트리뷰트 값이
-/// `x::table`·`x::dsl::y` 경로의 귀속 목록이다.
+/// 마지막 세그먼트(dsl 모듈 이름)와 diesel `table_name` 어트리뷰트 값이
+/// `x::table`·`x::dsl::y` 경로의 귀속 목록이다. sea_orm 선언은 DSL 모듈을
+/// 만들지 않으므로 이 목록에 넣지 않는다. import 수집이 먼저(1패스)여야
+/// `use diesel::table as t` 같은 별칭 `table!`도 인식된다.
 fn collect_diesel_names(ast: &syn::File, out: &mut BTreeSet<String>) {
     struct Names<'a> {
         out: &'a mut BTreeSet<String>,
+        binds: UseBindings,
+        pass_two: bool,
     }
     impl<'ast> Visit<'ast> for Names<'_> {
+        fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+            let mut prefix = Vec::new();
+            collect_use(&node.tree, &mut prefix, &mut self.binds);
+        }
         fn visit_macro(&mut self, m: &'ast syn::Macro) {
-            let segs: Vec<String> = m
-                .path
-                .segments
-                .iter()
-                .map(|s| s.ident.to_string())
-                .collect();
-            let owned = matches!(segs.as_slice(), [n] if n == "table")
-                || matches!(segs.as_slice(), [k, n] if k == "diesel" && n == "table");
-            if owned {
-                if let Some((rel, _)) = parse_table_macro(&m.tokens) {
-                    if let Some(last) = rel.rsplit('.').next() {
-                        self.out.insert(last.to_string());
+            if self.pass_two {
+                let segs: Vec<String> = m
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect();
+                let owned = match segs.as_slice() {
+                    [name] => matches!(
+                        resolve_use_name(name, &self.binds, true),
+                        Some(("diesel", orig)) if orig == "table"
+                    ),
+                    [krate, name] => crate_name(krate, &self.binds) == "diesel" && name == "table",
+                    _ => false,
+                };
+                if owned {
+                    if let Some((rel, _)) = parse_table_macro(&m.tokens) {
+                        if let Some(last) = rel.rsplit('.').next() {
+                            self.out.insert(last.to_string());
+                        }
                     }
                 }
             }
             syn::visit::visit_macro(self, m);
         }
         fn visit_item_struct(&mut self, st: &'ast syn::ItemStruct) {
-            for attr in &st.attrs {
-                if let Some(v) = meta_name_value(attr, &["diesel", "sea_orm"], "table_name") {
-                    if let Some(last) = v.text.rsplit('.').next() {
-                        self.out.insert(last.to_string());
+            if self.pass_two {
+                for attr in &st.attrs {
+                    if let Some(v) = meta_name_value(attr, &["diesel"], "table_name") {
+                        if let Some(last) = v.text.rsplit('.').next() {
+                            self.out.insert(last.to_string());
+                        }
                     }
                 }
             }
             syn::visit::visit_item_struct(self, st);
         }
     }
-    Names { out }.visit_file(ast);
+    let mut names = Names {
+        out,
+        binds: UseBindings::default(),
+        pass_two: false,
+    };
+    names.visit_file(ast);
+    names.pass_two = true;
+    names.visit_file(ast);
 }
 
 /// diesel `table!` 매크로 본문을 읽어 (관계 이름, [(컬럼, span)])을 돌려준다.
@@ -944,9 +1024,8 @@ fn scan_macro_literals(scan: &mut SchemaScan, m: &syn::Macro, src: &str, file: &
                 if let Ok(lit) =
                     syn::parse2::<LitStr>(TokenStream::from(TokenTree::Literal(l.clone())))
                 {
-                    if let Some(loc) = scan.locate(src, lit.span(), file) {
-                        scan.push_sql_literal(Some(loc), &lit.value());
-                    }
+                    // 위치를 못 구한 SQL 리터럴도 push_sql_literal이 센다.
+                    scan.push_sql_literal(scan.locate(src, lit.span(), file), &lit.value(), false);
                 }
             }
             _ => {}
@@ -958,13 +1037,16 @@ impl SchemaScan {
     /// SQL 형태의 리터럴에서 관계 이름을 읽어 사실로 낸다.
     /// 관계 자리에 플레이스홀더 같은 비리터럴 피연산자가 오면 관계 참조가
     /// 있었다는 근거를 동적 사실로 남긴다 — 조용히 버리지 않는다.
-    fn push_sql_literal(&mut self, loc: Option<BridgeLocation>, text: &str) {
-        let Some(loc) = loc else {
-            return;
-        };
-        if !looks_like_sql(text) {
+    /// `trusted`는 확인된 DB 인자 자리라는 뜻이다 — 그때는 동사 게이트를
+    /// 건너뛴다. 위치를 못 구한 SQL 리터럴은 unlocated로 센다.
+    fn push_sql_literal(&mut self, loc: Option<BridgeLocation>, text: &str, trusted: bool) {
+        if !trusted && !looks_like_sql(text) {
             return;
         }
+        let Some(loc) = loc else {
+            self.unlocated += 1;
+            return;
+        };
         let (names, unresolved) = sql_relations(text);
         for name in names {
             self.push(RelationFact {
@@ -982,8 +1064,16 @@ impl SchemaScan {
 
     /// 리터럴로 읽히지 않는 SQL 인자를 동적 사실로 보존한다.
     /// channel에는 잘린 원문 표현식을 실어 어느 위치의 호출인지 남긴다.
+    /// 위치를 못 구한 동적 근거는 unlocated로 센다.
     fn push_dynamic(&mut self, src: &str, expr: &Expr, loc: Option<BridgeLocation>, file: &Path) {
+        // 비문자열 리터럴 인자(`query!(1)`)는 SQL 근거가 될 수 없다 — 버린다.
+        if let Expr::Lit(el) = expr {
+            if !matches!(el.lit, syn::Lit::Str(_)) {
+                return;
+            }
+        }
         let Some(loc) = loc.or_else(|| self.locate(src, expr.span(), file)) else {
+            self.unlocated += 1;
             return;
         };
         let text = expr_text(src, expr);
@@ -991,7 +1081,7 @@ impl SchemaScan {
     }
 
     /// 표현식을 파싱하지 못했을 때의 dynamic 사실 — 매크로 위치를 남긴다.
-    fn push_dynamic_text(&mut self, _src: &str, loc: BridgeLocation, _file: &Path) {
+    fn push_dynamic_text(&mut self, loc: BridgeLocation) {
         self.push_dynamic_str("<unparsed macro argument>", loc);
     }
 
@@ -1111,7 +1201,7 @@ impl SchemaScan {
     }
 }
 
-/// 사실의 결정적 순서다 — 위치·종류·이름 순.
+/// 사실의 결정적 순서다 — 위치·종류·이름·동적 플래그 순.
 fn fact_cmp(a: &RelationFact, b: &RelationFact) -> std::cmp::Ordering {
     (
         &a.location.path,
@@ -1120,6 +1210,7 @@ fn fact_cmp(a: &RelationFact, b: &RelationFact) -> std::cmp::Ordering {
         a.kind,
         &a.channel,
         &a.method,
+        a.dynamic,
     )
         .cmp(&(
             &b.location.path,
@@ -1128,6 +1219,7 @@ fn fact_cmp(a: &RelationFact, b: &RelationFact) -> std::cmp::Ordering {
             b.kind,
             &b.channel,
             &b.method,
+            b.dynamic,
         ))
 }
 
@@ -1200,6 +1292,8 @@ fn is_sql_verb(word: &str) -> bool {
             | "desc"
             | "analyze"
             | "vacuum"
+            | "grant"
+            | "revoke"
     )
 }
 
@@ -1209,11 +1303,12 @@ struct SqlToken {
     quoted: bool,
 }
 
-/// 뒤따르는 식별자가 관계 이름인 키워드다.
+/// 뒤따르는 식별자가 관계 이름인 키워드다. `on`은 GRANT/REVOKE 문
+/// 안에서만 관계 키워드로 발화한다 — JOIN .. ON의 on은 제외다.
 fn is_relation_keyword(word: &str) -> bool {
     matches!(
         word.to_ascii_lowercase().as_str(),
-        "from" | "join" | "into" | "update" | "table" | "truncate"
+        "from" | "join" | "into" | "update" | "table" | "truncate" | "on"
     )
 }
 
@@ -1228,20 +1323,42 @@ fn sql_relations(text: &str) -> (Vec<String>, bool) {
     let mut seen = BTreeSet::new(); // 겹치는 키워드 창의 중복을 막는다
     let mut consumed = vec![false; tokens.len()]; // 이름·별칭·수식어로 소비된 토큰
     let mut unresolved = false;
-    // 문장 머리 식별자 위치 — update·truncate는 여기서만 관계 키워드로 연다.
-    let head = tokens.iter().position(is_name_token);
+    // `;`로 갈리는 각 문장의 머리 식별자 위치와 그 문장의 동사다 —
+    // update·truncate는 문장 머리에서만 관계 키워드로 열고, `on`은
+    // grant·revoke 문 안에서만 연다. 다중 문장 리터럴의 뒤 문장도
+    // 같은 규칙을 받는다.
+    let mut stmt_head = vec![false; tokens.len()];
+    let mut stmt_verb: Vec<Option<String>> = vec![None; tokens.len()];
+    {
+        let mut pending = true;
+        let mut verb: Option<String> = None;
+        for (i, t) in tokens.iter().enumerate() {
+            if !t.quoted && t.text == ";" {
+                pending = true;
+                verb = None;
+                continue;
+            }
+            if is_name_token(t) && pending {
+                stmt_head[i] = true;
+                verb = Some(t.text.to_ascii_lowercase());
+                pending = false;
+            }
+            stmt_verb[i] = verb.clone();
+        }
+    }
     for i in 0..tokens.len() {
         let tok = &tokens[i];
         if consumed[i] || tok.quoted || !is_relation_keyword(&tok.text) {
             continue;
         }
         let word = tok.text.to_ascii_lowercase();
+        let grant_stmt = matches!(stmt_verb[i].as_deref(), Some("grant" | "revoke"));
         let fires = match word.as_str() {
             // 산문 속 "update the .."·upsert의 `DO UPDATE SET`을 막기 위해
             // update는 문장 머리이고 뒤에 SET이 있을 때만 연다.
-            "update" => Some(i) == head && has_word(&tokens[i + 1..], "set"),
+            "update" => stmt_head[i] && has_word(&tokens[i + 1..], "set"),
             // truncate는 항상 문장 머리 동사다 — 산문 중간의 "truncate"는 무시.
-            "truncate" => Some(i) == head,
+            "truncate" => stmt_head[i],
             // into는 INSERT·SELECT·MERGE·REPLACE가 앞선 문맥에서만 연다 —
             // "merge the branch into main" 같은 산문을 막는다.
             "into" => tokens[..i].iter().any(|t| {
@@ -1254,7 +1371,13 @@ fn sql_relations(text: &str) -> (Vec<String>, bool) {
             // table은 직전 식별자가 DDL 동사일 때만 키워드다 — 산문의
             // "the table"이나 다른 절의 단어는 읽지 않는다.
             "table" => table_keyword_context(&tokens, i),
-            _ => true, // from·join — 게이트가 강한 동사를 요구했으므로 연다.
+            // on은 `GRANT .. ON t`·`REVOKE .. ON t`의 관계 자리다 —
+            // 다른 문장의 ON(조인 조건)은 관계가 아니다.
+            "on" => grant_stmt,
+            // grant·revoke의 FROM은 권한 주체 자리다 — 관계가 아니므로
+            // from·join을 그 문장에서는 열지 않는다.
+            "from" | "join" => !grant_stmt,
+            _ => true,
         };
         if !fires {
             continue;
@@ -1527,7 +1650,8 @@ fn lex_sql(text: &str) -> Vec<SqlToken> {
                 }
             }
             _ => {
-                if matches!(c, b'.' | b',' | b'(' | b')') {
+                // `;`는 문장 경계다 — 다중 문장 리터럴의 머리 동사 추적에 쓴다.
+                if matches!(c, b'.' | b',' | b'(' | b')' | b';') {
                     tokens.push(SqlToken {
                         text: (c as char).to_string(),
                         quoted: false,
@@ -1716,6 +1840,14 @@ mod tests {
             ("SELECT * FROM ONLY users", &["users"]),
             ("DROP TABLE IF EXISTS legacy", &["legacy"]),
             ("CREATE TABLE IF NOT EXISTS fresh (id int)", &["fresh"]),
+            // `;`로 갈린 뒤 문장의 머리 동사도 같은 규칙으로 연다.
+            ("SELECT 1; UPDATE users SET x = 1", &["users"]),
+            ("SELECT 1; TRUNCATE sessions", &["sessions"]),
+            // GRANT/REVOKE의 ON은 관계 자리 — 그 문장의 FROM은 주체 자리다.
+            ("GRANT SELECT ON t TO r", &["t"]),
+            ("REVOKE SELECT ON t FROM r", &["t"]),
+            // 다른 문장의 ON은 조인 조건이다 — 관계가 아니다.
+            ("SELECT * FROM a ON CONFLICT DO NOTHING", &["a"]),
             // FROM 없는 SQL은 관계 없음.
             ("SELECT 1", &[]),
             ("VALUES (1, 2)", &[]),

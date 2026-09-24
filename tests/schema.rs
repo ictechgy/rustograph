@@ -45,6 +45,25 @@ fn document_carries_persistence_contract() {
 }
 
 #[test]
+fn repeated_runs_are_byte_identical() {
+    // 시각 필드를 빼고 두 실행의 직렬화가 같아야 한다 — diff·캐시의
+    // 계약이 되는 결정성이다.
+    let strip = |d: &mut serde_json::Value| {
+        let o = d.as_object_mut().unwrap();
+        o.remove("generatedAt");
+        o.remove("sourceModifiedAt");
+    };
+    let mut a = doc();
+    let mut b = doc();
+    strip(&mut a);
+    strip(&mut b);
+    assert_eq!(
+        serde_json::to_string(&a).unwrap(),
+        serde_json::to_string(&b).unwrap()
+    );
+}
+
+#[test]
 fn sqlx_macros_and_calls_emit_relations() {
     let d = doc();
     // 한정·비한정 리터럴 모두 읽힌다.
@@ -108,15 +127,18 @@ fn non_literal_args_become_dynamic_facts() {
     let lim = d["limitations"].as_array().unwrap();
     assert!(lim.iter().any(|l| l
         .as_str()
-        .is_some_and(|s| s.starts_with("unjoined-dynamic-relations: 5"))));
+        .is_some_and(|s| s.starts_with("unjoined-dynamic-relations: 6"))));
 }
 
 #[test]
 fn unknown_diesel_dsl_paths_are_dynamic_not_static() {
     let d = doc();
     // 선언된 table! 이름이 아닌 `x::table` 경로는 정적 사실이 되지 않는다 —
-    // 동적 근거로만 남고 limitation으로 센다.
-    assert!(has_fact(&d, "config::table", None, true));
+    // 동적 근거로만 남고 limitation으로 센다. sea_orm이 선언한 이름도
+    // diesel DSL 귀속 목록에 들지 않으므로 같은 규칙이다.
+    for ch in ["config::table", "sea_only::table"] {
+        assert!(has_fact(&d, ch, None, true), "{ch} should stay dynamic");
+    }
     assert!(
         !has_fact(&d, "config", None, false),
         "undeclared diesel path must not become a relation fact"
@@ -124,7 +146,41 @@ fn unknown_diesel_dsl_paths_are_dynamic_not_static() {
     let lim = d["limitations"].as_array().unwrap();
     assert!(lim.iter().any(|l| l
         .as_str()
-        .is_some_and(|s| s.starts_with("unresolved-diesel-paths: 1"))));
+        .is_some_and(|s| s.starts_with("unresolved-diesel-paths: 2"))));
+}
+
+#[test]
+fn crate_and_macro_aliases_are_resolved() {
+    let d = doc();
+    // use sqlx as db → db::query("..")의 리터럴은 확정 SQL 자리다.
+    assert!(has_fact(&d, "aliased_q", None, false));
+    // use diesel::table as dt → dt! 선언과 metrics::table 경로.
+    assert!(has_fact(&d, "metrics", None, false));
+    assert!(has_fact(&d, "metrics", Some("id"), false));
+    // 타입 위치의 `audit_log::table`도 읽힌다 — audit_log의
+    // 컬럼 없는 관계 사실은 expr 컬럼 경로의 것과 별개 위치로 둘이다.
+    let rel_only = d["facts"].as_array().unwrap().iter().filter(|f| {
+        f["channel"] == "audit_log" && f.get("method").is_none() && !f["dynamic"].as_bool().unwrap()
+    });
+    assert!(
+        rel_only.count() >= 2,
+        "type-position diesel path must be read"
+    );
+}
+
+#[test]
+fn multi_statement_and_grant_literals_are_read() {
+    let d = doc();
+    // `;` 뒤 문장 머리의 UPDATE도 관계 키워드로 연다.
+    assert!(has_fact(&d, "sessions", None, false));
+    // GRANT .. ON t — 권한 문 안의 on만 관계 자리다.
+    assert!(has_fact(&d, "grant_t", None, false));
+    // GRANT의 TO/FROM은 권한 주체 자리다 — 관계로 읽지 않는다.
+    assert!(!has_fact(&d, "app_role", None, false));
+    // 알 수 없는 매크로의 SQL 리터럴도 스캔 대상이다(템플릿 보존).
+    assert!(has_fact(&d, "flagged_t", None, false));
+    // sea_orm만 선언한 이름은 관계 사실은 내지만 DSL 경로는 열지 않는다.
+    assert!(has_fact(&d, "sea_only", None, false));
 }
 
 #[test]
