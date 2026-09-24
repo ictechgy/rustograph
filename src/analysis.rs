@@ -106,6 +106,188 @@ pub fn impact(doc: &Document, id: &str, depth: usize, max: usize) -> ImpactResul
     }
 }
 
+/// 두 정점 사이의 경로 하나 — 각 홉이 어떤 간선을 건넜는지까지 싣는다.
+#[derive(Debug, Serialize)]
+pub struct Path {
+    /// 경로를 이루는 정점 ID — 첫째가 from, 마지막이 to.
+    pub vertices: Vec<String>,
+    /// 홉마다 실제로 건넌 간선 종류 — vertices보다 하나 짧다.
+    /// 같은 쌍에 여러 간선이 있으면 확정 간선·사전순 종류를 우선한다.
+    pub edges: Vec<EdgeKind>,
+    /// 추정(팬아웃) 간선이 하나라도 섞이면 이 경로는 "가능한" 경로다.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tentative: bool,
+}
+
+/// paths 질의 결과 — 탐색이 예산에 잘리면 truncated가 참이다.
+#[derive(Debug, Serialize)]
+pub struct PathsReport {
+    pub from: String,
+    pub to: String,
+    /// 두 정점이 모두 존재하고 경로가 하나 이상 발견됐는가.
+    pub found: bool,
+    /// 경로 상한이나 탐색 예산 때문에 잘렸다 — 보고된 목록이 전부가 아니다.
+    pub truncated: bool,
+    /// 탐색이 펼친 정점 수 — 예산 소비량 측정.
+    pub expanded: usize,
+    pub paths: Vec<Path>,
+}
+
+/// A→B 경로 탐색 — 의존 간선만 따라가는 bounded BFS.
+/// 경로는 정점 재방문이 없는 단순 경로만이고, BFS 특성상 짧은 것부터
+/// 나온다. 추정 간선도 따라가되 경로에 tentative로 표시한다 —
+/// "도달 가능할 수 있다"는 사실이 보고 가치다.
+pub fn paths(doc: &Document, from: &str, to: &str, max_paths: usize, budget: usize) -> PathsReport {
+    let ids = doc.vertex_ids();
+    // 인접 목록: (from,to) 쌍에 간선이 여러 개면 확정·사전순 하나만 남긴다 —
+    // 같은 경로를 간선 종류만큼 중복 보고하지 않기 위함이다.
+    let mut adj: BTreeMap<&str, Vec<(&str, EdgeKind, bool)>> = BTreeMap::new();
+    for e in &doc.edges {
+        if e.kind.is_dependency() {
+            adj.entry(e.from.as_str())
+                .or_default()
+                .push((e.to.as_str(), e.kind, e.tentative));
+        }
+    }
+    for outs in adj.values_mut() {
+        outs.sort_by(|a, b| (a.0, a.2, a.1).cmp(&(b.0, b.2, b.1)));
+        outs.dedup_by(|a, b| a.0 == b.0); // 정렬 후 첫 항목이 확정·최소 종류.
+    }
+    let mut report = PathsReport {
+        from: from.to_string(),
+        to: to.to_string(),
+        found: false,
+        truncated: false,
+        expanded: 0,
+        paths: Vec::new(),
+    };
+    if !ids.contains(from) || !ids.contains(to) {
+        return report; // 끝점이 없으면 경로도 없다 — 호출자가 404를 처리한다.
+    }
+    if from == to {
+        report.found = true;
+        report.paths.push(Path {
+            vertices: vec![from.to_string()],
+            edges: Vec::new(),
+            tentative: false,
+        });
+        return report;
+    }
+    // 부분 경로 상태 — 경로 내부 재방문 금지로 단순 경로만 나온다.
+    struct State {
+        vertices: Vec<String>,
+        edges: Vec<EdgeKind>,
+        tentative: bool,
+    }
+    let mut queue: VecDeque<State> = VecDeque::from([State {
+        vertices: vec![from.to_string()],
+        edges: Vec::new(),
+        tentative: false,
+    }]);
+    while let Some(s) = queue.pop_front() {
+        if report.paths.len() >= max_paths || report.expanded >= budget {
+            report.truncated = !queue.is_empty() || report.expanded >= budget;
+            break;
+        }
+        let cur = s.vertices.last().expect("state is never empty").clone();
+        if cur == to {
+            report.paths.push(Path {
+                vertices: s.vertices,
+                edges: s.edges,
+                tentative: s.tentative,
+            });
+            continue; // 목적지 도달 — 그 너머는 같은 경로의 연장일 뿐이다.
+        }
+        report.expanded += 1;
+        for (nbr, kind, tent) in adj.get(cur.as_str()).into_iter().flatten() {
+            if s.vertices.iter().any(|v| v.as_str() == *nbr) {
+                continue;
+            }
+            let mut next = State {
+                vertices: s.vertices.clone(),
+                edges: s.edges.clone(),
+                tentative: s.tentative || *tent,
+            };
+            next.vertices.push((*nbr).to_string());
+            next.edges.push(*kind);
+            queue.push_back(next);
+        }
+    }
+    report.found = !report.paths.is_empty();
+    report
+}
+
+/// 검색 히트 하나 — 정점과 그 식별 정보.
+#[derive(Debug, Serialize)]
+pub struct SearchHit {
+    pub id: String,
+    pub kind: Kind,
+    pub module: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<String>,
+}
+
+/// search 질의 결과 — 상한에 잘리면 truncated.
+#[derive(Debug, Serialize)]
+pub struct SearchReport {
+    pub query: String,
+    pub truncated: bool,
+    pub matches: Vec<SearchHit>,
+}
+
+/// 정점 검색 — 정확 일치 → `::query` 꼬리 일치 → 부분 문자열 순으로 점수를
+/// 매기고 같은 점수 안에서는 ID 정렬이다. 에이전트가 "이름만 아는" 정점을
+/// 찾는 입구다 — 정확 ID 없이 query/impact를 부르기 전의 단계.
+pub fn search(doc: &Document, query: &str, max: usize) -> SearchReport {
+    let suffix = format!("::{query}");
+    let q_lower = query.to_lowercase();
+    let mut scored: Vec<(u8, &crate::graph::Vertex)> = doc
+        .vertices
+        .iter()
+        .filter_map(|v| {
+            if v.id == query {
+                Some((0, v))
+            } else if v.id.ends_with(&suffix) {
+                Some((1, v))
+            } else if v.id.to_lowercase().contains(&q_lower) {
+                Some((2, v))
+            } else {
+                None
+            }
+        })
+        .collect();
+    scored.sort_by(|a, b| (a.0, &a.1.id).cmp(&(b.0, &b.1.id)));
+    let truncated = scored.len() > max;
+    scored.truncate(max);
+    SearchReport {
+        query: query.to_string(),
+        truncated,
+        matches: scored
+            .into_iter()
+            .map(|(_, v)| SearchHit {
+                id: v.id.clone(),
+                kind: v.kind,
+                module: v.module.clone(),
+                position: v.position.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// 정점 ID를 하나로 확정한다. 정확 일치가 없으면 검색 후보를 모아
+/// Err로 돌린다 — 조용히 아무 후보나 고르면 호출자가 엉뚱한 정점을
+/// 본다. 실패 메시지에 후보를 싣는 것이 애매 거부의 전부다.
+pub fn resolve_id(doc: &Document, id: &str) -> Result<String, Vec<String>> {
+    if doc.vertex_ids().contains(id) {
+        return Ok(id.to_string());
+    }
+    Err(search(doc, id, 10)
+        .matches
+        .into_iter()
+        .map(|h| h.id)
+        .collect())
+}
+
 /// Tarjan SCC — 2개 이상 정점의 강연결 컴포넌트, 또는 자기루프 단독 정점.
 #[derive(Debug, Serialize)]
 pub struct Cycle {
@@ -481,5 +663,101 @@ mod tests {
         let path = explain_path(&d, "c::c").unwrap();
         assert_eq!(path, vec!["c::a", "c::b", "c::c"]);
         assert!(explain_path(&d, "c::d").is_none());
+    }
+
+    #[test]
+    fn paths_finds_short_paths_with_edge_kinds() {
+        let mut d = doc();
+        // 두 갈래 경로 — a->b->c와 a->x->c.
+        d.edges
+            .push(Edge::new("c::a".into(), "c::x".into(), EdgeKind::Call));
+        d.edges
+            .push(Edge::new("c::x".into(), "c::c".into(), EdgeKind::Call));
+        let r = paths(&d, "c::a", "c::c", 10, 10_000);
+        assert!(r.found && !r.truncated);
+        let vs: Vec<Vec<String>> = r.paths.iter().map(|p| p.vertices.clone()).collect();
+        assert!(vs.contains(&vec![
+            "c::a".to_string(),
+            "c::b".to_string(),
+            "c::c".to_string()
+        ]));
+        assert!(vs.contains(&vec![
+            "c::a".to_string(),
+            "c::x".to_string(),
+            "c::c".to_string()
+        ]));
+        assert_eq!(r.paths[0].edges, vec![EdgeKind::Call, EdgeKind::Call]);
+        assert!(!r.paths.iter().any(|p| p.tentative));
+    }
+
+    #[test]
+    fn paths_respects_budget_and_marks_tentative() {
+        let d = doc();
+        // 예산 1 — 출발점 하나만 펼치고 멈춘다.
+        let r = paths(&d, "c::a", "c::c", 10, 1);
+        assert!(!r.found && r.truncated && r.expanded == 1);
+        // 추정 간선을 건너는 경로는 tentative로 표시된다 — "가능한" 경로다.
+        let r2 = paths(&d, "c::e", "c::c", 10, 10_000);
+        assert!(r2.found && r2.paths[0].tentative);
+        // 없는 끝점은 found=false — 호출자가 후보를 제안한다.
+        assert!(!paths(&d, "c::a", "nope", 10, 10).found);
+        // 자기 자신은 길이 0 경로 하나.
+        let r3 = paths(&d, "c::a", "c::a", 10, 10);
+        assert!(r3.found && r3.paths[0].vertices == vec!["c::a".to_string()]);
+        // max_paths가 차면 truncated — 보고된 목록이 전부가 아니다.
+        let mut d2 = doc();
+        d2.edges
+            .push(Edge::new("c::a".into(), "c::x".into(), EdgeKind::Call));
+        d2.edges
+            .push(Edge::new("c::x".into(), "c::c".into(), EdgeKind::Call));
+        let r4 = paths(&d2, "c::a", "c::c", 1, 10_000);
+        assert_eq!(r4.paths.len(), 1);
+        assert!(r4.truncated);
+    }
+
+    #[test]
+    fn paths_dedups_multi_edge_pairs() {
+        let mut d = doc();
+        // 같은 쌍에 두 종류의 간선 — 정점 경로는 중복되면 안 된다.
+        d.edges.push(Edge::new(
+            "c::a".into(),
+            "c::b".into(),
+            EdgeKind::References,
+        ));
+        d.edges
+            .push(Edge::maybe("c::a".into(), "c::b".into(), EdgeKind::Call));
+        let r = paths(&d, "c::a", "c::c", 10, 10_000);
+        assert_eq!(r.paths.len(), 1);
+        // 같은 쌍의 홉은 하나 — 확정·최소 종류가 선택된다.
+        assert_eq!(r.paths[0].edges.len(), 2);
+        assert!(!r.paths[0].tentative);
+    }
+
+    #[test]
+    fn search_scores_exact_suffix_then_substring() {
+        let d = doc();
+        // 정확 일치가 항상 먼저다.
+        let r = search(&d, "c::b", 10);
+        assert_eq!(r.matches[0].id, "c::b");
+        // `::b` 꼬리 일치 — 부분 문자열 "b"보다 높은 점수.
+        let r2 = search(&d, "b", 10);
+        assert_eq!(r2.matches[0].id, "c::b");
+        // 부분 문자열은 전부에 걸리고 max로 잘린다.
+        let r3 = search(&d, "c::", 3);
+        assert_eq!(r3.matches.len(), 3);
+        assert!(r3.truncated);
+        // 정렬은 결정적 — ID 오름차순.
+        assert_eq!(r3.matches[0].id, "c::a");
+    }
+
+    #[test]
+    fn resolve_id_accepts_exact_and_refuses_with_candidates() {
+        let d = doc();
+        assert_eq!(resolve_id(&d, "c::a"), Ok("c::a".to_string()));
+        // 부분 문자열은 조용히 고르지 않고 후보를 돌린다.
+        let err = resolve_id(&d, "c::").unwrap_err();
+        assert!(err.contains(&"c::a".to_string()));
+        // 후보조차 없으면 빈 목록 — 호출자가 "not found"만 보고한다.
+        assert_eq!(resolve_id(&d, "zzz").unwrap_err(), Vec::<String>::new());
     }
 }
