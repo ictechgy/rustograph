@@ -843,14 +843,9 @@ fn collect_attr_refs(
             }
         } else if a.path().is_ident("cfg_attr") {
             // #[cfg_attr(pred, meta, ...)] — 첫 인자는 술어, 나머지는 속성.
-            let args = a.parse_args_with(
-                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-            );
-            if let Ok(metas) = args {
-                let mut it = metas.into_iter();
-                if let Some(pred) = it.next() {
-                    let pred = meta_pred_string(&pred);
-                    for m in it {
+            if let syn::Meta::List(l) = &a.meta {
+                if let Some((pred, metas)) = split_cfg_attr(&l.tokens) {
+                    for m in metas {
                         collect_meta_refs(&m, owner, module, mod_decl, &pred, cfg, out);
                     }
                 }
@@ -898,16 +893,9 @@ fn collect_meta_refs(
         }
         // 중첩 cfg_attr — 바깥 술어와 안쪽 술어를 둘 다 성립 조건으로 쌓는다.
         syn::Meta::List(l) if l.path.is_ident("cfg_attr") => {
-            let args = l.parse_args_with(
-                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-            );
-            if let Ok(metas) = args {
-                let mut it = metas.into_iter();
-                if let Some(inner) = it.next() {
-                    let inner_pred = meta_pred_string(&inner);
-                    for m in it {
-                        collect_meta_refs(&m, owner, module, mod_decl, &inner_pred, &cond, out);
-                    }
+            if let Some((inner_pred, metas)) = split_cfg_attr(&l.tokens) {
+                for m in metas {
+                    collect_meta_refs(&m, owner, module, mod_decl, &inner_pred, &cond, out);
                 }
             }
         }
@@ -931,23 +919,34 @@ fn collect_meta_refs(
     }
 }
 
-/// cfg_attr의 술어 메타를 cfg 문자열 형태로 되돌린다 —
-/// `all(test , unix)`·`feature = "x"` 같은 cfgeval이 읽는 형태다.
-fn meta_pred_string(m: &syn::Meta) -> String {
-    match m {
-        syn::Meta::Path(p) => path_segments(p).join("::"),
-        syn::Meta::List(l) => format!("{}({})", path_segments(&l.path).join("::"), l.tokens),
-        syn::Meta::NameValue(nv) => {
-            let v = match &nv.value {
-                syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Str(s),
-                    ..
-                }) => format!("\"{}\"", s.value()),
-                _ => "\"?\"".to_string(),
-            };
-            format!("{} = {v}", path_segments(&nv.path).join("::"))
+/// cfg_attr의 인자를 (술어 원문, 적용 메타 목록)으로 쪼갠다.
+/// 첫 최상위 쉼표가 술어와 속성의 경계다. 술어는 토큰 원문 그대로
+/// 간다 — `Meta`로 재파싱해 LitStr의 value()를 다시 따옴표로 감싸면
+/// `\\x6c` 같은 이스케이프가 디코드된 채 남아 거짓 조건이 참으로
+/// 뒤집힌다.
+fn split_cfg_attr(tokens: &proc_macro2::TokenStream) -> Option<(String, Vec<syn::Meta>)> {
+    let mut pred_ts = proc_macro2::TokenStream::new();
+    let mut rest_ts = proc_macro2::TokenStream::new();
+    let mut seen_comma = false;
+    for tt in tokens.clone() {
+        if !seen_comma && matches!(&tt, proc_macro2::TokenTree::Punct(p) if p.as_char() == ',') {
+            seen_comma = true;
+            continue;
+        }
+        if seen_comma {
+            rest_ts.extend(std::iter::once(tt));
+        } else {
+            pred_ts.extend(std::iter::once(tt));
         }
     }
+    if !seen_comma {
+        return None;
+    }
+    use syn::parse::Parser;
+    let metas = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+        .parse2(rest_ts)
+        .ok()?;
+    Some((pred_ts.to_string(), metas.into_iter().collect()))
 }
 
 /// `file:line` 위치 — 아이템의 이름 span 줄을 쓴다.
@@ -1072,4 +1071,32 @@ pub fn is_extern_entry(attrs: &[syn::Attribute]) -> bool {
             )
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// cfg_attr 술어의 문자열 리터럴은 이스케이프 원문 그대로 보존된다 —
+    /// `feature = "a\x62c"`를 Meta로 재파싱해 value()를 다시 감싸면
+    /// "abc"로 바뀌어 거짓 조건이 참으로 평가될 수 있다.
+    #[test]
+    fn split_cfg_attr_preserves_predicate_escapes() {
+        let attr: syn::Attribute =
+            syn::parse_quote!(#[cfg_attr(feature = "a\x62c", derive(Debug))]);
+        let syn::Meta::List(l) = attr.meta else {
+            panic!("cfg_attr is a list meta")
+        };
+        let (pred, metas) = split_cfg_attr(&l.tokens).expect("split");
+        // 원문 이스케이프가 남고 디코드된 값이 섞이지 않아야 한다.
+        assert!(pred.contains("\\x62"), "predicate lost escape: {pred}");
+        assert!(!pred.contains("\"abc\""), "predicate decoded: {pred}");
+        assert_eq!(metas.len(), 1);
+        // 쉼표 없는 cfg_attr는 술어/속성 경계가 없다 — None.
+        let attr2: syn::Attribute = syn::parse_quote!(#[cfg_attr(test)]);
+        let syn::Meta::List(l2) = attr2.meta else {
+            panic!("cfg_attr is a list meta")
+        };
+        assert!(split_cfg_attr(&l2.tokens).is_none());
+    }
 }
