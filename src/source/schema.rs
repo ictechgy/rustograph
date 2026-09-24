@@ -623,7 +623,8 @@ impl<'ast> FileCtx<'ast> {
                             .or_else(|| self.scan_locate(fp.path.span()));
                         self.scan.push_sql_literal(loc, &lit.value(), true);
                     }
-                    // 비문자열 리터럴(`query(1)`)은 SQL 근거가 아니다 — 버린다.
+                    // 비문자열 리터럴(`query(1)`)은 SQL 근거가 아니다 —
+                    // 계약상 유일하게 계수하지 않고 버리는 예외다.
                 }
                 e => {
                     let loc = self.scan_locate(fp.path.span());
@@ -1066,7 +1067,8 @@ impl SchemaScan {
     /// channel에는 잘린 원문 표현식을 실어 어느 위치의 호출인지 남긴다.
     /// 위치를 못 구한 동적 근거는 unlocated로 센다.
     fn push_dynamic(&mut self, src: &str, expr: &Expr, loc: Option<BridgeLocation>, file: &Path) {
-        // 비문자열 리터럴 인자(`query!(1)`)는 SQL 근거가 될 수 없다 — 버린다.
+        // 비문자열 리터럴 인자(`query!(1)`)는 SQL 근거가 될 수 없다 — 모든
+        // 경로를 계수하는 계약에서 유일하게 "근거 없음"으로 버리는 예외다.
         if let Expr::Lit(el) = expr {
             if !matches!(el.lit, syn::Lit::Str(_)) {
                 return;
@@ -1353,15 +1355,24 @@ fn sql_relations(text: &str) -> (Vec<String>, bool) {
         }
         let word = tok.text.to_ascii_lowercase();
         let grant_stmt = matches!(stmt_verb[i].as_deref(), Some("grant" | "revoke"));
+        // 같은 문장(`;`로 갈리는 세그먼트) 안만 본다 — 뒤 세그먼트의
+        // 단어를 앞 문장의 근거로 쓰지 않는다.
+        let segment_before = |end: usize| tokens[..end].iter().rev().take_while(|t| t.text != ";");
+        let segment_after_has = |start: usize, w: &str| {
+            tokens[start..]
+                .iter()
+                .take_while(|t| t.text != ";")
+                .any(|t| !t.quoted && t.text.eq_ignore_ascii_case(w))
+        };
         let fires = match word.as_str() {
             // 산문 속 "update the .."·upsert의 `DO UPDATE SET`을 막기 위해
-            // update는 문장 머리이고 뒤에 SET이 있을 때만 연다.
-            "update" => stmt_head[i] && has_word(&tokens[i + 1..], "set"),
+            // update는 문장 머리이고 같은 문장에 SET이 있을 때만 연다.
+            "update" => stmt_head[i] && segment_after_has(i + 1, "set"),
             // truncate는 항상 문장 머리 동사다 — 산문 중간의 "truncate"는 무시.
             "truncate" => stmt_head[i],
-            // into는 INSERT·SELECT·MERGE·REPLACE가 앞선 문맥에서만 연다 —
-            // "merge the branch into main" 같은 산문을 막는다.
-            "into" => tokens[..i].iter().any(|t| {
+            // into는 같은 문장에 INSERT·SELECT·MERGE·REPLACE가 앞선 문맥에서만
+            // 연다 — "merge the branch into main" 같은 산문을 막는다.
+            "into" => segment_before(i).any(|t| {
                 !t.quoted
                     && matches!(
                         t.text.to_ascii_lowercase().as_str(),
@@ -1371,9 +1382,22 @@ fn sql_relations(text: &str) -> (Vec<String>, bool) {
             // table은 직전 식별자가 DDL 동사일 때만 키워드다 — 산문의
             // "the table"이나 다른 절의 단어는 읽지 않는다.
             "table" => table_keyword_context(&tokens, i),
-            // on은 `GRANT .. ON t`·`REVOKE .. ON t`의 관계 자리다 —
-            // 다른 문장의 ON(조인 조건)은 관계가 아니다.
-            "on" => grant_stmt,
+            // on은 `GRANT .. ON t`·`REVOKE .. ON t`의 관계 자리다 — 권한
+            // 단어(SELECT 등)가 앞서야 "grant access on .." 같은 산문을
+            // 막는다. `CREATE INDEX/TRIGGER .. ON t`의 on도 관계 자리다.
+            "on" => {
+                let grant_on =
+                    grant_stmt && segment_before(i).any(|t| !t.quoted && is_grant_priv(&t.text));
+                let create_on = stmt_verb[i].as_deref() == Some("create")
+                    && segment_before(i).any(|t| {
+                        !t.quoted
+                            && matches!(
+                                t.text.to_ascii_lowercase().as_str(),
+                                "index" | "trigger" | "rule" | "policy"
+                            )
+                    });
+                grant_on || create_on
+            }
             // grant·revoke의 FROM은 권한 주체 자리다 — 관계가 아니므로
             // from·join을 그 문장에서는 열지 않는다.
             "from" | "join" => !grant_stmt,
@@ -1394,6 +1418,60 @@ fn sql_relations(text: &str) -> (Vec<String>, bool) {
         {
             consumed[j] = true;
             j += 1;
+        }
+        if word == "on" && grant_stmt {
+            // GRANT/REVOKE ON은 객체 종류어가 낄 수 있다 — `ON TABLE t`의
+            // table은 수식어고, `ON SEQUENCE`/`ON FUNCTION`/`ON ALL TABLES`
+            // 같은 비테이블 객체는 관계가 아니라 조용히 삼킨다.
+            let kind = tokens
+                .get(j)
+                .filter(|t| !t.quoted)
+                .map(|t| t.text.to_ascii_lowercase());
+            match kind.as_deref() {
+                Some("table" | "tables" | "view" | "materialized") => {
+                    // 종류어 뒤의 이름이 관계다 — `ON FOREIGN TABLE`의
+                    // foreign는 비테이블 목록으로 보낸다(서버·래퍼가 더 흔함).
+                    let mut k = j;
+                    while k < tokens.len()
+                        && matches!(
+                            tokens[k].text.to_ascii_lowercase().as_str(),
+                            "table" | "tables" | "view" | "materialized"
+                        )
+                    {
+                        consumed[k] = true;
+                        k += 1;
+                    }
+                    j = k;
+                }
+                Some(
+                    "all" | "sequence" | "schema" | "database" | "domain" | "type" | "function"
+                    | "procedure" | "routine" | "foreign" | "server" | "wrapper" | "language"
+                    | "large" | "publication" | "subscription" | "statistics" | "tablespace"
+                    | "collation" | "conversion" | "extension" | "aggregate" | "operator"
+                    | "policy" | "cast" | "fdw" | "parser" | "template" | "dictionary"
+                    | "configuration",
+                ) => {
+                    // 비테이블 권한 객체 — 이름·한정자·인자 괄호까지 삼키고
+                    // 사실은 내지 않는다(미해석도 아니다 — 정상 문법이다).
+                    let mut k = j;
+                    while k < tokens.len() {
+                        let t = &tokens[k];
+                        if !t.quoted && t.text == "(" {
+                            match skip_parens(&tokens, k) {
+                                Some(next) => k = next,
+                                None => break,
+                            }
+                        } else if is_name_token(t) || (!t.quoted && t.text == ".") {
+                            consumed[k] = true;
+                            k += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
         }
         if j >= tokens.len() {
             unresolved = true; // 이름이 없는 키워드 — "SELECT ... FROM" 꼴.
@@ -1424,13 +1502,13 @@ fn sql_relations(text: &str) -> (Vec<String>, bool) {
                         next
                     }
                     None => {
-                        // `DO UPDATE SET`처럼 이름 자리에 절 키워드가 오는
-                        // 정상 형태는 넘기고, 플레이스홀더 등 읽히지 않는
-                        // 피연산자만 미해석으로 센다.
+                        // 이름 자리에 절 키워드가 오는 것(`DO UPDATE SET`,
+                        // `ON TABLES TO`)은 정상 종료다 — 플레이스홀더 등
+                        // 읽히지 않는 피연산자만 미해석으로 센다.
                         let clause_next = tokens
                             .get(j)
                             .is_some_and(|t| is_name_token(t) && is_clause_word(&t.text));
-                        if !(word == "update" && clause_next) {
+                        if !clause_next {
                             unresolved = true;
                         }
                         break;
@@ -1465,11 +1543,27 @@ fn sql_relations(text: &str) -> (Vec<String>, bool) {
     (out, unresolved)
 }
 
-/// 뒤쪽 토큰에 해당 단어가 있는지 본다 — `UPDATE`의 SET 동반 확인용이다.
-fn has_word(tokens: &[SqlToken], word: &str) -> bool {
-    tokens
-        .iter()
-        .any(|t| !t.quoted && t.text.eq_ignore_ascii_case(word))
+/// GRANT/REVOKE의 권한 단어인지 본다 — `ON`이 관계 자리임을 확정하는 근거다.
+/// "grant access on staging to the intern" 같은 산문은 권한 단어가 없어 막힌다.
+fn is_grant_priv(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "select"
+            | "insert"
+            | "update"
+            | "delete"
+            | "truncate"
+            | "references"
+            | "trigger"
+            | "execute"
+            | "usage"
+            | "create"
+            | "connect"
+            | "temporary"
+            | "temp"
+            | "maintain"
+            | "all"
+    )
 }
 
 /// `table` 토큰이 관계 키워드로 발화하는 문맥인지 본다 — 직전 비인용
@@ -1583,6 +1677,13 @@ fn is_clause_word(word: &str) -> bool {
             | "only"
             | "between"
             | "like"
+            | "to"
+            | "grant"
+            | "revoke"
+            | "option"
+            | "cascade"
+            | "restrict"
+            | "privileges"
     )
 }
 
@@ -1651,7 +1752,12 @@ fn lex_sql(text: &str) -> Vec<SqlToken> {
             }
             _ => {
                 // `;`는 문장 경계다 — 다중 문장 리터럴의 머리 동사 추적에 쓴다.
-                if matches!(c, b'.' | b',' | b'(' | b')' | b';') {
+                // 플레이스홀더 기호(`{}`·`$n`·`?`·`:name`·`@`)도 남긴다 — 관계
+                // 자리에 오면 읽히지 않는 피연산자로 미해석을 세야 하기 때문이다.
+                if matches!(
+                    c,
+                    b'.' | b',' | b'(' | b')' | b';' | b'{' | b'}' | b'$' | b'?' | b':' | b'@'
+                ) {
                     tokens.push(SqlToken {
                         text: (c as char).to_string(),
                         quoted: false,
@@ -1846,8 +1952,26 @@ mod tests {
             // GRANT/REVOKE의 ON은 관계 자리 — 그 문장의 FROM은 주체 자리다.
             ("GRANT SELECT ON t TO r", &["t"]),
             ("REVOKE SELECT ON t FROM r", &["t"]),
+            // ON 뒤의 객체 종류어는 수식어다 — 이름이 관계다.
+            ("GRANT SELECT ON TABLE metrics TO r", &["metrics"]),
+            ("GRANT SELECT ON a, b TO r", &["a", "b"]),
+            // 테이블이 아닌 권한 객체는 관계가 아니다 — 조용히 삼킨다.
+            ("GRANT USAGE ON SEQUENCE seq TO r", &[]),
+            ("GRANT EXECUTE ON FUNCTION f(int) TO r", &[]),
+            ("GRANT ALL ON SCHEMA s TO r", &[]),
+            ("GRANT SELECT ON ALL TABLES IN SCHEMA s TO r", &[]),
+            ("REVOKE ALL ON DATABASE d FROM r", &[]),
+            // 권한 단어 없는 산문의 grant/on은 관계가 아니다.
+            ("grant access on staging-db to the intern", &[]),
+            ("revoke permission on friday", &[]),
+            // CREATE INDEX·TRIGGER의 ON 대상도 관계다.
+            ("CREATE UNIQUE INDEX i ON users (email)", &["users"]),
+            ("CREATE TRIGGER tr ON audit AFTER UPDATE", &["audit"]),
             // 다른 문장의 ON은 조인 조건이다 — 관계가 아니다.
             ("SELECT * FROM a ON CONFLICT DO NOTHING", &["a"]),
+            // `;` 너머의 단어를 앞 문장의 근거로 쓰지 않는다.
+            ("select columns; update the readme; set up CI next", &[]),
+            ("SELECT 1; sign into the portal", &[]),
             // FROM 없는 SQL은 관계 없음.
             ("SELECT 1", &[]),
             ("VALUES (1, 2)", &[]),
