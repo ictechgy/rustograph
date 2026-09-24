@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 fixture_core = { path = "../fixture_core" }
+# 선언만 하고 참조하지 않는 의존성 — `deps`의 미사용 판정이 잡아야 한다.
+fixture_unused = { path = "../fixture_unused" }
 
 [features]
 never = []

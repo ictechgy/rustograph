@@ -281,12 +281,130 @@ mod cli_tests {
         let (code, out, _) = run(&["impact", "fixture_core::Used"]);
         assert_eq!(code, 0);
         assert!(out.contains("\"impacted\""));
-        // 없는 정점은 오류.
-        let (code, _, _) = run(&["query", "fixture_core::nope"]);
+        // 없는 정점은 오류 — 후보가 있으면 함께 보여준다.
+        let (code, _, err) = run(&["query", "fixture_core::nope"]);
         assert_eq!(code, 2);
+        assert!(err.contains("not found"));
+        // 애매한 부분 문자열은 조용히 고르지 않고 후보를 열거한다 —
+        // `nest`는 nest/deep/leaf 등 여러 정점에 걸린다.
+        let (code, _, err2) = run(&["query", "nest"]);
+        assert_eq!(code, 2);
+        assert!(err2.contains("did you mean"));
         // 위치 인자 없으면 오류.
         let (code, _, _) = run(&["query"]);
         assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn paths_and_search() {
+        // main -> entry 호출 경로가 발견된다.
+        let (code, out, _) = run(&["paths", "fixture_app::main", "fixture_core::entry"]);
+        assert_eq!(code, 0);
+        assert!(out.contains("\"found\": true"));
+        assert!(out.contains("fixture_app::main"));
+        // 없는 끝점은 사용법 오류가 아니라 분석 오류(2)다.
+        let (code, _, err) = run(&["paths", "fixture_app::main", "fixture_core::nope"]);
+        assert_eq!(code, 2);
+        assert!(err.contains("not found"));
+        // 인자 부족도 2.
+        let (code, _, _) = run(&["paths", "fixture_app::main"]);
+        assert_eq!(code, 2);
+        // search — `::entry` 꼬리 일치가 먼저 나온다.
+        let (code, out, _) = run(&["search", "entry"]);
+        assert_eq!(code, 0);
+        assert!(out.contains("\"fixture_core::entry\""));
+        let (code, _, _) = run(&["search"]);
+        assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn deps_reports_unused_declared_dep() {
+        // fixture_unused는 선언만 됐다 — 미사용 판정이 잡혀야 한다.
+        let (code, out, _) = run(&["deps"]);
+        assert_eq!(code, 0);
+        assert!(out.contains("fixture_app -> fixture_unused"));
+        // fixture_macros는 속성 경로(#[fixture_macros::x])로 관측돼 쓰인다.
+        assert!(!out.contains("fixture_macros (kind"));
+        let (code, out, _) = run(&["deps", "--format", "json"]);
+        assert_eq!(code, 0);
+        assert!(out.contains("\"fixture_unused\""));
+        // strict는 미사용 발견이면 1.
+        let (code, _, _) = run(&["deps", "--strict"]);
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn filters_focus_exclude_tests_target() {
+        // --focus — 서브트리만 남고 조상·형제는 사라진다.
+        let (code, out, _) = run(&["graph", "--level", "symbol", "--focus", "fixture_core::t"]);
+        assert_eq!(code, 0);
+        assert!(out.contains("fixture_core::t"));
+        assert!(!out.contains("fixture_app"));
+        // --exclude-tests — #[cfg(test)] 모듈과 그 내용이 빠진다.
+        let (code, out, _) = run(&["graph", "--level", "symbol", "--exclude-tests"]);
+        assert_eq!(code, 0);
+        assert!(!out.contains("\"fixture_core::t\""));
+        assert!(!out.contains("fixture_core::t::t1"));
+        // --tests와 --exclude-tests는 공존 불가 — 사용법 오류.
+        let (code, _, _) = run(&["dead", "--tests", "--exclude-tests"]);
+        assert_eq!(code, 2);
+        // --target — unix 게이트 정점은 windows 트리플에서 빠진다.
+        let (code, out, _) = run(&[
+            "graph",
+            "--level",
+            "symbol",
+            "--target",
+            "x86_64-pc-windows-msvc",
+        ]);
+        assert_eq!(code, 0);
+        assert!(!out.contains("\"fixture_core::unix_only\""));
+        assert!(out.contains("cfg-gated vertices excluded"));
+    }
+
+    #[test]
+    fn rules_baseline_freezes_existing_violations() {
+        let tmp = std::env::temp_dir().join(format!("rg-base-{}", std::process::id()));
+        let cfg = tmp.with_extension("yml");
+        let base = tmp.with_extension("txt");
+        // app이 core에 의존하면 안 되는 규칙 — fixture는 위반이 있다.
+        let mut f = std::fs::File::create(&cfg).unwrap();
+        writeln!(
+            f,
+            "components:\n  app: [\"fixture_app/**\"]\n  core: [\"fixture_core/**\"]\ndeps:\n  app: []\n  core: []"
+        )
+        .unwrap();
+        drop(f);
+        let cfgp = cfg.to_str().unwrap().to_string();
+        let basep = base.to_str().unwrap().to_string();
+        // baseline 없이 strict → 위반이 있어 1.
+        let (code, _, _) = run(&["rules", "--strict", "--config", &cfgp]);
+        assert_eq!(code, 1);
+        // 얼리기 — 현재 위반을 기준선으로 기록하고 0을 돌린다.
+        let (code, out, _) = run(&[
+            "rules",
+            "--config",
+            &cfgp,
+            "--baseline",
+            &basep,
+            "--write-baseline",
+        ]);
+        assert_eq!(code, 0);
+        assert!(out.contains("wrote baseline"));
+        // 얼린 뒤 strict → 기존 위반은 억눌려 0.
+        let (code, out, _) = run(&["rules", "--strict", "--config", &cfgp, "--baseline", &basep]);
+        assert_eq!(code, 0);
+        assert!(out.contains("suppressed by baseline"));
+        // 없는 명시 baseline 파일은 오타일 수 있으니 오류.
+        let (code, _, _) = run(&[
+            "rules",
+            "--config",
+            &cfgp,
+            "--baseline",
+            "/nonexistent-xyz.txt",
+        ]);
+        assert_eq!(code, 2);
+        let _ = std::fs::remove_file(&cfg);
+        let _ = std::fs::remove_file(&base);
     }
 }
 
