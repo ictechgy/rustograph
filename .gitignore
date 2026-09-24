@@ -3,3 +3,4 @@ tests/fixture/target/
 .rustograph/
 coverage/
 .serena/
+shrimp/

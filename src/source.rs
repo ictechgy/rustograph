@@ -3,6 +3,8 @@
 //! 외부 의존(cargo, syn)은 이 파일과 modtree/harvest/cargo_meta에만 있다.
 //! 수확은 판단하지 않는다: 해석 불가·조건부·외부 참조는 전부 실측 limitation이다.
 
+pub mod schema;
+
 use crate::cargo_meta::{self, Metadata};
 use crate::graph::{self, Document, Edge, EdgeKind, Kind, Level, Vertex};
 use crate::harvest::{self, BodyItem, Harvest};
