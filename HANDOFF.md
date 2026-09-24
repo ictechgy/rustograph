@@ -4,19 +4,30 @@
 
 ## 현재 상태 (2026-09-24)
 
+**feature/schema-facts 머지됨 — PR #15(be116ae).** isthmus persistence
+도메인의 두 번째 코드 생산자로 `rustograph schema`를 추가했다:
+bridge-facts v1, `platform: "rust"` + `target: "persistence"`(사실
+없으면 `target: null`), SQL 문자열·sqlx 매크로/함수·diesel `table!`·
+DSL 경로·sea_orm 어트리뷰트에서 relation-use 사실 수확. GLM 리뷰
+3라운드 반영 — 산문 오탐 게이트, 별칭·서브쿼리·`;` 다중 문장·
+GRANT/REVOKE 객체 종류어, 미해석·unlocated 계수, DSL 경로는 선언된
+table! 이름으로만 정적화. isthmus 쪽 계약 확장은 PR #110(rust 플랫폼 +
+relation-use 허용, bridge 구성과 격리).
+
 **v0.2.1 배포 완료.** https://github.com/ictechgy/rustograph (public),
 `brew install ictechgy/tap/rustograph`로 설치 가능(brew test 통과).
 v0.2.0도 배포됐으나 자기 분석에서 cli↔mcp 모듈 순환이 잡혀
 인자 파서를 cli_args로 분리한 0.2.1이 최신이다. PR #1~#6 머지됨.
 
-검증 상태: `cargo test` 106개 통과(단위 77 + 통합 29) + semantic
-feature 47개, 커버리지 92.95%(게이트 90), clippy 클린,
-verify-cli-contract OK(mcp 9도구 포함), 자기 분석 `rules --strict`
-0 위반 / `cycles --strict` 0 — semantic 모드도 동일 0.
+검증 상태: `cargo test` 130개 통과(단위 87 + 통합 29 + schema 14) +
+semantic feature 47개, 커버리지 92.95%(게이트 90, PR #14 시점),
+clippy 클린, verify-cli-contract OK(mcp 9도구 포함), 자기 분석
+`rules --strict` 0 위반 / `cycles --strict` 0 — semantic 모드도
+동일 0.
 PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
 #13(gitignore) a04c270, a4b576a · **#14(경쟁툴 보완 팩) 머지됨 —
 941da08.** PR #14는 Codex 2라운드 + GLM 1라운드 독립 리뷰를 거쳤고
-지적은 전부 수정 커밋으로 반영됐다.
+지적은 전부 수정 커밋으로 반영됐다. **#15(schema) 머지됨 — be116ae.**
 
 ## 구조
 
@@ -68,8 +79,11 @@ PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
 - `src/export.rs` — 결정적 JSON + mermaid + save/load.
 - `src/sarif.rs` — SARIF 2.1.0(`rustograph/deny` 등 ruleId).
 - `src/config.rs` — `.rustograph.yml` 파싱(serde_yml 격리), baseline 키.
+- `src/source/schema.rs` — isthmus bridge-facts 생산자(`rustograph
+  schema`). SQL 문자열·sqlx·diesel table!·DSL 경로·sea_orm에서
+  relation-use 사실 수확, 산문 오탐 게이트·미해석/unlocated 계수.
 - `src/cli.rs` — graph/cycles/dead/rules/query/impact/paths/search/deps/
-  mcp/version, 종료 코드 0/1/2.
+  schema/mcp/version, 종료 코드 0/1/2.
 - `src/cli_args.rs` — cli/mcp 공유 인자 파서(최하층, 순환 방지).
   이름이 args가 아닌 이유는 파일 헤더 주석 참고 — 지역 변수 `args`가
   이름 해석으로 모듈을 가리키는 가짜 참조를 피한다. 문서 필터는
@@ -138,8 +152,14 @@ PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
    전부 수정됨 — 핵심은 "부재=거짓"의 범위를 KNOWN_FLAGS·TARGET_KEYS로
    제한한 cfg 팩트 모델과 dev/build 의존 판정 제외다.
    다음 우선순위는 사용자가 정한다.
-7. `feature/schema-facts` — 사용자가 메인 워크트리에서 진행 중인
-   후속 작업(이 문서 기준 미기술).
+7. ~~feature/schema-facts~~ — 완료. PR #15 머지됨(be116ae).
+   `source/schema.rs` 신규 + `rustograph schema` 명령으로 isthmus
+   persistence 도메인의 bridge-facts v1을 낸다. GLM 리뷰 3라운드 반영.
+   상세는 위 "현재 상태" 첫 단락 참고.
+8. 다음 우선순위는 사용자가 정한다. 보류 중인 알려진 LOW:
+   `split_cfg_attr` 속성 목록 파싱 실패 시 unresolved_paths 미계수
+   (카운터 배선 비용 대비 미미). Codex 3차 리뷰는 사용량 한도로
+   보류됐다 — GLM 리뷰가 역할을 대신했다.
 
 ## 막힌 것 / 주의
 
