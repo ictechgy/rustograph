@@ -197,19 +197,24 @@ impl ModTree {
                     let root_mod = self.modules.get(&root)?;
                     if root_mod.items.contains(first) || root_mod.children.contains_key(first) {
                         format!("{root}::{first}")
-                    } else if self.modules.contains_key(first) {
-                        // 같은 워크스페이스의 다른 크레이트 루트 모듈.
-                        return self.walk(first, &segs[1..]);
-                    } else {
-                        // 외부는 크레이트 정점으로 붕괴한다. 멤버 별칭은
-                        // 그 멤버의 루트 정점으로 재작성해 계속 걷는다 —
-                        // 패키지 이름과 타깃(루트) 이름이 다를 수 있다.
-                        let t = dep_crates.lookup(from, first)?;
+                    } else if let Some(t) = dep_crates.lookup(from, first) {
+                        // 선언된 의존 별칭이 워크스페이스 루트보다 우선한다 —
+                        // 같은 이름의 멤버가 있어도 `app`의 `foo`는 선언된
+                        // 패키지다. 외부는 크레이트 정점으로 붕괴하고 멤버
+                        // 별칭은 그 멤버의 루트 정점으로 재작성해 계속 걷는다
+                        // — 패키지 이름과 타깃(루트) 이름이 다를 수 있다.
                         return if t.member {
                             self.walk(&t.vertex, &segs[1..])
                         } else {
                             Some(t.vertex.clone())
                         };
+                    } else if self.modules.contains_key(first) {
+                        // 같은 워크스페이스의 다른 크레이트 루트 모듈 —
+                        // 선언 없는 직접 참조는 컴파일되지 않지만, 관대하게
+                        // 해석하는 쪽이 잃는 것보다 낫다.
+                        return self.walk(first, &segs[1..]);
+                    } else {
+                        return None;
                     }
                 }
             }
@@ -606,6 +611,36 @@ mod tests {
                 DepCrates::new()
             }),
             None // other 크레이트는 modules에 없으니 None.
+        );
+    }
+
+    #[test]
+    fn declared_dep_alias_beats_same_named_workspace_root() {
+        // 워크스페이스에 `foo`라는 멤버 루트가 있어도, `c`가 `foo` 별칭을
+        // 다른 패키지에 선언했으면 `foo::x`는 선언 쪽으로 간다 —
+        // 루트 이름을 먼저 보면 선언된 의존이 엉뚱한 크레이트로 간다.
+        let mut t = tree();
+        t.modules.insert(
+            "foo".to_string(),
+            Module::new(PathBuf::from("foo/lib.rs"), true, true),
+        );
+        let map = dep_scope("foo", "real_pkg", false);
+        assert_eq!(
+            t.resolve("c", &["foo".into(), "x".into()], &map),
+            Some("real_pkg".to_string())
+        );
+        // 선언이 없는 크레이트에서의 `foo::x`는 멤버 루트로 걷는다.
+        let mut d_mod = Module::new(PathBuf::from("d/lib.rs"), true, true);
+        d_mod.items.insert("x".to_string());
+        t.modules
+            .get_mut("foo")
+            .unwrap()
+            .items
+            .insert("x".to_string());
+        t.modules.insert("d".to_string(), d_mod);
+        assert_eq!(
+            t.resolve("d", &["foo".into(), "x".into()], &map),
+            Some("foo::x".to_string())
         );
     }
 
