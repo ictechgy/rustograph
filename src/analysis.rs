@@ -112,7 +112,8 @@ pub struct Path {
     /// 경로를 이루는 정점 ID — 첫째가 from, 마지막이 to.
     pub vertices: Vec<String>,
     /// 홉마다 실제로 건넌 간선 종류 — vertices보다 하나 짧다.
-    /// 같은 쌍에 여러 간선이 있으면 확정 간선·사전순 종류를 우선한다.
+    /// 같은 쌍에 여러 간선이 있으면 확정·최소 종류(EdgeKind의
+    /// 선언 순서 Ord)를 우선한다.
     pub edges: Vec<EdgeKind>,
     /// 추정(팬아웃) 간선이 하나라도 섞이면 이 경로는 "가능한" 경로다.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -139,10 +140,11 @@ pub struct PathsReport {
 /// "도달 가능할 수 있다"는 사실이 보고 가치다.
 pub fn paths(doc: &Document, from: &str, to: &str, max_paths: usize, budget: usize) -> PathsReport {
     let ids = doc.vertex_ids();
-    // 인접 목록: (from,to) 쌍에 간선이 여러 개면 확정·사전순 하나만 남긴다 —
-    // 같은 경로를 간선 종류만큼 중복 보고하지 않기 위함이다. 끝점이 없는
-    // 간선은 건너뛴다 — 비형식 문서의 dangling 간선이 경로에 없는
-    // 정점을 끼워 넣는 것을 막는다.
+    // 인접 목록: (from,to) 쌍에 간선이 여러 개면 확정·최소 종류
+    // (EdgeKind의 선언 순서 Ord) 하나만 남긴다 — 같은 경로를 간선
+    // 종류만큼 중복 보고하지 않기 위함이다. 끝점이 없는 간선은 건너뛴다
+    // — 비형식 문서의 dangling 간선이 경로에 없는 정점을 끼워 넣는
+    // 것을 막는다.
     let mut adj: BTreeMap<&str, Vec<(&str, EdgeKind, bool)>> = BTreeMap::new();
     for e in &doc.edges {
         if e.kind.is_dependency() && ids.contains(e.from.as_str()) && ids.contains(e.to.as_str()) {
