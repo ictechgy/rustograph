@@ -357,6 +357,135 @@ impl Document {
             }
         }
     }
+
+    /// 부분 그래프 — keep_vertex가 참인 정점만 남기고, 간선은 양 끝이 살아
+    /// 있고 keep_edge를 통과한 것만 남는다. dangling 간선은 절대 안 생긴다.
+    fn filtered(
+        &self,
+        keep_vertex: impl Fn(&Vertex, &BTreeMap<&str, Option<&str>>) -> bool,
+        keep_edge: impl Fn(&Edge) -> bool,
+    ) -> Document {
+        let cfg_of: BTreeMap<&str, Option<&str>> = self
+            .vertices
+            .iter()
+            .map(|v| (v.id.as_str(), v.cfg.as_deref()))
+            .collect();
+        let kept: BTreeSet<&str> = self
+            .vertices
+            .iter()
+            .filter(|v| keep_vertex(v, &cfg_of))
+            .map(|v| v.id.as_str())
+            .collect();
+        let mut d = self.clone();
+        d.vertices.retain(|v| kept.contains(v.id.as_str()));
+        d.edges.retain(|e| {
+            keep_edge(e) && kept.contains(e.from.as_str()) && kept.contains(e.to.as_str())
+        });
+        d.roots.retain(|r| kept.contains(r.as_str()));
+        d
+    }
+
+    /// `--focus` — 주어진 경로 아래의 부분 트리만 남긴다.
+    /// `c::a::b`를 포커스하면 `c::a::b`와 그 후손만 남는다. 조상은
+    /// 남기지 않는다 — 포커스는 "이 서브트리만 보겠다"는 의미다.
+    pub fn focus(&self, prefixes: &[String]) -> Document {
+        self.filtered(
+            |v, _| {
+                prefixes
+                    .iter()
+                    .any(|p| v.id == *p || v.id.starts_with(&format!("{p}::")))
+            },
+            |_| true,
+        )
+    }
+
+    /// `--exclude-tests` — `#[cfg(test)]`로 게이트된 코드를 지운다.
+    /// 정점 자신 또는 조상 모듈 어느 하나에라도 test 조건이 있으면
+    /// 테스트 코드다 — `mod tests` 안의 아이템은 자신의 cfg가 비어
+    /// 있어도 모듈 조건을 물려받는다.
+    pub fn without_tests(&self) -> Document {
+        self.filtered(
+            |v, cfg_of| {
+                !cfg_chain(v, cfg_of)
+                    .flatten()
+                    .any(|c| cfg_has_ident(c, "test"))
+            },
+            |e| e.cfg.as_deref().is_none_or(|c| !cfg_has_ident(c, "test")),
+        )
+    }
+
+    /// `--target` — 타깃 트리플로 cfg 조건을 평가해 확실히 거짓인
+    /// 정점·간선을 지운다. 평가 불가(feature·test 등)는 keep하고
+    /// limitation에 그 수를 센다 — 모르는 것을 지우면 거짓 그래프다.
+    pub fn for_target(&self, triple: &str) -> Document {
+        let facts = crate::cfgeval::Facts::from_triple(triple);
+        let mut d = self.filtered(
+            |v, cfg_of| {
+                !cfg_chain(v, cfg_of)
+                    .flatten()
+                    .any(|c| crate::cfgeval::eval(c, &facts) == Some(false))
+            },
+            |e| {
+                e.cfg
+                    .as_deref()
+                    .is_none_or(|c| crate::cfgeval::eval(c, &facts) != Some(false))
+            },
+        );
+        let dropped = self.vertices.len() - d.vertices.len();
+        // 미지 조건을 품고 살아남은 정점 수 — 사슬에 미지가 하나라도 있으면.
+        let cfg_of: BTreeMap<&str, Option<&str>> = d
+            .vertices
+            .iter()
+            .map(|v| (v.id.as_str(), v.cfg.as_deref()))
+            .collect();
+        let unevaluated = d
+            .vertices
+            .iter()
+            .filter(|v| {
+                cfg_chain(v, &cfg_of)
+                    .flatten()
+                    .any(|c| crate::cfgeval::eval(c, &facts).is_none())
+            })
+            .count();
+        if dropped > 0 {
+            d.limitations.push(format!(
+                "{dropped} cfg-gated vertices excluded for target {triple}"
+            ));
+        }
+        if unevaluated > 0 {
+            d.limitations.push(format!(
+                "{unevaluated} cfg-gated vertices kept — condition not decidable for target {triple}"
+            ));
+        }
+        d
+    }
+}
+
+/// 정점의 cfg 사슬 — 자신의 조건 + 조상 모듈들의 조건.
+/// `#[cfg(unix)] mod m` 안의 아이템은 자신의 cfg가 없어도 조건부다.
+fn cfg_chain<'a>(
+    v: &'a Vertex,
+    cfg_of: &BTreeMap<&'a str, Option<&'a str>>,
+) -> impl Iterator<Item = Option<&'a str>> {
+    let mut chain = vec![v.cfg.as_deref()];
+    let mut cur = v.module.as_str();
+    loop {
+        if let Some(c) = cfg_of.get(cur) {
+            chain.push(*c);
+        }
+        match cur.rfind("::") {
+            Some(i) => cur = &cur[..i],
+            None => break,
+        }
+    }
+    chain.into_iter()
+}
+
+/// cfg 문자열에 특정 식별자 토큰이 있는가 — `all(test , unix)`의
+/// `test`는 잡되 `testify` 같은 더 긴 이름은 건드리지 않는다.
+fn cfg_has_ident(cfg: &str, name: &str) -> bool {
+    cfg.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|t| t == name)
 }
 
 /// 정렬·중복 제거된 최종 문서를 만든다.
@@ -481,5 +610,96 @@ mod tests {
         let d: Document = serde_json::from_str(j).unwrap();
         assert!(!d.edges[0].tentative);
         assert!(!d.vertices[0].exported);
+    }
+
+    /// module·cfg를 지정하는 헬퍼 — 필터 테스트는 cfg 사슬이 필요하다.
+    fn vm(id: &str, kind: Kind, module: &str, cfg: Option<&str>) -> Vertex {
+        Vertex {
+            module: module.to_string(),
+            cfg: cfg.map(|s| s.to_string()),
+            ..v(id, kind)
+        }
+    }
+
+    /// cfg 게이트가 섞인 문서 — tests(test), win(windows), feat(feature).
+    fn cfg_doc() -> Document {
+        document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec!["c::a::f".into()],
+            vec![
+                vm("c", Kind::Crate, "c", None),
+                vm("c::a", Kind::Module, "c", None),
+                vm("c::a::f", Kind::Fn, "c::a", None),
+                vm("c::tests", Kind::Module, "c", Some("test")),
+                vm("c::tests::helper", Kind::Fn, "c::tests", None),
+                vm("c::win", Kind::Module, "c", Some("target_os = \"windows\"")),
+                vm("c::win::g", Kind::Fn, "c::win", None),
+                vm("c::feat", Kind::Module, "c", Some("feature = \"x\"")),
+                vm("c::feat::h", Kind::Fn, "c::feat", None),
+            ],
+            vec![
+                Edge::new("c::a::f".into(), "c::tests::helper".into(), EdgeKind::Call),
+                Edge::new("c::a::f".into(), "c::win::g".into(), EdgeKind::Call),
+                Edge::new("c::a::f".into(), "c::feat::h".into(), EdgeKind::Call),
+            ],
+            vec![],
+        )
+    }
+
+    /// dangling 간선이 없다는 불변 — 필터가 어떻게 잘라도 성립해야 한다.
+    fn no_dangling(d: &Document) -> bool {
+        let ids = d.vertex_ids();
+        d.edges
+            .iter()
+            .all(|e| ids.contains(e.from.as_str()) && ids.contains(e.to.as_str()))
+    }
+
+    #[test]
+    fn focus_keeps_subtree_drops_ancestors_and_roots() {
+        let d = doc().focus(&["c::b".to_string()]);
+        let ids = d.vertex_ids();
+        assert!(ids.contains("c::b") && ids.contains("c::b::T") && ids.contains("c::b::T::m"));
+        // 조상·형제·루트는 포커스 밖 — 간선은 양끝이 없으니 전부 사라진다.
+        assert!(!ids.contains("c") && !ids.contains("c::a") && !ids.contains("c::a::f"));
+        assert!(d.edges.is_empty());
+        assert!(d.roots.is_empty());
+        assert!(no_dangling(&d));
+    }
+
+    #[test]
+    fn without_tests_drops_cfg_test_chain_and_edges() {
+        let d = cfg_doc().without_tests();
+        let ids = d.vertex_ids();
+        assert!(!ids.contains("c::tests"));
+        // 자신의 cfg는 없어도 조상의 test 조건을 물려받는다.
+        assert!(!ids.contains("c::tests::helper"));
+        assert!(ids.contains("c::a::f") && ids.contains("c::win::g") && ids.contains("c::feat::h"));
+        assert!(no_dangling(&d));
+    }
+
+    #[test]
+    fn for_target_drops_proven_false_keeps_unknown() {
+        let d = cfg_doc().for_target("aarch64-apple-darwin");
+        let ids = d.vertex_ids();
+        // target_os = "windows"는 darwin에서 확정 거짓 — 정점과 후손이 빠진다.
+        assert!(!ids.contains("c::win") && !ids.contains("c::win::g"));
+        // feature·test는 타깃이 모른다 — keep하고 limitation에 센다.
+        assert!(ids.contains("c::feat::h") && ids.contains("c::tests::helper"));
+        assert!(d
+            .limitations
+            .iter()
+            .any(|l| l.contains("2 cfg-gated vertices excluded")));
+        // tests 모듈+helper, feat 모듈+h — 미지 조건을 품은 정점 4개.
+        assert!(d
+            .limitations
+            .iter()
+            .any(|l| l.contains("4 cfg-gated vertices kept")));
+        assert!(no_dangling(&d));
+        // windows 타깃에서는 win이 살고 tests만 미지로 남는다.
+        let w = cfg_doc().for_target("x86_64-pc-windows-msvc");
+        assert!(w.vertex_ids().contains("c::win::g"));
+        assert!(w.vertex_ids().contains("c::tests::helper"));
     }
 }
