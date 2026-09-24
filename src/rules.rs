@@ -20,6 +20,84 @@ pub struct Violation {
     pub kind: EdgeKind,
 }
 
+impl Violation {
+    /// 기준선 키 — `rule|from|to|kind`. 위반의 정체성은 사람 문구가 아니라
+    /// 이 넷이다 — 문구가 바뀌어도 같은 위반은 같은 키다.
+    pub fn key(&self) -> String {
+        format!(
+            "{}|{}|{}|{}",
+            self.rule,
+            self.from,
+            self.to,
+            format!("{:?}", self.kind).to_lowercase()
+        )
+    }
+}
+
+/// 기준선 — 기존 위반을 "알고 있는" 키 목록. 레거시 코드베이스가 규칙을
+/// 도입할 때 기존 위반을 얼려서 새 위반만 실패하게 만드는 장치다.
+/// 파일 형식은 한 줄에 키 하나, `#` 주석과 빈 줄 허용.
+#[derive(Debug, Default)]
+pub struct Baseline {
+    keys: std::collections::BTreeSet<String>,
+}
+
+impl Baseline {
+    /// 기준선 파일을 파싱한다. 모르는 줄도 키로 받는다 — 위반과 안 맞으면
+    /// stale로 계수되니 형식 오류가 조용히 실패를 숨기지는 않는다.
+    pub fn parse(src: &str) -> Baseline {
+        Baseline {
+            keys: src
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.to_string())
+                .collect(),
+        }
+    }
+
+    /// 위반 목록을 기준선 파일로 렌더링한다 — 결정적 정렬이라 diff가 읽힌다.
+    pub fn render(violations: &[Violation]) -> String {
+        let mut keys: Vec<String> = violations.iter().map(|v| v.key()).collect();
+        keys.sort();
+        keys.dedup();
+        let mut out =
+            String::from("# rustograph rules baseline — existing violations frozen at adoption.\n");
+        for k in keys {
+            out.push_str(&k);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// 이 위반이 기준선에 있는가.
+    pub fn contains(&self, v: &Violation) -> bool {
+        self.keys.contains(&v.key())
+    }
+
+    /// 기준선 항목 수 — stale 계수용.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// 기준선이 비었는지 — len의 짝.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+}
+
+/// 보고서에 기준선을 적용한다 — 기준선 안 위반을 violations에서 빼고
+/// 수를 baselined에, 더는 위반이 아닌 기준선 항목 수를 stale_baseline에
+/// 센다. stale은 "개선됐으니 기준선을 갱신해도 된다"는 신호다.
+pub fn apply_baseline(rep: &mut RulesReport, base: &Baseline) {
+    let before = rep.violations.len();
+    rep.violations.retain(|v| !base.contains(v));
+    rep.baselined = before - rep.violations.len();
+    // 기준선 키 하나는 위반 최대 하나에만 대응한다(위반은 키로 중복 제거됨) —
+    // 안 쓰인 기준선 항목은 더는 위반이 아니라는 뜻이다.
+    rep.stale_baseline = base.len().saturating_sub(rep.baselined);
+}
+
 /// 규칙 보고서.
 #[derive(Debug, Serialize)]
 pub struct RulesReport {
@@ -29,6 +107,12 @@ pub struct RulesReport {
     /// 추정(팬아웃) 간선은 "가능한" 의존이라 위반 증거가 못 된다 — 건너뛴 수를 남긴다.
     #[serde(skip_serializing_if = "crate::graph::is_zero")]
     pub skipped_tentative: usize,
+    /// 기준선으로 억눌린 기존 위반 수 — 새 위반만 violations에 남는다.
+    #[serde(skip_serializing_if = "crate::graph::is_zero")]
+    pub baselined: usize,
+    /// 기준선에 있지만 더는 위반이 아닌 항목 수 — 개선 신호.
+    #[serde(skip_serializing_if = "crate::graph::is_zero")]
+    pub stale_baseline: usize,
 }
 
 /// 정점의 컴포넌트 — module 경로(또는 crate)를 패턴에 맞춘다. 긴 패턴 우선.
@@ -159,6 +243,8 @@ pub fn check(doc: &Document, cfg: &Config) -> RulesReport {
         violations,
         unmapped,
         skipped_tentative,
+        baselined: 0,
+        stale_baseline: 0,
     }
 }
 
@@ -211,6 +297,7 @@ mod tests {
                 "ui".to_string(),
                 vec!["ui".to_string(), "core".to_string()],
             )]),
+            baseline: None,
         }
     }
 
@@ -278,5 +365,47 @@ mod tests {
         let rep = check(&d, &cfg());
         assert!(rep.unmapped.contains(&"z::nowhere::m".to_string()));
         assert!(!rep.unmapped.contains(&"c::other::x".to_string()));
+    }
+
+    /// 위반 두 건을 내는 문서 — core→ui는 deny, other→ui는 allow 위반.
+    fn violating_doc() -> Document {
+        doc(vec![
+            Edge::new("c::core::a".into(), "c::ui::b".into(), EdgeKind::Call),
+            Edge::new("c::other::x".into(), "c::ui::b".into(), EdgeKind::Uses),
+        ])
+    }
+
+    #[test]
+    fn baseline_suppresses_known_and_marks_stale() {
+        let rep = check(&violating_doc(), &cfg());
+        assert_eq!(rep.violations.len(), 2);
+        // 얼리기: render → parse → apply — 같은 위반은 사라지고 센다.
+        let frozen = Baseline::parse(&Baseline::render(&rep.violations));
+        let mut rep2 = check(&violating_doc(), &cfg());
+        apply_baseline(&mut rep2, &frozen);
+        assert!(rep2.violations.is_empty());
+        assert_eq!(rep2.baselined, 2);
+        assert_eq!(rep2.stale_baseline, 0);
+        // 사라진 위반의 기준선 항목은 stale — 갱신 신호다.
+        let mut stale = Baseline::render(&rep.violations);
+        stale.push_str("deny|gone::a|gone::b|call\n# comment\n\n");
+        let mut rep3 = check(&violating_doc(), &cfg());
+        apply_baseline(&mut rep3, &Baseline::parse(&stale));
+        assert_eq!(rep3.baselined, 2);
+        assert_eq!(rep3.stale_baseline, 1);
+        // 기준선에 없는 새 위반은 막지 못한다 — 새 것만 남는다.
+        let mut rep4 = check(&violating_doc(), &cfg());
+        rep4.violations.push(Violation {
+            rule: "allow".to_string(),
+            from: "c::ui::b".to_string(),
+            to: "z::new".to_string(),
+            component: "ui".to_string(),
+            forbidden: "other".to_string(),
+            kind: EdgeKind::Call,
+        });
+        apply_baseline(&mut rep4, &frozen);
+        assert_eq!(rep4.violations.len(), 1);
+        assert_eq!(rep4.violations[0].to, "z::new");
+        assert_eq!(rep4.baselined, 2);
     }
 }
