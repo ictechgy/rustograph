@@ -45,6 +45,9 @@ pub struct Server {
     doc: Document,
     /// deps 도구가 cargo metadata를 읽을 워크스페이스 디렉터리.
     dir: PathBuf,
+    /// deps 보고서 — 시작 시 한 번 만든다. 매 요청마다 syn 수확을
+    /// 새로 하면 Box::leak된 AST가 서버 수명 동안 계속 쌓인다.
+    deps_report: Result<String, String>,
     /// rules 도구가 읽을 설정 파일 — 없으면 rules 호출이 isError로 답한다.
     cfg_path: Option<PathBuf>,
     /// 핸드셰이크로 합의한 프로토콜 버전.
@@ -65,9 +68,13 @@ pub(crate) fn cmd(
         Some(f) => Some(PathBuf::from(f)),
         None => find_config(&dir),
     };
+    // deps는 자체 syn 수확으로 문서를 만든다 — 공유 문서는 외부 정점이
+    // 없거나 필터됐을 수 있어 사용 증거로 쓸 수 없다. 시작 시 한 번만.
+    let deps_report = deps::report(&dir).map(|r| export::to_json(&r));
     let srv = Server {
         doc,
         dir,
+        deps_report,
         cfg_path,
         protocol: "2024-11-05".to_string(),
     };
@@ -253,10 +260,8 @@ impl Server {
                 let max = arg_usize(args, "max")?.unwrap_or(20);
                 Ok(export::to_json(&analysis::search(&self.doc, q, max)))
             }
-            // deps는 자체 syn 수확으로 문서를 만든다 — 시작 시점의
-            // 공유 문서는 외부 정점이 없거나 필터됐을 수 있어 사용
-            // 증거로 쓸 수 없다.
-            "rustograph_deps" => Ok(export::to_json(&deps::report(&self.dir)?)),
+            // 시작 시 만든 스냅샷 — 매 호출 수확은 AST 누수를 쌓는다.
+            "rustograph_deps" => self.deps_report.clone(),
             "rustograph_cycles" => {
                 let level = match arg_str(args, "level") {
                     Some(l) => Level::parse(l)
@@ -450,10 +455,16 @@ fn arg_str<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
 fn arg_usize(args: &serde_json::Value, key: &str) -> Result<Option<usize>, String> {
     match args.get(key) {
         None | Some(serde_json::Value::Null) => Ok(None),
-        Some(v) => v
-            .as_u64()
-            .map(|n| Some(n as usize))
-            .ok_or_else(|| format!("invalid {key} {v} — expected a non-negative integer")),
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .ok_or_else(|| format!("invalid {key} {v} — expected a non-negative integer"))?;
+            // 32비트에서 u64→usize `as` 캐스트는 값을 깎는다 — 한계
+            // 인자가 조용히 0이 되면 안 된다.
+            usize::try_from(n)
+                .map(Some)
+                .map_err(|_| format!("invalid {key} {v} — value exceeds usize range"))
+        }
     }
 }
 
@@ -498,6 +509,7 @@ mod tests {
                 vec![],
             ),
             dir: PathBuf::from("."),
+            deps_report: Err("deps report not computed".to_string()),
             cfg_path: None,
             protocol: "2024-11-05".to_string(),
         }
