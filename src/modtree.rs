@@ -204,7 +204,18 @@ impl ModTree {
                         // 별칭은 그 멤버의 루트 정점으로 재작성해 계속 걷는다
                         // — 패키지 이름과 타깃(루트) 이름이 다를 수 있다.
                         return if t.member {
-                            self.walk(&t.vertex, &segs[1..])
+                            match self.walk(&t.vertex, &segs[1..]) {
+                                Some(x) => Some(x),
+                                // 루트 모듈이 트리에 없는 멤버(proc-macro
+                                // 크레이트 등)는 내부를 모른다 — 외부처럼
+                                // 크레이트 정점으로 붕괴한다. 안 그러면
+                                // `use member_lib;`·`use member::x`가
+                                // 미해석이 돼 dep 사용 증거가 새 나간다.
+                                None if !self.modules.contains_key(&t.vertex) => {
+                                    Some(t.vertex.clone())
+                                }
+                                None => None,
+                            }
                         } else {
                             Some(t.vertex.clone())
                         };
@@ -641,6 +652,24 @@ mod tests {
         assert_eq!(
             t.resolve("d", &["foo".into(), "x".into()], &map),
             Some("foo::x".to_string())
+        );
+    }
+
+    #[test]
+    fn single_segment_member_alias_resolves_to_root() {
+        // `use real_lib;` 같은 단일 세그먼트 멤버 별칭 — 나머지가
+        // 비어 walk가 루트 그 자체를 돌려야 한다.
+        let t = tree();
+        let map = dep_scope("real_lib", "real_lib", true);
+        assert_eq!(
+            t.resolve("c", &["real_lib".into()], &map),
+            Some("real_lib".to_string())
+        );
+        // 외부 단일 세그먼트는 크레이트 정점으로 붕괴한다.
+        let ext = dep_scope("serde", "serde", false);
+        assert_eq!(
+            t.resolve("c", &["serde".into()], &ext),
+            Some("serde".to_string())
         );
     }
 
