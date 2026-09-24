@@ -363,15 +363,19 @@ fn pred<'a>(toks: &'a [Tok], facts: &Facts) -> Option<(Option<bool>, &'a [Tok])>
             "all" => {
                 if vals.contains(&Some(false)) {
                     Some(false)
+                } else if vals.iter().all(Option::is_some) {
+                    Some(true)
                 } else {
-                    Some(true).filter(|_| vals.iter().all(|v| v.is_some()))
+                    None
                 }
             }
             "any" => {
                 if vals.contains(&Some(true)) {
                     Some(true)
+                } else if vals.iter().all(Option::is_some) {
+                    Some(false)
                 } else {
-                    Some(false).filter(|_| vals.iter().all(|v| v.is_some()))
+                    None
                 }
             }
             "not" if vals.len() == 1 => vals[0].map(|v| !v),

@@ -200,17 +200,16 @@ impl ModTree {
                     } else if self.modules.contains_key(first) {
                         // 같은 워크스페이스의 다른 크레이트 루트 모듈.
                         return self.walk(first, &segs[1..]);
-                    } else if let Some(t) = dep_crates.lookup(from, first) {
+                    } else {
                         // 외부는 크레이트 정점으로 붕괴한다. 멤버 별칭은
                         // 그 멤버의 루트 정점으로 재작성해 계속 걷는다 —
                         // 패키지 이름과 타깃(루트) 이름이 다를 수 있다.
+                        let t = dep_crates.lookup(from, first)?;
                         return if t.member {
                             self.walk(&t.vertex, &segs[1..])
                         } else {
                             Some(t.vertex.clone())
                         };
-                    } else {
-                        return None;
                     }
                 }
             }
