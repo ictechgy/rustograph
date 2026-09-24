@@ -140,10 +140,12 @@ pub struct PathsReport {
 pub fn paths(doc: &Document, from: &str, to: &str, max_paths: usize, budget: usize) -> PathsReport {
     let ids = doc.vertex_ids();
     // 인접 목록: (from,to) 쌍에 간선이 여러 개면 확정·사전순 하나만 남긴다 —
-    // 같은 경로를 간선 종류만큼 중복 보고하지 않기 위함이다.
+    // 같은 경로를 간선 종류만큼 중복 보고하지 않기 위함이다. 끝점이 없는
+    // 간선은 건너뛴다 — 비형식 문서의 dangling 간선이 경로에 없는
+    // 정점을 끼워 넣는 것을 막는다.
     let mut adj: BTreeMap<&str, Vec<(&str, EdgeKind, bool)>> = BTreeMap::new();
     for e in &doc.edges {
-        if e.kind.is_dependency() {
+        if e.kind.is_dependency() && ids.contains(e.from.as_str()) && ids.contains(e.to.as_str()) {
             adj.entry(e.from.as_str())
                 .or_default()
                 .push((e.to.as_str(), e.kind, e.tentative));
@@ -165,12 +167,17 @@ pub fn paths(doc: &Document, from: &str, to: &str, max_paths: usize, budget: usi
         return report; // 끝점이 없으면 경로도 없다 — 호출자가 404를 처리한다.
     }
     if from == to {
-        report.found = true;
-        report.paths.push(Path {
-            vertices: vec![from.to_string()],
-            edges: Vec::new(),
-            tentative: false,
-        });
+        // 자기 경로도 max_paths=0이면 보고할 수 없다 — 0은 "없다"가
+        // 아니라 "제한"이니 truncated로 표시한다.
+        report.found = max_paths > 0;
+        report.truncated = max_paths == 0;
+        if max_paths > 0 {
+            report.paths.push(Path {
+                vertices: vec![from.to_string()],
+                edges: Vec::new(),
+                tentative: false,
+            });
+        }
         return report;
     }
     // 부분 경로 상태 — 경로 내부 재방문 금지로 단순 경로만 나온다.
@@ -185,11 +192,15 @@ pub fn paths(doc: &Document, from: &str, to: &str, max_paths: usize, budget: usi
         tentative: false,
     }]);
     while let Some(s) = queue.pop_front() {
-        if report.paths.len() >= max_paths || report.expanded >= budget {
-            report.truncated = !queue.is_empty() || report.expanded >= budget;
+        // 경로 수 한계가 찼으면 남은 큐는 전부 보고 못 한 경로 후보다 —
+        // 상태가 목적지인지 따지기 전에 잘렸다고 표시하고 멈춘다.
+        if report.paths.len() >= max_paths {
+            report.truncated = true;
             break;
         }
         let cur = s.vertices.last().expect("state is never empty").clone();
+        // 목적지 확인이 예산 검사보다 먼저다 — 대기 중인 완성 경로는
+        // 예산을 쓰지 않고 수확한다.
         if cur == to {
             report.paths.push(Path {
                 vertices: s.vertices,
@@ -197,6 +208,12 @@ pub fn paths(doc: &Document, from: &str, to: &str, max_paths: usize, budget: usi
                 tentative: s.tentative,
             });
             continue; // 목적지 도달 — 그 너머는 같은 경로의 연장일 뿐이다.
+        }
+        // 확장 예산은 후속을 펼칠 때만 쓴다 — 목적지 상태가 큐에
+        // 있는데 예산이 찼다고 버리면 있는 경로를 놓친다.
+        if report.expanded >= budget {
+            report.truncated = true;
+            break;
         }
         report.expanded += 1;
         for (nbr, kind, tent) in adj.get(cur.as_str()).into_iter().flatten() {
@@ -212,6 +229,11 @@ pub fn paths(doc: &Document, from: &str, to: &str, max_paths: usize, budget: usi
             next.edges.push(*kind);
             queue.push_back(next);
         }
+    }
+    // 남은 큐가 있으면 처리하지 못한 경로가 있다 — 잘렸다고 표시한다.
+    // max_paths만 차고 큐가 비었으면 자연 종료라 truncated가 아니다.
+    if !queue.is_empty() {
+        report.truncated = true;
     }
     report.found = !report.paths.is_empty();
     report
@@ -713,6 +735,49 @@ mod tests {
         let r4 = paths(&d2, "c::a", "c::c", 1, 10_000);
         assert_eq!(r4.paths.len(), 1);
         assert!(r4.truncated);
+    }
+
+    #[test]
+    fn paths_direct_edge_survives_minimal_budget() {
+        let d = doc();
+        // 직접 간선 a→b는 예산 1로도 찾아야 한다 — 예산은 확장에만
+        // 쓰이고, 큐에 있는 완성 경로의 수확은 예산을 쓰지 않는다.
+        let r = paths(&d, "c::a", "c::b", 10, 1);
+        assert!(r.found && !r.truncated);
+        assert_eq!(
+            r.paths[0].vertices,
+            vec!["c::a".to_string(), "c::b".to_string()]
+        );
+    }
+
+    #[test]
+    fn paths_zero_max_is_truncated_not_silent() {
+        let d = doc();
+        // max=0은 "경로 없음"이 아니라 "보고할 수 없음"이다.
+        let r = paths(&d, "c::a", "c::a", 0, 10);
+        assert!(!r.found && r.truncated && r.paths.is_empty());
+        let r2 = paths(&d, "c::a", "c::b", 0, 10);
+        assert!(!r2.found && r2.truncated);
+    }
+
+    #[test]
+    fn paths_ignores_dangling_intermediate_edges() {
+        // 비형식 문서 — 없는 정점을 가리키는 간선이 끼어 있으면 그
+        // 간선을 따라가 만든 경로는 유령 정점을 품는다. 건너뛴다.
+        let mut d = doc();
+        d.edges
+            .push(Edge::new("c::a".into(), "c::ghost".into(), EdgeKind::Call));
+        d.edges
+            .push(Edge::new("c::ghost".into(), "c::c".into(), EdgeKind::Call));
+        let r = paths(&d, "c::a", "c::c", 10, 10_000);
+        assert!(r.found);
+        // 모든 경로의 정점은 문서에 존재하는 정점뿐이다.
+        let ids = d.vertex_ids();
+        for p in &r.paths {
+            for v in &p.vertices {
+                assert!(ids.contains(v.as_str()), "ghost vertex {v} in path");
+            }
+        }
     }
 
     #[test]
