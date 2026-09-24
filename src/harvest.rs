@@ -820,7 +820,15 @@ fn collect_attr_refs(
     out: &mut Vec<AttrRef>,
 ) {
     let push = |segs: Vec<String>, cfg: &Option<String>, out: &mut Vec<AttrRef>| {
-        if segs.len() >= 2 {
+        if segs.len() >= 2
+            // 도구 네임스페이스 속성(rustfmt·clippy·diagnostic)은 크레이트
+            // 참조가 아니다 — 해석은 항상 실패하니 수집하면 미해석
+            // 카운터만 부푼다.
+            && !matches!(
+                segs[0].as_str(),
+                "rustfmt" | "clippy" | "diagnostic"
+            )
+        {
             out.push(AttrRef {
                 owner: owner.to_string(),
                 mod_decl,
