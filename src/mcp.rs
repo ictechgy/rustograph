@@ -45,9 +45,10 @@ pub struct Server {
     doc: Document,
     /// deps 도구가 cargo metadata를 읽을 워크스페이스 디렉터리.
     dir: PathBuf,
-    /// deps 보고서 — 시작 시 한 번 만든다. 매 요청마다 syn 수확을
-    /// 새로 하면 Box::leak된 AST가 서버 수명 동안 계속 쌓인다.
-    deps_report: Result<String, String>,
+    /// deps 보고서 — 첫 호출 시 한 번 만든다. 매 요청마다 syn 수확을
+    /// 새로 하면 Box::leak된 AST가 서버 수명 동안 계속 쌓이고, 시작
+    /// 시 무조건 수확하면 deps를 안 쓰는 세션도 수확 비용을 치른다.
+    deps_report: std::sync::OnceLock<Result<String, String>>,
     /// rules 도구가 읽을 설정 파일 — 없으면 rules 호출이 isError로 답한다.
     cfg_path: Option<PathBuf>,
     /// 핸드셰이크로 합의한 프로토콜 버전.
@@ -68,13 +69,10 @@ pub(crate) fn cmd(
         Some(f) => Some(PathBuf::from(f)),
         None => find_config(&dir),
     };
-    // deps는 자체 syn 수확으로 문서를 만든다 — 공유 문서는 외부 정점이
-    // 없거나 필터됐을 수 있어 사용 증거로 쓸 수 없다. 시작 시 한 번만.
-    let deps_report = deps::report(&dir).map(|r| export::to_json(&r));
     let srv = Server {
         doc,
         dir,
-        deps_report,
+        deps_report: std::sync::OnceLock::new(),
         cfg_path,
         protocol: "2024-11-05".to_string(),
     };
@@ -260,8 +258,13 @@ impl Server {
                 let max = arg_usize(args, "max")?.unwrap_or(20);
                 Ok(export::to_json(&analysis::search(&self.doc, q, max)))
             }
-            // 시작 시 만든 스냅샷 — 매 호출 수확은 AST 누수를 쌓는다.
-            "rustograph_deps" => self.deps_report.clone(),
+            // 첫 호출에 한 번 수확해 메모한다 — 자체 syn 수확으로
+            // 문서를 만드는 이유는 공유 문서가 외부 정점이 없거나
+            // 필터됐을 수 있어 사용 증거로 못 쓰기 때문이다.
+            "rustograph_deps" => self
+                .deps_report
+                .get_or_init(|| deps::report(&self.dir).map(|r| export::to_json(&r)))
+                .clone(),
             "rustograph_cycles" => {
                 let level = match arg_str(args, "level") {
                     Some(l) => Level::parse(l)
@@ -509,7 +512,7 @@ mod tests {
                 vec![],
             ),
             dir: PathBuf::from("."),
-            deps_report: Err("deps report not computed".to_string()),
+            deps_report: std::sync::OnceLock::new(),
             cfg_path: None,
             protocol: "2024-11-05".to_string(),
         }
