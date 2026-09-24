@@ -318,6 +318,60 @@ mod cli_tests {
     }
 
     #[test]
+    fn invalid_numeric_limits_are_errors() {
+        // 잘못된 한계를 기본값으로 되돌리면 사용자가 준 한계가 무시된다 —
+        // 모두 사용법 오류(2)다.
+        for args in [
+            &[
+                "paths",
+                "fixture_app::main",
+                "fixture_core::entry",
+                "--max",
+                "abc",
+            ][..],
+            &[
+                "paths",
+                "fixture_app::main",
+                "fixture_core::entry",
+                "--budget",
+                "-1",
+            ][..],
+            &["search", "entry", "--max", "1.5"][..],
+            &["query", "fixture_core::entry", "--depth", "x"][..],
+        ] {
+            let (code, _, err) = run(args);
+            assert_eq!(code, 2, "{args:?}: {err}");
+            assert!(err.contains("invalid"), "{args:?}: {err}");
+        }
+        // 올바른 값은 그대로 동작한다.
+        let (code, out, _) = run(&[
+            "paths",
+            "fixture_app::main",
+            "fixture_core::entry",
+            "--max",
+            "1",
+        ]);
+        assert_eq!(code, 0);
+        assert!(out.contains("\"found\": true"));
+    }
+
+    #[test]
+    fn deps_rejects_document_filters() {
+        // deps는 자체 수확을 쓴다 — 필터·저장 그래프·semantic은
+        // 사용 증거를 바꿔 거짓 미사용을 만들 수 있어 거부한다.
+        for args in [
+            &["deps", "--focus", "fixture_app"][..],
+            &["deps", "--target", "x86_64-pc-windows-msvc"][..],
+            &["deps", "--exclude-tests"][..],
+            &["deps", "--semantic"][..],
+        ] {
+            let (code, _, err) = run(args);
+            assert_eq!(code, 2, "{args:?}: {err}");
+            assert!(err.contains("not supported"), "{args:?}: {err}");
+        }
+    }
+
+    #[test]
     fn deps_reports_unused_declared_dep() {
         // fixture_unused는 선언만 됐다 — 미사용 판정이 잡혀야 한다.
         let (code, out, _) = run(&["deps"]);
@@ -403,6 +457,11 @@ mod cli_tests {
             "/nonexistent-xyz.txt",
         ]);
         assert_eq!(code, 2);
+        // baseline 경로가 디렉터리면 NotFound가 아니다 — 설정에서 온
+        // 경로여도 읽기 실패는 조용히 넘기지 않고 오류다.
+        let (code, _, err) = run(&["rules", "--config", &cfgp, "--baseline", "/tmp"]);
+        assert_eq!(code, 2);
+        assert!(err.contains("cannot read baseline"));
         let _ = std::fs::remove_file(&cfg);
         let _ = std::fs::remove_file(&base);
     }
