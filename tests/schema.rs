@@ -281,3 +281,28 @@ fn cli_schema_prints_document_and_writes_out() {
     assert_eq!(written["format"], "bridge-facts");
     let _ = std::fs::remove_file(&out_path);
 }
+
+#[test]
+fn cli_schema_rejects_unsupported_flags() {
+    // schema는 --dir/--out만 쓴다 — 그래프 옵션을 조용히 삼키면
+    // 사용자는 --semantic·--graph 등이 적용됐다고 오해한다.
+    let dir = fixture().display().to_string();
+    for extra in [
+        &["--semantic"][..],
+        &["--graph", "saved.json"][..],
+        &["--level", "symbol"][..],
+        &["--strict"][..],
+        &["--format", "json"][..],
+        &["stray"][..],
+    ] {
+        let mut argv: Vec<String> = vec!["schema".into(), "--dir".into(), dir.clone()];
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        let mut out = Cursor::new(Vec::new());
+        let mut err = Cursor::new(Vec::new());
+        let code = cli::run(&argv, &mut out, &mut err);
+        let err = String::from_utf8_lossy(err.get_ref()).into_owned();
+        assert_eq!(code, 2, "{extra:?}: {err}");
+        assert!(err.contains("not supported"), "{extra:?}: {err}");
+        assert!(out.get_ref().is_empty(), "{extra:?}: no document on error");
+    }
+}
