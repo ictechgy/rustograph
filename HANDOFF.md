@@ -12,8 +12,8 @@ DSL 경로·sea_orm 어트리뷰트에서 relation-use 사실 수확. GLM 리뷰
 3라운드 반영 — 산문 오탐 게이트, 별칭·서브쿼리·`;` 다중 문장·
 GRANT/REVOKE 객체 종류어, 미해석·unlocated 계수, DSL 경로는 선언된
 table! 이름으로만 정적화. isthmus 쪽 계약 확장은 PR #110(rust 플랫폼 +
-relation-use 허용, bridge 구성과 격리)로 머지됐다. `schema`는 v0.2.1
-이후 main 기능이라 발행본에는 없다.
+relation-use 허용, bridge 구성과 격리)로 머지됐다. `schema`는 v0.3.0부터
+발행본에 들어 있다.
 
 persistence 생산자는 현재 다섯 개 — schemagraph(SQL `relation-decl`
 수신 측), gartograph(Go, #11)·rustograph(Rust)·kartograph(Kotlin,
@@ -22,10 +22,14 @@ persistence 생산자는 현재 다섯 개 — schemagraph(SQL `relation-decl`
 수신 측 요건을 채우지 않는다(isthmus #111·#112). 계열 전체의 남은
 후보는 dartograph 생산자·교차 도메인 상관·네트워크 도메인.
 
-**v0.2.1 배포 완료.** https://github.com/ictechgy/rustograph (public),
+**v0.3.0 배포 완료(2026-09-25, PR #19, 태그 2da1fbf).**
+https://github.com/ictechgy/rustograph (public),
 `brew install ictechgy/tap/rustograph`로 설치 가능(brew test 통과).
-v0.2.0도 배포됐으나 자기 분석에서 cli↔mcp 모듈 순환이 잡혀
-인자 파서를 cli_args로 분리한 0.2.1이 최신이다. PR #1~#6 머지됨.
+semantic feature·paths/search/deps/schema·baseline·필터·캐시와 플래그
+거부 동작 변경이 들어가 0.2.2가 아니라 마이너 bump다. 설치된 0.3.0
+바이너리로 verify-cli-contract OK, 자기 분석 `rules`/`cycles --strict` 0.
+이전: v0.2.0은 자기 분석에서 cli↔mcp 모듈 순환이 잡혀 인자 파서를
+cli_args로 분리한 0.2.1로 패치됐다. PR #1~#6 머지됨.
 
 검증 상태: `cargo test` 131개 통과(단위 87 + 통합 29 + schema 15) +
 semantic feature 47개, 커버리지 92.59%(게이트 90, fix/schema-contract
@@ -125,7 +129,11 @@ PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
 ## 다음 단계 (우선순위 순)
 
 1. ~~공개 리포 + 릴리스~~ — 완료. `HOMEBREW_TAP_TOKEN` 리포 시크릿이
-   없어 탭 갱신은 수동으로 했다 — 넣으면 다음 릴리스부터 자동.
+   없어 탭 갱신은 수동으로 했다(0.3.0까지) — 넣으면 다음 릴리스부터 자동.
+   수동 절차: 게시된 checksums.txt를 받아 `shasum -c`로 대조 →
+   release.yml의 sed와 같은 치환으로 Formula/rustograph.rb를 렌더 →
+   탭 main에 `rustograph X.Y.Z` 커밋(기존 관례) → `brew upgrade` 후
+   설치 바이너리로 계약·자기 분석.
 2. ~~MCP 서버~~ — 완료(v0.2.0).
 3. ~~feature/cfg 의존 모델링~~ — 완료: 정점·간선 `cfg` 필드, 여러 cfg는
    `all(...)` 합성, cfg 다른 같은 간선은 별개로 유지.
