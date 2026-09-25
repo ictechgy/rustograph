@@ -14,9 +14,9 @@
 - PR #19 머지 + **v0.3.0 배포** — 태그 → release.yml(5 플랫폼·패키지
   바이너리 계약 검증) → 탭 수동 갱신(tap `d0605f6`) → `brew upgrade`
   설치본으로 계약·자기 분석 재검증. PR #20 머지 — HANDOFF 반영.
-- **PR #21 열림(미머지)** — `fix/cfg-attr-unparsed`. `split_cfg_attr`가
-  `.ok()?`로 삼키던 속성 목록 파싱 실패를 `Harvest.unparsed_attrs`로 세고
-  limitation 한 줄을 낸다. 전체 검증 통과. **사용자 머지 승인 대기.**
+- PR #21 머지 — `fix/cfg-attr-unparsed`. `split_cfg_attr`가 `.ok()?`로
+  삼키던 속성 목록 파싱 실패를 `Harvest.unparsed_attrs`로 세고
+  limitation 한 줄을 낸다. 이 수정은 v0.3.0 이후라 발행본에 없다.
 
 **효과 있던 것.**
 - 새 검사는 수정 전 바이너리/코드로 돌려 실패를 확인(뮤테이션) — 공허한
@@ -35,13 +35,12 @@
   의심했으나 syn 2.0.119는 받는다. 실패는 rustc도 거부하는 입력뿐.
 
 **다음 단계.**
-1. PR #21 CI 확인 후 머지(사용자 승인 필요 — 이전 승인은 이어지지 않는다).
-2. 이 저장소 안의 보류 항목은 없다. 남은 후보는 자매 저장소 일 —
+1. 이 저장소 안의 보류 항목은 없다. 남은 후보는 자매 저장소 일 —
    dartograph persistence 생산자, isthmus 교차 도메인 상관·네트워크
    도메인. 어느 쪽부터 할지 사용자에게 물을 것.
-3. 선택: `deps` 보고서가 harvest limitation(unresolved_paths·
+2. 선택: `deps` 보고서가 harvest limitation(unresolved_paths·
    unparsed_attrs)을 싣지 않는 것은 기존 설계 — 필요 시 별도 설계.
-4. `HOMEBREW_TAP_TOKEN` 시크릿이 들어오면 탭 갱신이 자동화된다.
+3. `HOMEBREW_TAP_TOKEN` 시크릿이 들어오면 탭 갱신이 자동화된다.
 
 ## 현재 상태 (2026-09-25)
 
@@ -219,7 +218,7 @@ PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
    상세는 위 "현재 상태" 첫 단락 참고. 후속(fix/schema-contract):
    schema는 --dir/--out 외 플래그·위치 인자를 허용 목록으로 거부(2)하고,
    verify-cli-contract가 종료 코드와 target null/persistence 계약을 본다.
-8. ~~`split_cfg_attr` 미계수~~ — PR #21(fix/cfg-attr-unparsed).
+8. ~~`split_cfg_attr` 미계수~~ — 완료. PR #21 머지됨.
 9. 다음 우선순위는 사용자가 정한다(위 "직전 세션 요약"의 다음 단계).
    Codex 3차 리뷰는 사용량 한도로 GLM 리뷰가 역할을 대신했다.
 
