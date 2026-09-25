@@ -79,6 +79,13 @@ fn run_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Resul
 /// `schema` — isthmus persistence 도메인의 bridge-facts 문서를 낸다.
 /// 그래프 문서가 아니라 교환 문서라 export 직렬화만 재사용한다.
 fn cmd_schema(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    // 교환 문서는 그래프 옵션(--semantic·--graph·--level 등)과 무관하다 —
+    // 조용히 무시하면 사용자가 옵션이 적용됐다고 오해한다.
+    if let Some(bad) = a.unsupported(&["dir", "out"]) {
+        return Err(format!(
+            "schema takes only --dir and --out — {bad} is not supported"
+        ));
+    }
     let dir = PathBuf::from(a.get("dir").unwrap_or("."));
     let doc = source::schema::facts(&dir, VERSION)?;
     let text = export::to_json(&doc);

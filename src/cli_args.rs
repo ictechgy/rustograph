@@ -34,6 +34,19 @@ impl Args {
     pub(crate) fn has(&self, key: &str) -> bool {
         self.flags.contains(key)
     }
+    /// `allowed` 밖의 플래그나 위치 인자가 있으면 첫 번째를 사람이 읽는
+    /// 형태로 돌려준다. 거부 목록이 아니라 허용 목록인 이유: 나중에
+    /// 추가되는 플래그가 이 명령에서 조용히 무시되는 일을 막는다.
+    pub(crate) fn unsupported(&self, allowed: &[&str]) -> Option<String> {
+        if let Some(p) = self.positional.first() {
+            return Some(format!("argument {p}"));
+        }
+        self.values
+            .keys()
+            .chain(self.flags.iter())
+            .find(|k| !allowed.contains(&k.as_str()))
+            .map(|k| format!("--{k}"))
+    }
 }
 
 const VALUE_FLAGS: &[&str] = &[
