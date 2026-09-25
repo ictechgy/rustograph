@@ -2,7 +2,48 @@
 
 세션을 이어받는 에이전트가 먼저 읽는 문서입니다.
 
-## 현재 상태 (2026-09-24)
+## 직전 세션 요약 (2026-09-25)
+
+**목표.** HANDOFF의 보류 항목을 정리하고 main에 쌓인 기능을 배포한다.
+
+**진행.**
+- PR #17 머지 — HANDOFF에 persistence 생산자 현황(자매 PR 번호는 gh로 확인).
+- PR #18 머지 — verify-cli-contract에 `schema` 추가. 넣다가 `schema`가
+  `--semantic`·`--graph`·`--level`·위치 인자를 종료 코드 0으로 조용히
+  삼키던 결함을 발견해 허용 목록(`Args::unsupported`)으로 거부(2).
+- PR #19 머지 + **v0.3.0 배포** — 태그 → release.yml(5 플랫폼·패키지
+  바이너리 계약 검증) → 탭 수동 갱신(tap `d0605f6`) → `brew upgrade`
+  설치본으로 계약·자기 분석 재검증. PR #20 머지 — HANDOFF 반영.
+- **PR #21 열림(미머지)** — `fix/cfg-attr-unparsed`. `split_cfg_attr`가
+  `.ok()?`로 삼키던 속성 목록 파싱 실패를 `Harvest.unparsed_attrs`로 세고
+  limitation 한 줄을 낸다. 전체 검증 통과. **사용자 머지 승인 대기.**
+
+**효과 있던 것.**
+- 새 검사는 수정 전 바이너리/코드로 돌려 실패를 확인(뮤테이션) — 공허한
+  테스트를 막는다. 수정 전 바이너리는 `git worktree add <tmp> HEAD~1` +
+  `CARGO_TARGET_DIR` 분리로 빌드했다.
+- 인자 추가 대신 **반환값으로 카운트를 올리는** 배선 — clippy
+  too_many_arguments(>7)와 타입 변경을 피했다.
+- 탭 수동 갱신은 게시된 checksums.txt를 받아 `shasum -c`로 대조한 값만 쓴다.
+
+**안 된 것 / 반복하지 말 것.**
+- zsh에서 `$B $c`로 명령 문자열을 돌리면 단어 분리가 안 돼 전부
+  "unknown command"(2)가 나온다 — 계약 탐침은 `bash -c`로.
+- 세션 시작 시 로컬 main이 origin보다 4커밋 뒤였고 HANDOFF 미커밋
+  수정분이 원격 PR #16과 겹쳤다 — 작업 전 `git fetch` + 비교부터.
+- `split_cfg_attr` 실패 재현에 Rust 2024 `unsafe(...)` 속성을 먼저
+  의심했으나 syn 2.0.119는 받는다. 실패는 rustc도 거부하는 입력뿐.
+
+**다음 단계.**
+1. PR #21 CI 확인 후 머지(사용자 승인 필요 — 이전 승인은 이어지지 않는다).
+2. 이 저장소 안의 보류 항목은 없다. 남은 후보는 자매 저장소 일 —
+   dartograph persistence 생산자, isthmus 교차 도메인 상관·네트워크
+   도메인. 어느 쪽부터 할지 사용자에게 물을 것.
+3. 선택: `deps` 보고서가 harvest limitation(unresolved_paths·
+   unparsed_attrs)을 싣지 않는 것은 기존 설계 — 필요 시 별도 설계.
+4. `HOMEBREW_TAP_TOKEN` 시크릿이 들어오면 탭 갱신이 자동화된다.
+
+## 현재 상태 (2026-09-25)
 
 **feature/schema-facts 머지됨 — PR #15(be116ae).** isthmus persistence
 도메인의 두 번째 코드 생산자로 `rustograph schema`를 추가했다:
@@ -178,10 +219,9 @@ PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
    상세는 위 "현재 상태" 첫 단락 참고. 후속(fix/schema-contract):
    schema는 --dir/--out 외 플래그·위치 인자를 허용 목록으로 거부(2)하고,
    verify-cli-contract가 종료 코드와 target null/persistence 계약을 본다.
-8. 다음 우선순위는 사용자가 정한다. 알려진 보류 항목은 아래
-   "막힌 것 / 주의" 참고 — Codex 3차 리뷰(사용량 한도 — GLM 리뷰가
-   역할을 대신했다). `split_cfg_attr` 미계수는 fix/cfg-attr-unparsed로
-   해소.
+8. ~~`split_cfg_attr` 미계수~~ — PR #21(fix/cfg-attr-unparsed).
+9. 다음 우선순위는 사용자가 정한다(위 "직전 세션 요약"의 다음 단계).
+   Codex 3차 리뷰는 사용량 한도로 GLM 리뷰가 역할을 대신했다.
 
 ## 막힌 것 / 주의
 
@@ -238,6 +278,8 @@ PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
 - 이름 기반 경로 해석은 지역 바인딩을 모른다 — 모듈·타입 이름을 흔한
   지역 변수명(`args` 등)으로 지으면 `let args`가 모듈을 가리키는 가짜
   참조가 생긴다. `cli_args`라는 이름이 그래서다.
+- 셸이 zsh다 — 문자열 변수로 명령을 조립해 실행하면 단어 분리가 안
+  된다. 종료 코드 탐침은 `bash -c`로 돌려라.
 - 릴리스 직후 설치된 바이너리로 자기 분석(`cycles`/`rules --strict`)을
   다시 돌려라 — cli↔mcp 순환은 커밋 시점이 아니라 v0.2.0 배포 바이너리
   검증에서 잡혔고 0.2.1 패치가 됐다.
