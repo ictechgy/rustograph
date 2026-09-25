@@ -27,10 +27,10 @@ persistence 생산자는 현재 다섯 개 — schemagraph(SQL `relation-decl`
 v0.2.0도 배포됐으나 자기 분석에서 cli↔mcp 모듈 순환이 잡혀
 인자 파서를 cli_args로 분리한 0.2.1이 최신이다. PR #1~#6 머지됨.
 
-검증 상태: `cargo test` 130개 통과(단위 87 + 통합 29 + schema 14) +
-semantic feature 47개, 커버리지 92.57%(게이트 90, PR #15 머지
-트리 기준), clippy 클린, verify-cli-contract OK(mcp 9도구 포함 —
-`schema` 명령은 아직 계약 미커버), 자기 분석 `rules --strict` 0 위반 /
+검증 상태: `cargo test` 131개 통과(단위 87 + 통합 29 + schema 15) +
+semantic feature 47개, 커버리지 92.59%(게이트 90, fix/schema-contract
+기준), clippy 클린, verify-cli-contract OK(mcp 9도구 + `schema` 종료
+코드·계약 필드), 자기 분석 `rules --strict` 0 위반 /
 `cycles --strict` 0 — semantic 모드도 동일 0.
 PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
 #13(gitignore) a04c270, a4b576a · **#14(경쟁툴 보완 팩) 머지됨 —
@@ -165,10 +165,12 @@ PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
 7. ~~feature/schema-facts~~ — 완료. PR #15 머지됨(be116ae).
    `source/schema.rs` 신규 + `rustograph schema` 명령으로 isthmus
    persistence 도메인의 bridge-facts v1을 낸다. GLM 리뷰 3라운드 반영.
-   상세는 위 "현재 상태" 첫 단락 참고.
+   상세는 위 "현재 상태" 첫 단락 참고. 후속(fix/schema-contract):
+   schema는 --dir/--out 외 플래그·위치 인자를 허용 목록으로 거부(2)하고,
+   verify-cli-contract가 종료 코드와 target null/persistence 계약을 본다.
 8. 다음 우선순위는 사용자가 정한다. 알려진 보류 항목은 아래
    "막힌 것 / 주의"의 LOW들 참고 — `split_cfg_attr` 미계수,
-   verify-cli-contract의 `schema` 미커버, Codex 3차 리뷰
+   Codex 3차 리뷰
    (사용량 한도 — GLM 리뷰가 역할을 대신했다).
 
 ## 막힌 것 / 주의
