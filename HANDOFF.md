@@ -12,7 +12,15 @@ DSL 경로·sea_orm 어트리뷰트에서 relation-use 사실 수확. GLM 리뷰
 3라운드 반영 — 산문 오탐 게이트, 별칭·서브쿼리·`;` 다중 문장·
 GRANT/REVOKE 객체 종류어, 미해석·unlocated 계수, DSL 경로는 선언된
 table! 이름으로만 정적화. isthmus 쪽 계약 확장은 PR #110(rust 플랫폼 +
-relation-use 허용, bridge 구성과 격리).
+relation-use 허용, bridge 구성과 격리)로 머지됐다. `schema`는 v0.2.1
+이후 main 기능이라 발행본에는 없다.
+
+persistence 생산자는 현재 다섯 개 — schemagraph(SQL `relation-decl`
+수신 측), gartograph(Go, #11)·rustograph(Rust)·kartograph(Kotlin,
+#102)·cartograph(Swift, #136)가 `relation-use`를 낸다. isthmus의 도메인
+판정은 `target === 'persistence'` 기준이며 persistence 문서는 bridge
+수신 측 요건을 채우지 않는다(isthmus #111·#112). 계열 전체의 남은
+후보는 dartograph 생산자·교차 도메인 상관·네트워크 도메인.
 
 **v0.2.1 배포 완료.** https://github.com/ictechgy/rustograph (public),
 `brew install ictechgy/tap/rustograph`로 설치 가능(brew test 통과).
