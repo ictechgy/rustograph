@@ -932,6 +932,12 @@ fn push_limitations(h: &Harvest, limitations: &mut Vec<String>) {
             h.unresolved_paths
         ));
     }
+    if h.unparsed_attrs > 0 {
+        limitations.push(format!(
+            "{} cfg_attr attribute lists could not be parsed; paths inside them are not counted as references",
+            h.unparsed_attrs
+        ));
+    }
     if h.fanned_method_calls > 0 {
         limitations.push(format!(
             "{} method calls resolved by name fan-out (no type information; errs toward alive)",

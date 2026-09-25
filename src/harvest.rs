@@ -23,6 +23,9 @@ pub struct Harvest {
     pub external_macros: usize,
     /// cfg 조건부로 포함한 아이템 수.
     pub cfg_items: usize,
+    /// 속성 목록을 Meta로 읽지 못한 cfg_attr 수 — 안쪽 경로가 참조로
+    /// 잡히지 않았으니 속성으로만 쓰는 dep이 미사용으로 보일 수 있다.
+    pub unparsed_attrs: usize,
 }
 
 /// 한 모듈의 아이템 목록을 정점으로 만든다(1패스 — 선언만).
@@ -328,7 +331,7 @@ pub fn decls<'a>(
                 .map(|i| format!("{module_path}::{i}"))
                 .unwrap_or_else(|| module_path.to_string());
             let mod_decl = matches!(item, syn::Item::Mod(m) if m.content.is_none());
-            collect_attr_refs(
+            harvest.unparsed_attrs += collect_attr_refs(
                 attrs_of(item),
                 &owner,
                 module_path,
@@ -417,7 +420,7 @@ pub fn impls<'a>(
                 (a, Some(b)) => conjoin(a, b.as_str()),
                 (a, None) => a.clone(),
             };
-            collect_attr_refs(
+            harvest.unparsed_attrs += collect_attr_refs(
                 &m.attrs,
                 &mid,
                 &b.items_module,
@@ -811,6 +814,7 @@ fn conjoin(a: &Option<String>, b: &str) -> Option<String> {
 /// 한 세그먼트 이름(test·cfg·derive·allow...)은 내장이거나 임포트로
 /// 이미 잡히므로 두 세그먼트 이상만 모은다. cfg_attr 안쪽 속성은
 /// 그 술어를 cfg로 물려받는다 — 조건 없이 성립한다고 속이면 안 된다.
+/// 반환값: 속성 목록을 읽지 못한 cfg_attr 수(unparsed_attrs로 간다).
 fn collect_attr_refs(
     attrs: &[syn::Attribute],
     owner: &str,
@@ -818,7 +822,8 @@ fn collect_attr_refs(
     mod_decl: bool,
     cfg: &Option<String>,
     out: &mut Vec<AttrRef>,
-) {
+) -> usize {
+    let mut unparsed = 0;
     let push = |segs: Vec<String>, cfg: &Option<String>, out: &mut Vec<AttrRef>| {
         if segs.len() >= 2
             // 도구 네임스페이스 속성(rustfmt·clippy·diagnostic)은 크레이트
@@ -852,21 +857,30 @@ fn collect_attr_refs(
         } else if a.path().is_ident("cfg_attr") {
             // #[cfg_attr(pred, meta, ...)] — 첫 인자는 술어, 나머지는 속성.
             if let syn::Meta::List(l) = &a.meta {
-                if let Some((pred, metas)) = split_cfg_attr(&l.tokens) {
-                    for m in metas {
-                        collect_meta_refs(&m, owner, module, mod_decl, &pred, cfg, out);
+                match split_cfg_attr(&l.tokens) {
+                    Some((pred, Ok(metas))) => {
+                        for m in metas {
+                            unparsed +=
+                                collect_meta_refs(&m, owner, module, mod_decl, &pred, cfg, out);
+                        }
                     }
+                    // 속성 목록이 Meta 문법이 아니면 안쪽 경로를 읽을 수 없다.
+                    Some((_, Err(_))) => unparsed += 1,
+                    // 쉼표 없는 cfg_attr(pred)는 적용할 속성이 없는 형태다.
+                    None => {}
                 }
             }
         } else {
             push(path_segments(a.path()), cfg, out);
         }
     }
+    unparsed
 }
 
 /// cfg_attr 안쪽 메타 하나를 참조로 모은다 — 술어와 아이템 자신의
 /// cfg를 all()로 합성해 단다. `derive(dep::T)` 인자와 중첩 `cfg_attr`도
 /// 재귀로 파낸다 — 그 안의 경로도 실제 참조다.
+/// 반환값: 중첩 cfg_attr 중 속성 목록을 읽지 못한 수.
 fn collect_meta_refs(
     m: &syn::Meta,
     owner: &str,
@@ -875,7 +889,7 @@ fn collect_meta_refs(
     pred: &str,
     cfg: &Option<String>,
     out: &mut Vec<AttrRef>,
-) {
+) -> usize {
     // 이 참조가 성립하는 조건 — 아이템 cfg와 cfg_attr 술어의 합성.
     let cond = conjoin(cfg, pred);
     match m {
@@ -901,11 +915,14 @@ fn collect_meta_refs(
         }
         // 중첩 cfg_attr — 바깥 술어와 안쪽 술어를 둘 다 성립 조건으로 쌓는다.
         syn::Meta::List(l) if l.path.is_ident("cfg_attr") => {
-            if let Some((inner_pred, metas)) = split_cfg_attr(&l.tokens) {
-                for m in metas {
-                    collect_meta_refs(&m, owner, module, mod_decl, &inner_pred, &cond, out);
-                }
-            }
+            return match split_cfg_attr(&l.tokens) {
+                Some((inner_pred, Ok(metas))) => metas
+                    .iter()
+                    .map(|m| collect_meta_refs(m, owner, module, mod_decl, &inner_pred, &cond, out))
+                    .sum(),
+                Some((_, Err(_))) => 1,
+                None => 0,
+            };
         }
         _ => {
             let path = match m {
@@ -925,14 +942,18 @@ fn collect_meta_refs(
             }
         }
     }
+    0
 }
 
 /// cfg_attr의 인자를 (술어 원문, 적용 메타 목록)으로 쪼갠다.
 /// 첫 최상위 쉼표가 술어와 속성의 경계다. 술어는 토큰 원문 그대로
 /// 간다 — `Meta`로 재파싱해 LitStr의 value()를 다시 따옴표로 감싸면
 /// `\\x6c` 같은 이스케이프가 디코드된 채 남아 거짓 조건이 참으로
-/// 뒤집힌다.
-fn split_cfg_attr(tokens: &proc_macro2::TokenStream) -> Option<(String, Vec<syn::Meta>)> {
+/// 뒤집힌다. 속성 목록의 파싱 실패는 Err로 남긴다 — 호출자가 세야
+/// 안쪽 경로의 유실이 limitation으로 드러난다.
+fn split_cfg_attr(
+    tokens: &proc_macro2::TokenStream,
+) -> Option<(String, syn::Result<Vec<syn::Meta>>)> {
     let mut pred_ts = proc_macro2::TokenStream::new();
     let mut rest_ts = proc_macro2::TokenStream::new();
     let mut seen_comma = false;
@@ -953,8 +974,8 @@ fn split_cfg_attr(tokens: &proc_macro2::TokenStream) -> Option<(String, Vec<syn:
     use syn::parse::Parser;
     let metas = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
         .parse2(rest_ts)
-        .ok()?;
-    Some((pred_ts.to_string(), metas.into_iter().collect()))
+        .map(|m| m.into_iter().collect());
+    Some((pred_ts.to_string(), metas))
 }
 
 /// `file:line` 위치 — 아이템의 이름 span 줄을 쓴다.
@@ -1096,6 +1117,7 @@ mod tests {
             panic!("cfg_attr is a list meta")
         };
         let (pred, metas) = split_cfg_attr(&l.tokens).expect("split");
+        let metas = metas.expect("derive(Debug) is a valid meta list");
         // 원문 이스케이프가 남고 디코드된 값이 섞이지 않아야 한다.
         assert!(pred.contains("\\x62"), "predicate lost escape: {pred}");
         assert!(!pred.contains("\"abc\""), "predicate decoded: {pred}");
@@ -1106,5 +1128,24 @@ mod tests {
             panic!("cfg_attr is a list meta")
         };
         assert!(split_cfg_attr(&l2.tokens).is_none());
+    }
+
+    /// 속성 목록이 Meta 문법이 아닌 cfg_attr는 안쪽 경로를 읽을 수 없다 —
+    /// 조용히 버리지 않고 unparsed_attrs로 센다. 중첩 cfg_attr도 같다.
+    /// 정상 목록은 세지 않고 참조를 그대로 모은다.
+    #[test]
+    fn unparsable_cfg_attr_list_is_counted() {
+        let file: syn::File = syn::parse_str(
+            "#[cfg_attr(test, 1 + 2)] fn a() {}
+             #[cfg_attr(unix, cfg_attr(test, 1 + 2))] fn b() {}
+             #[cfg_attr(test, dep::keep)] fn c() {}",
+        )
+        .expect("fixture parses as a file");
+        let groups = [(PathBuf::from("lib.rs"), file.items.as_slice())];
+        let mut h = Harvest::default();
+        let d = decls("k", "k", &groups, &mut h);
+        assert_eq!(h.unparsed_attrs, 2);
+        assert_eq!(d.attr_refs.len(), 1, "valid cfg_attr still harvested");
+        assert_eq!(d.attr_refs[0].path, ["dep", "keep"]);
     }
 }

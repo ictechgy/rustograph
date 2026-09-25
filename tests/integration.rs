@@ -69,6 +69,37 @@ fn orphan_and_cfg_are_measured() {
 }
 
 #[test]
+fn unparsable_cfg_attr_is_measured_and_silent_otherwise() {
+    // 읽지 못한 cfg_attr 속성 목록은 limitation으로 드러나야 한다 —
+    // 안쪽 경로가 참조로 안 잡혀 속성으로만 쓰는 dep이 미사용으로 보인다.
+    // rustc도 거부하는 입력이라 공유 fixture 대신 임시 크레이트를 쓴다.
+    let tmp = std::env::temp_dir().join(format!("rg-cfgattr-{}", std::process::id()));
+    std::fs::create_dir_all(tmp.join("src")).unwrap();
+    std::fs::write(
+        tmp.join("Cargo.toml"),
+        "[package]\nname = \"bad_attr\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.join("src/lib.rs"),
+        "#[cfg_attr(test, 1 + 2)]\npub fn f() {}\n",
+    )
+    .unwrap();
+    let d = source::load(&tmp, &Default::default()).expect("temp crate harvest failed");
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert!(
+        d.limitations
+            .iter()
+            .any(|l| l.starts_with("1 cfg_attr attribute lists could not be parsed")),
+        "{:?}",
+        d.limitations
+    );
+    // 셀 것이 없으면 조용해야 한다.
+    let clean = doc(&Default::default());
+    assert!(!clean.limitations.iter().any(|l| l.contains("cfg_attr")));
+}
+
+#[test]
 fn generated_files_are_marked() {
     let d = doc(&source::Options {
         symbol_level: true,
