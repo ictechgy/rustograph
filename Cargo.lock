@@ -1378,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "rustograph"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "proc-macro2",
  "ra_ap_hir",

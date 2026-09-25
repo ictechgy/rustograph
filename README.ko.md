@@ -37,7 +37,7 @@ Rust에는 `cargo-modules`, `cargo deps`, 그리고 syn/tree-sitter 기반 콜�
 ```bash
 brew install ictechgy/tap/rustograph
 # 또는
-cargo install --git https://github.com/ictechgy/rustograph --tag v0.2.1
+cargo install --git https://github.com/ictechgy/rustograph --tag v0.3.0
 ```
 
 타입 해석 분석은 opt-in `semantic` feature 빌드가 필요합니다
