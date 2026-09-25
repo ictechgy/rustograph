@@ -109,9 +109,37 @@ elif [ "$got" -ne 0 ]; then
 	fails=$((fails+1))
 fi
 
+# schema — isthmus bridge-facts 교환 문서. 종료 코드에 더해 계약 필드를
+# 본다: 사실이 없으면 target은 null이어야 isthmus가 persistence 문서로
+# 오인하지 않는다. 쓰지 않는 플래그는 조용히 삼키지 않고 거부(2)한다.
+check 0 "schema"            schema
+check 2 "schema semantic"   schema --semantic
+check 2 "schema graph"      schema --graph "$FIX/base.txt"
+check 2 "schema level"      schema --level symbol
+check 2 "schema positional" schema stray
+check 2 "schema bad out"    schema --out /nonexistent-xyz/facts.json
+schema_field() { # schema_field <설명> <패턴> <dir>
+	"$BIN" schema --dir "$3" 2>/dev/null | grep -q "$2" || {
+		echo "FAIL $1: missing $2" >&2
+		fails=$((fails+1))
+	}
+}
+cp -R tests/fixture-schema "$FIX/fixture-schema"
+schema_field "schema empty target"  '"target": null'           "$FIX/fixture"
+schema_field "schema format"        '"format": "bridge-facts"' "$FIX/fixture-schema"
+schema_field "schema platform"      '"platform": "rust"'       "$FIX/fixture-schema"
+schema_field "schema target"        '"target": "persistence"'  "$FIX/fixture-schema"
+schema_field "schema relation-use"  '"kind": "relation-use"'   "$FIX/fixture-schema"
+got=0
+"$BIN" schema --dir "$FIX/fixture-schema" --out "$FIX/facts.json" >/dev/null 2>&1 || got=$?
+if [ "$got" -ne 0 ] || ! grep -q '"target": "persistence"' "$FIX/facts.json" 2>/dev/null; then
+	echo "FAIL schema --out: exit $got or document not written" >&2
+	fails=$((fails+1))
+fi
+
 # --dir를 붙이지 않는 검사 — check()는 항상 fixture dir을 뒤에 붙이므로
 # 나쁜 --dir 검증은 마지막 인자가 이기는(last-wins) 구조상 여기서 따로 한다.
-for c in "graph --dir /nonexistent-xyz"; do
+for c in "graph --dir /nonexistent-xyz" "schema --dir /nonexistent-xyz"; do
 	got=0
 	# shellcheck disable=SC2086
 	"$BIN" $c >/dev/null 2>&1 || got=$?
