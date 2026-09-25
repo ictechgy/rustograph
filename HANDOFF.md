@@ -31,8 +31,8 @@ semantic feature·paths/search/deps/schema·baseline·필터·캐시와 플래�
 이전: v0.2.0은 자기 분석에서 cli↔mcp 모듈 순환이 잡혀 인자 파서를
 cli_args로 분리한 0.2.1로 패치됐다. PR #1~#6 머지됨.
 
-검증 상태: `cargo test` 131개 통과(단위 87 + 통합 29 + schema 15) +
-semantic feature 47개, 커버리지 92.59%(게이트 90, fix/schema-contract
+검증 상태: `cargo test` 133개 통과(단위 88 + 통합 30 + schema 15) +
+semantic feature 47개, 커버리지 92.66%(게이트 90, fix/cfg-attr-unparsed
 기준), clippy 클린, verify-cli-contract OK(mcp 9도구 + `schema` 종료
 코드·계약 필드), 자기 분석 `rules --strict` 0 위반 /
 `cycles --strict` 0 — semantic 모드도 동일 0.
@@ -68,7 +68,9 @@ PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
   속성 경로 수확(#[dep::attr]·derive(dep::X)·cfg_attr — dep 사용 증거).
   cfg_attr 술어는 토큰 원문 보존(split_cfg_attr — 이스케이프 디코드로
   조건이 뒤집히는 것 방지), 도구 네임스페이스(rustfmt/clippy/
-  diagnostic) 속성은 수집하지 않는다.
+  diagnostic) 속성은 수집하지 않는다. 속성 목록을 Meta로 못 읽은
+  cfg_attr는 `Harvest.unparsed_attrs`로 세고 limitation 한 줄을 낸다
+  (deps 보고서는 harvest limitation을 싣지 않는다 — 기존 설계).
 - `src/source.rs` — 오케스트레이터. AST arena('static 누수), 루트 병합
   (lib/bin 같은 이름 → extra_files), 보존 루트(main/#[no_mangle]/
   --tests/--retain-public), load(캐시)/harvest 분리, semantic 캐시
@@ -177,9 +179,9 @@ PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
    schema는 --dir/--out 외 플래그·위치 인자를 허용 목록으로 거부(2)하고,
    verify-cli-contract가 종료 코드와 target null/persistence 계약을 본다.
 8. 다음 우선순위는 사용자가 정한다. 알려진 보류 항목은 아래
-   "막힌 것 / 주의"의 LOW들 참고 — `split_cfg_attr` 미계수,
-   Codex 3차 리뷰
-   (사용량 한도 — GLM 리뷰가 역할을 대신했다).
+   "막힌 것 / 주의" 참고 — Codex 3차 리뷰(사용량 한도 — GLM 리뷰가
+   역할을 대신했다). `split_cfg_attr` 미계수는 fix/cfg-attr-unparsed로
+   해소.
 
 ## 막힌 것 / 주의
 
@@ -225,8 +227,9 @@ PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
 - **독립 리뷰 도구.** `packet-ask review --provider glm --diff <ref>`가
   diff를 스크럽해 GLM에 보낸다(패킷만 보고 diff는 실물 repo를 못 본다 —
   발견은 반드시 코드 대조 검증). `codex exec`도 쓰지만 사용량 한도가
-  있다. GLM 리뷰에서 보류된 유일 항목: `split_cfg_attr`의 속성 목록이
-  Meta로 파싱 안 될 때 unresolved_paths 미계수(LOW, 카운터 배선 비용).
+  있다. GLM 리뷰 보류 항목이던 `split_cfg_attr` 미계수는 전용 카운터
+  (unparsed_attrs)로 해소됐다 — syn 2.0.119는 `unsafe(...)`도 Meta로
+  받으므로 rustc도 거부하는 입력에서만 나는 경로다.
 - **deps 보고서의 판정 경계.** `--deps` 문서에만 외부 정점이 있고,
   dev 의존의 사용은 tests/examples/benches(미수확)에 산다 — 둘 다
   증거 불완전이니 finding이 아니라 limitation이다. 외부 패키지명과
