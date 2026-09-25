@@ -40,7 +40,7 @@ over it, with a deterministic JSON contract meant for coding agents:
 ```bash
 brew install ictechgy/tap/rustograph
 # or
-cargo install --git https://github.com/ictechgy/rustograph --tag v0.2.1
+cargo install --git https://github.com/ictechgy/rustograph --tag v0.3.0
 ```
 
 Or from source:

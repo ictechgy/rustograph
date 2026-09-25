@@ -1,6 +1,6 @@
 [package]
 name = "rustograph"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "Queryable dependency graph for Rust codebases — the graph is the artifact; everything else is a query over it"
