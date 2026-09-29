@@ -43,6 +43,19 @@ pub struct RelationFact {
     pub method: Option<String>,
     pub dynamic: bool,
     pub location: BridgeLocation,
+    /// 사실을 감싸는 그래프 정점 — `usr`는 `impact`/`reach`와 같은 정점 ID다.
+    /// 감싸는 정점이 없으면(최상위 매크로 호출·orphan 파일 등) 키가 빠지고
+    /// `missing-relation-usrs:` limitation으로 센다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<FactSymbol>,
+}
+
+/// relation-use 사실의 `symbol` — 계약상 qualifiedName이 필수다.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct FactSymbol {
+    #[serde(rename = "qualifiedName")]
+    pub qualified_name: String,
+    pub usr: String,
 }
 
 /// 계약의 1 기반 소스 위치다 — 열은 UTF-16 코드 단위다.
@@ -51,6 +64,9 @@ pub struct BridgeLocation {
     pub path: String,
     pub line: u32,
     pub column: u32,
+    /// 파일 안 바이트 오프셋 — 직렬화하지 않고 감싸는 정점을 찾는 데만 쓴다.
+    #[serde(skip)]
+    pub byte: usize,
 }
 
 /// 문서를 생산한 도구 식별자다.
@@ -118,6 +134,18 @@ pub fn facts(dir: &Path, tool_version: &str) -> Result<BridgeFactsDocument, Stri
         scan_file(&mut scan, file, src, ast);
     }
     let mut facts = std::mem::take(&mut scan.list);
+    // 감싸는 정점 귀속 — impact와 같은 syn 수확을 돌려 정점 ID와 범위를
+    // 얻는다. 그래프를 못 만들면 사실은 그대로 내되 usr는 싣지 않는다 —
+    // 사실 수확을 그래프 성공에 묶으면 파싱 실패 하나로 문서 전체를 잃는다.
+    let graph = crate::source::owner_spans(dir, &meta);
+    let index = match &graph {
+        Ok((doc, spans)) => Some(OwnerIndex::new(doc, spans)),
+        Err(_) => {
+            scan.graph_failed = true;
+            None
+        }
+    };
+    scan.missing_usrs = attach_symbols(&mut facts, &root, index.as_ref());
     facts.sort_by(fact_cmp);
     let limitations = scan.limitations();
     Ok(BridgeFactsDocument {
@@ -139,6 +167,64 @@ pub fn facts(dir: &Path, tool_version: &str) -> Result<BridgeFactsDocument, Stri
         facts,
         limitations,
     })
+}
+
+/// 파일별 정점 범위 색인 — 그래프에 실제로 있는 정점 ID만 담는다.
+struct OwnerIndex {
+    by_file: BTreeMap<PathBuf, Vec<(std::ops::Range<usize>, String)>>,
+}
+
+impl OwnerIndex {
+    /// 범위의 파일 경로를 정규화해 사실 경로(정규화된 루트 기준)와 맞춘다.
+    /// 정점 집합에 없는 ID는 버린다 — usr는 그래프 정점이어야 한다.
+    fn new(doc: &crate::graph::Document, spans: &[crate::harvest::OwnerSpan]) -> OwnerIndex {
+        let ids = doc.vertex_ids();
+        let mut canon: BTreeMap<&Path, PathBuf> = BTreeMap::new();
+        let mut by_file: BTreeMap<PathBuf, Vec<(std::ops::Range<usize>, String)>> = BTreeMap::new();
+        for sp in spans {
+            if !ids.contains(sp.id.as_str()) || sp.range.is_empty() {
+                continue;
+            }
+            let file = canon
+                .entry(sp.file.as_path())
+                .or_insert_with(|| sp.file.canonicalize().unwrap_or_else(|_| sp.file.clone()))
+                .clone();
+            by_file
+                .entry(file)
+                .or_default()
+                .push((sp.range.clone(), sp.id.clone()));
+        }
+        OwnerIndex { by_file }
+    }
+
+    /// 바이트 오프셋을 감싸는 가장 안쪽 정점이다. 같은 범위의 후보가
+    /// 여럿이면(cfg 변형은 ID가 같다) 사전순 첫 ID로 결정적으로 고른다.
+    fn owner(&self, file: &Path, byte: usize) -> Option<&str> {
+        self.by_file
+            .get(file)?
+            .iter()
+            .filter(|(r, _)| r.start <= byte && byte < r.end)
+            .min_by(|(ra, ia), (rb, ib)| (ra.len(), ia).cmp(&(rb.len(), ib)))
+            .map(|(_, id)| id.as_str())
+    }
+}
+
+/// 사실마다 감싸는 그래프 정점을 symbol로 단다. 못 단 사실 수를 돌려준다.
+fn attach_symbols(facts: &mut [RelationFact], root: &Path, index: Option<&OwnerIndex>) -> usize {
+    let mut missing = 0;
+    for f in facts.iter_mut() {
+        let file = root.join(&f.location.path);
+        match index.and_then(|ix| ix.owner(&file, f.location.byte)) {
+            Some(id) => {
+                f.symbol = Some(FactSymbol {
+                    qualified_name: id.to_string(),
+                    usr: id.to_string(),
+                })
+            }
+            None => missing += 1,
+        }
+    }
+    missing
 }
 
 /// 워크스페이스 멤버 각 패키지 루트 아래의 .rs 파일 목록이다 —
@@ -241,6 +327,8 @@ struct SchemaScan {
     unresolved_diesel: usize,              // 선언 이름과 맞지 않는 DSL 모양 경로 수
     unlocated: usize,                      // span을 위치로 변환하지 못해 버린 사실 수
     dynamic: usize,                        // 리터럴로 읽히지 않아 조인 불가한 SQL 인자 수
+    missing_usrs: usize,                   // 감싸는 그래프 정점이 없어 usr를 못 단 사실 수
+    graph_failed: bool,                    // 심볼 그래프 수확 자체가 실패했는가
     diesel_tables: BTreeSet<String>,       // 워크스페이스의 diesel 선언 이름
     latest: Option<std::time::SystemTime>, // 읽은 소스의 최신 mtime
     seen: BTreeSet<String>,
@@ -490,6 +578,7 @@ impl<'ast> FileCtx<'ast> {
                     method: None,
                     dynamic: false,
                     location: loc.clone(),
+                    symbol: None,
                 });
                 for (col, span) in columns {
                     match self.scan_locate(span) {
@@ -499,6 +588,7 @@ impl<'ast> FileCtx<'ast> {
                             method: Some(col),
                             dynamic: false,
                             location: cloc,
+                            symbol: None,
                         }),
                         None => self.scan.unlocated += 1,
                     }
@@ -674,6 +764,7 @@ impl<'ast> FileCtx<'ast> {
             method: None,
             dynamic: false,
             location: loc.clone(),
+            symbol: None,
         });
         if let Some(col) = column {
             self.scan.push(RelationFact {
@@ -682,6 +773,7 @@ impl<'ast> FileCtx<'ast> {
                 method: Some(col),
                 dynamic: false,
                 location: loc,
+                symbol: None,
             });
         }
     }
@@ -735,6 +827,7 @@ impl<'ast> FileCtx<'ast> {
             method: None,
             dynamic: false,
             location: rloc,
+            symbol: None,
         });
         for f in &st.fields {
             let mut col: Option<MetaVal> = None;
@@ -768,6 +861,7 @@ impl<'ast> FileCtx<'ast> {
                     method: Some(column),
                     dynamic: false,
                     location: cloc,
+                    symbol: None,
                 }),
                 None => self.scan.unlocated += 1,
             }
@@ -1056,6 +1150,7 @@ impl SchemaScan {
                 method: None,
                 dynamic: false,
                 location: loc.clone(),
+                symbol: None,
             });
         }
         if unresolved {
@@ -1103,6 +1198,7 @@ impl SchemaScan {
             dynamic: true,
             method: None,
             location: loc,
+            symbol: None,
         });
     }
 
@@ -1153,6 +1249,7 @@ impl SchemaScan {
             path: rel.to_string_lossy().replace('\\', "/"),
             line: start.line as u32,
             column,
+            byte: span.byte_range().start,
         })
     }
 
@@ -1187,6 +1284,19 @@ impl SchemaScan {
             out.push(format!(
                 "unlocated-references: {} extracted reference(s) had no resolvable source span",
                 self.unlocated
+            ));
+        }
+        if self.missing_usrs > 0 {
+            // isthmus 체인 전용 접두사다 — trace가 이 사실에서 핸들러 도달로
+            // 이어 가지 못한다는 뜻이고 check 심각도에는 영향이 없다.
+            let why = if self.graph_failed {
+                "the symbol graph could not be harvested"
+            } else {
+                "they sit outside any graph item (top-level macro invocations such as table!, files outside the module tree)"
+            };
+            out.push(format!(
+                "missing-relation-usrs: {} relation-use fact(s) carry no symbol.usr; {why}",
+                self.missing_usrs
             ));
         }
         if self.dynamic > 0 {
@@ -2131,5 +2241,96 @@ mod tests {
         assert!(meta_name_value(&attr, &["diesel"], "rename").is_none());
         let attr: syn::Attribute = syn::parse_quote!(#[diesel(check_for_backend(Pg))]);
         assert!(meta_name_value(&attr, &["diesel"], "table_name").is_none());
+    }
+
+    /// 사실 하나 — 귀속 테스트용.
+    fn fact_at(path: &str, byte: usize) -> RelationFact {
+        RelationFact {
+            kind: "relation-use",
+            channel: "t".into(),
+            method: None,
+            dynamic: false,
+            location: BridgeLocation {
+                path: path.into(),
+                line: 1,
+                column: 1,
+                byte,
+            },
+            symbol: None,
+        }
+    }
+
+    #[test]
+    fn owner_index_picks_innermost_vertex_and_skips_non_vertices() {
+        let doc = crate::graph::document(
+            crate::graph::Level::Symbol,
+            ".".into(),
+            None,
+            vec![],
+            ["c::T", "c::T::m"]
+                .iter()
+                .map(|id| crate::graph::Vertex {
+                    id: id.to_string(),
+                    kind: crate::graph::Kind::Fn,
+                    krate: "c".into(),
+                    module: "c".into(),
+                    position: None,
+                    exported: false,
+                    generated: false,
+                    cfg: None,
+                    unsafe_: false,
+                })
+                .collect(),
+            vec![],
+            vec![],
+        );
+        let file = PathBuf::from("/nonexistent-root/src/lib.rs");
+        let span = |id: &str, r: std::ops::Range<usize>| crate::harvest::OwnerSpan {
+            id: id.into(),
+            file: file.clone(),
+            range: r,
+        };
+        let spans = vec![
+            span("c::T", 0..100),
+            span("c::T::m", 10..20),
+            // 정점이 아닌 ID는 usr가 될 수 없다.
+            span("c::Ghost", 30..40),
+        ];
+        let ix = OwnerIndex::new(&doc, &spans);
+        let root = Path::new("/nonexistent-root");
+        let mut facts = vec![
+            fact_at("src/lib.rs", 15),
+            fact_at("src/lib.rs", 35),
+            fact_at("src/lib.rs", 150),
+            fact_at("src/other.rs", 15),
+        ];
+        let missing = attach_symbols(&mut facts, root, Some(&ix));
+        let usrs: Vec<Option<&str>> = facts
+            .iter()
+            .map(|f| f.symbol.as_ref().map(|s| s.usr.as_str()))
+            .collect();
+        assert_eq!(usrs, vec![Some("c::T::m"), Some("c::T"), None, None]);
+        assert_eq!(missing, 2);
+        // 그래프가 없으면 전부 못 단다.
+        let mut facts = vec![fact_at("src/lib.rs", 15)];
+        assert_eq!(attach_symbols(&mut facts, root, None), 1);
+    }
+
+    #[test]
+    fn missing_usr_limitation_names_the_cause() {
+        let mut scan = SchemaScan {
+            missing_usrs: 3,
+            ..Default::default()
+        };
+        assert!(scan
+            .limitations()
+            .iter()
+            .any(|l| l.starts_with("missing-relation-usrs: 3 ")
+                && l.contains("outside any graph item")));
+        scan.graph_failed = true;
+        assert!(scan
+            .limitations()
+            .iter()
+            .any(|l| l.contains("could not be harvested")));
     }
 }

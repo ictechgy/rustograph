@@ -306,3 +306,127 @@ fn cli_schema_rejects_unsupported_flags() {
         assert!(out.get_ref().is_empty(), "{extra:?}: no document on error");
     }
 }
+
+/// 같은 워크스페이스의 심볼 그래프 정점 ID — impact·reach가 쓰는 id 공간이다.
+fn graph_ids() -> std::collections::BTreeSet<String> {
+    let g = rustograph::source::load(
+        &fixture(),
+        &rustograph::source::Options {
+            symbol_level: true,
+            ..Default::default()
+        },
+    )
+    .expect("graph harvest failed");
+    g.vertices.into_iter().map(|v| v.id).collect()
+}
+
+#[test]
+fn every_usr_is_a_graph_vertex() {
+    // usr는 isthmus가 순회 문서의 id와 문자열 그대로 잇는다 — 그래프에
+    // 없는 문자열이면 trace가 사실을 핸들러 도달과 영영 잇지 못한다.
+    let d = doc();
+    let ids = graph_ids();
+    let mut with_usr = 0;
+    for f in d["facts"].as_array().unwrap() {
+        let Some(sym) = f.get("symbol") else { continue };
+        let usr = sym["usr"].as_str().expect("symbol carries usr");
+        assert!(ids.contains(usr), "usr {usr} is not a graph vertex");
+        assert_eq!(sym["qualifiedName"].as_str(), Some(usr));
+        with_usr += 1;
+    }
+    assert!(with_usr > 30, "most facts must carry a usr, got {with_usr}");
+}
+
+/// (경로 접미사, 채널, 컬럼)의 첫 사실이 싣는 usr.
+fn usr_of(
+    d: &serde_json::Value,
+    path: &str,
+    channel: &str,
+    method: Option<&str>,
+) -> Option<String> {
+    let f = d["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| {
+            f["location"]["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with(path))
+                && f["channel"].as_str() == Some(channel)
+                && f["method"].as_str() == method
+        })
+        .unwrap_or_else(|| panic!("fact {channel} {method:?} not found"));
+    f.get("symbol")
+        .map(|s| s["usr"].as_str().unwrap().to_string())
+}
+
+#[test]
+fn usr_follows_the_enclosing_graph_item() {
+    let d = doc();
+    let lib = "src/lib.rs";
+    let cases: &[(&str, Option<&str>, Option<&str>)] = &[
+        // 함수 본문.
+        ("app.orders", None, Some("schema_app::find_user")),
+        // 인라인 모듈 안 함수.
+        ("flagged_t", None, Some("schema_app::unimported::f")),
+        // 고유 impl 메서드와 트레이트 impl 메서드(`Type::<Trait>::m`).
+        ("repo_items", None, Some("schema_app::Repo::list")),
+        (
+            "loaded_items",
+            None,
+            Some("schema_app::Repo::<Loader>::load"),
+        ),
+        // 트레이트 기본 메서드.
+        (
+            "loader_defaults",
+            None,
+            Some("schema_app::Loader::fallback"),
+        ),
+        // 메서드 밖 연관 상수는 self 타입.
+        ("repo_consts", None, Some("schema_app::Repo")),
+        // 모듈 수준 const 초기화식.
+        ("public.members", None, Some("schema_app::LIST_SQL")),
+        // 구조체 어트리뷰트·필드 컬럼은 구조체 정점.
+        ("users", Some("nick_name"), Some("schema_app::User")),
+        ("sea_only", Some("id"), Some("schema_app::SeaOnly")),
+        // cfg(test) 모듈도 그래프 정점이다(조건은 정점의 cfg로 남는다).
+        (
+            "test_only_t",
+            None,
+            Some("schema_app::tests::reads_fixture_table"),
+        ),
+        // 최상위 table! 매크로 호출은 감싸는 정점이 없다.
+        ("public.users", Some("name"), None),
+    ];
+    for (channel, method, want) in cases {
+        assert_eq!(
+            usr_of(&d, lib, channel, *method).as_deref(),
+            *want,
+            "usr of {channel} {method:?}"
+        );
+    }
+    // mod 선언이 없는 orphan 파일은 그래프 밖이다.
+    assert_eq!(usr_of(&d, "src/orphan.rs", "orphan_t", None), None);
+}
+
+#[test]
+fn facts_without_usr_are_counted_as_missing() {
+    let d = doc();
+    let missing = d["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f.get("symbol").is_none())
+        .count();
+    assert!(missing > 0);
+    let want = format!("missing-relation-usrs: {missing} relation-use fact(s)");
+    assert!(
+        d["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l.as_str().is_some_and(|s| s.starts_with(&want))),
+        "limitations must count {missing} facts without usr: {}",
+        d["limitations"]
+    );
+}
