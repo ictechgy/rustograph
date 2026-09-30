@@ -1,0 +1,745 @@
+{
+  "fixture": "axum07",
+  "framework": "axum 0.7.9 (matchit 0.7.3)",
+  "dispatch": "specificity",
+  "verifiedFacts": [
+    {
+      "method": "GET",
+      "channel": "/api",
+      "pathAnchor": "root",
+      "trailingSlash": "strict",
+      "usr": "axum07_app::api_root"
+    },
+    {
+      "method": "POST",
+      "channel": "/api/echo",
+      "pathAnchor": "root",
+      "trailingSlash": "strict",
+      "usr": "axum07_app::api_echo"
+    },
+    {
+      "method": "GET",
+      "channel": "/f/{}",
+      "pathAnchor": "root",
+      "trailingSlash": "strict",
+      "usr": "axum07_app::json_named"
+    },
+    {
+      "method": "GET",
+      "channel": "/files/{**}",
+      "pathAnchor": "root",
+      "usr": "axum07_app::files"
+    },
+    {
+      "method": "GET",
+      "channel": "/items/{}",
+      "pathAnchor": "root",
+      "trailingSlash": "strict",
+      "usr": "axum07_app::items_show"
+    },
+    {
+      "method": "PATCH",
+      "channel": "/items/{}",
+      "pathAnchor": "root",
+      "trailingSlash": "strict",
+      "usr": "axum07_app::items_patch"
+    },
+    {
+      "method": "GET",
+      "channel": "/orders//lines",
+      "pathAnchor": "root",
+      "trailingSlash": "strict",
+      "usr": "axum07_app::order_lines"
+    },
+    {
+      "method": "GET",
+      "channel": "/orders/{}/lines",
+      "pathAnchor": "root",
+      "trailingSlash": "strict",
+      "usr": "axum07_app::order_lines"
+    },
+    {
+      "method": "ANY",
+      "channel": "/svc",
+      "pathAnchor": "root",
+      "trailingSlash": "strict"
+    },
+    {
+      "method": "GET",
+      "channel": "/user_{}",
+      "pathAnchor": "root",
+      "trailingSlash": "strict",
+      "usr": "axum07_app::user_prefixed"
+    },
+    {
+      "method": "GET",
+      "channel": "/x_/y",
+      "pathAnchor": "root",
+      "trailingSlash": "strict",
+      "usr": "axum07_app::x_prefixed"
+    },
+    {
+      "method": "GET",
+      "channel": "/x_{}/y",
+      "pathAnchor": "root",
+      "trailingSlash": "strict",
+      "usr": "axum07_app::x_prefixed"
+    }
+  ],
+  "unprobed": [],
+  "failedFacts": [],
+  "precision": {
+    "passed": 14,
+    "total": 14
+  },
+  "recall": {
+    "passed": 11,
+    "total": 11
+  },
+  "negatives": {
+    "passed": 6,
+    "total": 6
+  },
+  "trailingSlash": {
+    "passed": 13,
+    "total": 13
+  },
+  "probes": [
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/api",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::api_root"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::api_root"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "GET",
+      "path": "/api/",
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "POST",
+      "path": "/api/echo",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::api_echo"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::api_echo"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "POST",
+      "path": "/api/echo/",
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/f/x1",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::json_named"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::json_named"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "GET",
+      "path": "/f/x1/",
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/files/a/b",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::files"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::files"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/items/x1",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::items_show"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::items_show"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "GET",
+      "path": "/items/x1/",
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "PATCH",
+      "path": "/items/x1",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::items_patch"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::items_patch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "PATCH",
+      "path": "/items/x1/",
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/orders//lines",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::order_lines"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::order_lines"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "GET",
+      "path": "/orders//lines/",
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/orders/x1/lines",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::order_lines"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::order_lines"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "GET",
+      "path": "/orders/x1/lines/",
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/svc",
+      "predicted": {
+        "kind": "Unnamed"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Other",
+        "body": "service"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "GET",
+      "path": "/svc/",
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "POST",
+      "path": "/svc",
+      "predicted": {
+        "kind": "Unnamed"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Other",
+        "body": "service"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "POST",
+      "path": "/svc/",
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "DELETE",
+      "path": "/svc",
+      "predicted": {
+        "kind": "Unnamed"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Other",
+        "body": "service"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "DELETE",
+      "path": "/svc/",
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/user_x1",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::user_prefixed"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::user_prefixed"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "GET",
+      "path": "/user_x1/",
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/x_/y",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::x_prefixed"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::x_prefixed"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "GET",
+      "path": "/x_/y/",
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/x_x1/y",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::x_prefixed"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::x_prefixed"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "GET",
+      "path": "/x_x1/y/",
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/items/5",
+      "truth": "axum07_app::items_show",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::items_show"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::items_show"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "PATCH",
+      "path": "/items/5",
+      "truth": "axum07_app::items_patch",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::items_patch"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::items_patch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/files/a/b",
+      "truth": "axum07_app::files",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::files"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::files"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/user_42",
+      "truth": "axum07_app::user_prefixed",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::user_prefixed"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::user_prefixed"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/f/report.json",
+      "truth": "axum07_app::json_named",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::json_named"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::json_named"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/f/report",
+      "truth": "axum07_app::json_named",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::json_named"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::json_named"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/api",
+      "truth": "axum07_app::api_root",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::api_root"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::api_root"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "POST",
+      "path": "/api/echo",
+      "truth": "axum07_app::api_echo",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::api_echo"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::api_echo"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/orders//lines",
+      "truth": "axum07_app::order_lines",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::order_lines"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::order_lines"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/x_/y",
+      "truth": "axum07_app::x_prefixed",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::x_prefixed"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::x_prefixed"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/x_1/y",
+      "truth": "axum07_app::x_prefixed",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "axum07_app::x_prefixed"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "axum07_app::x_prefixed"
+      },
+      "pass": true
+    },
+    {
+      "kind": "negative",
+      "method": "GET",
+      "path": "/files",
+      "truth": null,
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "negative",
+      "method": "GET",
+      "path": "/files/",
+      "truth": null,
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "negative",
+      "method": "GET",
+      "path": "/user_",
+      "truth": null,
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "negative",
+      "method": "GET",
+      "path": "/api/",
+      "truth": null,
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "negative",
+      "method": "GET",
+      "path": "/items/5/",
+      "truth": null,
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "negative",
+      "method": "POST",
+      "path": "/items/5",
+      "truth": null,
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 405,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    }
+  ]
+}

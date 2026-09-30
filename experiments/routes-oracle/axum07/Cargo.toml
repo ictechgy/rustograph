@@ -1,0 +1,23 @@
+[package]
+name = "oracle-axum07"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# lib은 fixture 소스 그대로다 — 오라클이 요청을 보내는 라우터와 rustograph가
+# 읽은 선언이 같은 코드에서 나온다.
+[lib]
+name = "axum07_app"
+path = "../../../tests/fixture-routes/axum07/axum07_app/src/lib.rs"
+
+[[bin]]
+name = "oracle-axum07"
+path = "src/main.rs"
+
+[dependencies]
+oracle-common = { path = "../common" }
+axum = "=0.7.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+serde_json = "1"
