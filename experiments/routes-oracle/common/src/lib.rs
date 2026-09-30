@@ -24,13 +24,20 @@ pub struct Fact {
     pub usr: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub narrowed: bool,
-    #[serde(rename = "paramConstraints", skip_serializing_if = "Vec::is_empty", default)]
+    #[serde(
+        rename = "paramConstraints",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
     pub constraints: Vec<(usize, String, Option<String>)>,
 }
 
 /// routes 문서에서 정적 사실을 읽는다(dynamic 제외).
 pub fn load_facts(doc: &Value) -> (String, Vec<Fact>) {
-    let dispatch = doc["dispatch"].as_str().unwrap_or("specificity").to_string();
+    let dispatch = doc["dispatch"]
+        .as_str()
+        .unwrap_or("specificity")
+        .to_string();
     let mut out = Vec::new();
     for f in doc["facts"].as_array().into_iter().flatten() {
         if f["dynamic"].as_bool() == Some(true) {
@@ -41,10 +48,13 @@ pub fn load_facts(doc: &Value) -> (String, Vec<Fact>) {
             channel: f["channel"].as_str().unwrap_or_default().to_string(),
             path_anchor: f["pathAnchor"].as_str().unwrap_or_default().to_string(),
             trailing_slash: f["trailingSlash"].as_str().map(str::to_string),
-            order: f.get("order").and_then(|o| {
-                Some((o["group"].as_str()?.to_string(), o["index"].as_u64()?))
-            }),
-            usr: f.pointer("/symbol/usr").and_then(Value::as_str).map(str::to_string),
+            order: f
+                .get("order")
+                .and_then(|o| Some((o["group"].as_str()?.to_string(), o["index"].as_u64()?))),
+            usr: f
+                .pointer("/symbol/usr")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             narrowed: f["narrowed"].as_bool().unwrap_or(false),
             constraints: f["paramConstraints"]
                 .as_array()
@@ -105,7 +115,11 @@ pub enum Actual {
 }
 
 /// 요청 계획 — 사실마다 표본 경로, 끝 슬래시 뒤집기, 기대·음성 요청.
-pub fn plan(facts: &[Fact], expected: &[(&str, &str, &str)], negatives: &[(&str, &str)]) -> Vec<Probe> {
+pub fn plan(
+    facts: &[Fact],
+    expected: &[(&str, &str, &str)],
+    negatives: &[(&str, &str)],
+) -> Vec<Probe> {
     let mut out = Vec::new();
     for (i, f) in facts.iter().enumerate() {
         if f.path_anchor != "root" {
@@ -177,7 +191,9 @@ pub fn sample(f: &Fact) -> String {
                 let value = match f.constraints.iter().find(|c| c.0 == i) {
                     Some((_, k, _)) if k == "int" => "7".to_string(),
                     Some((_, k, _)) if k == "slug" => "ab-c".to_string(),
-                    Some((_, k, _)) if k == "uuid" => "123e4567-e89b-12d3-a456-426614174000".to_string(),
+                    Some((_, k, _)) if k == "uuid" => {
+                        "123e4567-e89b-12d3-a456-426614174000".to_string()
+                    }
                     Some((_, _, Some(p))) => regex_sample(p),
                     _ => "x1".to_string(),
                 };
@@ -193,11 +209,19 @@ pub fn sample(f: &Fact) -> String {
 /// 정규식 제약을 만족하는 후보 값.
 fn regex_sample(p: &str) -> String {
     let re = Regex::new(&format!("^(?:{p})$")).expect("constraint regex compiles");
-    ["7", "abc", "ab-c", "a.b", "x1", "A1", "123e4567-e89b-12d3-a456-426614174000"]
-        .iter()
-        .find(|c| re.is_match(c))
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "x1".to_string())
+    [
+        "7",
+        "abc",
+        "ab-c",
+        "a.b",
+        "x1",
+        "A1",
+        "123e4567-e89b-12d3-a456-426614174000",
+    ]
+    .iter()
+    .find(|c| re.is_match(c))
+    .map(|c| c.to_string())
+    .unwrap_or_else(|| "x1".to_string())
 }
 
 /// 사실 템플릿이 요청 경로와 맞는가(끝 슬래시 optional이면 양쪽 형태).
@@ -287,7 +311,9 @@ fn ranks(f: &Fact) -> Vec<u8> {
 
 /// 사실만으로 요청을 받을 핸들러를 고른다.
 pub fn predict(facts: &[Fact], dispatch: &str, method: &str, path: &str) -> Predicted {
-    let method_ok = |f: &Fact| f.method == method || f.method == "ANY" || (method == "HEAD" && f.method == "GET");
+    let method_ok = |f: &Fact| {
+        f.method == method || f.method == "ANY" || (method == "HEAD" && f.method == "GET")
+    };
     let mut cands: Vec<&Fact> = facts
         .iter()
         .filter(|f| f.path_anchor == "root" && method_ok(f) && matches(f, path))
@@ -391,15 +417,21 @@ pub fn evaluate(
         }
     }
     let mut failed: BTreeSet<usize> = BTreeSet::new();
-    let (mut precision, mut recall, mut negatives, mut trailing) =
-        (Tally::default(), Tally::default(), Tally::default(), Tally::default());
+    let (mut precision, mut recall, mut negatives, mut trailing) = (
+        Tally::default(),
+        Tally::default(),
+        Tally::default(),
+        Tally::default(),
+    );
     let mut probes = Vec::new();
     for (probe, status, body) in results {
         let predicted = predict(facts, dispatch, &probe.method, &probe.path);
         let act = actual(status, &body, &known);
         let pass = match &probe.truth {
             // 기대 요청: 실제가 기대 핸들러이고 사실 예측도 같아야 한다(재현율).
-            Some(Some(h)) => act == Actual::Handler(h.clone()) && predicted == Predicted::Handler(h.clone()),
+            Some(Some(h)) => {
+                act == Actual::Handler(h.clone()) && predicted == Predicted::Handler(h.clone())
+            }
             // 음성 요청: 실제로 닿지 않고 사실도 아무것도 주장하지 않는다.
             Some(None) => act == Actual::NoMatch && predicted == Predicted::None,
             None => agrees(&predicted, &act),
@@ -429,7 +461,10 @@ pub fn evaluate(
     let mut failed_facts = Vec::new();
     for (i, f) in facts.iter().enumerate() {
         if f.path_anchor != "root" {
-            unprobed.push((f.clone(), "pathAnchor base: the router is not mounted on the served app".to_string()));
+            unprobed.push((
+                f.clone(),
+                "pathAnchor base: the router is not mounted on the served app".to_string(),
+            ));
         } else if failed.contains(&i) {
             failed_facts.push(f.clone());
         } else {
@@ -454,7 +489,10 @@ pub fn evaluate(
 /// 명령행: `<routes 문서 경로> <기록 출력 경로>`.
 pub fn io_paths() -> (String, String) {
     let args: Vec<String> = std::env::args().collect();
-    assert!(args.len() == 3, "usage: oracle <routes.json> <recording.json>");
+    assert!(
+        args.len() == 3,
+        "usage: oracle <routes.json> <recording.json>"
+    );
     (args[1].clone(), args[2].clone())
 }
 

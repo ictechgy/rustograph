@@ -29,7 +29,10 @@ pub async fn trailing() -> &'static str {
     "axum_app::handlers::trailing"
 }
 pub async fn api_fallback() -> (axum::http::StatusCode, &'static str) {
-    (axum::http::StatusCode::NOT_FOUND, "axum_app::handlers::api_fallback")
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        "axum_app::handlers::api_fallback",
+    )
 }
 pub async fn admin_stats() -> &'static str {
     "axum_app::handlers::admin_stats"

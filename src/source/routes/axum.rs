@@ -13,8 +13,8 @@
 
 use super::common::{
     handler_ref, is_api, pat_ident, path_arg, prefix_template, unevaluated_constructors, Anchor,
-    Ctx, Decl, DeclPath, FnSite,
-    Handler, HandlerRef, Imports, JPath, Loc, Output, PathArg, ScopeSpec, Trailing,
+    Ctx, Decl, DeclPath, FnSite, Handler, HandlerRef, Imports, JPath, Loc, Output, PathArg,
+    ScopeSpec, Trailing,
 };
 use super::template::{normalize_uri_path, render, template_problem, Seg};
 use crate::harvest::path_segments;

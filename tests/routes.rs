@@ -494,7 +494,11 @@ fn rows(doc: &Value) -> Vec<String> {
                 f["channel"].as_str().unwrap_or("null"),
                 f["pathAnchor"].as_str().unwrap(),
                 f["trailingSlash"].as_str().unwrap_or("-"),
-                if f.get("narrowed").is_some() { " narrowed" } else { "" },
+                if f.get("narrowed").is_some() {
+                    " narrowed"
+                } else {
+                    ""
+                },
                 f.pointer("/symbol/usr")
                     .and_then(Value::as_str)
                     .map(|u| format!(" {u}"))
@@ -567,7 +571,12 @@ pub fn build(dynamic: &str) {
     ] {
         assert!(has(want), "missing {want:?} in {r:#?}");
     }
-    let dynamic = d["facts"].as_array().unwrap().iter().filter(|f| f["dynamic"] == true).count();
+    let dynamic = d["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["dynamic"] == true)
+        .count();
     assert_eq!(dynamic, 1, "two params in one segment is dynamic");
     let groups: BTreeSet<&str> = d["facts"]
         .as_array()
@@ -575,7 +584,11 @@ pub fn build(dynamic: &str) {
         .iter()
         .filter_map(|f| f.pointer("/order/group").and_then(Value::as_str))
         .collect();
-    assert_eq!(groups.len(), 2, "each App is its own order group: {groups:?}");
+    assert_eq!(
+        groups.len(),
+        2,
+        "each App is its own order group: {groups:?}"
+    );
     let lims = limitations(&d);
     for want in [
         "route-coverage: route macro on app::custom uses method PROPFIND",
@@ -586,12 +599,16 @@ pub fn build(dynamic: &str) {
         "route-dispatch-order-unknown:",
         "route-coverage: an App built inside a method",
     ] {
-        assert!(lims.iter().any(|l| l.starts_with(want)), "missing {want:?} in {lims:#?}");
+        assert!(
+            lims.iter().any(|l| l.starts_with(want)),
+            "missing {want:?} in {lims:#?}"
+        );
     }
     let scopes = d["limitationScopes"].as_array().unwrap();
     assert!(scopes
         .iter()
-        .any(|s| s["templatePrefixes"] == json!(["/static"]) && s["methods"] == json!(["GET", "HEAD"])));
+        .any(|s| s["templatePrefixes"] == json!(["/static"])
+            && s["methods"] == json!(["GET", "HEAD"])));
 }
 
 /// axum 메서드 라우터 변형·서비스·CONNECT·연관 함수 핸들러·동적 nest 접두사.
@@ -647,10 +664,21 @@ pub async fn run() { axum::serve(listener(), app("/x")).await; }
         "route-coverage: a Router built inside a method",
         "missing-route-usrs:",
     ] {
-        assert!(lims.iter().any(|l| l.starts_with(want)), "missing {want:?} in {lims:#?}");
+        assert!(
+            lims.iter().any(|l| l.starts_with(want)),
+            "missing {want:?} in {lims:#?}"
+        );
     }
-    let dynamic = d["facts"].as_array().unwrap().iter().filter(|f| f["dynamic"] == true).count();
-    assert_eq!(dynamic, 1, "catch-all after static text is a dynamic declaration");
+    let dynamic = d["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["dynamic"] == true)
+        .count();
+    assert_eq!(
+        dynamic, 1,
+        "catch-all after static text is a dynamic declaration"
+    );
 }
 
 /// 버전 밖 axum은 가까운 문법으로 읽고 한계를 낸다.
@@ -682,5 +710,8 @@ pub fn b_outer() -> Router { Router::new().nest("/mid", a_inner()) }
     let dir = temp_crate("unrooted", &[("axum", "0.8.9")], &[("lib.rs", src)]);
     let d = doc_of(&dir, None);
     let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(rows(&d), vec!["GET /mid/leaf base strict app::h".to_string()]);
+    assert_eq!(
+        rows(&d),
+        vec!["GET /mid/leaf base strict app::h".to_string()]
+    );
 }

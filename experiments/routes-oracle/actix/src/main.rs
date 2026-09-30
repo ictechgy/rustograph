@@ -11,10 +11,18 @@ const EXPECTED: &[(&str, &str, &str)] = &[
     ("GET", "/api/items/", "actix_app::handlers::items::list"),
     ("POST", "/api/items", "actix_app::handlers::items::create"),
     ("GET", "/api/items/42", "actix_app::handlers::items::show"),
-    ("GET", "/api/items/abc", "actix_app::handlers::items::by_slug"),
+    (
+        "GET",
+        "/api/items/abc",
+        "actix_app::handlers::items::by_slug",
+    ),
     ("GET", "/api/ping", "actix_app::handlers::ping"),
     ("GET", "/api/users/3", "actix_app::handlers::users::get"),
-    ("DELETE", "/api/users/3", "actix_app::handlers::users::delete"),
+    (
+        "DELETE",
+        "/api/users/3",
+        "actix_app::handlers::users::delete",
+    ),
     ("GET", "/api/a", "actix_app::handlers::multi"),
     ("PATCH", "/api/b", "actix_app::handlers::multi"),
     ("POST", "/api/cfg", "actix_app::handlers::cfg_post"),
@@ -41,7 +49,11 @@ const NEGATIVE: &[(&str, &str)] = &[
 /// 요청 하나를 보낸다(가드 헤더 포함 여부 선택).
 async fn send<S, B>(app: &S, p: &Probe, header: bool) -> (u16, String)
 where
-    S: actix_web::dev::Service<actix_http::Request, Response = actix_web::dev::ServiceResponse<B>, Error = actix_web::Error>,
+    S: actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse<B>,
+        Error = actix_web::Error,
+    >,
     B: actix_web::body::MessageBody,
 {
     let method = actix_web::http::Method::from_bytes(p.method.as_bytes()).expect("method");
@@ -59,7 +71,8 @@ where
 async fn main() -> std::process::ExitCode {
     let (input, output) = io_paths();
     let doc: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(input).expect("routes document")).expect("json");
+        serde_json::from_str(&std::fs::read_to_string(input).expect("routes document"))
+            .expect("json");
     let (dispatch, facts) = load_facts(&doc);
     let app = test::init_service(actix_app::app()).await;
     let mut probes = plan(&facts, EXPECTED, NEGATIVE);
@@ -77,7 +90,13 @@ async fn main() -> std::process::ExitCode {
         fact: None,
     };
     let (status, body) = send(&app, &unguarded, false).await;
-    let mut rec = evaluate("actix", "actix-web 4.15.0 (actix-router 0.5.4)", &dispatch, &facts, results);
+    let mut rec = evaluate(
+        "actix",
+        "actix-web 4.15.0 (actix-router 0.5.4)",
+        &dispatch,
+        &facts,
+        results,
+    );
     // narrowed 사실은 조건부라 사실 예측으로는 닿는다 — 실제로 닿지 않는지만 본다.
     rec.negatives.total += 1;
     let pass = status == 404;

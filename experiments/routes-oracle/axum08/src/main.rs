@@ -15,18 +15,42 @@ const EXPECTED: &[(&str, &str, &str)] = &[
     ("POST", "/api/items", "axum_app::handlers::items::create"),
     ("GET", "/api/items/42", "axum_app::handlers::items::show"),
     ("PUT", "/api/items/42", "axum_app::handlers::items::update"),
-    ("DELETE", "/api/items/42", "axum_app::handlers::items::remove"),
-    ("GET", "/api/items/special", "axum_app::handlers::items::special"),
-    ("GET", "/api/items/42/tags/red", "axum_app::handlers::items::tag"),
-    ("GET", "/api/files/a/b/c.txt", "axum_app::handlers::files::serve"),
+    (
+        "DELETE",
+        "/api/items/42",
+        "axum_app::handlers::items::remove",
+    ),
+    (
+        "GET",
+        "/api/items/special",
+        "axum_app::handlers::items::special",
+    ),
+    (
+        "GET",
+        "/api/items/42/tags/red",
+        "axum_app::handlers::items::tag",
+    ),
+    (
+        "GET",
+        "/api/files/a/b/c.txt",
+        "axum_app::handlers::files::serve",
+    ),
     ("GET", "/api/files/x", "axum_app::handlers::files::serve"),
     ("GET", "/api/v2/status", "axum_app::handlers::status"),
-    ("PATCH", "/api/users/7", "axum_app::handlers::users::any_method"),
+    (
+        "PATCH",
+        "/api/users/7",
+        "axum_app::handlers::users::any_method",
+    ),
     ("GET", "/api/search", "axum_app::handlers::search"),
     ("POST", "/api/search", "axum_app::handlers::search"),
     ("GET", "/api/closure", "axum_app::routes::api"),
     ("GET", "/api/v/status", "axum_app::handlers::status"),
-    ("GET", "/api/items//tags/red", "axum_app::handlers::items::tag"),
+    (
+        "GET",
+        "/api/items//tags/red",
+        "axum_app::handlers::items::tag",
+    ),
     ("GET", "/api/tag_x", "axum_app::handlers::tag_prefixed"),
     ("GET", "/api/trailing/", "axum_app::handlers::trailing"),
     ("GET", "/admin/stats", "axum_app::handlers::admin_stats"),
@@ -52,7 +76,8 @@ const NEGATIVE: &[(&str, &str)] = &[
 async fn main() -> std::process::ExitCode {
     let (input, output) = io_paths();
     let doc: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(input).expect("routes document")).expect("json");
+        serde_json::from_str(&std::fs::read_to_string(input).expect("routes document"))
+            .expect("json");
     let (dispatch, facts) = load_facts(&doc);
     let probes = plan(&facts, EXPECTED, NEGATIVE);
     let mut results = Vec::new();
@@ -74,6 +99,12 @@ async fn main() -> std::process::ExitCode {
         let body = marker.unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
         results.push((p, status, body));
     }
-    let rec = evaluate("axum08", "axum 0.8.9 (matchit 0.8.4)", &dispatch, &facts, results);
+    let rec = evaluate(
+        "axum08",
+        "axum 0.8.9 (matchit 0.8.4)",
+        &dispatch,
+        &facts,
+        results,
+    );
     write(&rec, &output)
 }

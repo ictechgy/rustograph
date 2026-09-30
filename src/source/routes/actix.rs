@@ -15,9 +15,8 @@
 
 use super::common::{
     handler_ref, is_api, order_group, pat_ident, path_arg, prefix_template, str_lit,
-    unevaluated_constructors, Anchor, Ctx, Decl,
-    DeclPath, FnSite, Handler, HandlerRef, Imports, JPath, Loc, Output, PathArg, ScopeSpec,
-    Trailing,
+    unevaluated_constructors, Anchor, Ctx, Decl, DeclPath, FnSite, Handler, HandlerRef, Imports,
+    JPath, Loc, Output, PathArg, ScopeSpec, Trailing,
 };
 use super::pattern::parse_actix;
 use super::template::{render, Seg};

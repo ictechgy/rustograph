@@ -11,7 +11,10 @@ const ADMIN_RESET: &str = "/admin/reset";
 pub fn api() -> Router {
     let items = Router::new()
         .route("/", get(items::list).post(items::create))
-        .route("/{id}", get(items::show).put(items::update).delete(items::remove))
+        .route(
+            "/{id}",
+            get(items::show).put(items::update).delete(items::remove),
+        )
         .route("/{id}/tags/{tag}", get(items::tag))
         .route("/special", get(items::special));
     let mut router = Router::new().nest("/items", items);
@@ -19,7 +22,10 @@ pub fn api() -> Router {
     router
         .route("/v{version}/status", get(handlers::status))
         .route("/users/{id}", any(users::any_method))
-        .route("/search", on(MethodFilter::GET.or(MethodFilter::POST), handlers::search))
+        .route(
+            "/search",
+            on(MethodFilter::GET.or(MethodFilter::POST), handlers::search),
+        )
         .route("/closure", get(|| async { "axum_app::routes::api" }))
         .route("/lit/{{braces}}", get(handlers::lit))
         .route("/trailing/", get(handlers::trailing))

@@ -35,7 +35,8 @@ const NEGATIVE: &[(&str, &str)] = &[
 async fn main() -> std::process::ExitCode {
     let (input, output) = io_paths();
     let doc: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(input).expect("routes document")).expect("json");
+        serde_json::from_str(&std::fs::read_to_string(input).expect("routes document"))
+            .expect("json");
     let (dispatch, facts) = load_facts(&doc);
     let probes = plan(&facts, EXPECTED, NEGATIVE);
     let mut results = Vec::new();
@@ -57,6 +58,12 @@ async fn main() -> std::process::ExitCode {
         let body = marker.unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
         results.push((p, status, body));
     }
-    let rec = evaluate("axum07", "axum 0.7.9 (matchit 0.7.3)", &dispatch, &facts, results);
+    let rec = evaluate(
+        "axum07",
+        "axum 0.7.9 (matchit 0.7.3)",
+        &dispatch,
+        &facts,
+        results,
+    );
     write(&rec, &output)
 }
