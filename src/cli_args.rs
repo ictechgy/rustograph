@@ -34,6 +34,18 @@ impl Args {
     pub(crate) fn has(&self, key: &str) -> bool {
         self.flags.contains(key)
     }
+    /// `allowed` 밖의 플래그를 하나 돌려준다 — 위치 인자는 보지 않는다.
+    pub(crate) fn unsupported_flag(&self, allowed: &[&str]) -> Option<String> {
+        self.values
+            .keys()
+            .chain(self.flags.iter())
+            .find(|k| !allowed.contains(&k.as_str()))
+            .map(|k| format!("--{k}"))
+    }
+    /// 값 플래그가 두 번 이상 주어졌는가 — 순회 명령은 반복 값을 조용히 덮지 않는다.
+    pub(crate) fn repeated(&self, key: &str) -> bool {
+        self.values.get(key).is_some_and(|v| v.len() > 1)
+    }
     /// `allowed` 밖의 플래그나 위치 인자가 있으면 첫 번째를 사람이 읽는
     /// 형태로 돌려준다. 거부 목록이 아니라 허용 목록인 이유: 나중에
     /// 추가되는 플래그가 이 명령에서 조용히 무시되는 일을 막는다.
@@ -50,8 +62,25 @@ impl Args {
 }
 
 const VALUE_FLAGS: &[&str] = &[
-    "dir", "level", "format", "out", "graph", "root", "explain", "config", "depth", "max", "focus",
-    "target", "budget", "baseline",
+    "dir",
+    "level",
+    "format",
+    "out",
+    "graph",
+    "root",
+    "explain",
+    "config",
+    "depth",
+    "max",
+    "focus",
+    "target",
+    "budget",
+    "baseline",
+    "roots-from",
+    "max-depth",
+    "max-reached",
+    "revision",
+    "generated-at",
 ];
 const BOOL_FLAGS: &[&str] = &[
     "deps",
@@ -77,6 +106,11 @@ pub(crate) fn parse(args: &[String]) -> Result<Args, String> {
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
+        if arg == "--" {
+            // `--` 뒤는 모두 위치 인자다 — `-`로 시작하는 정점 ID를 플래그로 읽지 않게 한다.
+            a.positional.extend(args[i + 1..].iter().cloned());
+            break;
+        }
         if let Some(name) = arg.strip_prefix("--") {
             if BOOL_FLAGS.contains(&name) {
                 a.flags.insert(name.to_string());

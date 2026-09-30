@@ -137,6 +137,36 @@ if [ "$got" -ne 0 ] || ! grep -q '"target": "persistence"' "$FIX/facts.json" 2>/
 	fails=$((fails+1))
 fi
 
+# reach·impact --format language-traversal — isthmus 순회 문서. 계열 계약대로
+# 사용법 오류는 표준 출력을 비운 채 64, 정점이 아닌 root가 섞이면 문서를
+# 쓰고 64다. schema 사실의 usr는 전부 root로 받아져야 한다(0).
+check 0  "reach"                reach fixture_app::main
+check 0  "impact traversal"     impact --format language-traversal fixture_core::Used fixture_core::entry
+check 64 "reach root-not-found" reach fixture_app::main no_such::root
+check 64 "reach no roots"       reach
+check 64 "reach control char"   reach "$(printf 'a\007b')"
+check 64 "reach bad depth"      reach fixture_app::main --max-depth 129
+check 64 "reach bad flag"       reach fixture_app::main --max 3
+check 64 "impact trav no roots" impact --format language-traversal
+trav_out="$("$BIN" reach --dir "$FIX/fixture" 2>/dev/null)" || true
+if [ -n "$trav_out" ]; then
+	echo "FAIL reach usage error: stdout must be empty" >&2
+	fails=$((fails+1))
+fi
+# pipefail이라 64를 파이프로 넘기면 grep 결과와 무관하게 실패한다 — 먼저 담는다.
+rnf_out="$("$BIN" reach --dir "$FIX/fixture" fixture_app::main no_such::root 2>/dev/null)" || true
+echo "$rnf_out" | grep -q '"root-not-found"' || {
+	echo "FAIL reach root-not-found: document not written" >&2
+	fails=$((fails+1))
+}
+got=0
+"$BIN" impact --format language-traversal --dir "$FIX/fixture-schema" \
+	--roots-from "$FIX/facts.json" >/dev/null 2>&1 || got=$?
+if [ "$got" -ne 0 ]; then
+	echo "FAIL schema usr roots: expected 0 (every usr is a vertex), got $got" >&2
+	fails=$((fails+1))
+fi
+
 # --dir를 붙이지 않는 검사 — check()는 항상 fixture dir을 뒤에 붙이므로
 # 나쁜 --dir 검증은 마지막 인자가 이기는(last-wins) 구조상 여기서 따로 한다.
 for c in "graph --dir /nonexistent-xyz" "schema --dir /nonexistent-xyz"; do

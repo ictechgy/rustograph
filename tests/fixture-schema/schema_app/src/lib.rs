@@ -129,3 +129,38 @@ pub mod unimported {
         let _ = other_query!("SELECT * FROM flagged_t");
     }
 }
+
+/// 사실의 symbol.usr 귀속 — impl 메서드·트레이트 impl 메서드·연관 상수·
+/// 트레이트 기본 메서드·cfg 모듈 안 함수가 각자 그래프 정점 ID를 싣는다.
+pub struct Repo;
+
+impl Repo {
+    /// 메서드 밖 연관 상수는 self 타입 정점에 귀속된다.
+    pub const LIST: &'static str = "SELECT * FROM repo_consts";
+
+    pub fn list(&self) {
+        let _ = sqlx::query!("SELECT * FROM repo_items");
+    }
+}
+
+pub trait Loader {
+    fn load(&self);
+    /// 트레이트 기본 메서드는 트레이트 소유 메서드 정점이다.
+    fn fallback(&self) {
+        let _ = sqlx::query!("SELECT * FROM loader_defaults");
+    }
+}
+
+impl Loader for Repo {
+    fn load(&self) {
+        let _ = sqlx::query!("SELECT * FROM loaded_items");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn reads_fixture_table() {
+        let _ = sqlx::query!("SELECT * FROM test_only_t");
+    }
+}

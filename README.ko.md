@@ -71,6 +71,8 @@ rustograph dead --exclude-tests          # #[cfg(test)] 서브트리 제외
 rustograph graph --target x86_64-pc-windows-msvc  # cfg(트리플) 평가
 rustograph mcp                           # MCP stdio 서버 — 에이전트가 되묻는 통로
 rustograph schema --dir . --out schema-facts.json  # isthmus persistence 사실
+rustograph reach mycrate::api::list_users          # isthmus language-traversal(정방향)
+rustograph impact --format language-traversal --roots-from schema-facts.json  # 역방향
 ```
 
 `#[cfg]` 조건은 메타데이터로 그래프에 실립니다 — 정점의 `cfg`는 자기
@@ -90,6 +92,9 @@ rustograph schema --dir . --out schema-facts.json  # isthmus persistence 사실
 조용히 새 수확으로 돌아갑니다. `--no-cache`로 끌 수 있습니다.
 
 종료 코드: `0` 정상 · `1` strict 위반/발견 · `2` 사용법/분석 오류.
+순회 명령(`reach`, `impact --format language-traversal`)은 isthmus 계열
+계약을 따릅니다 — 사용법 오류는 표준 출력을 비운 채 `64`, 그래프 정점이
+아닌 root가 섞이면 문서를 쓴 뒤 `64`입니다.
 
 ## persistence 사실 — `schema`
 
@@ -112,12 +117,48 @@ rustograph schema --dir . --out schema-facts.json  # isthmus persistence 사실
   `users::columns::name` — 워크스페이스에 선언된 `table!` 이름과
   맞물릴 때만 정적으로 인정하고, 안 맞는 같은 모양 경로는 `dynamic`
 
+사실마다 `symbol: {qualifiedName, usr}`을 싣고 `usr`는 감싸는 그래프
+정점 ID입니다 — `impact`/`reach`와 같은 ID라 isthmus `trace`가 핸들러
+도달과 관계 사용을 잇습니다. fn·impl 메서드(`Type::method`, 트레이트 impl은
+`Type::<Trait>::method`)·트레이트 기본 메서드·const/static 초기화식은 그
+정점, 구조체 어트리뷰트·필드 컬럼은 구조체, 메서드 밖 연관 상수는 impl의
+self 타입입니다. 감싸는 정점이 없는 사실(최상위 `table!` 호출, 모듈 트리
+밖 파일)은 `symbol` 없이 내고 `missing-relation-usrs:`로 셉니다. ID는
+`impact`와 같은 syn 수확에서 받아 오고(다시 유도하지 않음) 그래프 정점
+집합으로 확인합니다.
+
 비한정 이름(`query!`, `sql_query`, `table!`)은 그 파일이 sqlx/diesel에서
 import할 때만 인정합니다. 파싱 실패 파일·문법이 다른 `table!`·테이블
 바인딩 없는
 컬럼 어트리뷰트는 조용히 넘기지 않고 `limitations`로 셉니다. 이름 기반
 스캔은 추측하지 않습니다 — 정적으로 해석할 수 없는 것은 지어내지 않고
 센 것입니다.
+
+## 순회 문서 — `reach` / `impact --format language-traversal`
+
+isthmus [`language-traversal` v1](https://github.com/ictechgy/isthmus/blob/main/docs/LANGUAGE-TRAVERSAL.md)
+문서를 냅니다. `reach`는 root가 기대는 쪽(`dependencies`), `impact`는 root에
+기대는 쪽(`dependents`)입니다.
+
+- root는 위치 인자 다음 `--roots-from`(JSON 문자열 배열 또는 bridge-facts
+  문서의 `symbol.usr`, `-`는 표준 입력) 순서로, 처음 나온 자리에만 남깁니다.
+  빈 id·제어 문자 id·10,000개 초과는 사용법 오류(64, 표준 출력 비움)입니다.
+- 모든 root를 한 번에 훑어 정점마다 닿는 root 목록(64개까지 + `rootsTruncated`),
+  가장 가까운 깊이, 최단 경로 목격(`via`)을 싣습니다. root별 BFS 오라클과
+  무작위 그래프로 대조합니다.
+- 근거 등급: `tentative` 간선(이름 팬아웃·`dyn`/제네릭 트레이트 impl 후보)은
+  `candidate`, 나머지는 `direct`이고 정점마다 root별 하한을 싣습니다.
+  미해석 호출 수가 완전하다고 말할 수 없어 `dispatch`·`unresolvedCalls`는
+  싣지 않습니다.
+- `--max-depth` 1~128(기본 128, `--depth 0`은 128), `--max-reached` 1~100,000.
+- `project`는 `schema`와 같은 realpath, `revision`은 `--revision` 또는 작업
+  트리가 깨끗할 때의 git HEAD, `graphRevision`은 그래프 JSON의 SHA-256입니다.
+- 그래프 정점이 아닌 root는 `symbol` 없이 싣고 `root-not-found:` limitation을
+  더한 문서를 쓴 뒤 64로 끝납니다.
+
+isthmus는 `platform: "rust"` 문서의 `route-decl`을 받지 않아 Rust 핸들러에서
+시작하는 route 선택 `trace`는 아직 불가능합니다. relation·심볼 선택(역방향
+순회)은 지금 동작합니다.
 
 ## 개발
 

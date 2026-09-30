@@ -2,6 +2,33 @@
 
 세션을 이어받는 에이전트가 먼저 읽는 문서입니다.
 
+## 진행 중 — feature/schema-usr (2026-09-30, API 영향 프로그램 Phase 7c)
+
+isthmus `trace`가 Rust 백엔드의 핸들러 도달을 관계 사용과 잇도록 두 가지를 더했다.
+
+- `schema` 사실에 `symbol: {qualifiedName, usr}` — usr는 `impact`와 같은 정점 ID.
+  같은 syn 수확을 돌려 정점별 소스 범위(`harvest::OwnerSpan`)를 받고, 사실 바이트
+  오프셋을 감싸는 가장 안쪽 정점을 고른다(정점 집합으로 검증). 구조체 어트리뷰트·
+  필드 컬럼은 구조체, 메서드 밖 연관 상수는 impl self 타입. 최상위 `table!`·orphan
+  파일은 usr 없이 `missing-relation-usrs:`로 센다.
+- `reach`·`impact --format language-traversal` — language-traversal v1, 다중 root
+  단일 패스(`src/traversal.rs`, pythograph 알고리즘 포팅), tentative 간선 = candidate
+  root별 하한, `dispatch`·`unresolvedCalls` 미신고, 사용법 오류·root-not-found 64.
+- 자기 분석이 이름 충돌 거짓 순환 둘(지역명 `owner_spans`, 매개변수 `facts`)과
+  cli ↔ cli::reach 모듈 순환을 잡아 고쳤다 — 새 식별자는 같은 이름의 fn과 겹치지 않게.
+- 남은 것: isthmus가 rust `route-decl`을 받지 않아 route 선택 trace는 불가(relation·
+  심볼 선택은 동작). `type` 레벨 cycles는 main부터 10개(투영 산물)이고 이번에 3개가
+  같은 종류로 늘었다(게이트 아님).
+- 합성 e2e(axum·sqlx·sea_orm 스텁, scratch): `isthmus check --pairs` 5 matches,
+  relation 선택 trace는 relation-use → 역방향 순회까지 이어지고 route-decl이 없어
+  `non-http-entry`. isthmus를 scratch에서 고쳐 손으로 만든 route-decl로 route 선택도
+  핸들러 → 테이블 도달을 확인했다.
+- 발견(기존 수확 결함, 이번 범위 밖): 본문의 단일 식별자 경로가 지역 변수여도 크레이트
+  루트 모듈 이름과 같으면 모듈 정점 references 간선이 된다(`fn f(repo: &dyn R) { repo.all() }`
+  → `f → crate::repo`). 순회가 그 모듈의 `uses` 간선을 따라 모듈이 import한 아이템 전부에
+  닿는 과대 근사가 된다. 표현식 경로는 모듈일 수 없으므로 모듈로 해석되면 버리는 것이 후보.
+  syn 모드에서 메서드 호출은 이름 팬아웃(tentative)이라 구체 수신자 호출도 candidate다.
+
 ## 직전 세션 요약 (2026-09-25)
 
 **목표.** HANDOFF의 보류 항목을 정리하고 main에 쌓인 기능을 배포한다.

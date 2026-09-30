@@ -64,7 +64,7 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
             return Ok(doc);
         }
     }
-    let (doc, uses_include) = harvest(dir, &meta, opts)?;
+    let (doc, uses_include) = harvest(dir, &meta, opts, None)?;
     if let Some((key, path)) = &cache {
         // 지문이 못 보는 입력을 소비한 문서는 캐시에 쓰지 않는다 —
         // include!/OUT_DIR 생성 파일과 루트 밖 #[path] 파일, 지문이
@@ -74,6 +74,23 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
         }
     }
     Ok(doc)
+}
+
+/// syn 심볼 그래프와 정점별 소스 범위를 함께 돌려준다 — `schema`가
+/// relation-use 사실을 impact와 같은 정점 ID로 귀속하는 데 쓴다.
+/// 기본 옵션(심볼 레벨, 외부 크레이트 정점 없음, semantic 없음)으로
+/// 수확한다 — 정점 집합은 `impact`/`reach` 기본 실행과 같다.
+pub fn owner_spans(
+    dir: &Path,
+    meta: &Metadata,
+) -> Result<(Document, Vec<harvest::OwnerSpan>), String> {
+    let opts = Options {
+        symbol_level: true,
+        ..Default::default()
+    };
+    let mut spans = Vec::new();
+    let (doc, _) = harvest(dir, meta, &opts, Some(&mut spans))?;
+    Ok((doc, spans))
 }
 
 /// `--target`의 cfg 팩트 — `rustc --print cfg` 실측이 권위다.
@@ -264,7 +281,13 @@ fn write_cache(path: &Path, key: u64, doc: &Document) {
 /// 실제 수확 — 메타데이터 위에서 모듈 트리·간선을 조립한다.
 /// (문서, include! 계열 매크로 사용 여부)를 돌린다 — include!는
 /// 정점 위치에 안 나타나는 입력이라 캐시 판정이 별도로 필요하다.
-fn harvest(dir: &Path, meta: &Metadata, opts: &Options) -> Result<(Document, bool), String> {
+/// `spans`가 주어지면 정점별 소스 범위(OwnerSpan)도 모은다.
+fn harvest(
+    dir: &Path,
+    meta: &Metadata,
+    opts: &Options,
+    spans: Option<&mut Vec<harvest::OwnerSpan>>,
+) -> Result<(Document, bool), String> {
     let mut harvest = Harvest::default();
     let mut vertices: Vec<Vertex> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
@@ -408,6 +431,8 @@ fn harvest(dir: &Path, meta: &Metadata, opts: &Options) -> Result<(Document, boo
     let mut impls: Vec<harvest::ImplBlock> = Vec::new();
     let mut attr_refs: Vec<harvest::AttrRef> = Vec::new();
     let mut test_roots: Vec<String> = Vec::new();
+    // 지역명이 fn owner_spans와 같으면 이름 해석이 함수 정점으로 읽어 거짓 순환이 된다.
+    let mut item_spans: Vec<harvest::OwnerSpan> = Vec::new();
     for mp in tree.modules.keys().cloned().collect::<Vec<_>>() {
         let mh = harvest_module(&mut tree, &arena, &mp, &mut harvest, &dep_vertices);
         vertices.push(mh.vertex);
@@ -418,6 +443,7 @@ fn harvest(dir: &Path, meta: &Metadata, opts: &Options) -> Result<(Document, boo
         bodies.extend(mh.decls.bodies);
         attr_refs.extend(mh.decls.attr_refs);
         impls.extend(mh.decls.impls);
+        item_spans.extend(mh.decls.owner_spans);
     }
     for block in &impls {
         let krate = modtree::crate_of(&block.items_module);
@@ -427,6 +453,9 @@ fn harvest(dir: &Path, meta: &Metadata, opts: &Options) -> Result<(Document, boo
         edges.extend(es);
         attr_refs.extend(ar);
         bodies.extend(bs);
+    }
+    if let Some(out) = spans {
+        collect_owner_spans(&tree, &impls, &bodies, item_spans, out);
     }
 
     // 메서드 이름 → ID 인덱스 — 이름 팬아웃 폴백에 쓴다(semantic에서는
@@ -572,6 +601,37 @@ fn harvest(dir: &Path, meta: &Metadata, opts: &Options) -> Result<(Document, boo
         ),
         uses_include,
     ))
+}
+
+/// 정점별 소스 범위를 모은다 — 본문 아이템(fn·메서드·const·static·
+/// 트레이트 기본 메서드), 본문 없는 소유 아이템, 그리고 self 타입이
+/// 해석된 impl 블록(메서드 밖 연관 아이템을 self 타입에 귀속)이다.
+fn collect_owner_spans(
+    tree: &ModTree,
+    impls: &[harvest::ImplBlock],
+    bodies: &[BodyItem<'_>],
+    mut spans: Vec<harvest::OwnerSpan>,
+    out: &mut Vec<harvest::OwnerSpan>,
+) {
+    for block in impls {
+        if let Some(self_id) = tree.resolve(
+            &block.items_module,
+            &block.self_ty,
+            &modtree::DepCrates::new(),
+        ) {
+            spans.push(harvest::OwnerSpan {
+                id: self_id,
+                file: block.file.clone(),
+                range: block.range.clone(),
+            });
+        }
+    }
+    spans.extend(bodies.iter().map(|b| harvest::OwnerSpan {
+        id: b.id.clone(),
+        file: b.file.clone(),
+        range: b.range.clone(),
+    }));
+    *out = spans;
 }
 
 /// 크레이트 정점과 `depends` 간선을 만든다.

@@ -42,6 +42,24 @@ pub struct ModuleDecls<'a> {
     pub entry_roots: Vec<String>,
     /// #[test]/#[bench] 진입점 — --tests일 때만 보존 루트가 된다.
     pub test_roots: Vec<String>,
+    /// 본문이 없는 소유 아이템(struct·enum·union·trait·macro_rules)의 소스
+    /// 범위 — persistence 사실을 감싸는 그래프 정점으로 귀속할 때 쓴다.
+    /// 본문 아이템의 범위는 BodyItem이 이미 들고 있다.
+    pub owner_spans: Vec<OwnerSpan>,
+}
+
+/// 그래프 정점 하나가 소스에서 차지하는 범위다.
+/// schema 사실(위치만 있는)을 impact와 같은 정점 ID로 귀속하는 재료다 —
+/// 정점 ID 규칙(impl self 타입 해석 등)을 schema 쪽에서 다시 구현하면
+/// 두 규칙이 어긋나 사실의 usr가 그래프에 없는 문자열이 된다.
+#[derive(Debug, Clone)]
+pub struct OwnerSpan {
+    /// 정점 ID — 수확이 만든 그대로다.
+    pub id: String,
+    /// 선언 파일(수확이 읽은 경로 그대로 — 비교 전에 정규화한다).
+    pub file: PathBuf,
+    /// 파일 안 바이트 범위(syn span 기준, 속성 포함).
+    pub range: std::ops::Range<usize>,
 }
 
 /// 아이템 속성이 담은 경로 참조 하나.
@@ -77,6 +95,8 @@ pub struct ImplBlock {
     pub file: PathBuf,
     /// 선언 파일의 생성 코드 마커 — 메서드 정점의 generated 플래그.
     pub generated: bool,
+    /// impl 블록의 바이트 범위 — 메서드 밖 사실(연관 상수 등)을 self 타입에 귀속한다.
+    pub range: std::ops::Range<usize>,
 }
 
 /// 본문을 나중에 방문할 항목.
@@ -142,6 +162,7 @@ pub fn decls<'a>(
         attr_refs: Vec::new(),
         entry_roots: Vec::new(),
         test_roots: Vec::new(),
+        owner_spans: Vec::new(),
     };
     for (file, items) in groups {
         let generated = file_has_generated_marker(file);
@@ -317,9 +338,32 @@ pub fn decls<'a>(
                         unsafe_: i.unsafety.is_some(),
                         file: file.clone(),
                         generated,
+                        range: i.span().byte_range(),
                     });
                 }
                 _ => {}
+            }
+            // 본문 없는 소유 아이템의 범위 — 필드 어트리뷰트 같은 선언 수준
+            // 사실은 그 타입 정점이 감싼다.
+            let owner_kind = match item {
+                syn::Item::Struct(_)
+                | syn::Item::Enum(_)
+                | syn::Item::Union(_)
+                | syn::Item::Trait(_) => true,
+                syn::Item::Macro(m) => m.ident.is_some() && m.mac.path.is_ident("macro_rules"),
+                _ => false,
+            };
+            if owner_kind {
+                if let Some(ident) = item.ident().or(match item {
+                    syn::Item::Macro(m) => m.ident.as_ref(),
+                    _ => None,
+                }) {
+                    out.owner_spans.push(OwnerSpan {
+                        id: format!("{module_path}::{ident}"),
+                        file: file.clone(),
+                        range: item.span().byte_range(),
+                    });
+                }
             }
             // 아이템 속성의 경로 참조 — #[dep::attr]·#[derive(dep::X)]는
             // 그 크레이트의 실제 사용 증거다. impl 자체의 속성도 여기서 잡되
