@@ -71,6 +71,7 @@ rustograph dead --exclude-tests          # #[cfg(test)] 서브트리 제외
 rustograph graph --target x86_64-pc-windows-msvc  # cfg(트리플) 평가
 rustograph mcp                           # MCP stdio 서버 — 에이전트가 되묻는 통로
 rustograph schema --dir . --out schema-facts.json  # isthmus persistence 사실
+rustograph routes --role server --out routes.json  # isthmus http route-decl(axum·actix-web)
 rustograph reach mycrate::api::list_users          # isthmus language-traversal(정방향)
 rustograph impact --format language-traversal --roots-from schema-facts.json  # 역방향
 ```
@@ -133,6 +134,36 @@ import할 때만 인정합니다. 파싱 실패 파일·문법이 다른 `table!
 컬럼 어트리뷰트는 조용히 넘기지 않고 `limitations`로 셉니다. 이름 기반
 스캔은 추측하지 않습니다 — 정적으로 해석할 수 없는 것은 지어내지 않고
 센 것입니다.
+
+## 서버 라우트 — `routes --role server`
+
+`rustograph routes --role server`는 axum 0.7·0.8과 actix-web 4 서버가 선언한
+(method, 정규 경로 템플릿)마다 `route-decl` 사실 하나를 담은 isthmus
+`bridge-facts` v1 문서(`platform: "rust"`, `target: "http"`)를 냅니다.
+핸들러 `symbol.usr`가 `reach`의 정점 ID와 같아서 `isthmus trace`가 route →
+핸들러 → relation-use(`schema`) → 테이블(`schemagraph facts`)로 잇습니다.
+
+- **axum**(`dispatch: "specificity"`, matchit의 정적 > 파라미터 > catch-all):
+  `Router::new().route(..)` 체인, 메서드 라우터(`get`/`post`/…/`any`/
+  `on(MethodFilter)`), `nest`(axum `path_for_nested_route`와 같은 결합),
+  `merge`, 지역 `let`·재대입, 라우터를 돌려주는 크레이트 함수. 경로 문법은
+  해석된 axum 버전을 따릅니다 — 0.7은 `:id`/`*rest`, 0.8은 `{id}`/`{*rest}`/`{{`.
+- **actix-web**(`dispatch: "registration-order"`, App마다 `order.group`,
+  리소스마다 `order.index`): `#[get("/x/{id}")]` 매크로,
+  `web::resource().route(web::get().to(h))`, `web::scope`, `App::route`,
+  `configure`, 가드(`narrowed`), `{id:\d+}` → `paramConstraints`, `{tail}*`
+  catch-all, `NormalizePath` 미들웨어의 `trailingSlash` 효과.
+- 정적으로 확정하지 못한 것(리터럴이 아닌 경로, 모르는 함수가 만든 라우터,
+  fallback, tower 서비스)은 dynamic 사실이나 스코프 있는
+  `route-coverage:`·`framework-provided-routes:` 한계가 됩니다 — 추측한
+  라우트를 만들지 않습니다.
+
+규칙마다 근거가 된 axum·matchit·actix-web 소스 줄은
+[docs/HTTP-ROUTES.md](docs/HTTP-ROUTES.md)에 있습니다. 오라클
+(`experiments/routes-oracle/`)이 같은 fixture 소스를 진짜 크레이트로 컴파일해
+프로세스 안에서 요청을 보내 세 fixture 모두 정밀도·재현율 100%를 확인했고,
+그 기록을 `cargo test`가 오프라인으로 대조합니다. isthmus 공유 벡터는
+`conformance/`에 잠금 파일과 함께 벤더링했습니다.
 
 ## 순회 문서 — `reach` / `impact --format language-traversal`
 

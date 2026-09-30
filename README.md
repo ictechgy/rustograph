@@ -114,6 +114,10 @@ rustograph mcp --graph .rustograph/graph.json
 # Emit bridge-facts for isthmus' persistence join (SQL relation uses)
 rustograph schema --dir . --out schema-facts.json
 
+# Emit isthmus http route-decl facts for axum / actix-web servers
+rustograph routes --role server --dir . --out routes.json
+rustograph reach --roots-from routes.json   # handler usrs are graph vertices
+
 # isthmus language-traversal v1 for `isthmus trace` (many roots, one pass)
 rustograph reach mycrate::api::list_users mycrate::api::create_user
 rustograph impact --format language-traversal --roots-from schema-facts.json
@@ -228,6 +232,39 @@ file imports them from `sqlx`/`diesel`. Unparseable files, off-grammar
 and column attributes without a table binding surface as `limitations`,
 not silence. The name-based scan never guesses: what cannot be resolved
 statically is counted, not invented.
+
+## Server routes — `routes --role server`
+
+`rustograph routes --role server` emits an isthmus `bridge-facts` v1
+document with `platform: "rust"`, `target: "http"` and one `route-decl`
+fact per (method, canonical path template) that an axum 0.7/0.8 or
+actix-web 4 server declares. `isthmus trace` joins it with client calls,
+`reach` (the handler `symbol.usr` is the same vertex id), `schema` and
+`schemagraph facts` to answer "which tables does this endpoint touch".
+
+- **axum** (`dispatch: "specificity"`, matchit's static > param >
+  catch-all order): `Router::new().route(..)` chains, method routers
+  (`get`/`post`/…/`any`/`on(MethodFilter)`), `nest` (joined like axum's
+  `path_for_nested_route`), `merge`, local `let`/reassignment and crate
+  functions that return routers. The path syntax follows the resolved axum
+  version — `:id`/`*rest` for 0.7, `{id}`/`{*rest}`/`{{` for 0.8.
+- **actix-web** (`dispatch: "registration-order"`, one `order.group` per
+  `App`, one `order.index` per resource): `#[get("/x/{id}")]`-style macros,
+  `web::resource().route(web::get().to(h))`, `web::scope`, `App::route`,
+  `configure`, guards (`narrowed`), `{id:\d+}` → `paramConstraints`,
+  `{tail}*` catch-alls, and the `NormalizePath` middleware's effect on
+  `trailingSlash`.
+- Whatever cannot be resolved statically (non-literal paths, routers built
+  by unknown functions, fallbacks, tower services) becomes a dynamic fact or
+  a scoped `route-coverage:` / `framework-provided-routes:` limitation —
+  never a guessed route.
+
+Every rule, with the axum/matchit/actix-web source lines that back it, is in
+[docs/HTTP-ROUTES.md](docs/HTTP-ROUTES.md). An oracle
+(`experiments/routes-oracle/`) compiles the same fixture sources against
+the real crates and probes them in-process: 100% precision and recall on
+all three fixtures, recorded and checked offline by `cargo test`. The
+isthmus conformance vectors are vendored under `conformance/` with a lock.
 
 ## Traversal documents — `reach` / `impact --format language-traversal`
 

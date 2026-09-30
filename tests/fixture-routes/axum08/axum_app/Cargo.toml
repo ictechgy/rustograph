@@ -1,0 +1,10 @@
+[package]
+name = "axum_app"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# axum은 버전 판정용 스텁이다(../../stubs). 같은 lib.rs를 진짜 axum 0.8.9로
+# 컴파일해 요청을 보내는 오라클은 experiments/routes-oracle에 있다.
+[dependencies]
+axum = { path = "../../stubs/axum-0.8" }

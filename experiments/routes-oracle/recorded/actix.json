@@ -1,0 +1,1276 @@
+{
+  "fixture": "actix",
+  "framework": "actix-web 4.15.0 (actix-router 0.5.4)",
+  "dispatch": "registration-order",
+  "verifiedFacts": [
+    {
+      "method": "GET",
+      "channel": "/",
+      "pathAnchor": "root",
+      "trailingSlash": "strict",
+      "order": [
+        "actix:actix_app::app",
+        0
+      ],
+      "usr": "actix_app::handlers::index"
+    },
+    {
+      "method": "ANY",
+      "channel": "/api/a",
+      "pathAnchor": "root",
+      "trailingSlash": "optional",
+      "order": [
+        "actix:actix_app::app",
+        7
+      ],
+      "usr": "actix_app::handlers::multi"
+    },
+    {
+      "method": "ANY",
+      "channel": "/api/b",
+      "pathAnchor": "root",
+      "trailingSlash": "optional",
+      "order": [
+        "actix:actix_app::app",
+        7
+      ],
+      "usr": "actix_app::handlers::multi"
+    },
+    {
+      "method": "POST",
+      "channel": "/api/cfg",
+      "pathAnchor": "root",
+      "trailingSlash": "optional",
+      "order": [
+        "actix:actix_app::app",
+        8
+      ],
+      "usr": "actix_app::handlers::cfg_post"
+    },
+    {
+      "method": "GET",
+      "channel": "/api/items",
+      "pathAnchor": "root",
+      "trailingSlash": "optional",
+      "order": [
+        "actix:actix_app::app",
+        1
+      ],
+      "usr": "actix_app::handlers::items::list"
+    },
+    {
+      "method": "POST",
+      "channel": "/api/items",
+      "pathAnchor": "root",
+      "trailingSlash": "optional",
+      "order": [
+        "actix:actix_app::app",
+        2
+      ],
+      "usr": "actix_app::handlers::items::create"
+    },
+    {
+      "method": "GET",
+      "channel": "/api/items/{}",
+      "pathAnchor": "root",
+      "trailingSlash": "optional",
+      "order": [
+        "actix:actix_app::app",
+        3
+      ],
+      "usr": "actix_app::handlers::items::show",
+      "paramConstraints": [
+        [
+          2,
+          "int",
+          null
+        ]
+      ]
+    },
+    {
+      "method": "GET",
+      "channel": "/api/items/{}",
+      "pathAnchor": "root",
+      "trailingSlash": "optional",
+      "order": [
+        "actix:actix_app::app",
+        4
+      ],
+      "usr": "actix_app::handlers::items::by_slug"
+    },
+    {
+      "method": "GET",
+      "channel": "/api/ping",
+      "pathAnchor": "root",
+      "trailingSlash": "optional",
+      "order": [
+        "actix:actix_app::app",
+        5
+      ],
+      "usr": "actix_app::handlers::ping"
+    },
+    {
+      "method": "DELETE",
+      "channel": "/api/users/{}",
+      "pathAnchor": "root",
+      "trailingSlash": "optional",
+      "order": [
+        "actix:actix_app::app",
+        6
+      ],
+      "usr": "actix_app::handlers::users::delete"
+    },
+    {
+      "method": "GET",
+      "channel": "/api/users/{}",
+      "pathAnchor": "root",
+      "trailingSlash": "optional",
+      "order": [
+        "actix:actix_app::app",
+        6
+      ],
+      "usr": "actix_app::handlers::users::get"
+    },
+    {
+      "method": "ANY",
+      "channel": "/files/{**}",
+      "pathAnchor": "root",
+      "order": [
+        "actix:actix_app::app",
+        9
+      ],
+      "usr": "actix_app::handlers::files"
+    },
+    {
+      "method": "GET",
+      "channel": "/m",
+      "pathAnchor": "root",
+      "trailingSlash": "optional",
+      "order": [
+        "actix:actix_app::app",
+        12
+      ],
+      "usr": "actix_app::handlers::route_macro"
+    },
+    {
+      "method": "PUT",
+      "channel": "/m",
+      "pathAnchor": "root",
+      "trailingSlash": "optional",
+      "order": [
+        "actix:actix_app::app",
+        12
+      ],
+      "usr": "actix_app::handlers::route_macro"
+    },
+    {
+      "method": "GET",
+      "channel": "/r1",
+      "pathAnchor": "root",
+      "trailingSlash": "optional",
+      "order": [
+        "actix:actix_app::app",
+        10
+      ],
+      "usr": "actix_app::handlers::routes_multi"
+    },
+    {
+      "method": "POST",
+      "channel": "/r2",
+      "pathAnchor": "root",
+      "trailingSlash": "optional",
+      "order": [
+        "actix:actix_app::app",
+        11
+      ],
+      "usr": "actix_app::handlers::routes_multi"
+    },
+    {
+      "method": "GET",
+      "channel": "/v1/status",
+      "pathAnchor": "root",
+      "trailingSlash": "optional",
+      "order": [
+        "actix:actix_app::app",
+        13
+      ],
+      "usr": "actix_app::handlers::v1_status",
+      "narrowed": true
+    }
+  ],
+  "unprobed": [
+    [
+      {
+        "method": "GET",
+        "channel": "/lonely",
+        "pathAnchor": "base",
+        "trailingSlash": "strict",
+        "usr": "actix_app::handlers::lonely"
+      },
+      "pathAnchor base: the router is not mounted on the served app"
+    ]
+  ],
+  "failedFacts": [],
+  "precision": {
+    "passed": 23,
+    "total": 23
+  },
+  "recall": {
+    "passed": 18,
+    "total": 18
+  },
+  "negatives": {
+    "passed": 9,
+    "total": 9
+  },
+  "trailingSlash": {
+    "passed": 19,
+    "total": 19
+  },
+  "probes": [
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::index"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::index"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/api/a",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "GET",
+      "path": "/api/a/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "POST",
+      "path": "/api/a",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "POST",
+      "path": "/api/a/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "DELETE",
+      "path": "/api/a",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "DELETE",
+      "path": "/api/a/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/api/b",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "GET",
+      "path": "/api/b/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "POST",
+      "path": "/api/b",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "POST",
+      "path": "/api/b/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "DELETE",
+      "path": "/api/b",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "DELETE",
+      "path": "/api/b/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "POST",
+      "path": "/api/cfg",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::cfg_post"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::cfg_post"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "POST",
+      "path": "/api/cfg/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::cfg_post"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::cfg_post"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/api/items",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::items::list"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::items::list"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "GET",
+      "path": "/api/items/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::items::list"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::items::list"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "POST",
+      "path": "/api/items",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::items::create"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::items::create"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "POST",
+      "path": "/api/items/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::items::create"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::items::create"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/api/items/7",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::items::show"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::items::show"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "GET",
+      "path": "/api/items/7/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::items::show"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::items::show"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/api/items/x1",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::items::by_slug"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::items::by_slug"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "GET",
+      "path": "/api/items/x1/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::items::by_slug"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::items::by_slug"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/api/ping",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::ping"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::ping"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "GET",
+      "path": "/api/ping/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::ping"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::ping"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "DELETE",
+      "path": "/api/users/x1",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::users::delete"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::users::delete"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "DELETE",
+      "path": "/api/users/x1/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::users::delete"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::users::delete"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/api/users/x1",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::users::get"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::users::get"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "GET",
+      "path": "/api/users/x1/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::users::get"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::users::get"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/files/a/b",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::files"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::files"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "POST",
+      "path": "/files/a/b",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::files"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::files"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "DELETE",
+      "path": "/files/a/b",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::files"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::files"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/m",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::route_macro"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::route_macro"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "GET",
+      "path": "/m/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::route_macro"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::route_macro"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "PUT",
+      "path": "/m",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::route_macro"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::route_macro"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "PUT",
+      "path": "/m/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::route_macro"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::route_macro"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/r1",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::routes_multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::routes_multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "GET",
+      "path": "/r1/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::routes_multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::routes_multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "POST",
+      "path": "/r2",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::routes_multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::routes_multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "POST",
+      "path": "/r2/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::routes_multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::routes_multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "fact",
+      "method": "GET",
+      "path": "/v1/status",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::v1_status"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::v1_status"
+      },
+      "pass": true
+    },
+    {
+      "kind": "trailing",
+      "method": "GET",
+      "path": "/v1/status/",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::v1_status"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::v1_status"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/",
+      "truth": "actix_app::handlers::index",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::index"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::index"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/api/items",
+      "truth": "actix_app::handlers::items::list",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::items::list"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::items::list"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/api/items/",
+      "truth": "actix_app::handlers::items::list",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::items::list"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::items::list"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "POST",
+      "path": "/api/items",
+      "truth": "actix_app::handlers::items::create",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::items::create"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::items::create"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/api/items/42",
+      "truth": "actix_app::handlers::items::show",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::items::show"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::items::show"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/api/items/abc",
+      "truth": "actix_app::handlers::items::by_slug",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::items::by_slug"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::items::by_slug"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/api/ping",
+      "truth": "actix_app::handlers::ping",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::ping"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::ping"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/api/users/3",
+      "truth": "actix_app::handlers::users::get",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::users::get"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::users::get"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "DELETE",
+      "path": "/api/users/3",
+      "truth": "actix_app::handlers::users::delete",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::users::delete"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::users::delete"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/api/a",
+      "truth": "actix_app::handlers::multi",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "PATCH",
+      "path": "/api/b",
+      "truth": "actix_app::handlers::multi",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "POST",
+      "path": "/api/cfg",
+      "truth": "actix_app::handlers::cfg_post",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::cfg_post"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::cfg_post"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/files/a/b.txt",
+      "truth": "actix_app::handlers::files",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::files"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::files"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/r1",
+      "truth": "actix_app::handlers::routes_multi",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::routes_multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::routes_multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "POST",
+      "path": "/r2",
+      "truth": "actix_app::handlers::routes_multi",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::routes_multi"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::routes_multi"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/m",
+      "truth": "actix_app::handlers::route_macro",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::route_macro"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::route_macro"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "PUT",
+      "path": "/m",
+      "truth": "actix_app::handlers::route_macro",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::route_macro"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::route_macro"
+      },
+      "pass": true
+    },
+    {
+      "kind": "expected",
+      "method": "GET",
+      "path": "/v1/status",
+      "truth": "actix_app::handlers::v1_status",
+      "predicted": {
+        "kind": "Handler",
+        "usr": "actix_app::handlers::v1_status"
+      },
+      "status": 200,
+      "actual": {
+        "kind": "Handler",
+        "body": "actix_app::handlers::v1_status"
+      },
+      "pass": true
+    },
+    {
+      "kind": "negative",
+      "method": "POST",
+      "path": "/api/users/3",
+      "truth": null,
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 405,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "negative",
+      "method": "DELETE",
+      "path": "/r1",
+      "truth": null,
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "negative",
+      "method": "GET",
+      "path": "/r2",
+      "truth": null,
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "negative",
+      "method": "DELETE",
+      "path": "/m",
+      "truth": null,
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "negative",
+      "method": "GET",
+      "path": "/files/",
+      "truth": null,
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "negative",
+      "method": "GET",
+      "path": "/files",
+      "truth": null,
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "negative",
+      "method": "GET",
+      "path": "/lonely",
+      "truth": null,
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "negative",
+      "method": "GET",
+      "path": "/api/cfg",
+      "truth": null,
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 405,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "negative",
+      "method": "GET",
+      "path": "/v1/status",
+      "truth": null,
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    }
+  ]
+}

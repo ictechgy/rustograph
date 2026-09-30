@@ -3,6 +3,7 @@
 //! 외부 의존(cargo, syn)은 이 파일과 modtree/harvest/cargo_meta에만 있다.
 //! 수확은 판단하지 않는다: 해석 불가·조건부·외부 참조는 전부 실측 limitation이다.
 
+pub mod routes;
 pub mod schema;
 
 use crate::cargo_meta::{self, Metadata};
@@ -88,9 +89,64 @@ pub fn owner_spans(
         symbol_level: true,
         ..Default::default()
     };
-    let mut spans = Vec::new();
-    let (doc, _) = harvest(dir, meta, &opts, Some(&mut spans))?;
-    Ok((doc, spans))
+    let mut sink = Sink {
+        spans: Some(Vec::new()),
+        ..Default::default()
+    };
+    let (doc, _) = harvest(dir, meta, &opts, Some(&mut sink))?;
+    Ok((doc, sink.spans.unwrap_or_default()))
+}
+
+/// 수확 부산물을 받는 그릇 — 필요한 칸만 Some으로 채워 넘긴다.
+///
+/// `schema`는 정점 범위만, `routes`는 모듈 트리와 AST 아레나까지 받는다. 라우트
+/// 추출이 핸들러 경로를 `impact`와 같은 정점 ID로 해석하려면 같은 수확의 이름
+/// 표가 필요하다 — 따로 다시 만들면 ID 규칙이 갈라진다.
+#[derive(Default)]
+struct Sink {
+    spans: Option<Vec<harvest::OwnerSpan>>,
+    tree: Option<ModTree>,
+    arena: Option<Arena>,
+    want_tree: bool,
+}
+
+/// `routes`가 쓰는 수확 산출물 — 문서·정점 범위·모듈 트리·AST 아레나.
+pub(crate) struct Parts {
+    pub(crate) doc: Document,
+    pub(crate) spans: Vec<harvest::OwnerSpan>,
+    pub(crate) tree: ModTree,
+    arena: Arena,
+}
+
+impl Parts {
+    /// 모듈 하나의 (선언 파일, 아이템 목록) 묶음 — 인라인 모듈과 lib/bin 합본
+    /// 루트를 수확과 같은 규칙으로 푼다.
+    pub(crate) fn module_items(&self, module: &str) -> Vec<(PathBuf, &'static [syn::Item])> {
+        module_items(&self.tree, &self.arena, module).unwrap_or_default()
+    }
+}
+
+/// 기본 옵션(심볼 레벨)으로 수확하고 트리·아레나까지 돌려준다.
+pub(crate) fn harvest_parts(dir: &Path, meta: &Metadata) -> Result<Parts, String> {
+    let opts = Options {
+        symbol_level: true,
+        ..Default::default()
+    };
+    let mut sink = Sink {
+        spans: Some(Vec::new()),
+        want_tree: true,
+        ..Default::default()
+    };
+    let (doc, _) = harvest(dir, meta, &opts, Some(&mut sink))?;
+    let (Some(tree), Some(arena)) = (sink.tree, sink.arena) else {
+        return Err("internal error: harvest did not return its module tree".to_string());
+    };
+    Ok(Parts {
+        doc,
+        spans: sink.spans.unwrap_or_default(),
+        tree,
+        arena,
+    })
 }
 
 /// `--target`의 cfg 팩트 — `rustc --print cfg` 실측이 권위다.
@@ -281,12 +337,12 @@ fn write_cache(path: &Path, key: u64, doc: &Document) {
 /// 실제 수확 — 메타데이터 위에서 모듈 트리·간선을 조립한다.
 /// (문서, include! 계열 매크로 사용 여부)를 돌린다 — include!는
 /// 정점 위치에 안 나타나는 입력이라 캐시 판정이 별도로 필요하다.
-/// `spans`가 주어지면 정점별 소스 범위(OwnerSpan)도 모은다.
+/// `sink`가 주어지면 정점별 소스 범위(OwnerSpan)와 모듈 트리·아레나도 넘긴다.
 fn harvest(
     dir: &Path,
     meta: &Metadata,
     opts: &Options,
-    spans: Option<&mut Vec<harvest::OwnerSpan>>,
+    mut sink: Option<&mut Sink>,
 ) -> Result<(Document, bool), String> {
     let mut harvest = Harvest::default();
     let mut vertices: Vec<Vertex> = Vec::new();
@@ -454,7 +510,7 @@ fn harvest(
         attr_refs.extend(ar);
         bodies.extend(bs);
     }
-    if let Some(out) = spans {
+    if let Some(out) = sink.as_deref_mut().and_then(|k| k.spans.as_mut()) {
         collect_owner_spans(&tree, &impls, &bodies, item_spans, out);
     }
 
@@ -589,6 +645,10 @@ fn harvest(
     } else {
         Level::Module
     };
+    if let Some(k) = sink.filter(|k| k.want_tree) {
+        k.tree = Some(tree);
+        k.arena = Some(arena);
+    }
     Ok((
         graph::document(
             level,
@@ -820,14 +880,14 @@ fn parse_into(arena: &mut Arena, file: &Path, uses_include: &mut bool) -> Result
 /// 파일 모듈은 파일 AST(루트는 extra_files까지 — 같은 이름의 lib/bin이
 /// 루트를 공유할 때 각 아이템의 실제 파일을 보존해야 semantic 엔진이
 /// 본문 소유자를 올바른 소스에 맞춘다), 인라인 모듈은 조상의 mod 본문.
-fn module_items<'a>(
+fn module_items(
     tree: &ModTree,
-    arena: &'a Arena,
+    arena: &Arena,
     path: &str,
-) -> Option<Vec<(PathBuf, &'a [syn::Item])>> {
+) -> Option<Vec<(PathBuf, &'static [syn::Item])>> {
     let module = tree.modules.get(path)?;
     if module.file_module {
-        let mut out: Vec<(PathBuf, &'a [syn::Item])> = Vec::new();
+        let mut out: Vec<(PathBuf, &'static [syn::Item])> = Vec::new();
         if let Some(items) = arena.get(&module.file).copied() {
             out.push((module.file.clone(), items));
         }
@@ -847,11 +907,11 @@ fn module_items<'a>(
         }
         top = modtree::parent_of(&top)?;
     }
-    let mut items: &'a [syn::Item] = arena.get(&tree.modules[&top].file).copied()?;
+    let mut items: &'static [syn::Item] = arena.get(&tree.modules[&top].file).copied()?;
     // 파일 루트에서 목표까지 인라인 mod 본문을 따라 내려간다.
     let rel = path.strip_prefix(&format!("{top}::"))?;
     for seg in rel.split("::") {
-        let mut next: Option<&'a [syn::Item]> = None;
+        let mut next: Option<&'static [syn::Item]> = None;
         for it in items {
             if let syn::Item::Mod(m) = it {
                 if m.ident == seg {

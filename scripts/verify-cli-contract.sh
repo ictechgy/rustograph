@@ -167,9 +167,43 @@ if [ "$got" -ne 0 ]; then
 	fails=$((fails+1))
 fi
 
+# routes --role server — isthmus http 서버 문서. --role은 필수이고 server만
+# 받는다(생략을 server로 읽으면 client를 더할 때 명령의 뜻이 바뀐다).
+# 사실 0건이어도 roles가 있으니 target은 http다(계약의 http 예외).
+check 0 "routes"              routes --role server
+check 2 "routes no role"      routes
+check 2 "routes client role"  routes --role client
+check 2 "routes bad fw"       routes --role server --framework rocket
+check 2 "routes semantic"     routes --role server --semantic
+check 2 "routes positional"   routes --role server stray
+routes_field() { # routes_field <설명> <패턴> <dir>
+	"$BIN" routes --role server --dir "$3" 2>/dev/null | grep -q "$2" || {
+		echo "FAIL $1: missing $2" >&2
+		fails=$((fails+1))
+	}
+}
+cp -R tests/fixture-routes "$FIX/fixture-routes"
+routes_field "routes empty target" '"target": "http"'                 "$FIX/fixture"
+routes_field "routes roles"        '"server"'                          "$FIX/fixture"
+routes_field "routes platform"     '"platform": "rust"'                "$FIX/fixture-routes/axum08"
+routes_field "routes axum"         '"dispatch": "specificity"'         "$FIX/fixture-routes/axum08"
+routes_field "routes actix"        '"dispatch": "registration-order"'  "$FIX/fixture-routes/actix"
+routes_field "routes decl"         '"kind": "route-decl"'              "$FIX/fixture-routes/actix"
+# 핸들러 usr는 그래프 정점이어야 reach로 이어진다 — 문서의 usr를 root로 준다.
+"$BIN" routes --role server --dir "$FIX/fixture-routes/axum08" --out "$FIX/routes.json" >/dev/null 2>&1 || {
+	echo "FAIL routes --out: document not written" >&2
+	fails=$((fails+1))
+}
+got=0
+"$BIN" reach --dir "$FIX/fixture-routes/axum08" --roots-from "$FIX/routes.json" >/dev/null 2>&1 || got=$?
+if [ "$got" -ne 0 ]; then
+	echo "FAIL routes usr roots: expected 0 (every handler usr is a vertex), got $got" >&2
+	fails=$((fails+1))
+fi
+
 # --dir를 붙이지 않는 검사 — check()는 항상 fixture dir을 뒤에 붙이므로
 # 나쁜 --dir 검증은 마지막 인자가 이기는(last-wins) 구조상 여기서 따로 한다.
-for c in "graph --dir /nonexistent-xyz" "schema --dir /nonexistent-xyz"; do
+for c in "graph --dir /nonexistent-xyz" "schema --dir /nonexistent-xyz" "routes --role server --dir /nonexistent-xyz"; do
 	got=0
 	# shellcheck disable=SC2086
 	"$BIN" $c >/dev/null 2>&1 || got=$?

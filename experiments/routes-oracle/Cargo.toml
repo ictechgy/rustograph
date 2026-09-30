@@ -1,0 +1,6 @@
+# 라우팅 오라클 — fixture의 같은 lib.rs를 crates.io의 진짜 프레임워크로 컴파일해
+# rustograph `routes`가 낸 사실마다 요청을 보내 실제 디스패치와 대조한다.
+# rustograph 본체와 별개인 독립 워크스페이스다(본체는 이 의존성을 모른다).
+[workspace]
+members = ["common", "axum08", "axum07", "actix"]
+resolver = "2"
