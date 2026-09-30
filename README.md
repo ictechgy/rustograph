@@ -301,13 +301,14 @@ depends on it.
   are `route-call-coverage:` / `ambiguous-base-join:` /
   `http-wrapper-undeclared:` / `http-wrapper-unresolved:` limitations.
 
-The rules, the proposed base-join style names (`whatwg-concat`,
-`whatwg-join`, `http-uri-concat`) and the oracle table are in
+The rules (`Url::join` is the isthmus `rfc3986` join; reqwest and ureq have
+no base URL, so full-URL rules apply) and the oracle table are in
 [docs/HTTP-CLIENT.md](docs/HTTP-CLIENT.md). A mock-server oracle
 (`experiments/client-oracle/`) compiles the fixture against the real
 reqwest/ureq/url crates and records every request at a local server: 41
-scenarios, 0 mismatches, checked offline by `cargo test`. The 41 producer
-cases of the isthmus `url-compose` vectors pass.
+scenarios, 0 mismatches, checked offline by `cargo test`. All 48
+`producer`/`producer:rustograph` cases of the isthmus `url-compose` vectors
+pass.
 
 ## Traversal documents — `reach` / `impact --format language-traversal`
 
@@ -347,10 +348,9 @@ strings as `symbol.usr` in `schema`.
   `symbol`, a `root-not-found:` limitation is added, and the command exits
   `64` after writing the document.
 
-isthmus accepts Rust `route-decl` documents, so a route-selection `trace`
-starts at an axum/actix-web handler. It does not yet accept Rust
-`route-call` facts: until that lands, `routes --role client` documents are
-validated against an isthmus build that allows them (see HANDOFF.md).
+isthmus accepts Rust `route-decl` and (since isthmus #133) `route-call`
+documents, so a workspace `trace` joins a reqwest client to an axum/actix-web
+handler and continues into the client code with `impact`.
 
 ## Agent output contract
 

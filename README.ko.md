@@ -195,12 +195,12 @@ import할 때만 인정합니다. 파싱 실패 파일·문법이 다른 `table!
   `ambiguous-base-join:`·`http-wrapper-undeclared:`·`http-wrapper-unresolved:`
   한계입니다.
 
-규칙, 제안한 결합 방식 이름(`whatwg-concat`·`whatwg-join`·`http-uri-concat`),
-오라클 표는 [docs/HTTP-CLIENT.md](docs/HTTP-CLIENT.md)에 있습니다. 모의 서버
+규칙(`Url::join`은 isthmus `rfc3986` 결합, reqwest·ureq는 base URL이 없어
+전체 URL 규칙)과 오라클 표는 [docs/HTTP-CLIENT.md](docs/HTTP-CLIENT.md)에 있습니다. 모의 서버
 오라클(`experiments/client-oracle/`)이 fixture를 진짜 reqwest·ureq·url로
 컴파일해 로컬 서버가 받은 요청을 기록합니다 — 41개 시나리오 불일치 0, 기록은
-`cargo test`가 오프라인으로 대조합니다. isthmus `url-compose` 벡터의 생산자
-사례 41건을 통과합니다.
+`cargo test`가 오프라인으로 대조합니다. isthmus `url-compose` 벡터의
+`producer`·`producer:rustograph` 사례 48건을 모두 통과합니다.
 
 ## 순회 문서 — `reach` / `impact --format language-traversal`
 
@@ -224,10 +224,9 @@ isthmus [`language-traversal` v1](https://github.com/ictechgy/isthmus/blob/main/
 - 그래프 정점이 아닌 root는 `symbol` 없이 싣고 `root-not-found:` limitation을
   더한 문서를 쓴 뒤 64로 끝납니다.
 
-isthmus는 Rust `route-decl` 문서를 받아 axum·actix-web 핸들러에서 route 선택
-`trace`를 시작합니다. Rust `route-call`은 아직 받지 않습니다 — 그 변경이
-들어오기 전까지 `routes --role client` 문서는 그것을 허용한 isthmus 빌드로
-검증했습니다(HANDOFF.md).
+isthmus는 Rust `route-decl`과(isthmus #133부터) `route-call` 문서를 받아,
+workspace `trace`가 reqwest 클라이언트를 axum·actix-web 핸들러와 잇고
+`impact`로 클라이언트 코드까지 이어 갑니다.
 
 ## 개발
 

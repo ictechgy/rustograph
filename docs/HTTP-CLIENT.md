@@ -32,14 +32,19 @@ rustograph routes --role client [--dir DIR] [--out FILE] [--wrappers http-wrappe
 | ureq 2.x | 위와 같은 자유 함수·`Agent`, `request(method, url)`·`request_url` | `url::Url::parse`(소스 기준, 실행 미확인 — 버전 한계를 낸다) | — |
 | url 2.5.8 | `Url::parse(s)`(reqwest 재수출 `reqwest::Url` 포함), `url.join(p)` 체인 | WHATWG URL Standard | url 크레이트 실행 결과(아래) |
 
-**결합 방식 이름(제안).** isthmus url-compose 벡터의 `join` 입력에 Rust 결합을 더할 때 쓸 이름이다. 벡터에 Rust 이름이
-생기면 러너를 그 이름으로 옮긴다.
+**결합 방식 이름.** isthmus `3a45450`(HTTP-WRAPPERS "Go, Rust, Python 클라이언트")이 정했다. `url::Url::join`은
+`rfc3986`이다. reqwest·ureq에는 base URL 설정이 없으므로 호출 식의 URL이 곧 요청 URL이고, 전체 URL 리터럴은
+`compose.strip`, 문자열 조립은 보간 규칙을 쓴다. 조립한 문자열의 앞머리가 모르는 값(`format!("{base}/x")`)이면 계약의
+"그 밖" 규칙대로 `/`로 시작하는 뒤 리터럴만 base 앵커 꼬리이고, 아니면 dynamic + `ambiguous-base-join:`이다.
 
-| 이름 | 쓰는 곳 | `/x`(미상 base) | `x`(미상 base) | base 리터럴 |
-|---|---|---|---|---|
-| `whatwg-concat` | `format!`·`+`·`concat!`로 이은 문자열을 reqwest·ureq 2에 넘김 | base | dynamic + `ambiguous-base-join:` | 이은 문자열을 WHATWG로 해석(점 세그먼트 제거, `//` 보존), root |
-| `whatwg-join` | `url::Url::join` | root | base(RFC 3986 병합) | WHATWG 상대 해석, root |
-| `http-uri-concat` | 이은 문자열을 ureq 3에 넘김 | base | dynamic + `ambiguous-base-join:` | 이은 문자열 그대로(점 세그먼트 보존), root |
+| 쓰는 곳 | `/x`(미상 base) | `x`(미상 base) | base 리터럴 |
+|---|---|---|---|
+| `url::Url::join`(`rfc3986`) | root(점 세그먼트 제거) | base, `./`는 지움, `..`·빈 참조는 dynamic + `ambiguous-base-join:` | WHATWG 상대 해석, root |
+| 이은 문자열을 reqwest·ureq 2에 넘김(`Url::parse`) | base | dynamic + `ambiguous-base-join:` | 전체 URL을 WHATWG로 해석(점 세그먼트 제거, `//` 보존), root |
+| 이은 문자열을 ureq 3에 넘김(`http::Uri`) | base | dynamic + `ambiguous-base-join:` | 전체 URL 그대로(점 세그먼트 보존), root |
+
+코드 안의 이름은 `Join::WhatwgJoin`(=`rfc3986`), `Join::WhatwgConcat`, `Join::HttpUriConcat`이다. 벡터에는 뒤의 둘을
+가리키는 결합 이름이 없다(전체 URL 규칙이라 필요 없다).
 
 WHATWG 결합은 http(s)에서 RFC 3986과 같다. 다른 점은 셋이고 모두 구현했다: `\`를 `/`로 읽고, 같은 scheme의
 `http:x`는 상대 참조이며, 앞뒤 C0·공백과 탭·줄바꿈을 지운다. url 2.5.8로 실행해 확인한 값(단위 테스트
@@ -47,7 +52,8 @@ WHATWG 결합은 http(s)에서 RFC 3986과 같다. 다른 점은 셋이고 모�
 `http://h/a/b/c` + `../x` → `/a/x`, `http://h/api` + `\x` → `/x`, `http://h/api/` + `http:x` → `/api/x`,
 `http://h/api` + `//other/x` → host `other`의 `/x`, `http://h/api` + `?q=1` → `/api`.
 
-문자열 연결의 base 미상 행은 dio 단순 연결과 결과가 같아 공유 벡터의 `dio-concat` 사례를 `whatwg-concat`으로 실행한다.
+문자열 연결의 base 미상 행은 dio 단순 연결과 결과가 같아 공유 벡터의 공통(`producer`) `dio-concat` 사례를
+`Join::WhatwgConcat`으로 실행한다.
 `slash-join` 사례는 벡터용 `Join::SlashJoin`으로 실행한다(그 방식을 쓰는 Rust 라이브러리는 모델링하지 않았다).
 
 ## 해석과 증명
@@ -109,9 +115,12 @@ WHATWG 결합은 http(s)에서 RFC 3986과 같다. 다른 점은 셋이고 모�
 
 ## 공유 적합성 벡터
 
-`conformance/url-compose.json`(isthmus `76b6141`)의 `producer` 사례 41건을 `tests/client_routes.rs`가 제품 함수로
-실행한다(`compose::compose_path`·`join`·`UrlVal::parse`·`mask`, `wrappers::bind_method`). `wrapper.location`은 실제
-스캐너로 여러 줄 호출의 시작 줄과 UTF-8 열을 확인한다. `producer:kartograph`(Spring) 13건은 적용하지 않는다.
+`conformance/url-compose.json`(isthmus `3a45450`)의 `producer` 41건과 `producer:rustograph` 7건(`base-join/rust-url-join-*`·
+`rfc3986-unknown-*`)을 `tests/client_routes.rs`가 제품 함수로 실행한다(`compose::compose_path`·`join`·`UrlVal::parse`·`mask`,
+`wrappers::bind_method`) — **48/48 통과**. `wrapper.location`은 실제 스캐너로 여러 줄 호출의 시작 줄과 UTF-8 열을 확인한다.
+다른 생산자 전용 사례(`producer:kartograph`·`gartograph`·`pythograph`)는 적용하지 않는다. 오라클과 어긋난 벡터는 없다.
+벡터를 받으며 고친 것: 미상 base의 `rfc3986` 상대 참조에 `..`가 있거나 참조가 비면 dynamic + `ambiguous-base-join:`이다
+(이전에는 `..`가 알려진 세그먼트 안에서 끝나면 템플릿을 냈다).
 
 ## 모의 서버 오라클
 
@@ -172,6 +181,5 @@ crates.io의 진짜 reqwest 0.13.5·ureq 3.4.2·url 2.5.8로 컴파일해 시나
 
 ## isthmus 호환
 
-isthmus main(`c395c59`)은 rust `route-call`을 받지 않는다(`src/exchange/parse.ts` `routeKindPlatforms`, "Fact kind is
-not valid for platform"). 그 집합에 `rust`를 더한 scratch isthmus로 fixture 문서와 axum08 서버 문서를 workspace
-`trace`에 넣어 확인했다(HANDOFF의 e2e 절). isthmus가 rust route-call을 받는 변경을 머지하면 이 절을 갱신한다.
+isthmus `3a45450`(#133)부터 rust `route-call`을 받는다(그 전 main `c395c59`는 "Fact kind is not valid for platform"으로
+거부했다). 무패치 `3a45450` 빌드로 fixture 문서와 axum08 서버 문서를 workspace `trace`에 넣어 확인했다(HANDOFF의 e2e 절).
