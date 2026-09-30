@@ -799,3 +799,22 @@ pub fn build() {
         .iter()
         .any(|l| l.starts_with("route-coverage: an App passed to a function")));
 }
+
+/// 비ASCII 문자가 앞에 있어도 위치 열은 UTF-8 바이트다.
+#[test]
+fn server_route_columns_are_utf8_bytes() {
+    let line =
+        "pub fn app() -> Router { let _ = \"한😀\"; Router::new().route(\"/items\", get(h)) }";
+    let source = format!("use axum::{{Router, routing::get}};\nasync fn h() {{}}\n{line}\n");
+    let dir = temp_crate("utf8columns", &[("axum", "0.8.0")], &[("lib.rs", &source)]);
+    let doc = doc_of(&dir, None);
+    let fact = &doc["facts"][0];
+    assert!(fact.is_object(), "expected route fact: {doc}");
+    let column = fact["location"]["column"].as_u64().unwrap() as usize;
+    let suffix = &line.as_bytes()[column - 1..];
+    assert!(
+        suffix.starts_with(b"h") || suffix.starts_with(b"get") || suffix.starts_with(b"\"/items"),
+        "wrong byte column {column}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

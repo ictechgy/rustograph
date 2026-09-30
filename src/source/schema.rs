@@ -1625,15 +1625,26 @@ fn sql_relations(text: &str) -> (Vec<String>, bool) {
             } else {
                 match read_qualified_name(&tokens, j) {
                     Some((name, next)) => {
-                        if buffered_grant {
-                            buf.push(name);
-                        } else if seen.insert(name.clone()) {
-                            out.push(name);
-                        }
                         for c in consumed.iter_mut().take(next).skip(j) {
                             *c = true;
                         }
-                        next
+                        if matches!(word.as_str(), "from" | "join")
+                            && tokens.get(next).is_some_and(|t| !t.quoted && t.text == "(")
+                        {
+                            // 함수의 내부 관계를 추측하지 않고 미해석 근거를 남긴다.
+                            unresolved = true;
+                            match skip_parens(&tokens, next) {
+                                Some(end) => end,
+                                None => break,
+                            }
+                        } else {
+                            if buffered_grant {
+                                buf.push(name);
+                            } else if seen.insert(name.clone()) {
+                                out.push(name);
+                            }
+                            next
+                        }
                     }
                     None => {
                         // 이름 자리에 절 키워드가 오는 것(`DO UPDATE SET`,
@@ -2057,6 +2068,22 @@ mod tests {
 
     /// SQL 렉서·관계 추출의 표 테스트 — gartograph의 schema_test.go와
     /// 같은 경계를 검증한다.
+    #[test]
+    fn sql_table_valued_functions_are_not_relations() {
+        assert_eq!(
+            sql_relations("SELECT * FROM pragma_table_info('t')"),
+            (vec![], true)
+        );
+        assert_eq!(
+            sql_relations("SELECT * FROM users JOIN main.pragma_table_info('t') p ON true"),
+            (vec!["users".into()], true)
+        );
+        assert_eq!(
+            sql_relations("SELECT * FROM pragma_table_info('t') AS p, users"),
+            (vec!["users".into()], true)
+        );
+    }
+
     #[test]
     fn sql_relations_reads_keywords_and_lists() {
         let cases: &[(&str, &[&str])] = &[

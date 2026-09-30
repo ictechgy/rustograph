@@ -275,9 +275,9 @@ impl<'a> Ctx<'a> {
             .map(|(_, id)| id.clone())
     }
 
-    /// 계약의 위치(루트 기준 경로, 1 기반 줄, UTF-16 열)다.
+    /// 계약의 위치(루트 기준 경로, 1 기반 줄, UTF-8 바이트 열)다.
     pub fn locate(&self, loc: &Loc) -> Option<BridgeLocation> {
-        self.locate_with(loc, |c| c.len_utf16() as u32)
+        self.locate_with(loc, |c| c.len_utf8() as u32)
     }
 
     /// 계약의 위치 — 열은 GRAPH-EXCHANGE가 정한 UTF-8 바이트 오프셋 + 1이다.
