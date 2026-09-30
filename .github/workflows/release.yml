@@ -125,6 +125,7 @@ jobs:
           tar -xzf "rustograph-${VERSION}-darwin-arm64.tar.gz" -C "$RUNNER_TEMP"
           bin="$RUNNER_TEMP/rustograph-${VERSION}-darwin-arm64/rustograph"
           test "$("$bin" version)" = "rustograph ${VERSION}"
+          test "$("$bin" --version)" = "rustograph ${VERSION}"
           cmp README.md "$RUNNER_TEMP/rustograph-${VERSION}-darwin-arm64/README.md"
           scripts/verify-cli-contract.sh "$bin"
 

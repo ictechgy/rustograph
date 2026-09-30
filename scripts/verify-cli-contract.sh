@@ -56,6 +56,12 @@ check 2 "rules no config"   rules --strict
 check 0 "rules"             rules --config "$FIX/rules.yml"
 check 0 "rules sarif"       rules --config "$FIX/rules.yml" --format sarif
 check 0 "version"           version
+check 0 "--version"         --version
+# --version은 isthmus 설치 버전 대조가 읽는 별칭이다 — 하위 명령과 출력이 같아야 한다.
+if [ "$("$BIN" --version)" != "$("$BIN" version)" ]; then
+	echo "FAIL --version: output differs from version" >&2
+	fails=$((fails+1))
+fi
 check 2 "unknown command"   frobnicate
 check 2 "bad level"         graph --level bogus
 check 2 "bad format"        graph --format xml

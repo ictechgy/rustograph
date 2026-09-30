@@ -36,7 +36,7 @@ usage:
   rustograph routes --role server [--dir DIR] [--out FILE] [--framework axum|actix]
   rustograph routes --role client [--dir DIR] [--out FILE] [--wrappers FILE]
                    [--service NAME]
-  rustograph version
+  rustograph version | --version
 
 shared flags: --deps --tests --retain-public --semantic --no-cache
   --focus PATH --target TRIPLE --exclude-tests
@@ -74,7 +74,9 @@ fn run_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Resul
         Err(e) => return Err(format!("{e}\n{USAGE}")),
     };
     match a.cmd.as_str() {
-        "version" => {
+        // `--version`은 계열 관례(isthmus verify-installed-compatibility가
+        // `<tool> --version`의 마지막 semver를 읽는다)를 위한 별칭이다 — 출력은 하위 명령과 같다.
+        "version" | "--version" => {
             writeln!(out, "rustograph {VERSION}").ok();
             Ok(0)
         }
@@ -591,6 +593,16 @@ mod tests {
         let (code, out, _) = run_cli(&["version"]);
         assert_eq!(code, 0);
         assert!(out.contains("rustograph"));
+    }
+
+    #[test]
+    fn version_flag_matches_version_command() {
+        // 별칭이 따로 놀면 설치 버전 대조가 하위 명령과 다른 값을 읽게 된다.
+        let (code, flag_out, _) = run_cli(&["--version"]);
+        let (_, command_out, _) = run_cli(&["version"]);
+        assert_eq!(code, 0);
+        assert_eq!(flag_out, command_out);
+        assert_eq!(flag_out, format!("rustograph {VERSION}\n"));
     }
 
     #[test]
