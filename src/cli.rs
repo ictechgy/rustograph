@@ -3,8 +3,10 @@
 //! 종료 코드: 0 정상, 1 strict 위반 발견, 2 사용법/분석 오류.
 //! 플래그 파서는 외부 크레이트 없이 직접 만든다 — 명령이 적고 계약이 단순해서다.
 
+mod reach;
+
 use crate::cli_args::{self, Args};
-use crate::{analysis, config, deps, export, mcp, rules, sarif, source};
+use crate::{analysis, config, deps, export, mcp, rules, sarif, source, traversal};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -24,6 +26,9 @@ usage:
   rustograph deps [--strict] [--format text|json]
   rustograph query ID [--depth N] [--max N]
   rustograph impact ID [--depth N] [--max N]
+  rustograph reach ID... [--roots-from FILE|-] [--max-depth N] [--max-reached N]
+                   [--revision REV] [--generated-at TIMESTAMP]
+  rustograph impact --format language-traversal ID... (same options as reach)
   rustograph paths FROM TO [--max N] [--budget N]
   rustograph search QUERY [--max N]
   rustograph mcp [--dir DIR] [--graph FILE] [--config FILE] [--deps] [--tests]
@@ -36,7 +41,12 @@ shared flags: --deps --tests --retain-public --semantic --no-cache
   semantics (requires a build with `--features semantic`; results cached
   in .rustograph/semantic-cache.json unless --no-cache)
 
-exit codes: 0 ok · 1 strict violation found · 2 usage/analysis error";
+reach / impact --format language-traversal emit an isthmus language-traversal
+v1 document (dependencies / dependents) for many roots in one pass; ids that
+are not graph vertices are listed without symbol and the command exits 64.
+
+exit codes: 0 ok · 1 strict violation found · 2 usage/analysis error
+  (traversal output: 64 usage error with empty stdout, or root-not-found)";
 
 /// 명령을 실행하고 종료 코드를 돌려준다.
 /// os::exit 대신 반환값을 쓰는 것은 종료 코드 계약을 테스트하기 위함이다.
@@ -51,7 +61,15 @@ pub fn run(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i
 }
 
 fn run_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
-    let a = cli_args::parse(args).map_err(|e| format!("{e}\n{USAGE}"))?;
+    let a = match cli_args::parse(args) {
+        Ok(a) => a,
+        // 순회 명령은 계열 계약대로 사용법 오류가 64다 — 전역 파서 실패도 마찬가지.
+        Err(e) if reach::is_traversal_argv(args) => {
+            let _ = writeln!(err, "error: {e}");
+            return Ok(reach::EXIT_USAGE);
+        }
+        Err(e) => return Err(format!("{e}\n{USAGE}")),
+    };
     match a.cmd.as_str() {
         "version" => {
             writeln!(out, "rustograph {VERSION}").ok();
@@ -63,7 +81,11 @@ fn run_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Resul
         "rules" => cmd_rules(&a, out),
         "deps" => cmd_deps(&a, out),
         "query" => cmd_query(&a, out, false),
+        "impact" if a.get("format") == Some("language-traversal") => {
+            cmd_traversal(&a, traversal::Direction::Dependents, out, err)
+        }
         "impact" => cmd_query(&a, out, true),
+        "reach" => cmd_traversal(&a, traversal::Direction::Dependencies, out, err),
         "paths" => cmd_paths(&a, out),
         "search" => cmd_search(&a, out),
         "schema" => cmd_schema(&a, out),
@@ -73,6 +95,32 @@ fn run_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Resul
             Ok(0)
         }
         other => Err(format!("unknown command {other}\n{USAGE}")),
+    }
+}
+
+/// `reach`·`impact --format language-traversal` — 순회 문서를 낸다.
+/// 사용법 오류는 표준 출력을 비운 채 64, 수확 실패는 2다.
+fn cmd_traversal(
+    a: &Args,
+    direction: traversal::Direction,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<i32, String> {
+    match reach::cmd(a, VERSION, direction, &mut std::io::stdin().lock(), out) {
+        Ok(code) => {
+            if code == reach::EXIT_USAGE {
+                let _ = writeln!(
+                    err,
+                    "error: some roots are not rustograph graph vertices (root-not-found); the document lists them without symbol"
+                );
+            }
+            Ok(code)
+        }
+        Err(reach::Failure::Usage(m)) => {
+            let _ = writeln!(err, "error: {m}");
+            Ok(reach::EXIT_USAGE)
+        }
+        Err(reach::Failure::Analysis(m)) => Err(m),
     }
 }
 

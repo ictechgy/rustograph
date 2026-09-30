@@ -2011,7 +2011,8 @@ fn is_ident_part(c: u8) -> bool {
 
 /// bridge-facts 계약이 요구하는 RFC 3339 UTC 타임스탬프를 만든다.
 /// 달력 변환은 외부 의존 없이 표준 civil 알고리즘으로 처리한다.
-fn rfc3339_utc_now() -> String {
+/// 지금 시각의 계약 타임스탬프 — 순회 문서의 generatedAt도 같은 문법을 쓴다.
+pub fn rfc3339_utc_now() -> String {
     rfc3339_utc(std::time::SystemTime::now())
 }
 
