@@ -66,8 +66,9 @@ fn pieces_of(parts: &Value) -> Vec<Piece> {
         .collect()
 }
 
-/// 벡터의 결합 이름 → Rust 결합. `dio-concat`은 같은 입력에서 결과가 같은 WHATWG
-/// 문자열 연결로 실행한다(점 세그먼트·`//` 처리만 다르고 벡터 입력에는 없다).
+/// 벡터의 결합 이름 → Rust 결합. `rfc3986`은 isthmus가 Rust `Url::join`에 정한 이름이다.
+/// 공통 `dio-concat` 사례는 같은 입력에서 결과가 같은 WHATWG 문자열 연결로 실행한다(점
+/// 세그먼트·`//` 처리만 다르고 벡터 입력에는 없다).
 fn join_of(name: &str) -> Join {
     match name {
         "rfc3986" => Join::WhatwgJoin,
@@ -165,8 +166,8 @@ fn run_wrapper_method(id: &str, c: &Value) {
 #[test]
 fn url_compose_producer_cases_pass() {
     let cases = url_compose_cases();
-    // 조용히 줄지 않게 — 벡터 재벤더링 때 수를 확인한다(producer 41, producer:kartograph 13 제외).
-    assert_eq!(cases.len(), 41);
+    // 조용히 줄지 않게 — 벡터 재벤더링 때 수를 확인한다(producer 41 + producer:rustograph 7, 다른 생산자 전용 제외).
+    assert_eq!(cases.len(), 48);
     let mut by_rule: BTreeMap<String, usize> = BTreeMap::new();
     for c in &cases {
         let id = c["id"].as_str().unwrap_or("");
@@ -216,7 +217,7 @@ fn url_compose_producer_cases_pass() {
             other => panic!("unclassified url-compose rule {other} ({id})"),
         }
     }
-    assert_eq!(by_rule.get("compose.base-join"), Some(&7));
+    assert_eq!(by_rule.get("compose.base-join"), Some(&14));
 }
 
 /// `wrapper.location`: 여러 줄 호출은 호출식이 시작하는 줄이다. 열은 UTF-8 바이트다.

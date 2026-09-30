@@ -35,6 +35,8 @@ const SKIPPED: &[&str] = &[
     "dispatch.match",
     "dispatch.shadow",
     "scope.applies",
+    // dynamic 선언의 `dynamicScope` — rustograph는 이 선택 필드를 내지 않는다.
+    "scope.dynamic-",
     "framework.openapi.",
     "framework.spring.",
     // 클라이언트 조립 규칙 — tests/client_routes.rs가 실행한다.

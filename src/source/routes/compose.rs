@@ -262,7 +262,17 @@ impl UrlVal {
         }
         let mut out = self.clone();
         out.query = false;
+        let unknown_base = matches!(
+            self.path,
+            UrlPath::Opaque
+                | UrlPath::Known {
+                    anchor: PathAnchor::Base,
+                    ..
+                }
+        );
         let first = match input.first() {
+            // 빈 참조는 base 경로 그대로다 — base를 모르면 경로를 주장할 수 없다.
+            None if unknown_base => return out.into_dynamic(true),
             None => return out,
             Some(Piece::Lit(l)) => l.clone(),
             Some(_) => return out.into_dynamic(false),
@@ -295,8 +305,11 @@ impl UrlVal {
         } else if first.starts_with(['?', '#']) || first.is_empty() {
             out.query = true;
             if matches!(self.path, UrlPath::Opaque) {
-                return out.into_dynamic(false);
+                return out.into_dynamic(true);
             }
+        } else if unknown_base && has_dot_dot(&input) {
+            // HTTP-WRAPPERS `rfc3986`, base 미상: `..`는 지울 세그먼트를 알 수 없다.
+            return out.into_dynamic(true);
         } else {
             out.path = match &self.path {
                 UrlPath::Known { anchor, pieces } => UrlPath::Known {
@@ -465,6 +478,22 @@ fn preprocess(pieces: &[Piece]) -> Vec<Piece> {
     }
     out.retain(|p| !matches!(p, Piece::Lit(l) if l.is_empty()));
     out
+}
+
+/// 리터럴 조각에 `..`(또는 퍼센트 인코딩 변형) 세그먼트가 있는가. query·fragment 뒤는 보지 않는다.
+fn has_dot_dot(pieces: &[Piece]) -> bool {
+    for p in pieces {
+        if let Piece::Lit(l) = p {
+            let path = l.split(['?', '#']).next().unwrap_or("");
+            if path.split('/').any(is_double_dot) {
+                return true;
+            }
+            if path.len() != l.len() {
+                return false;
+            }
+        }
+    }
+    false
 }
 
 /// `scheme:` 접두사를 떼어 (소문자 scheme, 나머지)로 돌려준다.
@@ -883,10 +912,39 @@ mod tests {
     fn opaque_base_relative_and_dots() {
         let o = join(Join::WhatwgJoin, None, &[lit("a/b")]);
         assert_eq!(tpl(&o), ("/a/b", PathAnchor::Base));
-        let up = join(Join::WhatwgJoin, None, &[lit("../x")]);
-        assert!(matches!(up, Outcome::Dynamic { .. }), "{up:?}");
+        let up = join(Join::WhatwgJoin, None, &[lit("a/../x")]);
+        assert!(
+            matches!(
+                up,
+                Outcome::Dynamic {
+                    ambiguous: true,
+                    ..
+                }
+            ),
+            "{up:?}"
+        );
         let q = join(Join::WhatwgJoin, None, &[lit("?x")]);
-        assert!(matches!(q, Outcome::Dynamic { .. }));
+        assert!(matches!(
+            q,
+            Outcome::Dynamic {
+                ambiguous: true,
+                ..
+            }
+        ));
+        let empty = UrlVal::opaque(true).join(&[]).outcome();
+        assert!(matches!(
+            empty,
+            Outcome::Dynamic {
+                ambiguous: true,
+                ..
+            }
+        ));
+        let known_empty = UrlVal::parse(&[lit("http://h/a")], true)
+            .join(&[])
+            .outcome();
+        assert!(matches!(known_empty, Outcome::Template(_)));
+        let query_dots = join(Join::WhatwgJoin, None, &[lit("x?next=../y")]);
+        assert_eq!(tpl(&query_dots), ("/x", PathAnchor::Base));
         // 두 번 잇기 — 미상 base 뒤 `api/` + `users`.
         let u = UrlVal::opaque(true)
             .join(&[lit("api/")])
