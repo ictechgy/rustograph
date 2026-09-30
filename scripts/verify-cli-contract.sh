@@ -167,12 +167,17 @@ if [ "$got" -ne 0 ]; then
 	fails=$((fails+1))
 fi
 
-# routes --role server — isthmus http 서버 문서. --role은 필수이고 server만
-# 받는다(생략을 server로 읽으면 client를 더할 때 명령의 뜻이 바뀐다).
-# 사실 0건이어도 roles가 있으니 target은 http다(계약의 http 예외).
+# routes --role server|client — isthmus http 문서. --role은 필수다(생략을 한쪽으로
+# 읽으면 명령의 뜻이 역할에 따라 흔들린다). 사실 0건이어도 roles가 있으니 target은
+# http다(계약의 http 예외).
 check 0 "routes"              routes --role server
 check 2 "routes no role"      routes
-check 2 "routes client role"  routes --role client
+check 2 "routes bad role"     routes --role proxy
+check 0 "routes client"       routes --role client
+check 2 "routes client fw"    routes --role client --framework axum
+check 2 "routes server wrap"  routes --role server --wrappers x.json
+check 2 "routes client wrap"  routes --role client --wrappers /nonexistent-xyz.json
+check 2 "routes client svc"   routes --role client --service ""
 check 2 "routes bad fw"       routes --role server --framework rocket
 check 2 "routes semantic"     routes --role server --semantic
 check 2 "routes positional"   routes --role server stray
@@ -189,6 +194,37 @@ routes_field "routes platform"     '"platform": "rust"'                "$FIX/fix
 routes_field "routes axum"         '"dispatch": "specificity"'         "$FIX/fixture-routes/axum08"
 routes_field "routes actix"        '"dispatch": "registration-order"'  "$FIX/fixture-routes/actix"
 routes_field "routes decl"         '"kind": "route-decl"'              "$FIX/fixture-routes/actix"
+# 클라이언트 문서 — reqwest·ureq 호출과 선언된 래퍼. 선언 오류는 사용법 오류(2)다.
+cp -R tests/fixture-client "$FIX/fixture-client"
+client_field() { # client_field <설명> <패턴> <추가 인자...>
+	local desc="$1" pat="$2"; shift 2
+	"$BIN" routes --role client --dir "$FIX/fixture-client/app" "$@" 2>/dev/null | grep -q "$pat" || {
+		echo "FAIL $desc: missing $pat" >&2
+		fails=$((fails+1))
+	}
+}
+client_field "routes client roles"   '"client"'
+client_field "routes client call"    '"kind": "route-call"'
+client_field "routes client wrapper" '"/w/orders"' --wrappers "$FIX/fixture-client/http-wrappers.json"
+client_field "routes client service" '"service": "mobile"' --service mobile
+echo '{"format":"http-wrappers","version":1,"wrappers":[],"extra":1}' > "$FIX/bad-wrappers.json"
+got=0
+"$BIN" routes --role client --dir "$FIX/fixture-client/app" --wrappers "$FIX/bad-wrappers.json" >/dev/null 2>&1 || got=$?
+if [ "$got" -ne 2 ]; then
+	echo "FAIL routes client bad wrappers: expected 2, got $got" >&2
+	fails=$((fails+1))
+fi
+# 호출 usr도 그래프 정점이어야 impact로 이어진다.
+"$BIN" routes --role client --dir "$FIX/fixture-client/app" --out "$FIX/client.json" >/dev/null 2>&1 || {
+	echo "FAIL routes client --out: document not written" >&2
+	fails=$((fails+1))
+}
+got=0
+"$BIN" impact --format language-traversal --dir "$FIX/fixture-client/app" --roots-from "$FIX/client.json" >/dev/null 2>&1 || got=$?
+if [ "$got" -ne 0 ]; then
+	echo "FAIL routes client usr roots: expected 0 (every call usr is a vertex), got $got" >&2
+	fails=$((fails+1))
+fi
 # 핸들러 usr는 그래프 정점이어야 reach로 이어진다 — 문서의 usr를 root로 준다.
 "$BIN" routes --role server --dir "$FIX/fixture-routes/axum08" --out "$FIX/routes.json" >/dev/null 2>&1 || {
 	echo "FAIL routes --out: document not written" >&2
@@ -203,7 +239,7 @@ fi
 
 # --dir를 붙이지 않는 검사 — check()는 항상 fixture dir을 뒤에 붙이므로
 # 나쁜 --dir 검증은 마지막 인자가 이기는(last-wins) 구조상 여기서 따로 한다.
-for c in "graph --dir /nonexistent-xyz" "schema --dir /nonexistent-xyz" "routes --role server --dir /nonexistent-xyz"; do
+for c in "graph --dir /nonexistent-xyz" "schema --dir /nonexistent-xyz" "routes --role server --dir /nonexistent-xyz" "routes --role client --dir /nonexistent-xyz"; do
 	got=0
 	# shellcheck disable=SC2086
 	"$BIN" $c >/dev/null 2>&1 || got=$?

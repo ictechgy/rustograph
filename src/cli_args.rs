@@ -83,6 +83,8 @@ const VALUE_FLAGS: &[&str] = &[
     "generated-at",
     "role",
     "framework",
+    "wrappers",
+    "service",
 ];
 const BOOL_FLAGS: &[&str] = &[
     "deps",
