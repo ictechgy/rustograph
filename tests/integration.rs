@@ -684,6 +684,10 @@ pub fn if_let(x: Option<u32>) -> u32 {
 pub fn loops(v: Vec<u32>) -> u32 { let mut n = 0; for item in v { n += item; } n }
 pub fn block_scope() -> u32 { { let item = 1; let _ = item; } item() }
 pub fn capture(repo: u32) -> String { format!("{repo}") }
+pub mod util { pub fn inner() {} }
+pub fn util() -> u32 { 4 }
+pub fn same_name() -> u32 { util() }
+pub fn nested_fn() { let _ = { fn go(helper: u32) -> u32 { helper } go(1) }; }
 "#,
     )
     .unwrap();
@@ -714,6 +718,16 @@ pub fn capture(repo: u32) -> String { format!("{repo}") }
     assert!(has("locals::arms", "locals::MAX"));
     // 블록을 나가면 지역이 사라진다.
     assert!(has("locals::block_scope", "locals::item"));
+    // 모듈과 같은 이름의 fn(다른 이름공간)은 값 자리에서 fn으로 남는다.
+    assert!(
+        has("locals::same_name", "locals::util"),
+        "fn sharing a module name"
+    );
+    // 블록 안 fn의 매개변수도 지역이다.
+    assert!(
+        !has("locals::nested_fn", "locals::helper"),
+        "nested fn param"
+    );
     // `self` 수신자는 모듈이 아니다.
     assert!(!d
         .edges

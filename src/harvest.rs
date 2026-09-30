@@ -697,10 +697,24 @@ impl BodyVisitor<'_> {
             }
         }
         match self.resolve(segs) {
-            Some(id) if self.tree.modules.contains_key(&id) => ValueRes::Local,
+            Some(id) if self.tree.modules.contains_key(&id) && !self.value_item(&id) => {
+                ValueRes::Local
+            }
             Some(id) => ValueRes::Item(id),
             None => ValueRes::Unresolved,
         }
+    }
+
+    /// 모듈 경로가 같은 이름의 값 아이템(fn·const·static)과도 겹치는가 — 그때 값
+    /// 자리의 해석은 그 아이템이다(모듈과 값은 이름공간이 다르다).
+    fn value_item(&self, id: &str) -> bool {
+        let Some((parent, name)) = id.rsplit_once("::") else {
+            return false;
+        };
+        self.tree
+            .modules
+            .get(parent)
+            .is_some_and(|m| m.value_items.contains(name))
     }
 }
 
@@ -868,8 +882,12 @@ impl Visit<'_> for BodyVisitor<'_> {
     }
 
     fn visit_item(&mut self, i: &syn::Item) {
-        // 블록 안 아이템은 바깥 지역을 캡처하지 않는다.
+        // 블록 안 아이템은 바깥 지역을 캡처하지 않는다. 블록 안 fn은 자기
+        // 매개변수를 첫 겹으로 가진다.
         let saved = self.scopes.take();
+        if let syn::Item::Fn(f) = i {
+            self.scopes = locals::Scopes::with_params(&locals::param_bindings(&f.sig));
+        }
         syn::visit::visit_item(self, i);
         self.scopes.restore(saved);
     }

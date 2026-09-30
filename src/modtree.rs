@@ -89,6 +89,9 @@ pub struct Module {
     pub dir: PathBuf,
     /// 직접 선언된 아이템 이름들(모듈 스코프 해석용).
     pub items: BTreeSet<String>,
+    /// 그중 값 이름공간의 아이템(fn·const·static) — `mod util`과 `fn util`처럼
+    /// 이름공간이 다른 두 아이템이 한 경로를 공유할 때 값 자리 해석이 fn을 고른다.
+    pub value_items: BTreeSet<String>,
     /// `use` 임포트 맵: 마지막 세그먼트(또는 as 이름) → 임포트.
     pub imports: BTreeMap<String, Import>,
     /// 자식 모듈 이름 → 경로.
@@ -106,6 +109,7 @@ impl Module {
             public,
             cfg: None,
             items: BTreeSet::new(),
+            value_items: BTreeSet::new(),
             imports: BTreeMap::new(),
             children: BTreeMap::new(),
         }
@@ -397,10 +401,12 @@ pub fn cfg_of(attrs: &[syn::Attribute]) -> Option<String> {
 /// 따라 크로스 크레이트 임포트가 조용히 유실된다.
 pub fn fill_items(tree: &mut ModTree, path: &str, items: &[&syn::Item]) {
     let mut names = BTreeSet::new();
+    let mut values = BTreeSet::new();
     for item in items {
         match item {
             syn::Item::Fn(f) => {
                 names.insert(f.sig.ident.to_string());
+                values.insert(f.sig.ident.to_string());
             }
             syn::Item::Struct(s) => {
                 names.insert(s.ident.to_string());
@@ -419,9 +425,11 @@ pub fn fill_items(tree: &mut ModTree, path: &str, items: &[&syn::Item]) {
             }
             syn::Item::Const(c) => {
                 names.insert(c.ident.to_string());
+                values.insert(c.ident.to_string());
             }
             syn::Item::Static(s) => {
                 names.insert(s.ident.to_string());
+                values.insert(s.ident.to_string());
             }
             syn::Item::Mod(m) => {
                 names.insert(m.ident.to_string());
@@ -434,11 +442,9 @@ pub fn fill_items(tree: &mut ModTree, path: &str, items: &[&syn::Item]) {
             _ => {}
         }
     }
-    tree.modules
-        .get_mut(path)
-        .expect("module must exist")
-        .items
-        .extend(names);
+    let module = tree.modules.get_mut(path).expect("module must exist");
+    module.items.extend(names);
+    module.value_items.extend(values);
 }
 
 /// 모듈의 `use` 임포트 맵을 해석해 채운다(2단계 — 전 모듈의 fill_items 이후).
