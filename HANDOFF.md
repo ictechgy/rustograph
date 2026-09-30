@@ -2,7 +2,34 @@
 
 세션을 이어받는 에이전트가 먼저 읽는 문서입니다.
 
-## 진행 중 — feature/schema-usr (2026-09-30, API 영향 프로그램 Phase 7c)
+## 진행 중 — feature/server-routes (2026-09-30, API 영향 프로그램 Phase 7 후속)
+
+`rustograph routes --role server`(isthmus http `route-decl` 생산자)와 수확 이름 해석 결함 수정.
+
+- **routes** — `src/source/routes.rs`(조립·자체 계약 검사) + `routes/{axum,actix,common,pattern,template,validate}.rs`.
+  axum 0.7·0.8(`specificity`, 버전은 resolve의 패키지 버전으로), actix-web 4(`registration-order`, App마다 group·리소스마다
+  index). 규칙과 소스 근거(axum 0.7.9/0.8.9·matchit 0.7.3/0.8.4·actix-web 4.15.0·actix-router 0.5.4·codegen 4.4.0·
+  tower-http 0.6.11 줄 번호)는 `docs/HTTP-ROUTES.md`. usr는 `harvest_parts`(같은 syn 수확의 트리·아레나)로 해석한 정점 ID라
+  `reach --roots-from routes.json`이 그대로 받는다(verify-cli-contract가 확인).
+- **오라클** — `experiments/routes-oracle/`(독립 워크스페이스, `[lib] path`가 fixture lib.rs). 세 fixture 정밀도·재현율·
+  음성·끝 슬래시 요청 전부 100%, 기록을 `tests/routes.rs`가 오프라인 대조. 오라클이 잡아 고친 것: matchit 중간 파라미터·0.8
+  접두 파라미터의 빈 값 매칭(빈 값 변형), axum이 원문 경로를 비교해 리터럴 중괄호 경로에 인코딩 요청이 안 닿음, actix Trim
+  아래 빈 꼬리 변형이 안 닿음. 재기록은 `run_all.sh`.
+- **공유 벡터** — isthmus `76b6141`에서 `conformance/`+`conformance.lock` 벤더링. template.grammar·normalize·dispatch.validate·
+  scope.validate 60건 통과, 나머지는 분류(새 ruleId면 테스트가 실패).
+- **수확 수정(bea5155)** — 지역 묶음(let·매개변수·클로저·match 팔·if/while let·for) 스코프 스택(`harvest::locals`), 값 자리의
+  모듈 해석 폐기, `self` 수신자. 자기 분석 가짜 간선 109개 제거(모듈 references 100 + 지역명과 같은 fn 9), tests/fixture 8개.
+  type 레벨 cycles: 수정 커밋에서 13 → 8, 이 브랜치 끝에서 12(새 routes 모듈의 메서드 → 모듈 함수 투영 4개 — 게이트 아님).
+- **e2e(scratch, isthmus 76b6141 무패치 + schemagraph 703a21f)** — 합성 axum+sqlx 백엔드: route 선택 trace 4 chain 모두 route →
+  핸들러 → relation-use → 테이블. 경로 호출 hop은 `direct`, 메서드 호출 hop은 `candidate`(syn 이름 팬아웃 — 수확 수정과 무관,
+  `--semantic`이 필요). 수정 전 바이너리로 같은 입력을 돌리면 지역 `repo`가 모듈 `crate::repo`로 읽혀 checkout·get_order가
+  `audit_log`에 **direct**로 닿는 거짓 hop 2개가 생겼고, 수정 후 사라졌다.
+- 남은 것 / 알려진 근사(전부 거짓 match 쪽): axum 경로 우선 405 vs isthmus method 우선, actix 라우트 수준 method 가드(405)·
+  스코프 포획(뒤 서비스로 안 넘어감)·`web::get()`의 HEAD 미수용, 정규화 미들웨어가 닿지 않게 만든 선언을 strict로 냄. actix
+  매크로의 리소스 수준 method 가드에 소비자 `route-decl-path-shadowed` 경고가 날 수 있다(isthmus check로 확인, warning).
+  impl 메서드 안에서 만든 Router·App은 평가하지 않고 `route-coverage:`로 센다.
+
+## 직전 — feature/schema-usr (2026-09-30, API 영향 프로그램 Phase 7c, PR #22 머지됨)
 
 isthmus `trace`가 Rust 백엔드의 핸들러 도달을 관계 사용과 잇도록 두 가지를 더했다.
 
@@ -160,6 +187,11 @@ PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
 - `src/export.rs` — 결정적 JSON + mermaid + save/load.
 - `src/sarif.rs` — SARIF 2.1.0(`rustograph/deny` 등 ruleId).
 - `src/config.rs` — `.rustograph.yml` 파싱(serde_yml 격리), baseline 키.
+- `src/source/routes.rs` + `routes/` — isthmus http `route-decl` 생산자(`rustograph routes --role server`).
+  axum(라우터 값 정적 평가·nest 결합·버전별 문법·빈 값 변형)·actix(App·Scope·Resource·매크로·configure·가드·
+  NormalizePath)·`pattern`(actix 패턴·정규식 분류)·`template`(정규 템플릿 문법·정규화)·`validate`(order·스코프 검사).
+  `source::harvest_parts`가 같은 수확의 트리·아레나를 넘긴다.
+- `src/harvest/locals.rs` — 본문 지역 묶음 스코프(지역이 아이템보다 먼저).
 - `src/source/schema.rs` — isthmus bridge-facts 생산자(`rustograph
   schema`). SQL 문자열·sqlx·diesel table!·DSL 경로·sea_orm에서
   relation-use 사실 수확, 산문 오탐 게이트·미해석/unlocated 계수.
