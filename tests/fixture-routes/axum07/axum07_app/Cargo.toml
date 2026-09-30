@@ -1,0 +1,9 @@
+[package]
+name = "axum07_app"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# axum 0.7 경로 문법(`:id`·`*rest`) fixture — axum은 버전 판정용 스텁이다.
+[dependencies]
+axum = { path = "../../stubs/axum-0.7" }

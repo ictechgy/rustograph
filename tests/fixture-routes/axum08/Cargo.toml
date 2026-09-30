@@ -1,0 +1,3 @@
+[workspace]
+members = ["axum_app"]
+resolver = "2"

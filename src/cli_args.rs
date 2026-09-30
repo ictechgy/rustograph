@@ -81,6 +81,8 @@ const VALUE_FLAGS: &[&str] = &[
     "max-reached",
     "revision",
     "generated-at",
+    "role",
+    "framework",
 ];
 const BOOL_FLAGS: &[&str] = &[
     "deps",

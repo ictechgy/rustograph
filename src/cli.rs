@@ -33,6 +33,7 @@ usage:
   rustograph search QUERY [--max N]
   rustograph mcp [--dir DIR] [--graph FILE] [--config FILE] [--deps] [--tests]
   rustograph schema [--dir DIR] [--out FILE]
+  rustograph routes --role server [--dir DIR] [--out FILE] [--framework axum|actix]
   rustograph version
 
 shared flags: --deps --tests --retain-public --semantic --no-cache
@@ -89,6 +90,7 @@ fn run_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Resul
         "paths" => cmd_paths(&a, out),
         "search" => cmd_search(&a, out),
         "schema" => cmd_schema(&a, out),
+        "routes" => cmd_routes(&a, out),
         "mcp" => mcp::cmd(&a, &mut std::io::stdin().lock(), out, err),
         "-h" | "--help" | "help" => {
             writeln!(out, "{USAGE}").ok();
@@ -136,6 +138,47 @@ fn cmd_schema(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     }
     let dir = PathBuf::from(a.get("dir").unwrap_or("."));
     let doc = source::schema::facts(&dir, VERSION)?;
+    let text = export::to_json(&doc);
+    match a.get("out") {
+        Some(p) => {
+            std::fs::write(p, &text).map_err(|e| format!("cannot write {p}: {e}"))?;
+            writeln!(out, "wrote {p}").ok();
+        }
+        None => {
+            write!(out, "{text}").ok();
+        }
+    }
+    Ok(0)
+}
+
+/// `routes --role server` — isthmus http 도메인의 서버 route-decl 문서를 낸다.
+/// 클라이언트 route-call은 아직 내지 않으므로 `--role`은 server만 받는다 —
+/// 생략을 server로 읽으면 나중에 client를 더할 때 같은 명령의 뜻이 바뀐다.
+fn cmd_routes(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    if let Some(bad) = a.unsupported(&["dir", "out", "role", "framework"]) {
+        return Err(format!(
+            "routes takes only --role, --dir, --out and --framework — {bad} is not supported"
+        ));
+    }
+    match a.get("role") {
+        Some("server") => {}
+        Some(other) => {
+            return Err(format!(
+                "routes --role {other} is not supported; only --role server is implemented"
+            ))
+        }
+        None => return Err("routes requires --role server".to_string()),
+    }
+    let framework = match a.get("framework") {
+        None => None,
+        Some(f) => Some(
+            source::routes::Framework::parse(f)
+                .ok_or_else(|| format!("unknown --framework {f} (axum|actix)"))?,
+        ),
+    };
+    let dir = PathBuf::from(a.get("dir").unwrap_or("."));
+    let opts = source::routes::RouteOptions { framework };
+    let doc = source::routes::routes(&dir, VERSION, &opts)?;
     let text = export::to_json(&doc);
     match a.get("out") {
         Some(p) => {

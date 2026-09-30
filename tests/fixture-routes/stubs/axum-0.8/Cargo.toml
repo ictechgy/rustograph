@@ -1,0 +1,9 @@
+[package]
+name = "axum"
+version = "0.8.9"
+edition = "2021"
+publish = false
+
+# 이름·버전만 흉내 내는 스텁이다. rustograph는 cargo metadata가 해석한 버전으로
+# 경로 문법을 고르고 소스는 syn으로만 읽으므로 이 크레이트를 컴파일하지 않는다.
+# 실제 라우팅 동작은 experiments/routes-oracle이 crates.io의 진짜 크레이트로 확인한다.
