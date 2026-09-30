@@ -17,6 +17,7 @@ components:
   harvest: ["rustograph::harvest/**"]
   graph: ["rustograph::graph/**"]
   analysis: ["rustograph::analysis/**"]
+  traversal: ["rustograph::traversal/**"]
   rules: ["rustograph::rules/**"]
   export: ["rustograph::export/**"]
   sarif: ["rustograph::sarif/**"]
@@ -27,7 +28,7 @@ components:
   deps_report: ["rustograph::deps/**"]
 deps:
   app: [cli]
-  cli: [source, analysis, rules, export, sarif, config, graph, mcp, cli_args, deps_report]
+  cli: [source, analysis, traversal, rules, export, sarif, config, graph, mcp, cli_args, deps_report]
   mcp: [cli_args, analysis, rules, export, config, graph, deps_report]
   cli_args: [source, export, graph]
   source: [graph, harvest, modtree, cargo_meta, sem, cfgeval]
@@ -35,6 +36,8 @@ deps:
   sem: [graph, cargo_meta]
   harvest: [graph, modtree]
   analysis: [graph]
+  # 다중 root 순회는 문서만 소비한다 — 수확·입출력을 모른다.
+  traversal: [graph]
   rules: [graph, config]
   export: [graph]
   sarif: [graph, rules]
@@ -49,7 +52,7 @@ deps:
   config: []
 deny:
   # 도메인은 수확 경계와 CLI를 절대 모른다 — 순수성이 테스트 가능성이다.
-  graph: [cli, source, harvest, modtree, cargo_meta, analysis, rules, export, sarif, config, app, sem]
+  graph: [cli, source, harvest, modtree, cargo_meta, analysis, traversal, rules, export, sarif, config, app, sem]
   # cli는 cargo/syn/ra_ap 경계를 직접 만지지 않는다 — source를 통한다.
   cli: [cargo_meta, harvest, modtree, sem]
   # mcp도 마찬가지 — 수확 경계는 source 뒤에만 있다.

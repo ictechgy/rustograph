@@ -21,3 +21,4 @@ pub mod sarif;
 #[cfg(feature = "semantic")]
 pub mod sem;
 pub mod source;
+pub mod traversal;
