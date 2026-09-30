@@ -68,12 +68,16 @@ dispatch 하나만 선언한다). 둘 다 없으면 사실 0건과 `route-covera
   있으면 `p{}`), catch-all은 `{**}`. 리터럴이 정규형과 다르면(중괄호·공백·ASCII 밖 글자·인코딩된 unreserved)
   정규 템플릿으로 보낸 요청이 닿지 않으므로 선언 대신 그 템플릿 스코프의 `route-coverage:`를 낸다.
 - **빈 값 변형**: 마지막이 아닌 세그먼트의 파라미터마다 빈 값으로 채운 변형(`/items//tags/{}`, `/v/status`)을 같은
-  method·symbol·location으로 함께 낸다. 16개를 넘으면 dynamic과 `route-template-expansion-capped:`다.
+  method·symbol·location으로 함께 낸다. 16개를 넘으면 dynamic과 `route-template-expansion-capped:`다. 같은 앵커·템플릿의
+  진짜 선언이 있으면 변형은 뺀다 — 정적 경로가 먼저 골라지고 경로가 맞으면 method가 달라도 405로 끝나므로
+  (`/v{x}/status` GET과 `/v/status` POST가 있으면 `GET /v/status`는 405, 오라클 실측) 변형 핸들러에 닿는 요청이 없다.
 - **method**: 동사 생성자·체인은 그 동사, `any`·MethodRouter `fallback`은 `ANY`, `on`은 필터의 동사(모르는 필터는
   `ANY`). `get`의 자동 HEAD는 내지 않는다(소비자 `head-as-get`). CONNECT는 http 도메인 동사가 없어 한계다.
-- **trailingSlash**: `strict`, `{**}`로 끝나면 생략. Router 바깥에 `NormalizePathLayer::trim_trailing_slash()`가 있으면
-  끝 슬래시 없는 템플릿이 `optional`, `append_trailing_slash()`면 끝 슬래시 있는 템플릿이 `optional`이다.
-  `Router::layer` 인자로만 쓰였으면 효과가 없다.
+- **trailingSlash**: `strict`, `{**}`로 끝나면 생략. 레이어가 서비스를 감싸는 모양
+  (`NormalizePathLayer::trim_trailing_slash().layer(svc)`, `ServiceBuilder::new()….layer(NormalizePathLayer::…).service(svc)`,
+  `NormalizePath::trim_trailing_slash(svc)`)이 있으면 trim은 끝 슬래시 없는 템플릿을, append는 끝 슬래시 있는 템플릿을
+  `optional`로 낸다. `Router::layer`·`MethodRouter::layer` 인자나 변수로 넘긴 레이어처럼 라우팅 전에 동작한다는 증거가
+  없으면 효과가 없다고 본다(틀리면 선언이 strict로 남아 소비자는 끝 슬래시 불일치 경고를 낸다 — 거짓 error가 아니다).
 - **location**: `.route()`의 경로 인자(줄, UTF-16 열). 경로 인자가 `&str` 상수면 그 값을 쓴다.
 
 ## actix-web
@@ -112,6 +116,8 @@ dispatch 하나만 선언한다). 둘 다 없으면 사실 0건과 `route-covera
 - **trailingSlash**: `strict`. App(또는 스코프)의 `NormalizePath`가 Trim이면 끝 슬래시 없는 템플릿이 `optional`이고
   빈 값 변형은 내지 않는다(그 요청은 트림돼 꼬리 파라미터에 닿지 않는다). Always면 끝 슬래시 있는 템플릿이 `optional`.
   `{**}`로 끝나면 생략.
+- **App 평가**: `App::new()`에서 시작하는 체인마다, 그리고 함수 본문 최상위의 `let app = App::new()…;`와 그 재대입
+  (`app = app.route(..)`)을 따라간다. 함수 인자로 넘긴 App은 그 함수가 더 등록할 수 있어 `route-coverage:`로 센다.
 - **location**: 매크로 속성의 경로 리터럴, `App::route`·`web::resource`의 경로 인자.
 - 어느 App에도 등록되지 않은 매크로 핸들러와 리터럴이 아닌 스코프 아래 선언은 `pathAnchor: "base"`(order 없음)와
   `unresolved-route-prefix:`·`route-dispatch-order-unknown:`(`templateSuffixes` 스코프)이다.
@@ -126,6 +132,7 @@ dispatch 하나만 선언한다). 둘 다 없으면 사실 0건과 `route-covera
 | 평가하지 못한 nest·merge·서비스·설정 함수 | 그 자리 접두사가 리터럴이면 `templatePrefixes` 스코프의 `route-coverage:`, 아니면 스코프 없음 |
 | 조건·반복 안의 actix `ServiceConfig` 등록 | `route-coverage:` |
 | impl·trait 메서드 안의 `Router::new()`·`App::new()` | `route-coverage:`(추출기는 모듈 수준 함수만 평가한다) |
+| 함수 인자로 넘긴 actix App | `route-coverage:` |
 | axum Router fallback·actix App 기본 서비스 | 루트면 스코프 없는 `route-coverage:`, nest·스코프 아래면 그 접두사 스코프 |
 | axum `nest_service` | `framework-provided-routes:` + 접두사 스코프 |
 | actix-files `Files::new(prefix, ..)` | `framework-provided-routes:` + 접두사 스코프, `methods: ["GET","HEAD"]` |
@@ -173,13 +180,14 @@ dispatch 하나만 선언한다). 둘 다 없으면 사실 0건과 `route-covera
 
 | fixture | 정밀도 | 재현율 | 음성 | 끝 슬래시 | 요청 불가 |
 |---|---|---|---|---|---|
-| `tests/fixture-routes/axum08` (axum 0.8.9) | 24/24 | 23/23 | 11/11 | 22/22 | 1 (루트에 붙지 않은 base 라우터) |
+| `tests/fixture-routes/axum08` (axum 0.8.9) | 24/24 | 23/23 | 12/12 | 22/22 | 1 (루트에 붙지 않은 base 라우터) |
 | `tests/fixture-routes/axum07` (axum 0.7.9) | 14/14 | 11/11 | 6/6 | 13/13 | 0 |
 | `tests/fixture-routes/actix` (actix-web 4.15.0) | 23/23 | 18/18 | 9/9 | 19/19 | 1 (등록되지 않은 매크로 핸들러) |
 
 오라클이 처음 잡아 규칙을 고친 것: matchit의 중간 파라미터 빈 값 매칭(빈 값 변형 추가), 0.8 앞 글자 붙은 파라미터의
 빈 값 매칭, axum이 원문 경로를 비교해 리터럴 중괄호 경로에 인코딩된 요청이 닿지 않는 것(선언 대신 스코프 한계),
-actix Trim 아래 빈 꼬리 변형이 닿지 않는 것.
+actix Trim 아래 빈 꼬리 변형이 닿지 않는 것, 같은 템플릿의 정적 경로가 빈 값 변형을 가리는 것(GLM 리뷰 지적을 오라클로
+재현). 오라클의 HEAD→GET 예측은 axum(specificity)에서만 쓴다(actix `web::get()`은 HEAD를 받지 않는다).
 
 기록(`experiments/routes-oracle/recorded/*.json`)은 커밋하고 `tests/routes.rs`가 오프라인으로 지금 출력의 정적 사실이
 기록에서 검증된 사실(과 요청할 수 없는 base 사실)과 정확히 같은지 확인한다. 다시 기록하려면
