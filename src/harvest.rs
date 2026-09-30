@@ -12,6 +12,8 @@ use syn::parse::Parser;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
+mod locals;
+
 /// 수확 중간 산출물 — 문서 조립 전의 실측 카운터.
 #[derive(Default)]
 pub struct Harvest {
@@ -106,7 +108,10 @@ pub struct BodyItem<'a> {
     /// Self가 가리키는 타입(impl 안이면 Some).
     pub self_ty: Option<Vec<String>>,
     /// 블록의 표현식들 — 문 위치 매크로는 ExprMacro로 감싸져 있다.
+    /// `let` 문은 패턴을 잃지 않도록 `Expr::Let`으로 담는다(지역 가림).
     pub exprs: Vec<syn::Expr>,
+    /// 매개변수가 묶는 이름 — 본문 전체에서 같은 이름의 아이템을 가린다.
+    pub params: Vec<String>,
     pub signature_surface: Vec<&'a syn::Type>,
     /// 소유 아이템의 `#[cfg]` — 이 본문이 만드는 간선 전부가 그 조건 아래 있다.
     pub cfg: Option<String>,
@@ -125,10 +130,25 @@ fn block_exprs(b: &syn::Block) -> Vec<syn::Expr> {
     for s in &b.stmts {
         match s {
             syn::Stmt::Expr(e, _) => out.push(e.clone()),
+            // `let` 문은 패턴과 함께 `Expr::Let`으로 담는다 — 방문자가
+            // 초기식을 본 뒤 패턴의 이름을 지역으로 묶어, 뒤따르는 표현식의
+            // 같은 이름이 아이템(모듈·함수)으로 해석되지 않게 한다.
+            // `let .. else { }`의 else 블록은 묶음이 보이지 않으므로 먼저 둔다.
             syn::Stmt::Local(l) => {
-                if let Some(i) = &l.init {
-                    out.push((*i.expr).clone());
+                if let Some((_, diverge)) = l.init.as_ref().and_then(|i| i.diverge.as_ref()) {
+                    out.push((**diverge).clone());
                 }
+                let init = match &l.init {
+                    Some(i) => (*i.expr).clone(),
+                    None => syn::Expr::Verbatim(proc_macro2::TokenStream::new()),
+                };
+                out.push(syn::Expr::Let(syn::ExprLet {
+                    attrs: l.attrs.clone(),
+                    let_token: l.let_token,
+                    pat: Box::new(l.pat.clone()),
+                    eq_token: Default::default(),
+                    expr: Box::new(init),
+                }));
             }
             syn::Stmt::Macro(m) => out.push(syn::Expr::Macro(syn::ExprMacro {
                 attrs: m.attrs.clone(),
@@ -201,6 +221,7 @@ pub fn decls<'a>(
                         module: module_path.to_string(),
                         self_ty: None,
                         exprs,
+                        params: locals::param_bindings(&f.sig),
                         signature_surface: fn_signature_types(&f.sig),
                         cfg: cfg.clone(),
                         file: file.to_path_buf(),
@@ -249,6 +270,7 @@ pub fn decls<'a>(
                                     module: module_path.to_string(),
                                     self_ty: None,
                                     exprs,
+                                    params: locals::param_bindings(&m.sig),
                                     signature_surface: fn_signature_types(&m.sig),
                                     cfg: cfg.clone(),
                                     file: file.to_path_buf(),
@@ -285,6 +307,7 @@ pub fn decls<'a>(
                         module: module_path.to_string(),
                         self_ty: None,
                         exprs,
+                        params: Vec::new(),
                         signature_surface: vec![&c.ty],
                         cfg: cfg.clone(),
                         file: file.to_path_buf(),
@@ -303,6 +326,7 @@ pub fn decls<'a>(
                         module: module_path.to_string(),
                         self_ty: None,
                         exprs,
+                        params: Vec::new(),
                         signature_surface: vec![&s.ty],
                         cfg: cfg.clone(),
                         file: file.to_path_buf(),
@@ -477,6 +501,7 @@ pub fn impls<'a>(
                 module: b.items_module.clone(),
                 self_ty: Some(b.self_ty.clone()),
                 exprs,
+                params: locals::param_bindings(&m.sig),
                 signature_surface: fn_signature_types(&m.sig),
                 cfg: b.cfg.clone(),
                 file: b.file.clone(),
@@ -567,6 +592,7 @@ pub fn body_edges(
         method_index,
         edge_cfg: &b.cfg,
         in_unsafe: 0,
+        scopes: locals::Scopes::with_params(&b.params),
         edges: Vec::new(),
         unresolved: 0,
         fanned: 0,
@@ -616,6 +642,8 @@ struct BodyVisitor<'a> {
     edge_cfg: &'a Option<String>,
     /// 현재 unsafe 블록 깊이 — 0보다 크면 간선에 unsafe를 찍는다.
     in_unsafe: usize,
+    /// 지역 묶음 스택 — 단일 식별자 경로는 아이템보다 지역을 먼저 본다.
+    scopes: locals::Scopes,
     edges: Vec<Edge>,
     unresolved: usize,
     fanned: usize,
@@ -653,6 +681,37 @@ impl BodyVisitor<'_> {
     fn resolve(&mut self, segs: &[String]) -> Option<String> {
         self.tree.resolve(self.module, segs, self.dep_crates)
     }
+
+    /// 값 자리(표현식 경로·호출 대상·포맷 캡처)의 경로를 해석한다.
+    ///
+    /// rustc의 값 이름공간 규칙 두 가지를 지킨다. 단일 식별자가 지역
+    /// 묶음이거나 `self` 수신자면 아이템을 찾지 않는다(지역이 먼저다).
+    /// 해석 결과가 워크스페이스 모듈이면 버린다 — 모듈은 타입 이름공간에만
+    /// 있어 값이 될 수 없으므로, 그런 해석은 지역 변수를 같은 이름의
+    /// 모듈로 오독한 것이다. 외부 크레이트로 붕괴한 정점은 모듈 표에 없어
+    /// 그대로 남는다(`dep::f()`는 크레이트 경계 증거다).
+    fn resolve_value(&mut self, segs: &[String]) -> ValueRes {
+        if let [only] = segs {
+            if only == "self" || self.scopes.is_local(only) {
+                return ValueRes::Local;
+            }
+        }
+        match self.resolve(segs) {
+            Some(id) if self.tree.modules.contains_key(&id) => ValueRes::Local,
+            Some(id) => ValueRes::Item(id),
+            None => ValueRes::Unresolved,
+        }
+    }
+}
+
+/// 값 자리 경로의 해석 결과다.
+enum ValueRes {
+    /// 크레이트 아이템(또는 외부 크레이트 경계 정점).
+    Item(String),
+    /// 지역 묶음·`self`·값이 될 수 없는 모듈 — 간선도 미해석 계수도 없다.
+    Local,
+    /// 아이템 표에서 찾지 못함.
+    Unresolved,
 }
 
 impl Visit<'_> for BodyVisitor<'_> {
@@ -660,9 +719,11 @@ impl Visit<'_> for BodyVisitor<'_> {
         // foo::bar() — 경로 호출은 정확히 해석된다.
         if let syn::Expr::Path(p) = &*e.func {
             let segs = path_segments(&p.path);
-            match self.resolve(&segs) {
-                Some(id) => self.push(id, EdgeKind::Call),
-                None => {
+            match self.resolve_value(&segs) {
+                ValueRes::Item(id) => self.push(id, EdgeKind::Call),
+                // 지역 클로저·함수 값 호출 — 아이템 호출이 아니다.
+                ValueRes::Local => {}
+                ValueRes::Unresolved => {
                     // Type::assoc_fn() — 마지막 세그먼트가 연관 함수다.
                     // 앞부분이 타입 정점이면 그 타입의 메서드로 좁힌다.
                     let n = segs.len();
@@ -748,7 +809,7 @@ impl Visit<'_> for BodyVisitor<'_> {
                 }) = ex
                 {
                     for name in format_captures(&s.value()) {
-                        if let Some(id) = self.resolve(&[name]) {
+                        if let ValueRes::Item(id) = self.resolve_value(&[name]) {
                             self.push(id, EdgeKind::References);
                         }
                     }
@@ -777,13 +838,101 @@ impl Visit<'_> for BodyVisitor<'_> {
         self.in_unsafe -= 1;
     }
 
+    // ── 지역 스코프 관리 — 묶음을 만드는 구문마다 겹을 열고 닫는다. ──
+
+    fn visit_expr_let(&mut self, e: &syn::ExprLet) {
+        // 초기식은 새 묶음을 못 본다(`let x = x + 1`의 오른쪽은 바깥 x).
+        self.visit_expr(&e.expr);
+        syn::visit::visit_pat(self, &e.pat);
+        self.scopes.bind(&e.pat);
+    }
+
+    fn visit_block(&mut self, b: &syn::Block) {
+        self.scopes.push();
+        for stmt in &b.stmts {
+            match stmt {
+                syn::Stmt::Local(l) => {
+                    if let Some(init) = &l.init {
+                        self.visit_expr(&init.expr);
+                        if let Some((_, diverge)) = &init.diverge {
+                            self.visit_expr(diverge);
+                        }
+                    }
+                    syn::visit::visit_pat(self, &l.pat);
+                    self.scopes.bind(&l.pat);
+                }
+                other => self.visit_stmt(other),
+            }
+        }
+        self.scopes.pop();
+    }
+
+    fn visit_item(&mut self, i: &syn::Item) {
+        // 블록 안 아이템은 바깥 지역을 캡처하지 않는다.
+        let saved = self.scopes.take();
+        syn::visit::visit_item(self, i);
+        self.scopes.restore(saved);
+    }
+
+    fn visit_expr_if(&mut self, e: &syn::ExprIf) {
+        // `if let` 묶음은 조건과 then 블록에서만 보이고 else에서는 안 보인다.
+        self.scopes.push();
+        self.visit_expr(&e.cond);
+        self.visit_block(&e.then_branch);
+        self.scopes.pop();
+        if let Some((_, els)) = &e.else_branch {
+            self.visit_expr(els);
+        }
+    }
+
+    fn visit_expr_while(&mut self, e: &syn::ExprWhile) {
+        self.scopes.push();
+        self.visit_expr(&e.cond);
+        self.visit_block(&e.body);
+        self.scopes.pop();
+    }
+
+    fn visit_expr_for_loop(&mut self, e: &syn::ExprForLoop) {
+        self.visit_expr(&e.expr);
+        self.scopes.push();
+        syn::visit::visit_pat(self, &e.pat);
+        self.scopes.bind(&e.pat);
+        self.visit_block(&e.body);
+        self.scopes.pop();
+    }
+
+    fn visit_expr_match(&mut self, e: &syn::ExprMatch) {
+        self.visit_expr(&e.expr);
+        for arm in &e.arms {
+            self.scopes.push();
+            syn::visit::visit_pat(self, &arm.pat);
+            self.scopes.bind(&arm.pat);
+            if let Some((_, guard)) = &arm.guard {
+                self.visit_expr(guard);
+            }
+            self.visit_expr(&arm.body);
+            self.scopes.pop();
+        }
+    }
+
+    fn visit_expr_closure(&mut self, e: &syn::ExprClosure) {
+        self.scopes.push();
+        for input in &e.inputs {
+            syn::visit::visit_pat(self, input);
+            self.scopes.bind(input);
+        }
+        self.visit_expr(&e.body);
+        self.scopes.pop();
+    }
+
     fn visit_expr_path(&mut self, e: &syn::ExprPath) {
         // 호출이 아닌 경로 참조 — filter_map(f) 같은 함수 값 포함.
         // 단일 식별자는 모듈 아이템이면 잡고 지역 변수면 조용히 넘긴다.
         let segs = path_segments(&e.path);
-        match self.resolve(&segs) {
-            Some(id) => self.push(id, EdgeKind::References),
-            None => {
+        match self.resolve_value(&segs) {
+            ValueRes::Item(id) => self.push(id, EdgeKind::References),
+            ValueRes::Local => {}
+            ValueRes::Unresolved => {
                 // E::V 형태 — 마지막 세그먼트가 열거형 배리언트/상수면
                 // 앞부분 타입에의 참조다. 그것도 안 되면 진짜 미해석.
                 if segs.len() >= 2 {

@@ -649,3 +649,74 @@ fn inherent_impl_methods_and_scoped_self_call() {
             && e.kind == EdgeKind::Call
             && e.tentative));
 }
+
+/// 표현식의 단일 식별자는 지역 묶음이 아이템보다 먼저다(rustc 값 이름공간).
+/// 같은 이름의 크레이트 루트 모듈·함수로 읽으면 가짜 references 간선이
+/// 생기고, 순회가 그 모듈이 import한 아이템 전부로 번진다.
+#[test]
+fn locals_shadow_items_and_modules_are_never_values() {
+    let tmp = std::env::temp_dir().join(format!("rg-locals-{}", std::process::id()));
+    std::fs::create_dir_all(tmp.join("src")).unwrap();
+    std::fs::write(
+        tmp.join("Cargo.toml"),
+        "[package]\nname = \"locals\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.join("src/lib.rs"),
+        r#"
+pub mod repo { pub struct Repo; impl Repo { pub fn all(&self) -> u32 { 1 } } }
+pub fn helper() -> u32 { 2 }
+pub fn item() -> u32 { 3 }
+pub const MAX: u32 = 9;
+pub struct S;
+impl S { pub fn me(&self) -> u32 { self.me2() } pub fn me2(&self) -> u32 { 0 } }
+
+pub fn param(repo: &repo::Repo) -> u32 { repo.all() }
+pub fn let_shadow() -> u32 { let helper = helper(); helper + 1 }
+pub fn closure() -> u32 { let f = |item: u32| item + 1; f(1) }
+pub fn arms(x: Option<u32>) -> u32 {
+    match x { Some(item) => item, None => MAX }
+}
+pub fn if_let(x: Option<u32>) -> u32 {
+    if let Some(helper) = x { helper } else { helper() }
+}
+pub fn loops(v: Vec<u32>) -> u32 { let mut n = 0; for item in v { n += item; } n }
+pub fn block_scope() -> u32 { { let item = 1; let _ = item; } item() }
+pub fn capture(repo: u32) -> String { format!("{repo}") }
+"#,
+    )
+    .unwrap();
+    let d = source::load(
+        &tmp,
+        &source::Options {
+            symbol_level: true,
+            ..Default::default()
+        },
+    )
+    .expect("temp crate harvest failed");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let has = |from: &str, to: &str| d.edges.iter().any(|e| e.from == from && e.to == to);
+    // 매개변수·let·클로저·match 팔·if let·for 묶음은 아이템을 가린다.
+    assert!(
+        !has("locals::param", "locals::repo"),
+        "param shadowed module"
+    );
+    assert!(!has("locals::closure", "locals::item"));
+    assert!(!has("locals::arms", "locals::item"));
+    assert!(!has("locals::loops", "locals::item"));
+    assert!(!has("locals::capture", "locals::repo"), "format capture");
+    // 초기식은 새 묶음을 못 본다 — `let helper = helper()`는 fn 호출이다.
+    assert!(has("locals::let_shadow", "locals::helper"));
+    // if let 묶음은 else에서 안 보인다.
+    assert!(has("locals::if_let", "locals::helper"));
+    // 대문자 식별자 패턴은 묶음이 아니다(상수 비교) — 참조는 남는다.
+    assert!(has("locals::arms", "locals::MAX"));
+    // 블록을 나가면 지역이 사라진다.
+    assert!(has("locals::block_scope", "locals::item"));
+    // `self` 수신자는 모듈이 아니다.
+    assert!(!d
+        .edges
+        .iter()
+        .any(|e| e.from == "locals::S::me" && e.to == "locals"));
+}
