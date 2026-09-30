@@ -314,9 +314,7 @@ impl<'a> Ctx<'a> {
             .as_deref()
             .and_then(|t| t.get(span.byte_range()))
             .unwrap_or("<expression>");
-        raw.chars()
-            .take(super::template::MAX_TEMPLATE_LENGTH)
-            .collect()
+        take_utf16(raw, super::template::MAX_TEMPLATE_LENGTH)
     }
 }
 
@@ -675,6 +673,37 @@ pub(super) fn order_group(prefix: &str, id: &str) -> String {
     for b in full.bytes() {
         h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
     }
-    let head: String = full.chars().take(200).collect();
+    // `#` + 16자리 지문을 뺀 나머지를 UTF-16 단위로 채운다(BMP 밖 글자는 2단위).
+    let head = take_utf16(&full, 256 - 17);
     format!("{}#{h:016x}", head.trim_end())
+}
+
+/// 앞에서부터 UTF-16 코드 단위 `budget` 이하가 되도록 자른다 — 소비자의 길이 상한은
+/// UTF-16 기준이라 문자 수로 자르면 BMP 밖 글자에서 넘친다.
+pub(super) fn take_utf16(text: &str, budget: usize) -> String {
+    let mut used = 0;
+    text.chars()
+        .take_while(|c| {
+            used += c.len_utf16();
+            used <= budget
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_groups_and_texts_fit_utf16_budgets() {
+        let id = "\u{10300}".repeat(300);
+        let g = order_group("actix:", &id);
+        assert!(
+            g.encode_utf16().count() <= 256,
+            "{}",
+            g.encode_utf16().count()
+        );
+        assert_eq!(order_group("actix:", "a::b"), "actix:a::b");
+        assert_eq!(take_utf16("a\u{10300}b", 2), "a");
+    }
 }

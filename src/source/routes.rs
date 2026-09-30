@@ -299,10 +299,18 @@ fn assemble(
         };
         let symbol = match &d.handler {
             Handler::Usr(id) => Some(id.clone()),
-            Handler::Closure(l) => {
-                closures += 1;
-                ctx.owner_of(l)
-            }
+            // 감싸는 정점을 찾은 클로저만 근사 usr 한계로 센다 — 못 찾으면 usr가 없는
+            // 핸들러와 같다.
+            Handler::Closure(l) => match ctx.owner_of(l) {
+                Some(id) => {
+                    closures += 1;
+                    Some(id)
+                }
+                None => {
+                    unknown += 1;
+                    None
+                }
+            },
             Handler::Unknown => {
                 unknown += 1;
                 None

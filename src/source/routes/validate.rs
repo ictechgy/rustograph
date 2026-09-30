@@ -161,7 +161,9 @@ fn group_problem(document: &Value, facts: &[Value]) -> Option<String> {
 
 /// http `limitationScopes` 항목 하나의 위반이다. 문제가 없으면 None.
 pub fn scope_problem(scope: &Value) -> Option<&'static str> {
-    let obj = scope.as_object()?;
+    let Some(obj) = scope.as_object() else {
+        return Some("scope must be an object");
+    };
     const KEYS: &[&str] = &[
         "limitationIndex",
         "templates",
