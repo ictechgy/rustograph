@@ -30,17 +30,19 @@ pub fn hex_digest(data: &[u8]) -> String {
         msg.push(0);
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
-    for block in msg.chunks_exact(64) {
+    // 패딩 뒤 길이는 늘 64의 배수라 나머지는 비어 있다.
+    let (blocks, _) = msg.as_chunks::<64>();
+    for block in blocks {
         compress(&mut h, block);
     }
     h.iter().map(|w| format!("{w:08x}")).collect()
 }
 
 /// 64바이트 블록 하나로 상태를 갱신한다.
-fn compress(h: &mut [u32; 8], block: &[u8]) {
+fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 64];
-    for (i, chunk) in block.chunks_exact(4).enumerate() {
-        w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    for (i, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
+        w[i] = u32::from_be_bytes(*chunk);
     }
     for i in 16..64 {
         let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
