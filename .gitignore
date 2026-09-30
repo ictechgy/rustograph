@@ -5,3 +5,4 @@ coverage/
 .serena/
 shrimp/
 experiments/routes-oracle/target/
+experiments/client-oracle/target/

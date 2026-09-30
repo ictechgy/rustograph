@@ -118,6 +118,10 @@ rustograph schema --dir . --out schema-facts.json
 rustograph routes --role server --dir . --out routes.json
 rustograph reach --roots-from routes.json   # handler usrs are graph vertices
 
+# Emit isthmus http route-call facts for reqwest / ureq clients
+rustograph routes --role client --dir . --wrappers http-wrappers.json --out calls.json
+rustograph impact --format language-traversal --roots-from calls.json
+
 # isthmus language-traversal v1 for `isthmus trace` (many roots, one pass)
 rustograph reach mycrate::api::list_users mycrate::api::create_user
 rustograph impact --format language-traversal --roots-from schema-facts.json
@@ -266,6 +270,46 @@ the real crates and probes them in-process: 100% precision and recall on
 all three fixtures, recorded and checked offline by `cargo test`. The
 isthmus conformance vectors are vendored under `conformance/` with a lock.
 
+## Client calls — `routes --role client`
+
+`rustograph routes --role client` emits an isthmus `bridge-facts` v1
+document with `platform: "rust"`, `target: "http"`, `roles: ["client"]` and
+one `route-call` fact per HTTP request the code builds. `symbol.usr` is the
+enclosing function or method — the same vertex id `impact` uses, so
+`isthmus trace` can continue from a call site into the client code that
+depends on it.
+
+- **reqwest** (0.13; 0.12 checked too): `reqwest::get`, `blocking::get`,
+  `Client`/`blocking::Client` verb methods, `request(Method::X, url)`,
+  `Request::new`. Strings go through `url::Url::parse` (WHATWG): dot
+  segments are removed, `//` is kept.
+- **ureq** 3 (2.x read from source): free functions and `Agent` methods.
+  ureq 3 parses with `http::Uri`, which keeps dot segments.
+- **URL building**: literals, `format!` (positional, named and inline
+  arguments), `concat!`, `+`, consts/statics/associated consts, locals
+  (shadowing-aware, mutated names untrusted), `Url::parse(..)?.join(..)`
+  (RFC 3986 merge — `…/v2/catalog` + `tags` is `/v2/tags`), and a base URL
+  held in a struct field when every constructor fills it with the same
+  literal or const. Anything else stays a dynamic fact (`channel: null`, a
+  masked `channelPrefix` when proven) or a counted limitation.
+- **Wrappers**: functions, methods and struct-literal endpoints declared in
+  an isthmus `http-wrappers` v1 file (`"language": "rust"`, `owner::name` is
+  the rustograph vertex id) become calls with the declared verb and anchor.
+- **Measured gaps**: unmodelled clients (hyper client, surf, awc, isahc, …),
+  requests sent from a receiver that is not a proven client, relative URLs
+  the client rejects, undeclared wrapper sinks and unresolved declarations
+  are `route-call-coverage:` / `ambiguous-base-join:` /
+  `http-wrapper-undeclared:` / `http-wrapper-unresolved:` limitations.
+
+The rules (`Url::join` is the isthmus `rfc3986` join; reqwest and ureq have
+no base URL, so full-URL rules apply) and the oracle table are in
+[docs/HTTP-CLIENT.md](docs/HTTP-CLIENT.md). A mock-server oracle
+(`experiments/client-oracle/`) compiles the fixture against the real
+reqwest/ureq/url crates and records every request at a local server: 41
+scenarios, 0 mismatches, checked offline by `cargo test`. All 48
+`producer`/`producer:rustograph` cases of the isthmus `url-compose` vectors
+pass.
+
 ## Traversal documents — `reach` / `impact --format language-traversal`
 
 ```bash
@@ -304,9 +348,9 @@ strings as `symbol.usr` in `schema`.
   `symbol`, a `root-not-found:` limitation is added, and the command exits
   `64` after writing the document.
 
-isthmus rejects `route-decl` facts from `platform: "rust"` documents, so
-Rust handlers cannot yet start a route-selection `trace`; relation and
-symbol selections (reverse traversal) work today.
+isthmus accepts Rust `route-decl` and (since isthmus #133) `route-call`
+documents, so a workspace `trace` joins a reqwest client to an axum/actix-web
+handler and continues into the client code with `impact`.
 
 ## Agent output contract
 

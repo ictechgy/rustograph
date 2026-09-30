@@ -1,5 +1,6 @@
 //! isthmus `bridge-facts` v1 http 도메인의 서버 측 생산자(`rustograph routes
 //! --role server`) — axum·actix-web 라우트 선언을 `route-decl` 사실로 낸다.
+//! 호출 측(`--role client`, reqwest·ureq `route-call`)은 [`client`]에 있다.
 //!
 //! 계약의 정본은 ../isthmus의 docs/GRAPH-EXCHANGE.md "HTTP 경계"다. 프레임워크
 //! 규칙과 공식 소스 근거는 docs/HTTP-ROUTES.md에 있다. 흐름:
@@ -14,10 +15,13 @@
 
 mod actix;
 mod axum;
+pub mod client;
 mod common;
+pub mod compose;
 mod pattern;
 pub mod template;
 pub mod validate;
+pub mod wrappers;
 
 use crate::cargo_meta;
 use crate::source::schema::{rfc3339_utc_now, BridgeFactsTool, BridgeLocation, FactSymbol};

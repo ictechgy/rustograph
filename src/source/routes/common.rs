@@ -277,6 +277,17 @@ impl<'a> Ctx<'a> {
 
     /// 계약의 위치(루트 기준 경로, 1 기반 줄, UTF-16 열)다.
     pub fn locate(&self, loc: &Loc) -> Option<BridgeLocation> {
+        self.locate_with(loc, |c| c.len_utf16() as u32)
+    }
+
+    /// 계약의 위치 — 열은 GRAPH-EXCHANGE가 정한 UTF-8 바이트 오프셋 + 1이다.
+    /// 호출 측 사실(`wrapper.location`)이 이 열을 쓴다.
+    pub fn locate_utf8(&self, loc: &Loc) -> Option<BridgeLocation> {
+        self.locate_with(loc, |c| c.len_utf8() as u32)
+    }
+
+    /// 열 단위(`unit`: 문자 하나의 길이)를 골라 위치를 계산한다.
+    fn locate_with(&self, loc: &Loc, unit: fn(char) -> u32) -> Option<BridgeLocation> {
         let start = loc.span.start();
         if start.line == 0 {
             return None;
@@ -289,13 +300,8 @@ impl<'a> Ctx<'a> {
             .or_insert_with(|| std::fs::read_to_string(&loc.file).ok())
             .as_ref()?;
         let line_text = text.lines().nth(start.line - 1)?;
-        // proc-macro2의 열은 문자 수다 — UTF-16 코드 단위로 바꾼다.
-        let column = line_text
-            .chars()
-            .take(start.column)
-            .map(|c| c.len_utf16() as u32)
-            .sum::<u32>()
-            + 1;
+        // proc-macro2의 열은 문자 수다 — 요청한 단위로 바꾼다.
+        let column = line_text.chars().take(start.column).map(unit).sum::<u32>() + 1;
         Some(BridgeLocation {
             path: rel.to_string_lossy().replace('\\', "/"),
             line: start.line as u32,

@@ -1,0 +1,28 @@
+# 클라이언트 오라클 — fixture의 같은 소스를 crates.io의 진짜 reqwest·ureq·url로
+# 컴파일해 127.0.0.1 임시 포트의 기록 서버로 요청을 보내고, rustograph
+# `routes --role client`가 낸 사실과 대조한다. rustograph 본체와 별개인 독립
+# 워크스페이스다(본체는 이 의존성을 모른다).
+[workspace]
+
+[package]
+name = "oracle-client"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# lib은 fixture 소스 그대로다 — 오라클이 보내는 요청과 rustograph가 읽은 호출이
+# 같은 코드에서 나온다.
+[lib]
+name = "client_app"
+path = "../../tests/fixture-client/app/client_app/src/lib.rs"
+
+[[bin]]
+name = "oracle-client"
+path = "src/main.rs"
+
+[dependencies]
+reqwest = { version = "=0.13.5", default-features = false, features = ["blocking"] }
+ureq = { version = "=3.4.2", default-features = false }
+url = "=2.5.8"
+tokio = { version = "1", features = ["rt", "macros"] }
+serde_json = "1"

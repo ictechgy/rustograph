@@ -72,6 +72,7 @@ rustograph graph --target x86_64-pc-windows-msvc  # cfg(트리플) 평가
 rustograph mcp                           # MCP stdio 서버 — 에이전트가 되묻는 통로
 rustograph schema --dir . --out schema-facts.json  # isthmus persistence 사실
 rustograph routes --role server --out routes.json  # isthmus http route-decl(axum·actix-web)
+rustograph routes --role client --wrappers http-wrappers.json --out calls.json  # route-call(reqwest·ureq)
 rustograph reach mycrate::api::list_users          # isthmus language-traversal(정방향)
 rustograph impact --format language-traversal --roots-from schema-facts.json  # 역방향
 ```
@@ -165,6 +166,42 @@ import할 때만 인정합니다. 파싱 실패 파일·문법이 다른 `table!
 그 기록을 `cargo test`가 오프라인으로 대조합니다. isthmus 공유 벡터는
 `conformance/`에 잠금 파일과 함께 벤더링했습니다.
 
+## 클라이언트 호출 — `routes --role client`
+
+`rustograph routes --role client`는 코드가 만드는 HTTP 요청마다 `route-call`
+사실 하나를 담은 isthmus `bridge-facts` v1 문서(`platform: "rust"`,
+`target: "http"`, `roles: ["client"]`)를 냅니다. `symbol.usr`는 호출을 감싼
+함수·메서드이고 `impact`의 정점 ID와 같아서 `isthmus trace`가 호출부에서 그
+호출부에 기대는 클라이언트 코드로 이어 갑니다.
+
+- **reqwest**(0.13, 0.12도 확인): `reqwest::get`·`blocking::get`,
+  `Client`·`blocking::Client`의 동사 메서드, `request(Method::X, url)`,
+  `Request::new`. 문자열은 `url::Url::parse`(WHATWG)로 해석합니다 — 점
+  세그먼트는 지우고 `//`는 남깁니다.
+- **ureq** 3(2.x는 소스 기준): 자유 함수와 `Agent` 메서드. ureq 3은
+  `http::Uri`로 해석해 점 세그먼트를 남깁니다.
+- **URL 조립**: 리터럴, `format!`(위치·이름·인라인 인자), `concat!`, `+`,
+  상수·static·연관 상수, 지역 변수(그림자 추적, 수정되는 이름은 믿지 않음),
+  `Url::parse(..)?.join(..)`(RFC 3986 병합 — `…/v2/catalog` + `tags`는
+  `/v2/tags`), 모든 생성자가 같은 리터럴·상수로 채우는 구조체 필드 base.
+  그 밖은 dynamic 사실(`channel: null`, 증명한 경우 마스킹한 `channelPrefix`)
+  이나 센 한계입니다.
+- **래퍼**: isthmus `http-wrappers` v1 파일에 선언한 함수·메서드·구조체
+  리터럴 엔드포인트(`"language": "rust"`, `owner::name`이 rustograph 정점
+  ID)는 선언한 동사·앵커로 호출 사실이 됩니다.
+- **센 공백**: 모델링하지 않는 클라이언트(hyper client·surf·awc·isahc 등),
+  클라이언트로 증명하지 못한 수신자의 요청, 클라이언트가 거부하는 상대
+  URL, 선언되지 않은 래퍼 싱크, 풀리지 않는 선언은 `route-call-coverage:`·
+  `ambiguous-base-join:`·`http-wrapper-undeclared:`·`http-wrapper-unresolved:`
+  한계입니다.
+
+규칙(`Url::join`은 isthmus `rfc3986` 결합, reqwest·ureq는 base URL이 없어
+전체 URL 규칙)과 오라클 표는 [docs/HTTP-CLIENT.md](docs/HTTP-CLIENT.md)에 있습니다. 모의 서버
+오라클(`experiments/client-oracle/`)이 fixture를 진짜 reqwest·ureq·url로
+컴파일해 로컬 서버가 받은 요청을 기록합니다 — 41개 시나리오 불일치 0, 기록은
+`cargo test`가 오프라인으로 대조합니다. isthmus `url-compose` 벡터의
+`producer`·`producer:rustograph` 사례 48건을 모두 통과합니다.
+
 ## 순회 문서 — `reach` / `impact --format language-traversal`
 
 isthmus [`language-traversal` v1](https://github.com/ictechgy/isthmus/blob/main/docs/LANGUAGE-TRAVERSAL.md)
@@ -187,9 +224,9 @@ isthmus [`language-traversal` v1](https://github.com/ictechgy/isthmus/blob/main/
 - 그래프 정점이 아닌 root는 `symbol` 없이 싣고 `root-not-found:` limitation을
   더한 문서를 쓴 뒤 64로 끝납니다.
 
-isthmus는 `platform: "rust"` 문서의 `route-decl`을 받지 않아 Rust 핸들러에서
-시작하는 route 선택 `trace`는 아직 불가능합니다. relation·심볼 선택(역방향
-순회)은 지금 동작합니다.
+isthmus는 Rust `route-decl`과(isthmus #133부터) `route-call` 문서를 받아,
+workspace `trace`가 reqwest 클라이언트를 axum·actix-web 핸들러와 잇고
+`impact`로 클라이언트 코드까지 이어 갑니다.
 
 ## 개발
 

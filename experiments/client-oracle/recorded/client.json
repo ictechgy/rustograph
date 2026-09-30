@@ -1,0 +1,910 @@
+{
+  "scenarios": [
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/items",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "queryTailStripped": true,
+          "usr": "client_app::scenarios::literal_query"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/v1/items"
+        }
+      ],
+      "result": "match",
+      "scenario": "literal_query"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/users/{}",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "usr": "client_app::scenarios::async_user"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/v1/users/7"
+        }
+      ],
+      "result": "match",
+      "scenario": "async_user"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/orders",
+          "dynamic": false,
+          "method": "POST",
+          "pathAnchor": "root",
+          "usr": "client_app::scenarios::concat_post"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "POST",
+          "path": "/v1/orders"
+        }
+      ],
+      "result": "match",
+      "scenario": "concat_post"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/items/{}",
+          "dynamic": false,
+          "method": "PUT",
+          "pathAnchor": "root",
+          "usr": "client_app::scenarios::put_positional"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "PUT",
+          "path": "/v1/items/5"
+        }
+      ],
+      "result": "match",
+      "scenario": "put_positional"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/items/{}",
+          "dynamic": false,
+          "method": "DELETE",
+          "pathAnchor": "root",
+          "usr": "client_app::scenarios::delete_plus"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "DELETE",
+          "path": "/v1/items/9"
+        }
+      ],
+      "result": "match",
+      "scenario": "delete_plus"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/profile",
+          "dynamic": false,
+          "method": "PATCH",
+          "pathAnchor": "root",
+          "usr": "client_app::scenarios::patch_local"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "PATCH",
+          "path": "/v1/profile"
+        }
+      ],
+      "result": "match",
+      "scenario": "patch_local"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/health",
+          "dynamic": false,
+          "method": "HEAD",
+          "pathAnchor": "root",
+          "usr": "client_app::scenarios::head_health"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "HEAD",
+          "path": "/v1/health"
+        }
+      ],
+      "result": "match",
+      "scenario": "head_health"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/items",
+          "dynamic": false,
+          "method": "OPTIONS",
+          "pathAnchor": "root",
+          "usr": "client_app::scenarios::request_options"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "OPTIONS",
+          "path": "/v1/items"
+        }
+      ],
+      "result": "match",
+      "scenario": "request_options"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/verbs",
+          "dynamic": false,
+          "methodDynamic": true,
+          "pathAnchor": "root",
+          "usr": "client_app::scenarios::request_dynamic"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "PATCH",
+          "path": "/v1/verbs"
+        }
+      ],
+      "result": "match",
+      "scenario": "request_dynamic"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v2/users/{}",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "usr": "client_app::scenarios::join_relative"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/v2/users/5"
+        }
+      ],
+      "result": "match",
+      "scenario": "join_relative"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v2/tags",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "usr": "client_app::scenarios::join_replaces_last"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/v2/tags"
+        }
+      ],
+      "result": "match",
+      "scenario": "join_replaces_last"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/root/ping",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "usr": "client_app::scenarios::join_absolute_path"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/root/ping"
+        }
+      ],
+      "result": "match",
+      "scenario": "join_absolute_path"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/b",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "usr": "client_app::scenarios::dot_segments"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/v1/b"
+        }
+      ],
+      "result": "match",
+      "scenario": "dot_segments"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v3//items",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "usr": "client_app::scenarios::double_slash"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/v3//items"
+        }
+      ],
+      "result": "match",
+      "scenario": "double_slash"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/search",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "queryTailStripped": true,
+          "usr": "client_app::scenarios::query_tail"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/v1/search"
+        }
+      ],
+      "result": "match",
+      "scenario": "query_tail"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/search",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "queryTailStripped": true,
+          "usr": "client_app::scenarios::query_tail"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/v1/search"
+        }
+      ],
+      "result": "match",
+      "scenario": "query_tail_empty"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "channel": null,
+          "channelPrefix": "/v1/files/",
+          "dynamic": true,
+          "method": "GET",
+          "pathAnchor": "root",
+          "usr": "client_app::scenarios::partial_segment"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/v1/files/report.json"
+        }
+      ],
+      "result": "dynamic",
+      "scenario": "partial_segment"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "channel": "/v1/status",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "base",
+          "usr": "client_app::scenarios::unknown_base_rooted"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/prefix/v1/status"
+        }
+      ],
+      "result": "match",
+      "scenario": "unknown_base_rooted"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "channel": null,
+          "dynamic": true,
+          "method": "GET",
+          "pathAnchor": "base",
+          "usr": "client_app::scenarios::unknown_base_glued"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/prefixstatus"
+        }
+      ],
+      "result": "dynamic",
+      "scenario": "unknown_base_glued"
+    },
+    {
+      "error": true,
+      "facts": [],
+      "requests": [],
+      "result": "no-request",
+      "scenario": "relative_url"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/tokens/{}",
+          "dynamic": false,
+          "maskedSegments": 1,
+          "method": "GET",
+          "pathAnchor": "root",
+          "usr": "client_app::scenarios::masked_token"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/v1/tokens/a1b2c3d4e5f6a7b8c9d0"
+        }
+      ],
+      "result": "match",
+      "scenario": "masked_token"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/caf%C3%A9",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "usr": "client_app::scenarios::non_ascii"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/v1/caf%C3%A9"
+        }
+      ],
+      "result": "match",
+      "scenario": "non_ascii"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/secure",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "queryTailStripped": true,
+          "usr": "client_app::scenarios::userinfo_fragment"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/v1/secure"
+        }
+      ],
+      "result": "match",
+      "scenario": "userinfo_fragment"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com:8080",
+          "channel": "/v1/port",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "usr": "client_app::scenarios::with_port"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com:8080",
+          "method": "GET",
+          "path": "/v1/port"
+        }
+      ],
+      "result": "match",
+      "scenario": "with_port"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/bs",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "usr": "client_app::scenarios::backslashes"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/v1/bs"
+        }
+      ],
+      "result": "match",
+      "scenario": "backslashes"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/built",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "usr": "client_app::scenarios::builder_client"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/v1/built"
+        }
+      ],
+      "result": "match",
+      "scenario": "builder_client"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/api/items",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "usr": "client_app::api::ApiClient::list_items"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/api/items"
+        }
+      ],
+      "result": "match",
+      "scenario": "struct_field_base"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/api/items/{}",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "usr": "client_app::api::ApiClient::get_item"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/api/items/42"
+        }
+      ],
+      "result": "match",
+      "scenario": "struct_field_item"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/api/items",
+          "dynamic": false,
+          "method": "POST",
+          "pathAnchor": "root",
+          "usr": "client_app::api::ApiClient::create_item"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "POST",
+          "path": "/api/items"
+        }
+      ],
+      "result": "match",
+      "scenario": "struct_field_plus"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/api/search",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "queryTailStripped": true,
+          "usr": "client_app::api::ApiClient::search"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/api/search"
+        }
+      ],
+      "result": "match",
+      "scenario": "struct_field_query"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "channel": "/users/{}",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "base",
+          "usr": "client_app::api::RemoteClient::user"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/remote/users/3"
+        }
+      ],
+      "result": "match",
+      "scenario": "struct_param_base"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/cat/products",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "usr": "client_app::api::Catalog::products"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/cat/products"
+        }
+      ],
+      "result": "match",
+      "scenario": "url_field"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/ureq/items",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "usr": "client_app::ureq_calls::ureq_get"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/v1/ureq/items"
+        }
+      ],
+      "result": "match",
+      "scenario": "ureq_get"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/ureq/items/{}",
+          "dynamic": false,
+          "method": "DELETE",
+          "pathAnchor": "root",
+          "usr": "client_app::ureq_calls::ureq_delete"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "DELETE",
+          "path": "/v1/ureq/items/4"
+        }
+      ],
+      "result": "match",
+      "scenario": "ureq_delete"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/x/../ureq-dots",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "root",
+          "usr": "client_app::ureq_calls::ureq_dots"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/v1/x/../ureq-dots"
+        }
+      ],
+      "result": "match",
+      "scenario": "ureq_dots"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/ureq/health",
+          "dynamic": false,
+          "method": "HEAD",
+          "pathAnchor": "root",
+          "usr": "client_app::ureq_calls::ureq_agent_head"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "HEAD",
+          "path": "/v1/ureq/health"
+        }
+      ],
+      "result": "match",
+      "scenario": "ureq_agent_head"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "authority": "api.example.com",
+          "channel": "/v1/ureq/orders",
+          "dynamic": false,
+          "method": "POST",
+          "pathAnchor": "root",
+          "usr": "client_app::ureq_calls::ureq_post"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "POST",
+          "path": "/v1/ureq/orders"
+        }
+      ],
+      "result": "match",
+      "scenario": "ureq_post"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "channel": "/w/items",
+          "dynamic": false,
+          "method": "GET",
+          "pathAnchor": "base",
+          "usr": "client_app::wrappers::wrapper_function"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/wb/w/items"
+        }
+      ],
+      "result": "match",
+      "scenario": "wrapper_function"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "channel": "/w/orders",
+          "dynamic": false,
+          "method": "POST",
+          "pathAnchor": "base",
+          "usr": "client_app::wrappers::wrapper_method"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "POST",
+          "path": "/api/w/orders"
+        }
+      ],
+      "result": "match",
+      "scenario": "wrapper_method"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "channel": null,
+          "dynamic": true,
+          "methodDynamic": true,
+          "pathAnchor": "base",
+          "usr": "client_app::api::ApiClient::execute"
+        },
+        {
+          "channel": "/e/items/{}",
+          "dynamic": false,
+          "method": "DELETE",
+          "pathAnchor": "base",
+          "usr": "client_app::wrappers::wrapper_constructor"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "DELETE",
+          "path": "/api/e/items/6"
+        }
+      ],
+      "result": "match",
+      "scenario": "wrapper_constructor"
+    },
+    {
+      "error": false,
+      "facts": [
+        {
+          "channel": null,
+          "dynamic": true,
+          "method": "GET",
+          "pathAnchor": "base",
+          "usr": "client_app::wrappers::raw_get"
+        }
+      ],
+      "requests": [
+        {
+          "authority": "api.example.com",
+          "method": "GET",
+          "path": "/v1/undeclared"
+        }
+      ],
+      "result": "dynamic",
+      "scenario": "undeclared_sink"
+    }
+  ],
+  "totals": {
+    "dynamic": 3,
+    "match": 37,
+    "mismatch": 0,
+    "noRequest": 1,
+    "scenarios": 41
+  },
+  "unclaimedFacts": [],
+  "versions": {
+    "reqwest": "0.13.5",
+    "ureq": "3.4.2",
+    "url": "2.5.8"
+  }
+}

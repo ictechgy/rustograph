@@ -1,0 +1,44 @@
+{
+  "format": "http-wrappers",
+  "version": 1,
+  "wrappers": [
+    {
+      "language": "rust",
+      "kind": "function",
+      "owner": "client_app::wrappers",
+      "name": "fetch_json",
+      "pathArg": { "index": 0 },
+      "defaultMethod": "GET",
+      "pathAnchor": "base"
+    },
+    {
+      "language": "rust",
+      "kind": "function",
+      "owner": "client_app::api::ApiClient",
+      "name": "send",
+      "methodArg": { "index": 0 },
+      "methodEnum": { "Get": "GET", "Post": "POST", "Delete": "DELETE" },
+      "pathArg": { "index": 1 },
+      "pathAnchor": "base"
+    },
+    {
+      "language": "rust",
+      "kind": "constructor",
+      "owner": "client_app::api::Endpoint",
+      "name": "Endpoint",
+      "methodArg": { "label": "verb" },
+      "methodEnum": { "Get": "GET", "Post": "POST", "Delete": "DELETE" },
+      "pathArg": { "label": "path" },
+      "pathAnchor": "base"
+    },
+    {
+      "language": "swift",
+      "kind": "function",
+      "owner": "Network",
+      "name": "send",
+      "pathArg": { "label": "path" },
+      "defaultMethod": "GET",
+      "pathAnchor": "root"
+    }
+  ]
+}

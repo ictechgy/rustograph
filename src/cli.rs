@@ -34,6 +34,8 @@ usage:
   rustograph mcp [--dir DIR] [--graph FILE] [--config FILE] [--deps] [--tests]
   rustograph schema [--dir DIR] [--out FILE]
   rustograph routes --role server [--dir DIR] [--out FILE] [--framework axum|actix]
+  rustograph routes --role client [--dir DIR] [--out FILE] [--wrappers FILE]
+                   [--service NAME]
   rustograph version
 
 shared flags: --deps --tests --retain-public --semantic --no-cache
@@ -151,23 +153,38 @@ fn cmd_schema(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     Ok(0)
 }
 
-/// `routes --role server` — isthmus http 도메인의 서버 route-decl 문서를 낸다.
-/// 클라이언트 route-call은 아직 내지 않으므로 `--role`은 server만 받는다 —
-/// 생략을 server로 읽으면 나중에 client를 더할 때 같은 명령의 뜻이 바뀐다.
+/// `routes --role server|client` — isthmus http 도메인 문서를 낸다. 서버는 axum·
+/// actix-web `route-decl`, 클라이언트는 reqwest·ureq·선언된 래퍼의 `route-call`이다.
+/// `--role`은 필수다 — 생략을 한쪽으로 읽으면 명령의 뜻이 역할에 따라 흔들린다.
 fn cmd_routes(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
-    if let Some(bad) = a.unsupported(&["dir", "out", "role", "framework"]) {
-        return Err(format!(
-            "routes takes only --role, --dir, --out and --framework — {bad} is not supported"
-        ));
-    }
-    match a.get("role") {
-        Some("server") => {}
+    let text = match a.get("role") {
+        Some("server") => routes_server(a)?,
+        Some("client") => routes_client(a)?,
         Some(other) => {
             return Err(format!(
-                "routes --role {other} is not supported; only --role server is implemented"
+                "routes --role {other} is not supported; use --role server or --role client"
             ))
         }
-        None => return Err("routes requires --role server".to_string()),
+        None => return Err("routes requires --role server or --role client".to_string()),
+    };
+    match a.get("out") {
+        Some(p) => {
+            std::fs::write(p, &text).map_err(|e| format!("cannot write {p}: {e}"))?;
+            writeln!(out, "wrote {p}").ok();
+        }
+        None => {
+            write!(out, "{text}").ok();
+        }
+    }
+    Ok(0)
+}
+
+/// 서버 route-decl 문서(JSON 텍스트).
+fn routes_server(a: &Args) -> Result<String, String> {
+    if let Some(bad) = a.unsupported(&["dir", "out", "role", "framework"]) {
+        return Err(format!(
+            "routes --role server takes only --dir, --out and --framework — {bad} is not supported"
+        ));
     }
     let framework = match a.get("framework") {
         None => None,
@@ -179,17 +196,34 @@ fn cmd_routes(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     let dir = PathBuf::from(a.get("dir").unwrap_or("."));
     let opts = source::routes::RouteOptions { framework };
     let doc = source::routes::routes(&dir, VERSION, &opts)?;
-    let text = export::to_json(&doc);
-    match a.get("out") {
-        Some(p) => {
-            std::fs::write(p, &text).map_err(|e| format!("cannot write {p}: {e}"))?;
-            writeln!(out, "wrote {p}").ok();
-        }
-        None => {
-            write!(out, "{text}").ok();
-        }
+    Ok(export::to_json(&doc))
+}
+
+/// 클라이언트 route-call 문서(JSON 텍스트).
+fn routes_client(a: &Args) -> Result<String, String> {
+    if let Some(bad) = a.unsupported(&["dir", "out", "role", "wrappers", "service"]) {
+        return Err(format!(
+            "routes --role client takes only --dir, --out, --wrappers and --service — {bad} is not supported"
+        ));
     }
-    Ok(0)
+    let wrappers = match a.get("wrappers") {
+        None => Vec::new(),
+        Some(p) => {
+            let text = std::fs::read_to_string(p)
+                .map_err(|e| format!("cannot read --wrappers {p}: {e}"))?;
+            source::routes::wrappers::parse(&text).map_err(|e| format!("--wrappers {p}: {e}"))?
+        }
+    };
+    let service = match a.get("service") {
+        Some(s) if s.is_empty() || s.chars().any(char::is_control) => {
+            return Err("--service must be a non-empty name without control characters".into())
+        }
+        other => other.map(str::to_string),
+    };
+    let dir = PathBuf::from(a.get("dir").unwrap_or("."));
+    let opts = source::routes::client::ClientOptions { wrappers, service };
+    let doc = source::routes::client::client_routes(&dir, VERSION, &opts)?;
+    Ok(export::to_json(&doc))
 }
 
 fn cmd_graph(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
