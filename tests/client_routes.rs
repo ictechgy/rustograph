@@ -779,3 +779,20 @@ fn service_conflict_is_a_usage_error() {
     assert!(doc["facts"].as_array().unwrap().is_empty());
     assert_eq!(doc["target"], "http");
 }
+
+/// 상수가 상수를 가리키는 긴 사슬도 깊이 상한 안에서 끝난다 — 스택을 넘기지 않고
+/// 모르는 값(baseRef)으로 낮추며, 짧은 사슬은 그대로 푼다.
+#[test]
+fn deep_const_chains_degrade_instead_of_overflowing() {
+    let mut src = String::from("const C0: &str = \"http://h.test/x\";\n");
+    for i in 1..3000 {
+        src.push_str(&format!("const C{i}: &str = C{};\n", i - 1));
+    }
+    src.push_str(
+        "pub fn deep() { reqwest::get(C2999); }\npub fn shallow() { reqwest::get(C3); }\n",
+    );
+    let dir = temp_crate("deepconst", &[("reqwest", "0.13.5")], &[("lib.rs", &src)]);
+    let r = rows(&doc_of(&dir, None));
+    assert!(has(&r, "deep", "GET", "DYN:", "base"), "{r:#?}");
+    assert!(has(&r, "shallow", "GET", "/x", "root"), "{r:#?}");
+}

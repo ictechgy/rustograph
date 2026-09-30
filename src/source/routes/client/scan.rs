@@ -697,7 +697,7 @@ impl Scanner<'_, '_> {
                 lit: syn::Lit::Str(s),
                 ..
             }) => Val::Str(vec![Piece::Lit(s.value())], None),
-            syn::Expr::Path(p) => self.eval_path(&crate::harvest::path_segments(&p.path)),
+            syn::Expr::Path(p) => self.eval_path(&crate::harvest::path_segments(&p.path), d),
             syn::Expr::Field(f) => self.eval_field(f),
             syn::Expr::Macro(m) => self.eval_macro(&m.mac, d),
             syn::Expr::Binary(b) if matches!(b.op, syn::BinOp::Add(_)) => {
@@ -716,21 +716,22 @@ impl Scanner<'_, '_> {
         }
     }
 
-    /// 경로 값 — 지역 변수, 문자열 상수·static.
-    fn eval_path(&self, segs: &[String]) -> Val {
+    /// 경로 값 — 지역 변수, 문자열 상수·static. `depth`는 상수가 상수를 가리키는 사슬에도
+    /// 이어져 깊은 사슬이 스택을 넘기지 않게 한다.
+    fn eval_path(&self, segs: &[String], depth: usize) -> Val {
         if let [one] = segs {
             if let Some(b) = self.env.get(one) {
                 return b.val.clone();
             }
         }
         match self.resolve_path(segs) {
-            Some(id) if self.sh.index.consts.contains_key(&id) => self.eval_const(&id),
+            Some(id) if self.sh.index.consts.contains_key(&id) => self.eval_const(&id, depth),
             _ => Val::unknown(),
         }
     }
 
-    /// 상수·static의 값(순환 방지 캐시).
-    fn eval_const(&self, id: &str) -> Val {
+    /// 상수·static의 값(순환 방지 캐시). 깊이 상한에 닿은 사슬은 모르는 값(`baseRef`)이다.
+    fn eval_const(&self, id: &str, depth: usize) -> Val {
         if let Some(cached) = self.sh.consts.borrow().get(id) {
             return cached
                 .clone()
@@ -752,7 +753,7 @@ impl Scanner<'_, '_> {
             mutated: BTreeSet::new(),
             in_wrapper: false,
         };
-        let v = scanner.eval(c.expr);
+        let v = scanner.eval_depth(c.expr, depth);
         let known = match v {
             Val::Str(..) | Val::Url(..) => Some(v.with_ref(Some(id.to_string()))),
             Val::Other(_) => None,
@@ -908,7 +909,7 @@ impl Scanner<'_, '_> {
                         FmtKey::Index(n) => positional.get(n).map(|e| self.eval_depth(e, d)),
                         FmtKey::Name(n) => match named.get(&n) {
                             Some(e) => Some(self.eval_depth(e, d)),
-                            None => Some(self.eval_path(&[n])),
+                            None => Some(self.eval_path(&[n], d)),
                         },
                     };
                     let Some(v) = v else {
@@ -1249,7 +1250,7 @@ impl Scanner<'_, '_> {
             syn::Expr::Path(p) => {
                 let segs = crate::harvest::path_segments(&p.path);
                 let local = matches!(segs.as_slice(), [one] if self.env.get(one).is_some());
-                match self.eval_path(&segs) {
+                match self.eval_path(&segs, 0) {
                     Val::Str(pieces, _) if !local => match pieces.as_slice() {
                         [Piece::Lit(s)] => ArgValue::Literal(s.clone()),
                         _ => ArgValue::Other,

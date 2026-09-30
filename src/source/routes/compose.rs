@@ -496,6 +496,8 @@ fn authority_of(raw: &str) -> Option<String> {
             None => (lower.as_str(), None),
         }
     };
+    // WHATWG: 빈 포트(`h:`)는 포트 없음이다(url 2.5.8 실행 확인).
+    let port = port.filter(|p| !p.is_empty());
     let host_ok = if host.starts_with('[') {
         host[1..host.len() - 1]
             .chars()
@@ -504,10 +506,13 @@ fn authority_of(raw: &str) -> Option<String> {
         !host.is_empty()
             && host
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
     };
-    let port_ok = port.is_none_or(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
-    (host_ok && port_ok).then_some(lower)
+    let port_ok = port.is_none_or(|p| p.chars().all(|c| c.is_ascii_digit()));
+    (host_ok && port_ok).then(|| match port {
+        Some(p) => format!("{host}:{p}"),
+        None => host.to_string(),
+    })
 }
 
 /// 조각의 첫 `?`·`#`부터 끝까지 뗀다. 뗐으면 true.
@@ -934,7 +939,10 @@ mod tests {
         );
         assert_eq!(authority_of("[::1]:3000").as_deref(), Some("[::1]:3000"));
         assert_eq!(authority_of("caf\u{e9}.com"), None);
-        assert_eq!(authority_of("h:"), None);
+        // 밑줄 host와 빈 포트는 WHATWG가 받는다(url 2.5.8: `my_api.example.com`, `h:` → 포트 없음).
+        assert_eq!(authority_of("My_Api.test").as_deref(), Some("my_api.test"));
+        assert_eq!(authority_of("h:").as_deref(), Some("h"));
+        assert_eq!(authority_of("h:x1"), None);
     }
 
     #[test]
