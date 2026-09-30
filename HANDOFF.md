@@ -2,7 +2,24 @@
 
 세션을 이어받는 에이전트가 먼저 읽는 문서입니다.
 
-## 진행 중 — feature/client-routes (2026-09-30, API 영향 프로그램 개선 #3 Rust 부분)
+## 릴리스 준비 — v0.4.0 (2026-09-30, release/v0.4.0)
+
+`Cargo.toml`·`Cargo.lock` 자기 항목(0.4.0, `cargo update` 없이 손으로 — ra_ap 핀 유지, `cargo build --locked` 확인)과
+README 설치 태그를 올렸다. 태그·Release·탭 갱신은 머지 뒤 별도 승인으로 한다. 릴리스 노트(v0.3.0 이후):
+
+- **새 명령** — `routes --role server`(axum 0.7·0.8, actix-web 4 → isthmus http `route-decl`), `routes --role client`
+  (reqwest·ureq, `--wrappers` http-wrappers v1, `--service` → `route-call`), `reach`·`impact --format language-traversal`
+  (language-traversal v1, 다중 root 단일 패스), 최상위 `--version`(= `version`, isthmus 설치 버전 대조용).
+- **출력 변경** — `schema` 사실에 `symbol: {qualifiedName, usr}`(usr = 그래프 정점 ID). 읽지 못한 `cfg_attr` 속성 목록을
+  세어 limitation으로 보고한다.
+- **동작 변경** — 수확의 지역 바인딩 스코프 해석을 고쳐, 지역 변수·매개변수가 같은 이름의 모듈·함수로 읽히던 거짓
+  간선이 사라졌다(자기 분석 기준 109개). `graph`·`dead`·`cycles`·`query`·`impact` 결과가 달라질 수 있다.
+- **소비자 요건** — route-decl·route-call·language-traversal 문서는 isthmus `3a45450` 이후(차기 isthmus-cli 0.10.0)가
+  있어야 받는다. 발행된 isthmus-cli 0.9.0은 거부한다. 벤더링한 공유 벡터 lock은 `3a45450`.
+- **알려진 결함** — 서버 `route-decl`의 위치 열(`Ctx::locate`)이 UTF-16 코드 단위로 세어진다. GRAPH-EXCHANGE는 UTF-8
+  바이트를 요구하므로 경로 인자 앞에 비ASCII 문자가 있는 줄에서 열이 어긋난다. 클라이언트 `route-call`은 UTF-8 바이트다.
+
+## 직전 — feature/client-routes (2026-09-30, PR #24 머지됨)
 
 `rustograph routes --role client`(isthmus http `route-call` 생산자). 규칙·근거·오라클 표는 `docs/HTTP-CLIENT.md`.
 

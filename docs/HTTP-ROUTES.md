@@ -78,7 +78,7 @@ dispatch 하나만 선언한다). 둘 다 없으면 사실 0건과 `route-covera
   `NormalizePath::trim_trailing_slash(svc)`)이 있으면 trim은 끝 슬래시 없는 템플릿을, append는 끝 슬래시 있는 템플릿을
   `optional`로 낸다. `Router::layer`·`MethodRouter::layer` 인자나 변수로 넘긴 레이어처럼 라우팅 전에 동작한다는 증거가
   없으면 효과가 없다고 본다(틀리면 선언이 strict로 남아 소비자는 끝 슬래시 불일치 경고를 낸다 — 거짓 error가 아니다).
-- **location**: `.route()`의 경로 인자(줄, UTF-16 열). 경로 인자가 `&str` 상수면 그 값을 쓴다.
+- **location**: `.route()`의 경로 인자(줄, UTF-16 열 — 알려진 결함: GRAPH-EXCHANGE는 UTF-8 바이트 열을 요구하므로 비ASCII 줄에서 어긋난다). 경로 인자가 `&str` 상수면 그 값을 쓴다.
 
 ## actix-web
 
