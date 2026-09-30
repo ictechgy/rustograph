@@ -237,6 +237,19 @@ fn usage_errors_exit_64_with_empty_stdout() {
             "--format".into(),
             "language-traversal".into(),
         ],
+        // `=` 표기도 순회 형식 요청이다 — 파싱 실패는 2가 아니라 64다.
+        vec![
+            "impact".into(),
+            "--format=language-traversal".into(),
+            "--bogus".into(),
+            "x".into(),
+        ],
+        vec![
+            "reach".into(),
+            "x".into(),
+            "--generated-at".into(),
+            "2026-09-30T00:00:00+99:99".into(),
+        ],
     ];
     for mut argv in cases {
         argv.extend(["--dir".to_string(), dir.clone()]);

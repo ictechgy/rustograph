@@ -51,9 +51,11 @@ pub(crate) enum Failure {
 pub(crate) fn is_traversal_argv(args: &[String]) -> bool {
     args.first().is_some_and(|c| c == "reach")
         || (args.first().is_some_and(|c| c == "impact")
-            && args
+            && (args
                 .windows(2)
-                .any(|w| w[0] == "--format" && w[1] == "language-traversal"))
+                .any(|w| w[0] == "--format" && w[1] == "language-traversal")
+                // `=` 표기도 같은 요청이다 — 파싱이 실패해도 순회 명령의 64 계약을 따른다.
+                || args.iter().any(|a| a == "--format=language-traversal")))
 }
 
 /// 순회 명령을 실행한다. 반환값은 종료 코드다.
@@ -299,11 +301,18 @@ fn is_timestamp(s: &str) -> bool {
         rest = &frac[n..];
     }
     let zone = rest.as_bytes();
+    // 오프셋도 시각이다 — +99:99처럼 범위 밖이면 isthmus가 문서 전체를 거부한다.
+    let offset_ok = || {
+        let hh = std::str::from_utf8(&zone[1..3]).ok()?.parse::<u32>().ok()?;
+        let mm = std::str::from_utf8(&zone[4..6]).ok()?.parse::<u32>().ok()?;
+        Some(hh <= 23 && mm <= 59)
+    };
     rest == "Z"
         || (zone.len() == 6
             && (zone[0] == b'+' || zone[0] == b'-')
             && zone[3] == b':'
-            && zone[1..3].iter().chain(&zone[4..6]).all(u8::is_ascii_digit))
+            && zone[1..3].iter().chain(&zone[4..6]).all(u8::is_ascii_digit)
+            && offset_ok() == Some(true))
 }
 
 /// 순회 문서와 정점이 아닌 root 수.
@@ -617,6 +626,9 @@ mod tests {
             "2026-09-30T00:00:00",
             "2026-09-30T00:00:00.Z",
             "2026-09-30T00:00:00+0900",
+            "2026-09-30T00:00:00+99:99",
+            "2026-09-30T00:00:00-00:60",
+            "2026-09-30T00:00:00+24:00",
             "２０２６-09-30T00:00:00Z",
         ] {
             assert!(!is_timestamp(bad), "{bad}");
