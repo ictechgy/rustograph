@@ -19,6 +19,15 @@ isthmus `trace`가 Rust 백엔드의 핸들러 도달을 관계 사용과 잇도
 - 남은 것: isthmus가 rust `route-decl`을 받지 않아 route 선택 trace는 불가(relation·
   심볼 선택은 동작). `type` 레벨 cycles는 main부터 10개(투영 산물)이고 이번에 3개가
   같은 종류로 늘었다(게이트 아님).
+- 합성 e2e(axum·sqlx·sea_orm 스텁, scratch): `isthmus check --pairs` 5 matches,
+  relation 선택 trace는 relation-use → 역방향 순회까지 이어지고 route-decl이 없어
+  `non-http-entry`. isthmus를 scratch에서 고쳐 손으로 만든 route-decl로 route 선택도
+  핸들러 → 테이블 도달을 확인했다.
+- 발견(기존 수확 결함, 이번 범위 밖): 본문의 단일 식별자 경로가 지역 변수여도 크레이트
+  루트 모듈 이름과 같으면 모듈 정점 references 간선이 된다(`fn f(repo: &dyn R) { repo.all() }`
+  → `f → crate::repo`). 순회가 그 모듈의 `uses` 간선을 따라 모듈이 import한 아이템 전부에
+  닿는 과대 근사가 된다. 표현식 경로는 모듈일 수 없으므로 모듈로 해석되면 버리는 것이 후보.
+  syn 모드에서 메서드 호출은 이름 팬아웃(tentative)이라 구체 수신자 호출도 candidate다.
 
 ## 직전 세션 요약 (2026-09-25)
 
