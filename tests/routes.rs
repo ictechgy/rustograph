@@ -366,6 +366,46 @@ pub async fn run() { axum::serve(listener(), app()).await; }
     std::fs::write(dir.join("app/src/lib.rs"), src_inner).unwrap();
     let d = doc_of(&dir, None);
     assert!(facts(&d).contains(&("GET".into(), "/items".into(), Some("strict".into()))));
+    // MethodRouter::layer도 라우팅 뒤다. 변수로 넘긴 레이어는 모양을 못 읽어 효과 없음.
+    let src_method = r#"
+use axum::{routing::get, Router};
+use tower_http::normalize_path::NormalizePathLayer;
+async fn h() {}
+pub fn app() -> Router {
+    let norm = NormalizePathLayer::trim_trailing_slash();
+    Router::new()
+        .route("/items", get(h).layer(NormalizePathLayer::trim_trailing_slash()))
+        .route("/other", get(h))
+        .layer(norm)
+}
+pub async fn run() { axum::serve(listener(), app()).await; }
+"#;
+    std::fs::write(dir.join("app/src/lib.rs"), src_method).unwrap();
+    let d = doc_of(&dir, None);
+    let f = facts(&d);
+    assert!(
+        f.contains(&("GET".into(), "/items".into(), Some("strict".into()))),
+        "{f:?}"
+    );
+    assert!(
+        f.contains(&("GET".into(), "/other".into(), Some("strict".into()))),
+        "{f:?}"
+    );
+    // ServiceBuilder로 감싼 서비스는 라우팅 전이다.
+    let src_builder = r#"
+use axum::{routing::get, Router};
+use tower_http::normalize_path::NormalizePathLayer;
+async fn h() {}
+pub fn app() -> Router { Router::new().route("/items", get(h)) }
+pub async fn run() {
+    let svc = tower::ServiceBuilder::new().layer(NormalizePathLayer::trim_trailing_slash()).service(app());
+    serve_somehow(svc);
+    axum::serve(listener(), app()).await;
+}
+"#;
+    std::fs::write(dir.join("app/src/lib.rs"), src_builder).unwrap();
+    let d = doc_of(&dir, None);
+    assert!(facts(&d).contains(&("GET".into(), "/items".into(), Some("optional".into()))));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -714,4 +754,45 @@ pub fn b_outer() -> Router { Router::new().nest("/mid", a_inner()) }
         rows(&d),
         vec!["GET /mid/leaf base strict app::h".to_string()]
     );
+}
+
+/// actix App을 지역 변수로 키우는 재대입은 따라가고, 함수에 넘긴 App은 한계로 센다.
+#[test]
+fn actix_app_through_variables_and_helpers() {
+    let src = r#"
+use actix_web::{web, App};
+async fn h() -> &'static str { "" }
+fn extend<T>(app: T) -> T { app }
+pub fn build() {
+    let mut app = App::new().route("/a", web::get().to(h));
+    app = app.route("/b", web::post().to(h));
+    let _ = extend(App::new().route("/c", web::get().to(h)));
+    let _ = app;
+}
+"#;
+    let dir = temp_crate("actixvar", &[("actix-web", "4.15.0")], &[("lib.rs", src)]);
+    let d = doc_of(&dir, None);
+    let _ = std::fs::remove_dir_all(&dir);
+    let r = rows(&d);
+    for want in [
+        "GET /a root strict app::h",
+        "POST /b root strict app::h",
+        "GET /c root strict app::h",
+    ] {
+        assert!(r.iter().any(|x| x == want), "missing {want:?} in {r:#?}");
+    }
+    // /a·/b는 한 App(같은 group), /c는 다른 App이다.
+    let group_of = |ch: &str| {
+        d["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["channel"] == ch)
+            .and_then(|f| f.pointer("/order/group").cloned())
+    };
+    assert_eq!(group_of("/a"), group_of("/b"));
+    assert_ne!(group_of("/a"), group_of("/c"));
+    assert!(limitations(&d)
+        .iter()
+        .any(|l| l.starts_with("route-coverage: an App passed to a function")));
 }

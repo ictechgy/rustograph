@@ -45,7 +45,11 @@ const EXPECTED: &[(&str, &str, &str)] = &[
     ("GET", "/api/search", "axum_app::handlers::search"),
     ("POST", "/api/search", "axum_app::handlers::search"),
     ("GET", "/api/closure", "axum_app::routes::api"),
-    ("GET", "/api/v/status", "axum_app::handlers::status"),
+    (
+        "POST",
+        "/api/v/status",
+        "axum_app::handlers::status_literal",
+    ),
     (
         "GET",
         "/api/items//tags/red",
@@ -69,6 +73,7 @@ const NEGATIVE: &[(&str, &str)] = &[
     ("GET", "/orphan"),
     ("GET", "/api/lit/braces"),
     ("GET", "/api/lit/%7Bbraces%7D"),
+    ("GET", "/api/v/status"),
     ("GET", "/api/tag_"),
 ];
 

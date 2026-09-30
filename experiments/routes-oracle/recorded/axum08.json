@@ -129,11 +129,11 @@
       "usr": "axum_app::handlers::users::any_method"
     },
     {
-      "method": "GET",
+      "method": "POST",
       "channel": "/api/v/status",
       "pathAnchor": "root",
       "trailingSlash": "strict",
-      "usr": "axum_app::handlers::status"
+      "usr": "axum_app::handlers::status_literal"
     },
     {
       "method": "GET",
@@ -179,8 +179,8 @@
     "total": 23
   },
   "negatives": {
-    "passed": 11,
-    "total": 11
+    "passed": 12,
+    "total": 12
   },
   "trailingSlash": {
     "passed": 22,
@@ -723,22 +723,22 @@
     },
     {
       "kind": "fact",
-      "method": "GET",
+      "method": "POST",
       "path": "/api/v/status",
       "predicted": {
         "kind": "Handler",
-        "usr": "axum_app::handlers::status"
+        "usr": "axum_app::handlers::status_literal"
       },
       "status": 200,
       "actual": {
         "kind": "Handler",
-        "body": "axum_app::handlers::status"
+        "body": "axum_app::handlers::status_literal"
       },
       "pass": true
     },
     {
       "kind": "trailing",
-      "method": "GET",
+      "method": "POST",
       "path": "/api/v/status/",
       "predicted": {
         "kind": "None"
@@ -1107,17 +1107,17 @@
     },
     {
       "kind": "expected",
-      "method": "GET",
+      "method": "POST",
       "path": "/api/v/status",
-      "truth": "axum_app::handlers::status",
+      "truth": "axum_app::handlers::status_literal",
       "predicted": {
         "kind": "Handler",
-        "usr": "axum_app::handlers::status"
+        "usr": "axum_app::handlers::status_literal"
       },
       "status": 200,
       "actual": {
         "kind": "Handler",
-        "body": "axum_app::handlers::status"
+        "body": "axum_app::handlers::status_literal"
       },
       "pass": true
     },
@@ -1336,6 +1336,20 @@
         "kind": "None"
       },
       "status": 404,
+      "actual": {
+        "kind": "NoMatch"
+      },
+      "pass": true
+    },
+    {
+      "kind": "negative",
+      "method": "GET",
+      "path": "/api/v/status",
+      "truth": null,
+      "predicted": {
+        "kind": "None"
+      },
+      "status": 405,
       "actual": {
         "kind": "NoMatch"
       },

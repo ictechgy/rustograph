@@ -50,7 +50,7 @@ pub(super) enum Trailing {
 }
 
 /// 템플릿이 서버 루트부터 확정됐는지(`root`) 알 수 없는 접두사 뒤인지(`base`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Anchor {
     Root,
     Base,

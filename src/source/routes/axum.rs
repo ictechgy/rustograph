@@ -54,7 +54,6 @@ pub(super) fn extract(ctx: &Ctx, krate: &str, version: Version, out: &mut Output
         stack: Vec::new(),
         consumed: BTreeSet::new(),
         imports: BTreeMap::new(),
-        layer_normalize: 0,
     };
     // 1) 서빙되는 라우터(루트) — `axum::serve(_, X)`·`X.into_make_service()`.
     let mut roots: Vec<RouterVal> = Vec::new();
@@ -108,17 +107,19 @@ pub(super) fn extract(ctx: &Ctx, krate: &str, version: Version, out: &mut Output
             format!("a Router built inside a method at {at} is not evaluated; its routes are not extracted"),
         );
     }
-    let normalize = normalize_effect(&ev, &fns);
+    let normalize = normalize_effect(&fns);
     let mut emit = Emit {
         ctx,
         version,
         normalize,
         out,
         bases: Vec::new(),
+        variants: Vec::new(),
     };
     for (i, f) in flat.iter().enumerate() {
         emit.flat(f, i >= rooted);
     }
+    emit.drop_shadowed_variants();
     emit.finish_bases();
 }
 
@@ -202,8 +203,6 @@ struct Eval<'a> {
     /// 다른 라우터·서빙 식에 쓰인 라우터 함수.
     consumed: BTreeSet<String>,
     imports: BTreeMap<String, Imports>,
-    /// `Router::layer` 인자로 쓰인 경로 정규화 레이어 수(라우팅 뒤라 효과 없음).
-    layer_normalize: usize,
 }
 
 impl Eval<'_> {
@@ -438,9 +437,6 @@ impl Eval<'_> {
             ("fallback" | "fallback_service", [h]) => {
                 r.entries.push(Entry::Fallback { loc: loc_of(h) })
             }
-            ("layer" | "route_layer", [layer]) if mentions(layer, "NormalizePathLayer") => {
-                self.layer_normalize += 1;
-            }
             _ => {}
         }
     }
@@ -547,7 +543,7 @@ impl Eval<'_> {
     }
 }
 
-/// 식이 이름 `name`을 담는가(경로 세그먼트 기준) — 레이어 판별용.
+/// 식이 이름 `name`을 경로 세그먼트나 메서드 이름으로 담는가 — 레이어 판별용.
 fn mentions(e: &syn::Expr, name: &str) -> bool {
     struct Finder<'n>(&'n str, bool);
     impl Visit<'_> for Finder<'_> {
@@ -556,6 +552,12 @@ fn mentions(e: &syn::Expr, name: &str) -> bool {
                 self.1 = true;
             }
             syn::visit::visit_path(self, p);
+        }
+        fn visit_expr_method_call(&mut self, m: &syn::ExprMethodCall) {
+            if m.method == self.0 {
+                self.1 = true;
+            }
+            syn::visit::visit_expr_method_call(self, m);
         }
     }
     let mut f = Finder(name, false);
@@ -742,55 +744,79 @@ fn strip_make_service(e: &syn::Expr) -> syn::Expr {
     e.clone()
 }
 
-/// 크레이트의 `NormalizePathLayer` 효과. Router::layer 인자로만 쓰였으면 효과가 없다
-/// (axum 문서: 그 미들웨어는 라우팅 뒤에 돈다).
-fn normalize_effect(ev: &Eval, fns: &BTreeMap<String, FnSite>) -> Normalize {
+/// 크레이트의 `NormalizePathLayer` 효과 — 라우터 **바깥**을 감싼 증거만 센다.
+///
+/// `Router::layer`·`MethodRouter::layer` 미들웨어는 라우팅 뒤에 돈다(axum layer.md:57-62)
+/// 그래서 효과를 인정하는 모양은 레이어가 서비스를 감싸는 경우뿐이다:
+/// `NormalizePathLayer::trim_trailing_slash().layer(svc)`, `ServiceBuilder::new()…
+/// .layer(NormalizePathLayer::…).service(svc)`, `NormalizePath::trim_trailing_slash(svc)`.
+/// 변수에 담아 넘기는 등 모양을 못 읽으면 효과가 없다고 본다 — 틀리면 선언이 strict로
+/// 남아 소비자는 끝 슬래시 불일치 경고를 내고, 반대로 틀리면 거짓 match가 된다.
+fn normalize_effect(fns: &BTreeMap<String, FnSite>) -> Normalize {
+    #[derive(Default)]
     struct Finder {
         trim: usize,
         append: usize,
-        other: usize,
+    }
+    impl Finder {
+        fn mode(&mut self, e: &syn::Expr) {
+            if mentions(e, "trim_trailing_slash") {
+                self.trim += 1;
+            }
+            if mentions(e, "append_trailing_slash") {
+                self.append += 1;
+            }
+        }
     }
     impl Visit<'_> for Finder {
-        fn visit_path(&mut self, p: &syn::Path) {
-            let segs: Vec<String> = p.segments.iter().map(|s| s.ident.to_string()).collect();
-            if let Some(i) = segs
-                .iter()
-                .position(|s| s == "NormalizePathLayer" || s == "NormalizePath")
-            {
-                match segs.get(i + 1).map(String::as_str) {
-                    Some("trim_trailing_slash") => self.trim += 1,
-                    Some("append_trailing_slash") => self.append += 1,
-                    _ => {}
-                }
-            }
-            syn::visit::visit_path(self, p);
-        }
         fn visit_expr_method_call(&mut self, m: &syn::ExprMethodCall) {
-            if m.method == "trim_trailing_slash" || m.method == "append_trailing_slash" {
-                self.other += 1;
+            // 체인의 뿌리와 체인 메서드들 — 안쪽 인자에 섞인 레이어는 세지 않는다.
+            let mut calls = Vec::new();
+            let mut root: &syn::Expr = &m.receiver;
+            while let syn::Expr::MethodCall(mc) = root {
+                calls.push(mc);
+                root = &mc.receiver;
+            }
+            let root_is = |name: &str| {
+                matches!(root, syn::Expr::Call(c) if matches!(&*c.func,
+                    syn::Expr::Path(p) if p.path.segments.iter().any(|s| s.ident == name)))
+            };
+            if m.method == "layer" && root_is("NormalizePathLayer") {
+                // NormalizePathLayer::trim_trailing_slash().layer(svc)
+                self.mode(&m.receiver);
+            } else if m.method == "service" && root_is("ServiceBuilder") {
+                // ServiceBuilder::new().layer(NormalizePathLayer::..).service(svc)
+                for mc in calls.iter().filter(|mc| mc.method == "layer") {
+                    if let Some(arg) = mc
+                        .args
+                        .first()
+                        .filter(|a| mentions(a, "NormalizePathLayer"))
+                    {
+                        self.mode(arg);
+                    }
+                }
             }
             syn::visit::visit_expr_method_call(self, m);
         }
+        fn visit_expr_call(&mut self, c: &syn::ExprCall) {
+            if let syn::Expr::Path(p) = &*c.func {
+                let segs = path_segments(&p.path);
+                if segs.iter().any(|s| s == "NormalizePath") && c.args.len() == 1 {
+                    self.mode(&c.func);
+                }
+            }
+            syn::visit::visit_expr_call(self, c);
+        }
     }
-    let mut f = Finder {
-        trim: 0,
-        append: 0,
-        other: 0,
-    };
+    let mut f = Finder::default();
     for site in fns.values() {
         f.visit_block(&site.item.block);
     }
-    let total = f.trim + f.append;
-    if total == 0 && f.other == 0 {
-        return Normalize::None;
-    }
-    if total <= ev.layer_normalize && f.other == 0 {
-        return Normalize::None;
-    }
     match (f.trim > 0, f.append > 0) {
+        (false, false) => Normalize::None,
         (true, false) => Normalize::Trim,
         (false, true) => Normalize::Append,
-        _ => Normalize::Unknown,
+        (true, true) => Normalize::Unknown,
     }
 }
 
@@ -802,6 +828,8 @@ struct Emit<'a, 'o> {
     out: &'o mut Output,
     /// base 선언의 (접미사 스코프 원소, 루트에서 닿지 않은 라우터인가) — 한계용.
     bases: Vec<(Option<String>, bool)>,
+    /// 빈 값 변형 선언의 `out.decls` 위치.
+    variants: Vec<usize>,
 }
 
 impl Emit<'_, '_> {
@@ -912,9 +940,10 @@ impl Emit<'_, '_> {
                         self.at(dl)
                     ),
                 );
+                // 루트에서 닿지 않은 라우터의 dynamic 선언도 붙는 곳을 모른다.
                 (
                     vec![DeclPath::Dynamic(self.ctx.source_text(&dl.file, dl.span))],
-                    Anchor::Root,
+                    if unrooted { Anchor::Base } else { Anchor::Root },
                 )
             }
         };
@@ -951,7 +980,11 @@ impl Emit<'_, '_> {
             if methods.is_empty() {
                 continue;
             }
-            for p in &paths {
+            for (i, p) in paths.iter().enumerate() {
+                // 빈 값 변형(첫 원소 뒤)은 나중에 같은 템플릿의 진짜 선언과 겹치는지 본다.
+                if i > 0 {
+                    self.variants.push(self.out.decls.len());
+                }
                 self.out.decls.push(Decl {
                     methods: methods.clone(),
                     path: p.clone(),
@@ -1045,6 +1078,32 @@ impl Emit<'_, '_> {
                 Some(DeclPath::Dynamic(raw.to_string()))
             }
         }
+    }
+
+    /// 같은 앵커·템플릿의 진짜 선언이 있는 빈 값 변형을 뺀다. matchit은 정적 경로를
+    /// 파라미터보다 먼저 고르고 경로가 맞으면 method가 달라도 거기서 끝나므로(405),
+    /// 그 경로의 요청은 method와 무관하게 변형의 핸들러에 닿지 않는다(오라클 실측).
+    fn drop_shadowed_variants(&mut self) {
+        let key = |d: &Decl| match &d.path {
+            DeclPath::Template { segs, .. } => Some((d.anchor, render(segs))),
+            DeclPath::Dynamic(_) => None,
+        };
+        let variants: BTreeSet<usize> = self.variants.iter().copied().collect();
+        let real: BTreeSet<(Anchor, String)> = self
+            .out
+            .decls
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !variants.contains(i))
+            .filter_map(|(_, d)| key(d))
+            .collect();
+        let mut i = 0;
+        self.out.decls.retain(|d| {
+            let shadowed = variants.contains(&i) && key(d).is_some_and(|k| real.contains(&k));
+            i += 1;
+            !shadowed
+        });
+        self.variants.clear();
     }
 
     /// 핸들러 식을 정점 ID로 해석한다.

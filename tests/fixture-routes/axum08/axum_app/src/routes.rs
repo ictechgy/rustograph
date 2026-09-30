@@ -21,6 +21,7 @@ pub fn api() -> Router {
     router = router.route("/files/{*path}", get(files::serve));
     router
         .route("/v{version}/status", get(handlers::status))
+        .route("/v/status", post(handlers::status_literal))
         .route("/users/{id}", any(users::any_method))
         .route(
             "/search",

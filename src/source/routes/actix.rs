@@ -313,33 +313,121 @@ impl Eval<'_> {
     fn apps_in(&mut self, site: &FnSite) -> Vec<AppVal> {
         struct Finder<'b> {
             imports: &'b Imports,
+            /// 지역 묶음·재대입으로 이미 평가한 체인(바이트 범위) — 다시 루트로 세지 않는다.
+            handled: &'b BTreeSet<(usize, usize)>,
             chains: Vec<syn::Expr>,
+            /// 함수·메서드 인자로 넘어간 App 체인의 위치.
+            passed: Vec<proc_macro2::Span>,
+        }
+        impl Finder<'_> {
+            fn is_app(&self, e: &syn::Expr) -> bool {
+                chain_root_is(self.imports, e, &["App", "new"])
+            }
         }
         impl Visit<'_> for Finder<'_> {
             fn visit_expr(&mut self, e: &syn::Expr) {
-                if chain_root_is(self.imports, e, &["App", "new"]) {
-                    self.chains.push(e.clone());
+                if self.is_app(e) {
+                    let r = e.span().byte_range();
+                    if !self.handled.contains(&(r.start, r.end)) {
+                        self.chains.push(e.clone());
+                    }
                     // 인자 안의 App은 없다고 본다 — 체인 안으로 내려가지 않는다.
                     return;
                 }
                 syn::visit::visit_expr(self, e);
             }
+            fn visit_expr_call(&mut self, c: &syn::ExprCall) {
+                let spans: Vec<_> = c
+                    .args
+                    .iter()
+                    .filter(|a| self.is_app(a))
+                    .map(|a| a.span())
+                    .collect();
+                self.passed.extend(spans);
+                syn::visit::visit_expr_call(self, c);
+            }
+            fn visit_expr_method_call(&mut self, m: &syn::ExprMethodCall) {
+                let spans: Vec<_> = m
+                    .args
+                    .iter()
+                    .filter(|a| self.is_app(a))
+                    .map(|a| a.span())
+                    .collect();
+                self.passed.extend(spans);
+                syn::visit::visit_expr_method_call(self, m);
+            }
         }
         let groups = self.ctx.parts.module_items(&site.module);
         let imports = Imports::of(&groups);
+        // 1) 본문 최상위의 `let app = App::new()…;`와 `app = app.route(..);` 재대입을 따라간다.
+        let mut env: BTreeMap<String, Val> = BTreeMap::new();
+        let mut handled: BTreeSet<(usize, usize)> = BTreeSet::new();
+        for stmt in &site.item.block.stmts {
+            let (name, init) = match stmt {
+                syn::Stmt::Local(l) => match (pat_ident(&l.pat), &l.init) {
+                    (Some(n), Some(i)) => (n, &*i.expr),
+                    _ => continue,
+                },
+                syn::Stmt::Expr(syn::Expr::Assign(a), _) => match &*a.left {
+                    syn::Expr::Path(p) => match p.path.get_ident() {
+                        Some(n) if env.contains_key(&n.to_string()) => (n.to_string(), &*a.right),
+                        _ => continue,
+                    },
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            let rooted_here = chain_root_is(&imports, init, &["App", "new"]);
+            let from_env = chain_root_ident(init).is_some_and(|r| env.contains_key(&r));
+            if !rooted_here && !from_env {
+                continue;
+            }
+            if let Some(v @ Val::App(_)) = self.eval(site, &env, init) {
+                let r = init.span().byte_range();
+                handled.insert((r.start, r.end));
+                env.insert(name, v);
+            }
+        }
+        // 2) 그 밖의 App 체인(클로저 안의 `App::new()…` 등).
         let mut f = Finder {
             imports: &imports,
+            handled: &handled,
             chains: Vec::new(),
+            passed: Vec::new(),
         };
         f.visit_block(&site.item.block);
-        let env = BTreeMap::new();
-        f.chains
+        for span in &f.passed {
+            let loc = Loc {
+                file: site.file.clone(),
+                span: *span,
+            };
+            let at = self
+                .ctx
+                .locate(&loc)
+                .map(|l| format!("{}:{}", l.path, l.line))
+                .unwrap_or_default();
+            self.out_gaps.push(super::common::Gap {
+                prefix: "route-coverage:",
+                text: format!(
+                    "an App passed to a function at {at} may receive more registrations there"
+                ),
+                scope: None,
+            });
+        }
+        let empty = BTreeMap::new();
+        let mut apps: Vec<AppVal> = f
+            .chains
             .iter()
-            .filter_map(|e| match self.eval(site, &env, e) {
+            .filter_map(|e| match self.eval(site, &empty, e) {
                 Some(Val::App(a)) => Some(a),
                 _ => None,
             })
-            .collect()
+            .collect();
+        apps.extend(env.into_values().filter_map(|v| match v {
+            Val::App(a) => Some(a),
+            _ => None,
+        }));
+        apps
     }
 
     /// 크레이트 함수의 반환 값(스코프·리소스 등)을 평가한다.
@@ -890,6 +978,18 @@ fn mentions_ident(e: &syn::Expr, name: &str) -> bool {
     let mut f = Finder(name, false);
     f.visit_expr(e);
     f.1
+}
+
+/// 메서드 체인의 뿌리가 식별자면 그 이름(`app.route(..)`의 `app`).
+fn chain_root_ident(e: &syn::Expr) -> Option<String> {
+    let mut cur = e;
+    while let syn::Expr::MethodCall(m) = cur {
+        cur = &m.receiver;
+    }
+    match cur {
+        syn::Expr::Path(p) => p.path.get_ident().map(|i| i.to_string()),
+        _ => None,
+    }
 }
 
 /// 메서드 체인의 뿌리가 `tail` 호출(예: `App::new()`)인가.

@@ -311,8 +311,13 @@ fn ranks(f: &Fact) -> Vec<u8> {
 
 /// 사실만으로 요청을 받을 핸들러를 고른다.
 pub fn predict(facts: &[Fact], dispatch: &str, method: &str, path: &str) -> Predicted {
+    // axum `get`은 HEAD도 받지만(method_routing.rs:1157-1159) actix `web::get()`은
+    // 정확히 같은 동사만 받는다(guard/mod.rs:412) — HEAD→GET은 axum(specificity)에서만.
+    let head_as_get = dispatch == "specificity";
     let method_ok = |f: &Fact| {
-        f.method == method || f.method == "ANY" || (method == "HEAD" && f.method == "GET")
+        f.method == method
+            || f.method == "ANY"
+            || (head_as_get && method == "HEAD" && f.method == "GET")
     };
     let mut cands: Vec<&Fact> = facts
         .iter()

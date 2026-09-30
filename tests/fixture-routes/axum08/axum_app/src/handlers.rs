@@ -19,6 +19,9 @@ pub async fn tag_prefixed() -> &'static str {
 pub async fn status() -> &'static str {
     "axum_app::handlers::status"
 }
+pub async fn status_literal() -> &'static str {
+    "axum_app::handlers::status_literal"
+}
 pub async fn search() -> &'static str {
     "axum_app::handlers::search"
 }
