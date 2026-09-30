@@ -113,10 +113,17 @@ rustograph mcp --graph .rustograph/graph.json
 
 # Emit bridge-facts for isthmus' persistence join (SQL relation uses)
 rustograph schema --dir . --out schema-facts.json
+
+# isthmus language-traversal v1 for `isthmus trace` (many roots, one pass)
+rustograph reach mycrate::api::list_users mycrate::api::create_user
+rustograph impact --format language-traversal --roots-from schema-facts.json
 ```
 
 Exit codes: `0` ok · `1` strict violation/finding · `2` usage or analysis
-error.
+error. The traversal commands (`reach`, `impact --format
+language-traversal`) follow the isthmus family contract instead: `64` for a
+usage error (stdout stays empty) or when some roots are not graph vertices
+(the document is still written).
 
 ## Graph model
 
@@ -199,12 +206,70 @@ Extracted references:
   `users::columns::name` — matched against the workspace's declared
   `table!` names; same-shaped paths that match nothing stay `dynamic`
 
+Each fact carries `symbol: {qualifiedName, usr}` where `usr` is the id of
+the enclosing graph vertex — the same id `impact`/`reach` use, so isthmus
+`trace` can join handler reach to relation uses:
+
+- `fn`, impl method (`crate::m::Type::method`, trait impls
+  `crate::m::Type::<Trait>::method`), trait default method, and
+  `const`/`static` initializer → that vertex
+- struct-level facts (`table_name` attributes, field columns) → the struct
+- impl-level facts outside any method (associated consts) → the impl's
+  self type
+- no enclosing vertex (top-level `table!` invocations, files outside the
+  module tree) → no `symbol`; counted as `missing-relation-usrs:`
+
+The ids come from the same syn harvest `impact` uses (not re-derived), and
+every attached `usr` is checked against the graph's vertex set.
+
 Unqualified names (`query!`, `sql_query`, `table!`) count only when the
 file imports them from `sqlx`/`diesel`. Unparseable files, off-grammar
 `table!` bodies,
 and column attributes without a table binding surface as `limitations`,
 not silence. The name-based scan never guesses: what cannot be resolved
 statically is counted, not invented.
+
+## Traversal documents — `reach` / `impact --format language-traversal`
+
+```bash
+rustograph reach  ID... [--roots-from FILE|-] [--max-depth N] [--max-reached N]
+                  [--revision REV] [--generated-at TIMESTAMP] [-- ID...]
+rustograph impact --format language-traversal ID... (same options)
+```
+
+Both write an isthmus
+[`language-traversal` v1](https://github.com/ictechgy/isthmus/blob/main/docs/LANGUAGE-TRAVERSAL.md)
+document: `reach` the symbols the roots depend on (`dependencies`),
+`impact` the symbols that depend on them (`dependents`). Ids are the same
+strings as `symbol.usr` in `schema`.
+
+- **Roots**: positional ids, then `--roots-from` (a JSON array of strings or
+  a bridge-facts document — its facts' `symbol.usr`; `-` reads stdin),
+  deduplicated in first-seen order (that order is the meaning of
+  `reached[].roots`). Empty or control-character ids and more than 10,000
+  roots are usage errors (`64`, empty stdout).
+- **One pass over all roots**: every reached symbol lists every root that
+  reaches it (`roots`, first 64 plus `rootsTruncated`), the nearest depth,
+  and a shortest-path witness (`via`). A root reached from another root is
+  listed without its own index. Checked against a per-root BFS oracle on
+  random graphs.
+- **Evidence**: `tentative` edges (name fan-out, `dyn`/generic trait impl
+  candidates) are `candidate`, all other edges `direct`; each symbol carries
+  the per-root lower bound. `dispatch` and `unresolvedCalls` are not emitted
+  — rustograph cannot claim its unresolved-call counts are complete.
+- **Limits**: `--max-depth` 1–128 (default 128; `--depth 0` means 128),
+  `--max-reached` 1–100,000; cuts set `truncated` with `depth` /
+  `max-reached`.
+- **Identity**: `project` is the same realpath `schema` writes; `revision`
+  is `--revision` or git `HEAD` when the work tree is clean; `graphRevision`
+  is the SHA-256 of the graph JSON (with `root` normalized to the project).
+- **root-not-found**: ids that are not graph vertices are listed without
+  `symbol`, a `root-not-found:` limitation is added, and the command exits
+  `64` after writing the document.
+
+isthmus rejects `route-decl` facts from `platform: "rust"` documents, so
+Rust handlers cannot yet start a route-selection `trace`; relation and
+symbol selections (reverse traversal) work today.
 
 ## Agent output contract
 
