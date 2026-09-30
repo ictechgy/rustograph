@@ -2,7 +2,37 @@
 
 세션을 이어받는 에이전트가 먼저 읽는 문서입니다.
 
-## 진행 중 — feature/server-routes (2026-09-30, API 영향 프로그램 Phase 7 후속)
+## 진행 중 — feature/client-routes (2026-09-30, API 영향 프로그램 개선 #3 Rust 부분)
+
+`rustograph routes --role client`(isthmus http `route-call` 생산자). 규칙·근거·오라클 표는 `docs/HTTP-CLIENT.md`.
+
+- **코드** — `src/source/routes/client.rs`(멤버·의존 버전, 문서 조립, 한계) + `client/{index,scan}.rs`(색인과 두 단계
+  스캐너: 구조체 필드 값 수집 → 호출 사실), `compose.rs`(url-compose 규칙의 순수 구현 — `UrlVal`, WHATWG concat/join,
+  `http::Uri` concat, 마스킹), `wrappers.rs`(http-wrappers v1 파싱·동사 바인딩). 위치 열은 계약대로 UTF-8 바이트다
+  (`Ctx::locate_utf8`). **서버 `route-decl`의 `Ctx::locate`는 UTF-16 열을 낸다 — GRAPH-EXCHANGE는 UTF-8 바이트를
+  요구하므로 비ASCII 줄에서 어긋난다(이번 범위 밖, 후속 수정 후보).**
+- **인식** — reqwest(`get`·`blocking::get`·Client 동사·`request`·`Request::new`), ureq 2/3 자유 함수·Agent, 선언된
+  래퍼(`owner::name` = 정점 ID, 구조체 리터럴 생성자는 이름 = 타입 이름). 수신자는 구문 타입 추론(생성자·주석·필드
+  타입·반환 타입·static 타입, `Arc`·`LazyLock` 등 벗김). 증명하지 못한 수신자는 사실 없이 센다.
+- **검증** — url-compose 생산자 41건 통과. 오라클 41 시나리오: 일치 37 · dynamic 3 · 요청 없음 1 · 불일치 0
+  (reqwest 0.13.5·ureq 3.4.2·url 2.5.8, scratch에서 reqwest 0.12.28도 같음). 오라클이 확인한 것: `Url::join`의 마지막
+  세그먼트 교체, WHATWG `//` 보존·점 세그먼트 제거, **ureq 3의 점 세그먼트 보존**, ureq 3이 http 요청도 프록시에
+  CONNECT를 연다(기록 서버가 터널을 수락). 커버리지 92.14%, stable clippy(1.98.1) 0.
+- **e2e(scratch)** — isthmus `c395c59` 무패치는 rust route-call 문서를 "Fact kind is not valid for platform"으로 거부한다.
+  `routeKindPlatforms`의 route-call에 `rust`를 더한 scratch 빌드로 workspace trace(`server` = axum08 fixture +
+  `reach --roots-from`, `client` = fixture-client + `impact --format language-traversal --roots-from`, link match
+  hosts `api.example.com`)를 돌렸다: 3 routes · 3 calls · 3 handlers · 3 client symbols. 예: `POST /api/items` —
+  client `client_app::api::ApiClient::create_item`(api.rs:38, quality exact) → route-decl axum08 routes.rs:13 →
+  handler `axum_app::handlers::items::create`; client 역방향 `struct_field_plus`(depth 1, candidate — syn 메서드 호출
+  팬아웃). base 앵커 호출 10건은 host가 없어 `unattributed-calls-omitted`.
+- **isthmus 쪽 남은 것** — rust route-call 수용과 Rust 결합 이름 벡터(`feature/scopes-upstream-clients`, 이 세션 동안
+  원격에 없음). 이름을 정하면 `tests/client_routes.rs`의 `join_of`를 옮기고 `conformance/`를 재벤더링한다. 제안 이름:
+  `whatwg-concat`·`whatwg-join`·`http-uri-concat`.
+- 알려진 근사: 필드 수정 감지는 소유 타입을 모르면 이름 단위(보수적), `Url` 값의 `set_path` 등은 지역·필드를 믿지 않게
+  만들 뿐 새 값을 계산하지 않는다, 선언된 구조체 래퍼 값을 받아 다른 래퍼를 부르는 함수(`execute`)는 동사 동적 dynamic
+  사실을 하나 더 낸다, ureq 3에서 `http::Uri`가 거부하는 문자(공백 등)가 든 리터럴도 사실로 낸다.
+
+## 직전 — feature/server-routes (2026-09-30, PR #23 머지됨)
 
 `rustograph routes --role server`(isthmus http `route-decl` 생산자)와 수확 이름 해석 결함 수정.
 
