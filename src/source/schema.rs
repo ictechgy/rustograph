@@ -210,9 +210,10 @@ impl OwnerIndex {
 }
 
 /// 사실마다 감싸는 그래프 정점을 symbol로 단다. 못 단 사실 수를 돌려준다.
-fn attach_symbols(facts: &mut [RelationFact], root: &Path, index: Option<&OwnerIndex>) -> usize {
+/// 매개변수 이름을 `facts`로 두면 이름 해석이 fn facts로 읽어 거짓 순환이 된다.
+fn attach_symbols(list: &mut [RelationFact], root: &Path, index: Option<&OwnerIndex>) -> usize {
     let mut missing = 0;
-    for f in facts.iter_mut() {
+    for f in list.iter_mut() {
         let file = root.join(&f.location.path);
         match index.and_then(|ix| ix.owner(&file, f.location.byte)) {
             Some(id) => {

@@ -431,7 +431,8 @@ fn harvest(
     let mut impls: Vec<harvest::ImplBlock> = Vec::new();
     let mut attr_refs: Vec<harvest::AttrRef> = Vec::new();
     let mut test_roots: Vec<String> = Vec::new();
-    let mut owner_spans: Vec<harvest::OwnerSpan> = Vec::new();
+    // 지역명이 fn owner_spans와 같으면 이름 해석이 함수 정점으로 읽어 거짓 순환이 된다.
+    let mut item_spans: Vec<harvest::OwnerSpan> = Vec::new();
     for mp in tree.modules.keys().cloned().collect::<Vec<_>>() {
         let mh = harvest_module(&mut tree, &arena, &mp, &mut harvest, &dep_vertices);
         vertices.push(mh.vertex);
@@ -442,7 +443,7 @@ fn harvest(
         bodies.extend(mh.decls.bodies);
         attr_refs.extend(mh.decls.attr_refs);
         impls.extend(mh.decls.impls);
-        owner_spans.extend(mh.decls.owner_spans);
+        item_spans.extend(mh.decls.owner_spans);
     }
     for block in &impls {
         let krate = modtree::crate_of(&block.items_module);
@@ -454,7 +455,7 @@ fn harvest(
         bodies.extend(bs);
     }
     if let Some(out) = spans {
-        collect_owner_spans(&tree, &impls, &bodies, owner_spans, out);
+        collect_owner_spans(&tree, &impls, &bodies, item_spans, out);
     }
 
     // 메서드 이름 → ID 인덱스 — 이름 팬아웃 폴백에 쓴다(semantic에서는
