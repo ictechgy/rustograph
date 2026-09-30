@@ -1,0 +1,12 @@
+[package]
+name = "client_app"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# 의존성은 버전 판정용 스텁이다(../stubs). 같은 소스를 진짜 reqwest 0.13.5·ureq 3.4.2·
+# url 2.5.8로 컴파일해 로컬 서버로 요청을 보내는 오라클은 experiments/client-oracle에 있다.
+[dependencies]
+reqwest = { path = "../../stubs/reqwest" }
+ureq = { path = "../../stubs/ureq" }
+url = { path = "../../stubs/url" }

@@ -37,6 +37,7 @@ const SKIPPED: &[&str] = &[
     "scope.applies",
     "framework.openapi.",
     "framework.spring.",
+    // 클라이언트 조립 규칙 — tests/client_routes.rs가 실행한다.
     "compose.",
     "wrapper.",
 ];

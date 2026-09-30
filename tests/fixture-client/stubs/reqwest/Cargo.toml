@@ -1,0 +1,9 @@
+[package]
+name = "reqwest"
+version = "0.13.5"
+edition = "2021"
+publish = false
+
+# 이름·버전만 흉내 내는 스텁이다. rustograph는 cargo metadata가 해석한 버전으로
+# URL 해석 규칙을 고르고 소스는 syn으로만 읽으므로 이 크레이트를 컴파일하지 않는다.
+# 실제 요청은 experiments/client-oracle이 crates.io의 진짜 크레이트로 보낸다.
