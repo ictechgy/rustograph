@@ -2,6 +2,25 @@
 
 세션을 이어받는 에이전트가 먼저 읽는 문서입니다.
 
+## 분석 정확성 보강 (2026-10-11)
+
+- `impact`가 양방향 `query` 결과를 뒤늦게 걸러 공유 의존의 다른 사용자까지
+  영향받는다고 보고하던 결함을 수정했다. 처음부터 incoming 의존만 BFS한다.
+- `query`/`impact`는 시작 정점을 다시 보고하지 않고, 같은 이웃·방향의 최단
+  깊이 증거를 합친다. 역방향/contains 종류를 섞지 않으며 dangling 간선은 제외한다.
+- `--max 0`과 정확히 맞는 상한을 지키고 실제 생략이 있을 때만 `truncated`다.
+  수정 전 실패한 단위 회귀 6개와 실제 CLI/MCP 바이너리 회귀 3개를 추가했다.
+- 조건별 간선 정렬에서 tentative를 cfg보다 먼저 비교해 같은 키가 떨어지던
+  문제를 수정했다. 같은 cfg 안에서만 확정을 우선하며 unsafe 증거는 투영과 같이
+  합친다. 수정 전 중복이 남는 회귀 2개와 순서 불변/멱등 검증을 추가했다.
+- 3정점의 모든 유향 그래프 512개에 대해 root·depth·max 조합 24,576개를
+  독립 거리 행렬 오라클과 대조했다. 기본 전체 테스트는 217개 통과했다.
+- 기본 전체 테스트·clippy(`-D warnings`)·fmt·CLI 종료 코드 계약·자기 분석
+  rules/cycles strict 통과. 로컬 coverage 도구 설치가 취소되어 coverage는
+  미검증이며 CI의 기존 90% 게이트를 확인해야 한다. semantic feature 빌드는
+  성공했지만 병렬 fixture 실행이 8개 통과 뒤 SIGKILL로 종료됐다. 공유 환경의
+  부하가 내려간 뒤 `--test semantic -- --test-threads=1`로 별도 재검증해야 한다.
+
 ## 릴리스 준비 — v0.4.0 (2026-09-30, release/v0.4.0)
 
 `Cargo.toml`·`Cargo.lock` 자기 항목(0.4.0, `cargo update` 없이 손으로 — ra_ap 핀 유지, `cargo build --locked` 확인)과

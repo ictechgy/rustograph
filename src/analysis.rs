@@ -27,55 +27,96 @@ pub struct QueryResult {
 }
 
 /// 정점의 양방향 이웃을 depth까지 BFS로 찾는다.
+/// 같은 이웃·방향은 최단 거리에서 한 번만 보고하고 시작 정점은 제외한다.
 pub fn query(doc: &Document, id: &str, depth: usize, max: usize) -> QueryResult {
-    let found = doc.vertex_ids().contains(id);
-    let out = doc.outgoing();
-    let inc = doc.incoming();
-    let mut neighbors = Vec::new();
-    let mut seen: BTreeSet<&str> = BTreeSet::from([id]);
-    let mut queue: VecDeque<(&str, usize)> = VecDeque::from([(id, 0)]);
-    let mut truncated = false;
-    while let Some((cur, d)) = queue.pop_front() {
-        if d >= depth {
+    walk_neighbors(doc, id, depth, max, false)
+}
+
+/// 방향별 간선 종류를 색인한다 — 역방향 종류나 contains를 증거에 섞지 않는다.
+type NeighborIndex<'a> = BTreeMap<&'a str, BTreeMap<(&'a str, &'static str), BTreeSet<EdgeKind>>>;
+
+fn neighbor_index(doc: &Document, incoming_only: bool) -> NeighborIndex<'_> {
+    let ids = doc.vertex_ids();
+    let mut index: NeighborIndex<'_> = BTreeMap::new();
+    for edge in &doc.edges {
+        if !edge.kind.is_dependency()
+            || !ids.contains(edge.from.as_str())
+            || !ids.contains(edge.to.as_str())
+        {
             continue;
         }
-        // 이웃 정점 단위로 묶고 간선 종류는 전부 싣는다 — 하나만 고르면
-        // 나머지 관계가 사라지고 정렬 타이에 따라 실행마다 달라진다.
-        let mut step: Vec<(&str, &str)> = Vec::new(); // (neighbor, direction)
-        for (_, to) in out.get(cur).into_iter().flatten() {
-            step.push((to, "out"));
+        index
+            .entry(&edge.to)
+            .or_default()
+            .entry((&edge.from, "in"))
+            .or_default()
+            .insert(edge.kind);
+        if !incoming_only {
+            index
+                .entry(&edge.from)
+                .or_default()
+                .entry((&edge.to, "out"))
+                .or_default()
+                .insert(edge.kind);
         }
-        for (_, from) in inc.get(cur).into_iter().flatten() {
-            step.push((from, "in"));
-        }
-        step.sort();
-        step.dedup();
-        for (nbr, dir) in step {
-            neighbors.push(Neighbor {
-                id: nbr.to_string(),
-                edges: doc.edge_kinds_between(cur, nbr),
-                direction: dir.to_string(),
-                depth: d + 1,
-            });
-            if seen.insert(nbr) {
-                if neighbors.len() >= max {
-                    truncated = true;
-                    break;
-                }
-                queue.push_back((nbr, d + 1));
-            }
-        }
-        if truncated {
+    }
+    index
+}
+
+/// BFS의 한 깊이를 먼저 합쳐 다이아몬드 경로의 모든 최단 증거를 보존한다.
+/// 상한은 실제 보고 항목 수에 적용하고, 생략할 항목이 있어야 truncated다.
+fn walk_neighbors(
+    doc: &Document,
+    id: &str,
+    depth: usize,
+    max: usize,
+    incoming_only: bool,
+) -> QueryResult {
+    let mut result = QueryResult {
+        id: id.to_string(),
+        found: doc.vertex_ids().contains(id),
+        depth,
+        truncated: false,
+        neighbors: Vec::new(),
+    };
+    if !result.found || depth == 0 {
+        return result;
+    }
+    let index = neighbor_index(doc, incoming_only);
+    let mut seen = BTreeSet::from([id]);
+    let mut reported = BTreeSet::new();
+    let mut frontier = BTreeSet::from([id]);
+    for distance in 1..=depth {
+        if frontier.is_empty() {
             break;
         }
+        let mut step: BTreeMap<(&str, &str), BTreeSet<EdgeKind>> = BTreeMap::new();
+        for current in frontier {
+            for (&key, kinds) in index.get(current).into_iter().flatten() {
+                if key.0 != id && !reported.contains(&key) {
+                    step.entry(key).or_default().extend(kinds);
+                }
+            }
+        }
+        frontier = BTreeSet::new();
+        for ((neighbor, direction), kinds) in step {
+            if result.neighbors.len() == max {
+                result.truncated = true;
+                return result;
+            }
+            reported.insert((neighbor, direction));
+            result.neighbors.push(Neighbor {
+                id: neighbor.to_string(),
+                edges: kinds.into_iter().collect(),
+                direction: direction.to_string(),
+                depth: distance,
+            });
+            if seen.insert(neighbor) {
+                frontier.insert(neighbor);
+            }
+        }
     }
-    QueryResult {
-        id: id.to_string(),
-        found,
-        depth,
-        truncated,
-        neighbors,
-    }
+    result
 }
 
 /// 역방향 전이 — 이 정점을 바꾸면 뭐가 깨지는가(incoming BFS).
@@ -89,20 +130,15 @@ pub struct ImpactResult {
     pub impacted: Vec<Neighbor>,
 }
 
-/// impact 질의 — query의 incoming 방향만 골라 깊이를 단다.
+/// impact 질의 — 처음부터 incoming만 따라가야 공유 의존의 다른 사용자가 섞이지 않는다.
 pub fn impact(doc: &Document, id: &str, depth: usize, max: usize) -> ImpactResult {
-    let q = query(doc, id, depth, max);
-    let impacted = q
-        .neighbors
-        .into_iter()
-        .filter(|n| n.direction == "in")
-        .collect();
+    let q = walk_neighbors(doc, id, depth, max, true);
     ImpactResult {
         id: q.id,
         found: q.found,
         depth: q.depth,
         truncated: q.truncated,
-        impacted,
+        impacted: q.neighbors,
     }
 }
 
@@ -678,6 +714,171 @@ mod tests {
         let ids: Vec<&str> = r.impacted.iter().map(|n| n.id.as_str()).collect();
         assert!(ids.contains(&"c::b"));
         assert!(ids.contains(&"c::a")); // 깊이 2
+    }
+
+    #[test]
+    fn impact_does_not_cross_shared_dependencies() {
+        let mut d = doc();
+        // a -> b <- d: a의 변경은 같은 b를 쓰는 d에 영향을 주지 않는다.
+        d.edges
+            .push(Edge::new("c::d".into(), "c::b".into(), EdgeKind::Call));
+        let r = impact(&d, "c::a", usize::MAX, 100);
+        assert_eq!(
+            r.impacted.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec!["c::e"]
+        );
+        assert_eq!(r.impacted[0].depth, 1);
+        assert!(!r.truncated);
+    }
+
+    #[test]
+    fn impact_budget_is_not_spent_on_dependencies() {
+        let r = impact(&doc(), "c::a", usize::MAX, 1);
+        assert_eq!(r.impacted.len(), 1);
+        assert_eq!(r.impacted[0].id, "c::e");
+        assert!(!r.truncated);
+    }
+
+    #[test]
+    fn neighbors_obey_zero_and_exact_limits() {
+        let d = doc();
+        for max in 0..=4 {
+            let q = query(&d, "c::a", 1, max);
+            assert_eq!(q.neighbors.len(), max.min(2));
+            assert_eq!(q.truncated, max < 2);
+            let r = impact(&d, "c::c", usize::MAX, max);
+            assert_eq!(r.impacted.len(), max.min(3));
+            assert_eq!(r.truncated, max < 3);
+        }
+        assert!(!query(&d, "c::d", 10, 0).truncated);
+        assert!(!query(&d, "c::a", 0, 0).truncated);
+    }
+
+    #[test]
+    fn neighbors_do_not_repeat_cycle_members_or_the_root() {
+        let d = doc();
+        let q = query(&d, "c::x", usize::MAX, 2);
+        assert_eq!(q.neighbors.len(), 2);
+        assert!(q.neighbors.iter().all(|n| n.id == "c::y" && n.depth == 1));
+        assert!(!q.truncated);
+        let r = impact(&d, "c::x", usize::MAX, 1);
+        assert_eq!(r.impacted.len(), 1);
+        assert_eq!(r.impacted[0].id, "c::y");
+        assert!(!r.truncated);
+    }
+
+    #[test]
+    fn neighbors_keep_edge_kinds_in_their_actual_direction() {
+        let mut d = doc();
+        d.edges.push(Edge::new(
+            "c::b".into(),
+            "c::a".into(),
+            EdgeKind::References,
+        ));
+        d.edges
+            .push(Edge::new("c::a".into(), "c::b".into(), EdgeKind::Contains));
+        let q = query(&d, "c::a", 1, 10);
+        let outgoing = q
+            .neighbors
+            .iter()
+            .find(|n| n.id == "c::b" && n.direction == "out")
+            .unwrap();
+        assert_eq!(outgoing.edges, vec![EdgeKind::Call]);
+        let incoming = q
+            .neighbors
+            .iter()
+            .find(|n| n.id == "c::b" && n.direction == "in")
+            .unwrap();
+        assert_eq!(incoming.edges, vec![EdgeKind::References]);
+    }
+
+    #[test]
+    fn neighbors_merge_shortest_layer_evidence_and_ignore_dangling_edges() {
+        let mut d = doc();
+        d.edges.extend([
+            Edge::new("c::d".into(), "c::c".into(), EdgeKind::Call),
+            Edge::new("c::a".into(), "c::d".into(), EdgeKind::References),
+            Edge::new("c::ghost".into(), "c::c".into(), EdgeKind::Call),
+        ]);
+        let r = impact(&d, "c::c", 2, 10);
+        assert_eq!(
+            r.impacted.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec!["c::b", "c::d", "c::a"]
+        );
+        assert_eq!(
+            r.impacted[2].edges,
+            vec![EdgeKind::Call, EdgeKind::References]
+        );
+        assert_eq!(r.impacted[2].depth, 2);
+        assert!(!impact(&d, "c::ghost", 10, 10).found);
+        assert!(query(&d, "c::ghost", 10, 10).neighbors.is_empty());
+        let expected = serde_json::to_string(&r).unwrap();
+        d.edges.reverse();
+        d.vertices.reverse();
+        assert_eq!(
+            serde_json::to_string(&impact(&d, "c::c", 2, 10)).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn impact_matches_reverse_reachability_for_every_three_vertex_graph() {
+        // 3개 정점의 가능한 유향 그래프 512개를 독립 거리 행렬과 대조한다.
+        // 자기 루프·순환·재수렴·고립 정점이 방향/상한 수정에서 빠지지 않게 한다.
+        let names = ["c::a", "c::b", "c::c"];
+        for mask in 0..(1_u16 << 9) {
+            let mut d = doc();
+            d.vertices.retain(|v| names.contains(&v.id.as_str()));
+            d.edges.clear();
+            let mut distances = [[4_usize; 3]; 3];
+            for from in 0..3 {
+                distances[from][from] = 0;
+                for to in 0..3 {
+                    if mask & (1 << (from * 3 + to)) != 0 {
+                        d.edges.push(Edge::new(
+                            names[from].into(),
+                            names[to].into(),
+                            EdgeKind::Call,
+                        ));
+                        if from != to {
+                            distances[from][to] = 1;
+                        }
+                    }
+                }
+            }
+            for via in 0..3 {
+                for from in 0..3 {
+                    for to in 0..3 {
+                        distances[from][to] =
+                            distances[from][to].min(distances[from][via] + distances[via][to]);
+                    }
+                }
+            }
+            for (root, name) in names.iter().enumerate() {
+                for depth in 0..=3 {
+                    let mut expected: Vec<_> = (0..3)
+                        .filter(|&i| i != root && distances[i][root] <= depth)
+                        .map(|i| (distances[i][root], names[i]))
+                        .collect();
+                    expected.sort();
+                    for max in 0..=3 {
+                        let r = impact(&d, name, depth, max);
+                        assert_eq!(
+                            r.truncated,
+                            expected.len() > max,
+                            "mask {mask}, root {name}, depth {depth}, max {max}"
+                        );
+                        assert_eq!(
+                            r.impacted
+                                .iter()
+                                .map(|n| (n.depth, n.id.as_str()))
+                                .collect::<Vec<_>>(),
+                            expected.iter().copied().take(max).collect::<Vec<_>>()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

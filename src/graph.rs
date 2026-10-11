@@ -189,22 +189,29 @@ pub struct Document {
 impl Document {
     /// 정렬된 문서 — 같은 입력이 같은 바이트가 되게 하는 계약의 핵심.
     /// (from,to,kind,cfg)가 같은 간선이 겹치면 하나로 합친다 — 정렬에서
-    /// 확정·unsafe 표시가 먼저 오므로 dedup이 확정·경계 진입 쪽을 남긴다.
+    /// 같은 키를 붙이고 확정을 먼저 둔다. unsafe 증거는 투영과 같이 OR다.
     /// cfg가 다르면 다른 빌드 조건의 별개 간선이라 합치지 않는다.
     pub fn sort(&mut self) {
         self.vertices.sort_by(|a, b| a.id.cmp(&b.id));
         self.edges.sort_by(|a, b| {
-            (&a.from, &a.to, a.kind, a.tentative, &a.cfg, !a.unsafe_).cmp(&(
+            (&a.from, &a.to, a.kind, &a.cfg, a.tentative, !a.unsafe_).cmp(&(
                 &b.from,
                 &b.to,
                 b.kind,
-                b.tentative,
                 &b.cfg,
+                b.tentative,
                 !b.unsafe_,
             ))
         });
         self.edges.dedup_by(|a, b| {
-            a.from == b.from && a.to == b.to && a.kind == b.kind && a.cfg == b.cfg
+            if a.from == b.from && a.to == b.to && a.kind == b.kind && a.cfg == b.cfg {
+                // b가 남는 항목이다. 확정 간선이 앞서도 추정 간선의 unsafe
+                // 위치 증거는 사라지면 안 된다 — view와 같은 병합 규칙이다.
+                b.unsafe_ |= a.unsafe_;
+                true
+            } else {
+                false
+            }
         });
         self.roots.sort();
         self.roots.dedup();
@@ -625,6 +632,60 @@ mod tests {
             .collect();
         assert_eq!(uses.len(), 1);
         assert!(!uses[0].tentative);
+    }
+
+    #[test]
+    fn sort_deduplicates_each_cfg_and_preserves_all_unsafe_evidence() {
+        let mut d = doc();
+        let mut unix = Edge::new("c::a".into(), "c::b".into(), EdgeKind::Call);
+        unix.cfg = Some("unix".into());
+        let mut windows = unix.clone();
+        windows.cfg = Some("windows".into());
+        let mut tentative_unsafe = unix.clone();
+        tentative_unsafe.tentative = true;
+        tentative_unsafe.unsafe_ = true;
+        d.edges = vec![unix, windows, tentative_unsafe];
+        d.sort();
+        assert_eq!(d.edges.len(), 2);
+        assert_eq!(d.edges[0].cfg.as_deref(), Some("unix"));
+        assert!(!d.edges[0].tentative);
+        assert!(d.edges[0].unsafe_);
+        assert_eq!(d.edges[1].cfg.as_deref(), Some("windows"));
+        assert!(!d.edges[1].unsafe_);
+        let expected = serde_json::to_string(&d).unwrap();
+        d.sort();
+        assert_eq!(serde_json::to_string(&d).unwrap(), expected);
+    }
+
+    #[test]
+    fn sort_is_invariant_to_mixed_evidence_input_order() {
+        let mut d = doc();
+        d.edges.clear();
+        for cfg in [None, Some("unix"), Some("windows")] {
+            for tentative in [false, true] {
+                for unsafe_ in [false, true] {
+                    let mut edge = Edge::new("c::a".into(), "c::b".into(), EdgeKind::Call);
+                    edge.cfg = cfg.map(str::to_string);
+                    edge.tentative = tentative;
+                    edge.unsafe_ = unsafe_;
+                    d.edges.push(edge);
+                }
+            }
+        }
+        let mut expected = d.clone();
+        expected.sort();
+        assert_eq!(expected.edges.len(), 3);
+        assert!(expected.edges.iter().all(|e| !e.tentative && e.unsafe_));
+        for shift in 0..d.edges.len() {
+            let mut permuted = d.clone();
+            permuted.edges.rotate_left(shift);
+            permuted.edges.reverse();
+            permuted.sort();
+            assert_eq!(
+                serde_json::to_string(&permuted).unwrap(),
+                serde_json::to_string(&expected).unwrap()
+            );
+        }
     }
 
     #[test]
