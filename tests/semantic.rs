@@ -7,21 +7,43 @@
 use rustograph::graph::{Document, Edge, EdgeKind};
 use rustograph::source::{self, Options};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixture")
 }
 
 fn sem_doc() -> Document {
-    source::load(
-        &fixture(),
-        &Options {
-            symbol_level: true,
-            semantic: true,
-            ..Default::default()
-        },
-    )
-    .expect("semantic fixture load failed")
+    // 모든 검사는 같은 불변 fixture를 읽는다. 병렬 검사마다 cargo/RA를
+    // 다시 기동하면 메모리가 검사 수만큼 늘어난다. 한 번만 실제 수확하고
+    // 각 검사에는 별도 문서를 줘 변형이 다른 검사로 새지 않게 한다.
+    static DOCUMENT: OnceLock<Document> = OnceLock::new();
+    DOCUMENT
+        .get_or_init(|| {
+            source::load(
+                &fixture(),
+                &Options {
+                    symbol_level: true,
+                    semantic: true,
+                    ..Default::default()
+                },
+            )
+            .expect("semantic fixture load failed")
+        })
+        .clone()
+}
+
+#[test]
+fn shared_fixture_keeps_test_documents_independent() {
+    let mut changed = sem_doc();
+    let vertices = changed.vertices.len();
+    let edges = changed.edges.len();
+    assert!(vertices > 0 && edges > 0);
+    changed.vertices.clear();
+    changed.edges.clear();
+    let original = sem_doc();
+    assert_eq!(original.vertices.len(), vertices);
+    assert_eq!(original.edges.len(), edges);
 }
 
 fn syn_doc() -> Document {
