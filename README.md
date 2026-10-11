@@ -359,6 +359,13 @@ between neighbors, and per-project `limitations`. Optional fields that have
 no value are omitted — an absent `tentative` means confirmed, an absent
 `truncated` means complete.
 
+`impact` follows incoming dependency edges only. Sharing a dependency with
+another symbol does not make that symbol impacted. `query` walks both directions;
+each neighbor/direction is reported once at its shortest discovered depth, with
+all dependency edge kinds for that direction and depth. The starting symbol is
+not repeated as its own neighbor. `--max` bounds the number of result records,
+including zero; `truncated` becomes true only when a record is actually omitted.
+
 ## Development
 
 ```bash
