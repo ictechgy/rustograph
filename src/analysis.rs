@@ -175,6 +175,17 @@ pub struct PathsReport {
 /// 나온다. 추정 간선도 따라가되 경로에 tentative로 표시한다 —
 /// "도달 가능할 수 있다"는 사실이 보고 가치다.
 pub fn paths(doc: &Document, from: &str, to: &str, max_paths: usize, budget: usize) -> PathsReport {
+    paths_bounded(doc, from, to, max_paths, budget, &mut 0)
+}
+
+fn paths_bounded(
+    doc: &Document,
+    from: &str,
+    to: &str,
+    max_paths: usize,
+    budget: usize,
+    peak_pending: &mut usize,
+) -> PathsReport {
     let ids = doc.vertex_ids();
     // 인접 목록: (from,to) 쌍에 간선이 여러 개면 확정·최소 종류
     // (EdgeKind의 선언 순서 Ord) 하나만 남긴다 — 같은 경로를 간선
@@ -229,8 +240,16 @@ pub fn paths(doc: &Document, from: &str, to: &str, max_paths: usize, budget: usi
         edges: Vec::new(),
         tentative: false,
     }]);
+    let mut pending_states = 1usize;
+    let mut pending_paths = 0usize;
+    *peak_pending = 1;
     while let Some(s) = queue.pop_front() {
         let cur = s.vertices.last().expect("state is never empty").clone();
+        if cur == to {
+            pending_paths -= 1;
+        } else {
+            pending_states -= 1;
+        }
         // 목적지 확인이 예산 검사보다 먼저다 — 대기 중인 완성 경로는
         // 예산을 쓰지 않고 수확한다. 경로 수 상한을 넘는 하나가 더
         // 보이면 잘림이 확정이다 — 더 찾지 않고 멈춘다.
@@ -257,6 +276,16 @@ pub fn paths(doc: &Document, from: &str, to: &str, max_paths: usize, budget: usi
             if s.vertices.iter().any(|v| v.as_str() == *nbr) {
                 continue;
             }
+            // 확장할 수 없는 부분 경로는 복제 전에 버린다. 완성 경로는
+            // 별도 슬롯을 사용해 예산이 찼어도 이미 찾은 증거를 보존한다.
+            if *nbr != to && report.expanded.saturating_add(pending_states) >= budget {
+                report.truncated = true;
+                continue;
+            }
+            if *nbr == to && report.paths.len().saturating_add(pending_paths) > max_paths {
+                report.truncated = true;
+                continue;
+            }
             let mut next = State {
                 vertices: s.vertices.clone(),
                 edges: s.edges.clone(),
@@ -264,7 +293,13 @@ pub fn paths(doc: &Document, from: &str, to: &str, max_paths: usize, budget: usi
             };
             next.vertices.push((*nbr).to_string());
             next.edges.push(*kind);
+            if *nbr == to {
+                pending_paths += 1;
+            } else {
+                pending_states += 1;
+            }
             queue.push_back(next);
+            *peak_pending = (*peak_pending).max(queue.len());
         }
     }
     // 남은 큐가 있으면 처리하지 못한 경로가 있다 — 잘렸다고 표시한다.
@@ -568,7 +603,8 @@ pub fn explain_path(doc: &Document, id: &str) -> Option<Vec<String>> {
 
 /// 도달 불가 심볼 보고 — state+reason만, 삭제 판정 없음.
 /// 루트도 크레이트/모듈 정점도 리포트 대상이 아니다(그것들은 골격이다).
-pub fn dead(doc: &Document) -> DeadReport {
+pub fn dead(doc: &Document) -> Result<DeadReport, String> {
+    doc.require_level(crate::graph::Level::Symbol)?;
     let reach = reachable(doc);
     let mut findings = Vec::new();
     for v in &doc.vertices {
@@ -594,11 +630,11 @@ pub fn dead(doc: &Document) -> DeadReport {
             "{method_findings} unreachable methods may be invoked via trait objects, generics, or external crates — dispatch not visible to syntactic analysis"
         ));
     }
-    DeadReport {
+    Ok(DeadReport {
         roots: doc.roots.clone(),
         findings,
         limitations,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -651,6 +687,31 @@ mod tests {
     }
 
     #[test]
+    fn path_budget_bounds_queued_copies_and_keeps_completed_paths() {
+        let mut graph = doc();
+        graph.vertices = vec![v("start", Kind::Fn), v("zz_target", Kind::Fn)];
+        graph.edges.clear();
+        for i in 0..1000 {
+            let id = format!("branch_{i:04}");
+            graph.vertices.push(v(&id, Kind::Fn));
+            graph
+                .edges
+                .push(Edge::new("start".into(), id, EdgeKind::Call));
+        }
+        graph.edges.push(Edge::new(
+            "start".into(),
+            "zz_target".into(),
+            EdgeKind::Call,
+        ));
+        let mut peak = 0;
+        let report = paths_bounded(&graph, "start", "zz_target", 1, 2, &mut peak);
+        assert!(report.found && report.truncated);
+        assert_eq!(report.paths[0].vertices, ["start", "zz_target"]);
+        assert_eq!(report.expanded, 2);
+        assert!(peak <= 3, "unbounded pending states: {peak}");
+    }
+
+    #[test]
     fn reachable_follows_tentative_but_roots_gate() {
         let d = doc();
         let r = reachable(&d);
@@ -662,7 +723,7 @@ mod tests {
     #[test]
     fn dead_reports_unreachable_with_reason() {
         let d = doc();
-        let rep = dead(&d);
+        let rep = dead(&d).unwrap();
         let ids: Vec<&str> = rep.findings.iter().map(|f| f.id.as_str()).collect();
         assert!(ids.contains(&"c::d"));
         assert_eq!(rep.roots, vec!["c::a"]);

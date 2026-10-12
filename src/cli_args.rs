@@ -182,6 +182,9 @@ fn document_impl(
             },
         )?
     };
+    if symbol_level && !matches!(a.cmd.as_str(), "graph" | "cycles" | "mcp" | "search") {
+        doc.require_level(Level::Symbol)?;
+    }
     if a.has("exclude-tests") {
         doc = doc.without_tests();
     }

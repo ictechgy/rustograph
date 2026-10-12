@@ -4,7 +4,8 @@
 //! 같은 입력이 같은 바이트가 되는 계약은 struct 필드 순서와 정렬된 Vec에 있다.
 
 use crate::graph::Document;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 /// 문서를 결정적 pretty JSON으로 직렬화한다.
 pub fn to_json<T: serde::Serialize>(v: &T) -> String {
@@ -55,11 +56,127 @@ fn edge_label(kind: crate::graph::EdgeKind) -> &'static str {
 
 /// 문서를 파일로 저장한다.
 pub fn save_file(doc: &Document, path: &Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    let protected = document_inputs(doc);
+    write_file(path, to_json(doc).as_bytes(), &protected)
+}
+
+/// 스냅샷이 가리키는 원본 소스를 산출물로 바꾸지 않도록 보호한다.
+pub(crate) fn document_inputs(doc: &Document) -> Vec<PathBuf> {
+    let mut inputs: Vec<PathBuf> = doc
+        .vertices
+        .iter()
+        .filter_map(|vertex| vertex.position.as_ref())
+        .filter_map(|position| position.rsplit_once(':'))
+        .map(|(file, _)| Path::new(&doc.root).join(file))
+        .collect();
+    inputs.extend(
+        [
+            "Cargo.toml",
+            "Cargo.lock",
+            ".rustograph.yml",
+            ".rustograph.yaml",
+        ]
+        .into_iter()
+        .map(|name| Path::new(&doc.root).join(name)),
+    );
+    inputs
+}
+
+/// 완성된 바이트만 같은 디렉터리의 rename으로 공개한다. 입력 별칭은 거절한다.
+pub fn write_file(path: &Path, contents: &[u8], protected: &[PathBuf]) -> Result<(), String> {
+    write_file_with(path, protected, |file| file.write_all(contents))
+}
+
+fn validate_output(path: &Path, protected: &[PathBuf]) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+    };
+    if !metadata.is_file() || metadata.permissions().readonly() {
+        return Err(format!(
+            "refusing non-regular, symbolic-link or read-only output {}",
+            path.display()
+        ));
     }
-    std::fs::write(path, to_json(doc)).map_err(|e| format!("cannot write {}: {e}", path.display()))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() > 1 {
+            return Err(format!("refusing hard-linked output {}", path.display()));
+        }
+    }
+    let resolved = path
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve {}: {error}", path.display()))?;
+    for input in protected {
+        match input.canonicalize() {
+            Ok(input) if input == resolved => {
+                return Err(format!(
+                    "output {} aliases an input; choose a different output path",
+                    path.display()
+                ))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot inspect input {}: {error}", input.display())),
+        }
+    }
+    Ok(())
+}
+
+fn write_file_with(
+    path: &Path,
+    protected: &[PathBuf],
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<(), String> {
+    validate_output(path, protected)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    let parent = parent
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve {}: {error}", parent.display()))?;
+    let destination = parent.join(path.file_name().ok_or("output must name a file")?);
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let (temporary, mut file) = loop {
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = parent.join(format!(".rustograph-{}-{sequence}.tmp", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("cannot stage {}: {error}", path.display())),
+        }
+    };
+    let result = (|| {
+        write(&mut file).map_err(|error| format!("cannot stage {}: {error}", path.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("cannot sync {}: {error}", path.display()))?;
+        // 준비 중 교체된 입력 별칭도 공개 직전에 다시 확인한다.
+        validate_output(&destination, protected)?;
+        std::fs::rename(&temporary, &destination)
+            .map_err(|error| format!("cannot publish {}: {error}", path.display()))
+    })();
+    if let Err(failure) = result {
+        if let Err(error) = std::fs::remove_file(&temporary) {
+            return Err(format!(
+                "{failure}; cannot remove staged file {}: {error}",
+                temporary.display()
+            ));
+        }
+        return Err(failure);
+    }
+    Ok(())
 }
 
 /// 저장된 문서를 읽는다. 미래 버전은 거부한다 — 모르는 필드보다 버전 불일치가 위험하다.
@@ -116,6 +233,25 @@ mod tests {
             vec![Edge::new("c".into(), "c::m".into(), EdgeKind::Contains)],
             vec![],
         )
+    }
+
+    #[test]
+    fn failed_stage_preserves_previous_output_and_removes_temporary() {
+        let dir = std::env::temp_dir().join(format!("rg-stage-failure-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("result.json");
+        std::fs::write(&path, b"previous complete output").unwrap();
+        let failure = write_file_with(&path, &[], |file| {
+            file.write_all(b"partial replacement")?;
+            Err(std::io::Error::other("injected write failure"))
+        })
+        .unwrap_err();
+        assert!(failure.contains("injected write failure"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous complete output");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        write_file(&path, b"new complete output", &[]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new complete output");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

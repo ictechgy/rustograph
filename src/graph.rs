@@ -263,13 +263,23 @@ impl Document {
         kinds
     }
 
+    /// 없는 세밀도의 데이터를 완전한 분석으로 보고하지 않도록 거절한다.
+    pub fn require_level(&self, level: Level) -> Result<(), String> {
+        if self.level < level {
+            return Err(format!(
+                "graph level {:?} is insufficient for {:?} analysis; regenerate with `rustograph graph --level symbol`",
+                self.level, level
+            ));
+        }
+        Ok(())
+    }
+
     /// 상위 레벨로 투영한다. 각 정점·간선을 해당 레벨의 소유 정점으로 귀속시킨다.
     /// 심볼 → 타입 → 모듈 → 크레이트 순으로 올라간다.
-    pub fn view(&self, level: Level) -> Document {
-        if level >= self.level {
-            let mut d = self.clone();
-            d.level = level.max(self.level);
-            return d;
+    pub fn view(&self, level: Level) -> Result<Document, String> {
+        self.require_level(level)?;
+        if level == self.level {
+            return Ok(self.clone());
         }
         let by_id: BTreeMap<&str, &Vertex> =
             self.vertices.iter().map(|v| (v.id.as_str(), v)).collect();
@@ -302,7 +312,7 @@ impl Document {
                     .or_insert((e.tentative, e.unsafe_));
             }
         }
-        Document {
+        Ok(Document {
             version: self.version,
             tool: self.tool.clone(),
             level,
@@ -328,7 +338,7 @@ impl Document {
                 })
                 .collect(),
             limitations: self.limitations.clone(),
-        }
+        })
     }
 
     /// 정점 ID를 주어진 레벨의 소유자로 귀속한다. 상위로 올라가는 기준은
@@ -690,7 +700,7 @@ mod tests {
 
     #[test]
     fn view_projects_symbols_to_modules() {
-        let d = doc().view(Level::Module);
+        let d = doc().view(Level::Module).unwrap();
         assert!(d.vertex_ids().contains("c::a"));
         assert!(d.vertex_ids().contains("c::b"));
         assert!(!d.vertex_ids().contains("c::a::f"));
@@ -706,7 +716,7 @@ mod tests {
     #[test]
     fn view_merges_tentative_only_when_all_tentative() {
         // a::f -> T::m (확정 call) 과 a::f -> T (추정 call)는 다른 to라 따로 남는다.
-        let d = doc().view(Level::Module);
+        let d = doc().view(Level::Module).unwrap();
         let call = d
             .edges
             .iter()

@@ -24,3 +24,11 @@ jobs:
       # 도그푸딩 — 이 도구로 이 저장소를 분석한다
       - run: cargo run --quiet -- rules --strict
       - run: cargo run --quiet -- cycles --level symbol --strict
+
+  windows-output-safety:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --test snapshot_safety
+      - run: cargo test --locked export::tests
