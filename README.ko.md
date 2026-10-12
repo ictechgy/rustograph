@@ -37,8 +37,12 @@ Rust에는 `cargo-modules`, `cargo deps`, 그리고 syn/tree-sitter 기반 콜�
 ```bash
 brew install ictechgy/tap/rustograph
 # 또는
-cargo install --git https://github.com/ictechgy/rustograph --tag v0.4.2
+cargo install --locked --git https://github.com/ictechgy/rustograph --tag v0.4.1
 ```
+
+소스 설치 명령은 공개된
+[v0.4.1 릴리스](https://github.com/ictechgy/rustograph/releases/tag/v0.4.1)와
+해당 태그의 의존성 잠금 파일을 사용합니다. main 브랜치의 0.5.0은 아직 개발 중인 버전입니다.
 
 타입 해석 분석은 opt-in `semantic` feature 빌드가 필요합니다
 (rust-analyzer `ra_ap_*` — 의존이 커서 기본이 아닙니다):
