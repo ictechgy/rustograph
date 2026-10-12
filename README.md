@@ -40,8 +40,13 @@ over it, with a deterministic JSON contract meant for coding agents:
 ```bash
 brew install ictechgy/tap/rustograph
 # or
-cargo install --git https://github.com/ictechgy/rustograph --tag v0.4.2
+cargo install --locked --git https://github.com/ictechgy/rustograph --tag v0.4.1
 ```
+
+The source-install command is pinned to the published
+[v0.4.1 release](https://github.com/ictechgy/rustograph/releases/tag/v0.4.1)
+and its committed dependency lockfile. The main branch prepares the unreleased
+0.5.0 version.
 
 Or from source:
 
