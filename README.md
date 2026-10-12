@@ -399,3 +399,16 @@ macro-generated) fall back to the syntactic path with measured counters.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+
+## Upcoming 0.5.0 compatibility notes
+
+The next release rejects analyses that require detail absent from a saved graph.
+Regenerate snapshots with `rustograph graph --level symbol` for dead-code,
+reachability, and rule analyses. Coarser projections remain available for graph
+exports and cycle analysis.
+
+The Rust library's `Document::view` and `analysis::dead` now return `Result`.
+See [the 0.5 migration notes](docs/MIGRATING-0.5.md) for source changes and output
+safety behavior. The installation tag above continues to identify the current
+release until 0.5.0 is published.

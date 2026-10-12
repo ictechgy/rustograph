@@ -145,7 +145,7 @@ fn cmd_schema(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     let text = export::to_json(&doc);
     match a.get("out") {
         Some(p) => {
-            std::fs::write(p, &text).map_err(|e| format!("cannot write {p}: {e}"))?;
+            write_output(a, Path::new(p), &text, &[])?;
             writeln!(out, "wrote {p}").ok();
         }
         None => {
@@ -171,7 +171,7 @@ fn cmd_routes(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     };
     match a.get("out") {
         Some(p) => {
-            std::fs::write(p, &text).map_err(|e| format!("cannot write {p}: {e}"))?;
+            write_output(a, Path::new(p), &text, &[])?;
             writeln!(out, "wrote {p}").ok();
         }
         None => {
@@ -228,10 +228,34 @@ fn routes_client(a: &Args) -> Result<String, String> {
     Ok(export::to_json(&doc))
 }
 
+/// 출력 형식과 무관하게 그래프 입력과 수확 원본을 보호한다.
+fn write_output(a: &Args, path: &Path, text: &str, extra: &[PathBuf]) -> Result<(), String> {
+    let mut protected = extra.to_vec();
+    let directory = Path::new(a.get("dir").unwrap_or("."));
+    protected.extend(
+        [".rustograph.yml", ".rustograph.yaml"]
+            .into_iter()
+            .map(|name| directory.join(name)),
+    );
+    for flag in ["graph", "wrappers", "config", "roots-from"] {
+        if let Some(input) = a.get(flag) {
+            protected.push(PathBuf::from(input));
+        }
+    }
+    if a.get("graph").is_none() {
+        let (files, unresolved_includes) = source::input_files(directory)?;
+        protected.extend(files);
+        if unresolved_includes && path.exists() {
+            return Err("cannot safely replace an existing output with unresolved include paths; choose a new output path or write to stdout".into());
+        }
+    }
+    export::write_file(path, text.as_bytes(), &protected)
+}
+
 fn cmd_graph(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     let level = cli_args::level_of(a)?;
     // 수확은 항상 최대 깊이로 — 얕은 레벨은 투영이다.
-    let doc = cli_args::document_for(a, true)?.view(level);
+    let doc = cli_args::document_for(a, true)?.view(level)?;
     let text = match a.get("format").unwrap_or("json") {
         "json" => export::to_json(&doc),
         "mermaid" => export::to_mermaid(&doc),
@@ -240,11 +264,7 @@ fn cmd_graph(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     match a.get("out") {
         Some(p) => {
             let path = Path::new(p);
-            if a.get("format").unwrap_or("json") == "json" {
-                export::save_file(&doc, path)?;
-            } else {
-                std::fs::write(path, &text).map_err(|e| format!("cannot write {p}: {e}"))?;
-            }
+            write_output(a, path, &text, &export::document_inputs(&doc))?;
             writeln!(out, "wrote {p}").ok();
         }
         None => {
@@ -256,7 +276,7 @@ fn cmd_graph(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
 
 fn cmd_cycles(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     let level = cli_args::level_of(a)?;
-    let doc = cli_args::document_for(a, true)?.view(level);
+    let doc = cli_args::document_for(a, true)?.view(level)?;
     let rep = analysis::cycles(&doc);
     match a.get("format").unwrap_or("text") {
         "json" => write!(out, "{}", export::to_json(&rep)).ok(),
@@ -303,7 +323,7 @@ fn cmd_dead(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
             }
         }
     }
-    let report = analysis::dead(&doc);
+    let report = analysis::dead(&doc)?;
     match a.get("format").unwrap_or("text") {
         "json" => write!(out, "{}", export::to_json(&report)).ok(),
         "text" => {
@@ -366,8 +386,12 @@ fn cmd_rules(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
                     .to_string(),
             );
         };
-        std::fs::write(path, rules::Baseline::render(&report.violations))
-            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        write_output(
+            a,
+            path,
+            &rules::Baseline::render(&report.violations),
+            &export::document_inputs(&doc),
+        )?;
         writeln!(
             out,
             "wrote baseline {} ({} violations)",

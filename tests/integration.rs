@@ -16,7 +16,7 @@ fn doc(opts: &source::Options) -> rustograph::graph::Document {
 
 #[test]
 fn crate_level_has_members_and_dep_edge() {
-    let d = doc(&Default::default()).view(Level::Crate);
+    let d = doc(&Default::default()).view(Level::Crate).unwrap();
     let ids = d.vertex_ids();
     assert!(ids.contains("fixture_core") && ids.contains("fixture_app"));
     assert!(d
@@ -130,7 +130,7 @@ fn dead_reports_private_unused() {
         symbol_level: true,
         ..Default::default()
     });
-    let rep = analysis::dead(&d);
+    let rep = analysis::dead(&d).unwrap();
     let ids: Vec<&str> = rep.findings.iter().map(|f| f.id.as_str()).collect();
     assert!(ids.contains(&"fixture_core::dead_private"));
     assert!(ids.contains(&"fixture_app::extra::dead"));
@@ -146,7 +146,7 @@ fn retain_public_keeps_exported() {
         retain_public: true,
         ..Default::default()
     });
-    let rep = analysis::dead(&d);
+    let rep = analysis::dead(&d).unwrap();
     let ids: Vec<&str> = rep.findings.iter().map(|f| f.id.as_str()).collect();
     assert!(!ids.contains(&"fixture_core::gen::generated_fn"));
     assert!(!ids.contains(&"fixture_core::Unused")); // pub struct는 보존.
@@ -161,7 +161,8 @@ fn module_level_graph() {
         symbol_level: true,
         ..Default::default()
     })
-    .view(Level::Module);
+    .view(Level::Module)
+    .unwrap();
     assert!(d.vertex_ids().contains("fixture_core::util"));
     assert!(d.vertex_ids().contains("fixture_app::extra"));
     // uses 간선: app -> core의 심볼 임포트는 모듈로 귀속.

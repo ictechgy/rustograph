@@ -206,6 +206,16 @@ impl Server {
 
     /// 도구별로 분석을 실행하고 JSON 문자열을 돌려준다.
     fn run_tool(&self, name: &str, args: &serde_json::Value) -> Result<String, String> {
+        if matches!(
+            name,
+            "rustograph_query"
+                | "rustograph_impact"
+                | "rustograph_paths"
+                | "rustograph_dead"
+                | "rustograph_rules"
+        ) {
+            self.doc.require_level(Level::Symbol)?;
+        }
         match name {
             "rustograph_summary" => Ok(export::to_json(&serde_json::json!({
                 "version": self.doc.version,
@@ -271,7 +281,7 @@ impl Server {
                         .ok_or_else(|| format!("unknown level {l} (crate|module|type|symbol)"))?,
                     None => self.doc.level,
                 };
-                let view = self.doc.view(level);
+                let view = self.doc.view(level)?;
                 Ok(export::to_json(&analysis::cycles(&view)))
             }
             "rustograph_dead" => {
@@ -304,7 +314,7 @@ impl Server {
                 }
                 let mut d = self.doc.clone();
                 d.roots = roots.into_iter().collect();
-                let rep = analysis::dead(&d);
+                let rep = analysis::dead(&d)?;
                 let mut out = serde_json::to_value(&rep).expect("report must serialize");
                 if !unknown_roots.is_empty() {
                     out["unknownRoots"] = serde_json::json!(unknown_roots);

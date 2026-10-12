@@ -149,6 +149,123 @@ pub(crate) fn harvest_parts(dir: &Path, meta: &Metadata) -> Result<Parts, String
     })
 }
 
+/// 산출물 경로가 실제 수확 입력을 덮어쓰지 않도록 파일 목록을 돌려준다.
+/// 모듈·사용자 지정 타깃은 수확 아레나를, include 계열은 별도 경로 검사를 쓴다.
+pub(crate) fn input_files(dir: &Path) -> Result<(Vec<PathBuf>, bool), String> {
+    let metadata = cargo_meta::load(dir)?;
+    let parts = harvest_parts(dir, &metadata)?;
+    let mut files: BTreeSet<PathBuf> = parts.arena.keys().cloned().collect();
+    let unresolved_includes = include_inputs(&parts.arena, &mut files);
+    files.extend(parts.tree.orphan_files);
+    for path in files
+        .clone()
+        .into_iter()
+        .chain(std::iter::once(metadata.workspace_root.join("Cargo.toml")))
+    {
+        for parent in path.ancestors().skip(1) {
+            for name in [
+                "Cargo.toml",
+                "Cargo.lock",
+                ".rustograph.yml",
+                ".rustograph.yaml",
+            ] {
+                let input = parent.join(name);
+                if input.is_file() {
+                    files.insert(input);
+                }
+            }
+        }
+    }
+    Ok((files.into_iter().collect(), unresolved_includes))
+}
+
+/// 매크로 확장을 추정하지 않고 리터럴 include 입력만 보호한다.
+fn include_inputs(arena: &Arena, files: &mut BTreeSet<PathBuf>) -> bool {
+    use syn::visit::Visit;
+    #[derive(Default)]
+    struct Includes {
+        paths: Vec<(String, bool)>,
+        unresolved: bool,
+    }
+    impl<'ast> Visit<'ast> for Includes {
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            let Some(name) = mac
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string())
+            else {
+                return;
+            };
+            if matches!(name.as_str(), "include" | "include_str" | "include_bytes") {
+                match syn::parse2::<syn::LitStr>(mac.tokens.clone()) {
+                    Ok(path) => self.paths.push((path.value(), name == "include")),
+                    Err(_) => self.unresolved = true,
+                }
+            } else if nested_include(mac.tokens.clone()) {
+                // macro_rules! 안의 경로는 확장 위치에 의존한다. 읽은 입력인
+                // 척하지 않고 기존 산출물 교체를 보수적으로 막는다.
+                self.unresolved = true;
+            }
+        }
+    }
+    let mut pending = Vec::new();
+    let mut unresolved = false;
+    for (file, items) in arena {
+        let mut includes = Includes::default();
+        for item in *items {
+            includes.visit_item(item);
+        }
+        unresolved |= includes.unresolved;
+        pending.extend(
+            includes
+                .paths
+                .into_iter()
+                .map(|(path, code)| (file.parent().unwrap_or(Path::new(".")).join(path), code)),
+        );
+    }
+    let mut visited = BTreeSet::new();
+    while let Some((file, code)) = pending.pop() {
+        let file = file.canonicalize().unwrap_or(file);
+        files.insert(file.clone());
+        if !code || !visited.insert(file.clone()) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            unresolved = true;
+            continue;
+        };
+        let mut includes = Includes::default();
+        if let Ok(parsed) = syn::parse_file(&text) {
+            includes.visit_file(&parsed);
+        } else if let Ok(parsed) = syn::parse_str::<syn::Expr>(&text) {
+            includes.visit_expr(&parsed);
+        } else {
+            unresolved = true;
+        }
+        unresolved |= includes.unresolved;
+        pending.extend(
+            includes
+                .paths
+                .into_iter()
+                .map(|(path, code)| (file.parent().unwrap_or(Path::new(".")).join(path), code)),
+        );
+    }
+    unresolved
+}
+
+/// 매크로 토큰 안의 include 호출은 syn 방문자가 확장하지 않는다.
+fn nested_include(tokens: proc_macro2::TokenStream) -> bool {
+    let tokens: Vec<_> = tokens.into_iter().collect();
+    tokens.windows(2).any(|pair| {
+        matches!(&pair[0], proc_macro2::TokenTree::Ident(name) if matches!(name.to_string().as_str(), "include" | "include_str" | "include_bytes"))
+            && matches!(&pair[1], proc_macro2::TokenTree::Punct(punct) if punct.as_char() == '!')
+    }) || tokens.into_iter().any(|token| match token {
+        proc_macro2::TokenTree::Group(group) => nested_include(group.stream()),
+        _ => false,
+    })
+}
+
 /// `--target`의 cfg 팩트 — `rustc --print cfg` 실측이 권위다.
 /// rustc를 못 쓰거나 트리플을 모르면 트리플 추정으로 폴백한다.
 /// 어느 쪽이든 프로필·feature·커스텀 --cfg 조건은 미지로 남는다.
