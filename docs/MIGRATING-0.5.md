@@ -1,6 +1,7 @@
 # Migrating to rustograph 0.5
 
-Version 0.5.0 is in preparation. No release is implied by this document.
+Version 0.5.0 was published on 2026-10-13 (UTC). See the
+[release notes and verified binary assets](https://github.com/ictechgy/rustograph/releases/tag/v0.5.0).
 
 ## Rust library callers
 
