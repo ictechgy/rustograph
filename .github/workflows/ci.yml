@@ -6,6 +6,22 @@ on:
   pull_request:
 
 jobs:
+  release-assets:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Windows'
+        run: bash scripts/test-release-build-manifest.sh
+        shell: bash
+      - if: runner.os != 'Windows'
+        run: |
+          /bin/bash scripts/test-release-build-manifest.sh
+          /bin/bash scripts/test-publish-release-assets.sh
+        shell: bash
+
   test:
     runs-on: ubuntu-latest
     steps:
