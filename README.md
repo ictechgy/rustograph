@@ -40,13 +40,13 @@ over it, with a deterministic JSON contract meant for coding agents:
 ```bash
 brew install ictechgy/tap/rustograph
 # or
-cargo install --locked --git https://github.com/ictechgy/rustograph --tag v0.4.1
+cargo install --locked --git https://github.com/ictechgy/rustograph --tag v0.5.0
 ```
 
 The source-install command is pinned to the published
-[v0.4.1 release](https://github.com/ictechgy/rustograph/releases/tag/v0.4.1)
-and its committed dependency lockfile. The main branch prepares the unreleased
-0.5.0 version.
+[v0.5.0 release](https://github.com/ictechgy/rustograph/releases/tag/v0.5.0)
+and its committed dependency lockfile. Homebrew availability follows the tap
+formula separately; this GitHub release does not establish crates.io publication.
 
 Or from source:
 
@@ -406,14 +406,13 @@ macro-generated) fall back to the syntactic path with measured counters.
 MIT — see [LICENSE](LICENSE).
 
 
-## Upcoming 0.5.0 compatibility notes
+## 0.5.0 compatibility notes
 
-The next release rejects analyses that require detail absent from a saved graph.
+Version 0.5.0 rejects analyses that require detail absent from a saved graph.
 Regenerate snapshots with `rustograph graph --level symbol` for dead-code,
 reachability, and rule analyses. Coarser projections remain available for graph
 exports and cycle analysis.
 
 The Rust library's `Document::view` and `analysis::dead` now return `Result`.
 See [the 0.5 migration notes](docs/MIGRATING-0.5.md) for source changes and output
-safety behavior. The installation tag above continues to identify the current
-release until 0.5.0 is published.
+safety behavior. Version 0.5.0 was published on 2026-10-13 (UTC).
