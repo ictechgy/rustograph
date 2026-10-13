@@ -30,6 +30,34 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
+      - name: Resolve version and exact source commit
+        env:
+          REQUESTED_TAG: ${{ github.event.inputs.tag }}
+        shell: bash
+        run: |
+          tag="$REQUESTED_TAG"
+          if [ -z "$tag" ]; then tag="${GITHUB_REF_NAME}"; fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release tag: expected vMAJOR.MINOR.PATCH." >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          # 소스의 버전과 태그가 어긋나면 cargo install 사용자가 잘못된 값을 본다.
+          declared="$(grep -oE '^version = "[^"]+"' Cargo.toml | head -1 | cut -d'"' -f2)"
+          if [ "$declared" != "$version" ]; then
+            echo "태그($tag)와 Cargo.toml version($declared)이 다릅니다." >&2
+            exit 1
+          fi
+
+          commit="$(git rev-parse HEAD)"
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$commit" != "$GITHUB_SHA" ]; then
+            echo "Checked-out source does not match the tag event commit." >&2
+            exit 1
+          fi
+          echo "RELEASE_COMMIT=$commit" >> "$GITHUB_ENV"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -51,11 +79,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            version="${{ github.event.inputs.tag }}"
-            version="${version#v}"
-          fi
+          version="$VERSION"
           dir="rustograph-${version}-${NAME}"
           mkdir -p "$dir"
           cp "target/${TARGET}/release/rustograph" "$dir/"
@@ -69,19 +93,27 @@ jobs:
           TARGET: ${{ matrix.target }}
         shell: pwsh
         run: |
-          $version = "${{ github.event.inputs.tag }}"
-          if ($version -eq "") { $version = $env:GITHUB_REF_NAME }
-          $version = $version -replace '^v', ''
+          $version = $env:VERSION
           $dir = "rustograph-$version-$env:NAME"
           New-Item -ItemType Directory -Path $dir | Out-Null
           Copy-Item "target/$env:TARGET/release/rustograph.exe" $dir/
           Copy-Item LICENSE, README.md $dir/
           Compress-Archive -Path $dir -DestinationPath "rustograph-$version-$env:NAME.zip"
 
+      - name: Record the built commit and archive digest
+        shell: bash
+        env:
+          NAME: ${{ matrix.name }}
+        run: bash scripts/release-build-manifest.sh record "$VERSION" "$RELEASE_COMMIT" "$NAME"
+
       - uses: actions/upload-artifact@v4
         with:
           name: rustograph-${{ matrix.name }}
-          path: rustograph-*
+          path: |
+            rustograph-*.tar.gz
+            rustograph-*.zip
+            rustograph-*.build-info
+          if-no-files-found: error
 
   release:
     name: Publish release
@@ -94,9 +126,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Resolve version and check Cargo.toml agreement
+      - name: Resolve version and exact source commit
         env:
           REQUESTED_TAG: ${{ github.event.inputs.tag }}
+        shell: bash
         run: |
           tag="$REQUESTED_TAG"
           if [ -z "$tag" ]; then tag="${GITHUB_REF_NAME}"; fi
@@ -114,10 +147,20 @@ jobs:
             exit 1
           fi
 
+          commit="$(git rev-parse HEAD)"
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$commit" != "$GITHUB_SHA" ]; then
+            echo "Checked-out source does not match the tag event commit." >&2
+            exit 1
+          fi
+          echo "RELEASE_COMMIT=$commit" >> "$GITHUB_ENV"
+
       - uses: actions/download-artifact@v4
         with:
           pattern: rustograph-*
           merge-multiple: true
+
+      - name: Verify all matrix build commits and archive bytes
+        run: bash scripts/release-build-manifest.sh verify "$VERSION" "$RELEASE_COMMIT"
 
       # 배포하기 전에 압축을 푼 그 바이너리로 CLI 계약 전체를 검증한다.
       - name: Verify the packaged binary
@@ -134,7 +177,7 @@ jobs:
           shasum -a 256 rustograph-*.tar.gz rustograph-*.zip > checksums.txt
           cat checksums.txt
 
-      - name: Create the GitHub release
+      - name: Publish and verify GitHub release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -151,8 +194,7 @@ jobs:
 
           \`rustograph-${VERSION}-<os>-<arch>.tar.gz\` — macOS (arm64/x86_64), Linux (arm64/x86_64); \`.zip\` for Windows. \`checksums.txt\` has SHA-256 for every asset.
           NOTES
-          gh release create "$TAG" rustograph-*.tar.gz rustograph-*.zip checksums.txt \
-            --title "$TAG" --notes-file notes.md --verify-tag
+          bash scripts/publish-release-assets.sh "$TAG" "$RELEASE_COMMIT" notes.md
 
       # tap 저장소는 다른 저장소라 기본 GITHUB_TOKEN으로는 쓸 수 없다.
       # HOMEBREW_TAP_TOKEN 시크릿이 있을 때만 formula를 갱신하고, 없으면 조용히 건너뛴다.
