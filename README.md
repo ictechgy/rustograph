@@ -437,7 +437,11 @@ working directory outside the checkout (neither the checkout nor one of its
 subdirectories), and pass the checkout with `--dir`. The checkout's
 `.cargo/config.toml` and `rust-toolchain.toml` then do not apply to the
 toolchain commands rustograph runs; configuration in the working directory,
-its parents, and your Cargo home still does. rustograph does not sandbox these
+its parents, and your Cargo home still does. `cargo metadata` resolves the
+checkout's dependencies wherever it runs. It can write `Cargo.lock` into the
+checkout, and the analysis fails if that write fails; it can also fetch
+registry and git dependencies named in the checkout's manifests, so limit the
+sandbox's network access if that matters. rustograph does not sandbox these
 commands itself.
 
 ## License
