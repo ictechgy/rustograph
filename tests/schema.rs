@@ -238,6 +238,123 @@ fn empty_workspace_emits_null_target() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// 임시 워크스페이스(`app` 패키지의 src/lib.rs 하나)를 만든다 — fixture의 계수를
+/// 건드리지 않고 입력 모양 하나만 검증할 때 쓴다.
+fn temp_workspace(tag: &str, lib: &str) -> PathBuf {
+    let tmp = std::env::temp_dir().join(format!("rustograph-schema-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("app/src")).unwrap();
+    std::fs::write(
+        tmp.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(tmp.join("app/src/lib.rs"), lib).unwrap();
+    tmp
+}
+
+/// isthmus `controlCharacterPattern`(C0·DEL·C1·U+2028·U+2029)과 같은 판정이다.
+fn has_control(text: &str) -> bool {
+    text.chars()
+        .any(|c| matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}' | '\u{2028}' | '\u{2029}'))
+}
+
+/// 여러 줄 raw SQL·rustfmt가 나눈 `&format!(..)` 인자처럼 원문이 여러 줄인 dynamic
+/// 사실도 채널에는 공백을 접은 한 줄만 싣는다 — 줄바꿈·탭 하나로 isthmus가 문서
+/// 전체를 거부한다(GRAPH-EXCHANGE: 채널에 제어 문자·NEL·U+2028/2029 금지).
+/// 120자 절단은 정화한 뒤에 건다.
+#[test]
+fn dynamic_channels_are_sanitized_single_lines() {
+    let padded = format!(
+        "SELECT 1{}FROM unnest($1::int[]) t",
+        "\n            ".repeat(12)
+    );
+    let columns: Vec<String> = (0..40).map(|i| format!("c{i:02}")).collect();
+    let lib = r##"
+pub fn by_ids(ids: &[i32]) {
+    let _ = sqlx::query!(
+        r#"
+        SELECT u.id
+          FROM unnest($1::int[]) AS t(id)
+          JOIN users u ON u.id = t.id
+        "#,
+        ids
+    );
+}
+
+pub fn templated(table: &str) -> String {
+    format!(
+        "SELECT id, name
+         FROM {}
+         WHERE id = 1",
+        table
+    )
+}
+
+pub async fn find(table: &str) {
+    let _ = sqlx::query(&format!(
+        "SELECT id FROM {} WHERE id = $1",
+        table
+    ));
+}
+
+pub fn escapes() {
+    let _ = sqlx::query("SELECT *\tFROM {} \u{85}\u{2028} WHERE\u{1}x");
+}
+
+pub fn padded() {
+    let _ = sqlx::query!(r#"@PADDED@"#);
+}
+
+pub fn wide() {
+    let _ = sqlx::query!(r#"SELECT @COLUMNS@ FROM {}"#);
+}
+"##
+    .replace("@PADDED@", &padded)
+    .replace("@COLUMNS@", &columns.join(",\n      "));
+    let dir = temp_workspace("dynamic-channels", &lib);
+    let d = serde_json::to_value(schema::facts(&dir, "test").expect("schema facts")).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let facts = d["facts"].as_array().unwrap();
+    for f in facts {
+        let channel = f["channel"].as_str().unwrap();
+        assert!(!has_control(channel), "control character in {channel:?}");
+        assert_eq!(channel, channel.trim(), "untrimmed channel {channel:?}");
+        assert!(!channel.contains("  "), "unfolded channel {channel:?}");
+    }
+    let folded_wide = format!("SELECT {} FROM {{}}", columns.join(", "));
+    let cut_wide = format!(
+        "{}...",
+        folded_wide.chars().take(120).collect::<String>().trim_end()
+    );
+    let dynamic: std::collections::BTreeSet<&str> = facts
+        .iter()
+        .filter(|f| f["dynamic"] == true)
+        .map(|f| f["channel"].as_str().unwrap())
+        .collect();
+    let want: std::collections::BTreeSet<&str> = [
+        "SELECT u.id FROM unnest($1::int[]) AS t(id) JOIN users u ON u.id = t.id",
+        "SELECT id, name FROM {} WHERE id = 1",
+        "&format!( \"SELECT id FROM {} WHERE id = $1\", table )",
+        "SELECT id FROM {} WHERE id = $1",
+        "SELECT * FROM {} WHEREx",
+        // 원문은 120자를 넘지만 접으면 짧다 — 자르지 않는다.
+        "SELECT 1 FROM unnest($1::int[]) t",
+        cut_wide.as_str(),
+    ]
+    .into();
+    assert_eq!(dynamic, want);
+    // 정적 사실은 그대로다.
+    assert!(facts
+        .iter()
+        .any(|f| f["channel"] == "users" && f["dynamic"] == false));
+}
+
 #[test]
 fn cli_schema_prints_document_and_writes_out() {
     let mut out = Cursor::new(Vec::new());

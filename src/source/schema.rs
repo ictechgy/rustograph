@@ -1183,10 +1183,11 @@ impl SchemaScan {
         self.push_dynamic_str("<unparsed macro argument>", loc);
     }
 
-    /// dynamic 사실 공통 경로 — 원문은 120자로 자른다.
+    /// dynamic 사실 공통 경로 — 원문을 채널 규칙으로 정화한 뒤 120자로 자른다.
     fn push_dynamic_str(&mut self, text: &str, loc: BridgeLocation) {
+        let summary = dynamic_channel(text);
         // 문자·바이트 단위를 섞지 않는다 — 실제로 잘렸을 때만 ...를 붙인다.
-        let mut chars = text.chars();
+        let mut chars = summary.chars();
         let head: String = chars.by_ref().take(120).collect();
         let channel = if chars.next().is_some() {
             format!("{}...", head.trim_end())
@@ -1334,6 +1335,42 @@ fn fact_cmp(a: &RelationFact, b: &RelationFact) -> std::cmp::Ordering {
             &b.method,
             b.dynamic,
         ))
+}
+
+/// dynamic 사실의 channel에 실을 원문 요약이다 — 공백류 연속을 한 칸으로 접어 앞뒤를
+/// 다듬고, 남은 제어 문자(C0·DEL·C1·U+2028·U+2029)를 지운다. 남는 글자가 없으면
+/// `<dynamic>`이다.
+///
+/// 원문 식은 rustfmt가 여러 줄로 나눈 인자나 여러 줄 raw SQL이 흔한데, isthmus는
+/// dynamic 사실이어도 채널에 제어 문자가 하나라도 있으면 문서 전체를 거부한다
+/// (GRAPH-EXCHANGE 채널 규칙). 계열 생산자(dartograph `_dynamicChannel`, tsograph
+/// `dynamicChannel`)와 같은 규칙이다. 길이 상한은 호출자가 이 결과에 건다 — 정화 전에
+/// 자르면 접힐 공백이 상한을 먼저 써 버린다.
+pub(crate) fn dynamic_channel(text: &str) -> String {
+    let mut summary = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            pending_space = true;
+        } else if !is_channel_control(c) {
+            // 지운 제어 문자는 공백 연속을 끊지 않는다 — `a \u{1} b`도 `a b`다.
+            if pending_space && !summary.is_empty() {
+                summary.push(' ');
+            }
+            pending_space = false;
+            summary.push(c);
+        }
+    }
+    if summary.is_empty() {
+        "<dynamic>".to_string()
+    } else {
+        summary
+    }
+}
+
+/// isthmus `controlCharacterPattern`과 같은 판정이다 — C0·DEL·C1(NEL 포함)·U+2028·U+2029.
+fn is_channel_control(c: char) -> bool {
+    matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}' | '\u{2028}' | '\u{2029}')
 }
 
 /// 표현식의 원문을 span 범위로 잘라낸다 — 토큰 재조합보다 소스 그대로가
@@ -2199,6 +2236,28 @@ mod tests {
         // 산문 속 "update"는 문장 머리가 아니면 SQL로 보지 않는다.
         assert!(!looks_like_sql("please update the config"));
         assert!(!looks_like_sql(""));
+    }
+
+    /// dynamic 채널 요약 — 공백류는 한 칸으로 접히고(NEL·U+2028/2029·NBSP 포함),
+    /// 나머지 제어 문자는 공백 연속을 끊지 않고 사라지며, 비면 `<dynamic>`이다.
+    #[test]
+    fn dynamic_channel_folds_whitespace_and_drops_controls() {
+        let cases = [
+            ("a\n  b\tc", "a b c"),
+            ("  lead and trail \r\n", "lead and trail"),
+            ("x\u{85}y\u{2028}z\u{2029}w\u{a0}v", "x y z w v"),
+            ("a\u{1}b\u{7f}c\u{9f}d", "abcd"),
+            ("a \u{1} b", "a b"),
+            ("\u{1}a", "a"),
+            ("한글\n😀", "한글 😀"),
+            ("<unparsed macro argument>", "<unparsed macro argument>"),
+            ("", "<dynamic>"),
+            (" \n\t\u{85} ", "<dynamic>"),
+            ("\u{1}\u{9b}", "<dynamic>"),
+        ];
+        for (text, want) in cases {
+            assert_eq!(dynamic_channel(text), want, "{text:?}");
+        }
     }
 
     #[test]

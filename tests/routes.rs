@@ -800,6 +800,62 @@ pub fn build() {
         .any(|l| l.starts_with("route-coverage: an App passed to a function")));
 }
 
+/// 여러 줄 비리터럴 경로 식과 템플릿으로 못 바꾼 리터럴 경로의 dynamic 채널은 공백을
+/// 접고 제어 문자를 지운다 — 줄바꿈·탭이 남으면 isthmus가 문서 전체를 거부한다
+/// (GRAPH-EXCHANGE: 채널에 제어 문자·NEL·U+2028/2029 금지).
+#[test]
+fn dynamic_route_channels_are_sanitized() {
+    let axum_src = r#"
+use axum::{routing::get, Router};
+async fn h() {}
+pub fn app(prefix: &str) -> Router {
+    Router::new()
+        .route(
+            &format!(
+                "{}/items",
+                prefix
+            ),
+            get(h),
+        )
+        .route("/a\tb/x{*rest}", get(h))
+}
+pub async fn run() { axum::serve(listener(), app("/x")).await; }
+"#;
+    let actix_src = r#"
+use actix_web::{web, App};
+async fn h() -> &'static str { "" }
+pub fn build(prefix: &str) {
+    let _ = App::new()
+        .route(
+            &format!(
+                "{}/items",
+                prefix
+            ),
+            web::get().to(h),
+        )
+        .route("/a\tb/{x", web::get().to(h));
+}
+"#;
+    let cases = [
+        ("dynaxum", ("axum", "0.8.9"), axum_src, "/a b/x{*rest}"),
+        ("dynactix", ("actix-web", "4.15.0"), actix_src, "/a b/{x"),
+    ];
+    for (tag, dep, src, literal) in cases {
+        let dir = temp_crate(tag, &[dep], &[("lib.rs", src)]);
+        let d = doc_of(&dir, None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let dynamic: BTreeSet<&str> = d["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["dynamic"] == true)
+            .map(|f| f["channel"].as_str().unwrap())
+            .collect();
+        let want: BTreeSet<&str> = ["&format!( \"{}/items\", prefix )", literal].into();
+        assert_eq!(dynamic, want, "{tag}");
+    }
+}
+
 /// 비ASCII 문자가 앞에 있어도 위치 열은 UTF-8 바이트다.
 #[test]
 fn server_route_columns_are_utf8_bytes() {

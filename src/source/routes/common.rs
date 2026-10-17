@@ -310,17 +310,17 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// 식의 원문(최대 2,048자) — dynamic 사실의 channel이다.
+    /// 식의 원문 — dynamic 선언 channel의 재료다. 정화와 길이 절단은 문서를 조립할 때
+    /// 모든 dynamic 선언에 한 번에 건다(리터럴 원문 경로도 같은 규칙을 받아야 한다).
     pub fn source_text(&self, file: &Path, span: Span) -> String {
         let mut cache = self.sources.borrow_mut();
         let text = cache
             .entry(file.to_path_buf())
             .or_insert_with(|| std::fs::read_to_string(file).ok());
-        let raw = text
-            .as_deref()
+        text.as_deref()
             .and_then(|t| t.get(span.byte_range()))
-            .unwrap_or("<expression>");
-        take_utf16(raw, super::template::MAX_TEMPLATE_LENGTH)
+            .unwrap_or("<expression>")
+            .to_string()
     }
 }
 

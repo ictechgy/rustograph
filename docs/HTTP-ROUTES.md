@@ -128,7 +128,7 @@ dispatch 하나만 선언한다). 둘 다 없으면 사실 0건과 `route-covera
 |---|---|
 | 워크스페이스에 axum·actix-web 의존이 없음 | 사실 0건 + `route-coverage:` |
 | 확인한 메이저 밖의 버전 | `route-framework-version-unknown:` |
-| 리터럴·`&str` 상수가 아닌 경로 | dynamic 사실(원문) + `route-coverage:` |
+| 리터럴·`&str` 상수가 아닌 경로 | dynamic 사실(원문 요약 — 공백류를 한 칸으로 접고 제어 문자·NEL·U+2028/2029를 지운 한 줄, UTF-16 2,048 단위 이하. 템플릿으로 못 바꾼 리터럴 경로도 같다) + `route-coverage:` |
 | 평가하지 못한 nest·merge·서비스·설정 함수 | 그 자리 접두사가 리터럴이면 `templatePrefixes` 스코프의 `route-coverage:`, 아니면 스코프 없음 |
 | 조건·반복 안의 actix `ServiceConfig` 등록 | `route-coverage:` |
 | impl·trait 메서드 안의 `Router::new()`·`App::new()` | `route-coverage:`(추출기는 모듈 수준 함수만 평가한다) |
