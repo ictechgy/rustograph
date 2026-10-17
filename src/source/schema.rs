@@ -346,6 +346,9 @@ struct SchemaScan {
     diesel_tables: BTreeSet<String>,       // 워크스페이스의 diesel 선언 이름
     latest: Option<std::time::SystemTime>, // 읽은 소스의 최신 mtime
     seen: BTreeSet<String>,
+    /// 위치를 계산한 횟수 — 버릴 리터럴에 위치를 구하지 않는지 단위 테스트가 센다.
+    #[cfg(test)]
+    located: std::cell::Cell<usize>,
 }
 
 /// `use` 트리에서 모은 sqlx·diesel 바인딩 집합이다.
@@ -368,7 +371,7 @@ struct UseBindings {
 fn scan_file(scan: &mut SchemaScan, file: &Path, src: &str, ast: &syn::File) {
     let mut ctx = FileCtx {
         scan,
-        src,
+        lines: LineIndex::new(src),
         file,
         binds: UseBindings::default(),
         pass_two: false,
@@ -378,10 +381,58 @@ fn scan_file(scan: &mut SchemaScan, file: &Path, src: &str, ast: &syn::File) {
     ctx.visit_file(ast); // 2패스: 사실 수확
 }
 
+/// 파일 원문과 줄 시작 바이트 오프셋 색인이다. 사실마다 `str::lines().nth()`로 파일
+/// 앞에서부터 줄을 세면 파일 하나가 O(리터럴 × 줄)이 된다 — 문서 주석·문자열이 수만
+/// 개인 생성 파일에서 제곱으로 커진다. 파일마다 한 번 만들어 줄을 바로 찾는다.
+struct LineIndex<'a> {
+    src: &'a str,
+    /// 줄마다 시작 바이트 — 0과 모든 `\n` 바로 다음 자리다.
+    starts: Vec<usize>,
+}
+
+impl<'a> LineIndex<'a> {
+    /// 원문을 한 번 훑어 줄 시작을 모은다 — proc-macro2처럼 `\n`만 줄 경계로 본다.
+    fn new(src: &'a str) -> LineIndex<'a> {
+        let mut starts = vec![0];
+        starts.extend(src.match_indices('\n').map(|(i, _)| i + 1));
+        LineIndex { src, starts }
+    }
+
+    /// 1 기반 줄의 본문 — `str::lines().nth(line - 1)`과 같은 규칙이다. 줄 끝 `\n`과
+    /// 그 바로 앞 `\r`을 떼고, 개행 없는 마지막 줄의 `\r`은 남기며, 마지막 개행 뒤의
+    /// 빈 꼬리는 줄이 아니다.
+    fn line(&self, line: usize) -> Option<&'a str> {
+        let start = *self.starts.get(line.checked_sub(1)?)?;
+        match self.starts.get(line) {
+            Some(&next) => {
+                let text = &self.src[start..next - 1];
+                Some(text.strip_suffix('\r').unwrap_or(text))
+            }
+            None => (start < self.src.len()).then(|| &self.src[start..]),
+        }
+    }
+
+    /// proc-macro2 위치(1 기반 줄, 줄 시작부터의 문자 수)의 원문 바이트 오프셋이다 —
+    /// 열은 문자 수라 그만큼의 문자를 바이트로 센다. 없는 줄은 원문 끝이다.
+    fn offset(&self, line: usize, column: usize) -> usize {
+        let start = line
+            .checked_sub(1)
+            .and_then(|i| self.starts.get(i))
+            .copied()
+            .unwrap_or(self.src.len());
+        start
+            + self.src[start..]
+                .chars()
+                .take(column)
+                .map(char::len_utf8)
+                .sum::<usize>()
+    }
+}
+
 /// 파일 단위 스캔 문맥 — sqlx·diesel에서 import한 이름과 누적 상태.
 struct FileCtx<'a> {
     scan: &'a mut SchemaScan,
-    src: &'a str,
+    lines: LineIndex<'a>,
     file: &'a Path,
     binds: UseBindings,
     pass_two: bool,
@@ -402,7 +453,7 @@ impl<'ast> Visit<'ast> for FileCtx<'ast> {
         }
         // 알려진 매크로가 아니면 토큰 안의 SQL 리터럴만 훑는다 —
         // format!("DELETE FROM {}", t) 같은 템플릿도 관계 참조다.
-        scan_macro_literals(self.scan, node, self.src, self.file);
+        scan_macro_literals(self.scan, node, &self.lines, self.file);
     }
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
@@ -437,9 +488,11 @@ impl<'ast> Visit<'ast> for FileCtx<'ast> {
 
     fn visit_lit_str(&mut self, node: &'ast LitStr) {
         if self.pass_two {
-            // 맥락 없는 리터럴은 산문 오탐을 막는 동사 게이트를 적용한다.
+            // 맥락 없는 리터럴은 산문 오탐을 막는 동사 게이트를 적용한다 — 문서 주석
+            // (`#[doc = ".."]`)도 여기로 오므로 위치는 게이트를 통과한 뒤에만 구한다.
+            let (lines, file, span) = (&self.lines, self.file, node.span());
             self.scan
-                .push_sql_literal(self.scan_locate(node.span()), &node.value(), false);
+                .push_sql_literal(&node.value(), false, |scan| scan.locate(lines, span, file));
         }
         syn::visit::visit_lit_str(self, node);
     }
@@ -653,7 +706,7 @@ impl<'ast> FileCtx<'ast> {
         match (is_file, expr) {
             // 파일 매크로는 SQL이 파일에 있으므로 항상 dynamic이다 — 채널에는
             // 경로 리터럴의 원문을 실어 어느 호출인지 남긴다.
-            (true, Some(e)) => self.scan.push_dynamic(self.src, &e, loc, self.file),
+            (true, Some(e)) => self.scan.push_dynamic(&self.lines, &e, loc, self.file),
             (true, None) => match loc {
                 Some(l) => self.scan.push_dynamic_text(l),
                 None => self.scan.unlocated += 1,
@@ -662,17 +715,14 @@ impl<'ast> FileCtx<'ast> {
                 if let syn::Lit::Str(lit) = &el.lit {
                     // 확인된 sqlx 인자 자리의 리터럴은 SQL 컨텍스트가
                     // 확정됐다 — 동사 게이트를 건너뛴다.
-                    self.scan.push_sql_literal(
-                        self.scan_locate(lit.span()).or(loc),
-                        &lit.value(),
-                        true,
-                    );
+                    let at = self.scan_locate(lit.span()).or(loc);
+                    self.scan.push_sql_literal(&lit.value(), true, |_| at);
                 } else {
                     self.scan
-                        .push_dynamic(self.src, &Expr::Lit(el.clone()), loc, self.file);
+                        .push_dynamic(&self.lines, &Expr::Lit(el.clone()), loc, self.file);
                 }
             }
-            (false, Some(e)) => self.scan.push_dynamic(self.src, &e, loc, self.file),
+            (false, Some(e)) => self.scan.push_dynamic(&self.lines, &e, loc, self.file),
             (false, None) => match loc {
                 Some(l) => self.scan.push_dynamic_text(l),
                 None => self.scan.unlocated += 1,
@@ -725,14 +775,14 @@ impl<'ast> FileCtx<'ast> {
                         let loc = self
                             .scan_locate(lit.span())
                             .or_else(|| self.scan_locate(fp.path.span()));
-                        self.scan.push_sql_literal(loc, &lit.value(), true);
+                        self.scan.push_sql_literal(&lit.value(), true, |_| loc);
                     }
                     // 비문자열 리터럴(`query(1)`)은 SQL 근거가 아니다 —
                     // 계약상 유일하게 계수하지 않고 버리는 예외다.
                 }
                 e => {
                     let loc = self.scan_locate(fp.path.span());
-                    self.scan.push_dynamic(self.src, e, loc, self.file);
+                    self.scan.push_dynamic(&self.lines, e, loc, self.file);
                 }
             }
         }
@@ -749,7 +799,7 @@ impl<'ast> FileCtx<'ast> {
             .collect();
         let loc_of = |i: usize| {
             self.scan
-                .locate(self.src, path.segments[i].ident.span(), self.file)
+                .locate(&self.lines, path.segments[i].ident.span(), self.file)
         };
         // `x::dsl::table`처럼 dsl·columns 아래의 `table`은 컬럼 이름이다 —
         // 끝 세그먼트가 table인 팔보다 이 팔을 먼저 맞춰야 한다.
@@ -885,7 +935,7 @@ impl<'ast> FileCtx<'ast> {
     /// 토큰 span을 프로젝트 상대의 계약 위치로 바꾼다.
     /// 프로젝트 밖 파일은 상대 경로가 없어 사실로 만들지 않는다.
     fn scan_locate(&self, span: Span) -> Option<BridgeLocation> {
-        self.scan.locate(self.src, span, self.file)
+        self.scan.locate(&self.lines, span, self.file)
     }
 }
 
@@ -1124,7 +1174,7 @@ fn split_top_level_commas(tokens: &TokenStream) -> Vec<TokenStream> {
 
 /// 알려지지 않은 매크로의 토큰 안에서 SQL 리터럴을 찾는다 —
 /// format!·const concat 같은 템플릿 속 SQL도 관계 참조다.
-fn scan_macro_literals(scan: &mut SchemaScan, m: &syn::Macro, src: &str, file: &Path) {
+fn scan_macro_literals(scan: &mut SchemaScan, m: &syn::Macro, lines: &LineIndex, file: &Path) {
     let mut stack: Vec<TokenTree> = m.tokens.clone().into_iter().collect();
     while let Some(tt) = stack.pop() {
         match tt {
@@ -1134,7 +1184,8 @@ fn scan_macro_literals(scan: &mut SchemaScan, m: &syn::Macro, src: &str, file: &
                     syn::parse2::<LitStr>(TokenStream::from(TokenTree::Literal(l.clone())))
                 {
                     // 위치를 못 구한 SQL 리터럴도 push_sql_literal이 센다.
-                    scan.push_sql_literal(scan.locate(src, lit.span(), file), &lit.value(), false);
+                    let span = lit.span();
+                    scan.push_sql_literal(&lit.value(), false, |s| s.locate(lines, span, file));
                 }
             }
             _ => {}
@@ -1147,12 +1198,19 @@ impl SchemaScan {
     /// 관계 자리에 플레이스홀더 같은 비리터럴 피연산자가 오면 관계 참조가
     /// 있었다는 근거를 동적 사실로 남긴다 — 조용히 버리지 않는다.
     /// `trusted`는 확인된 DB 인자 자리라는 뜻이다 — 그때는 동사 게이트를
-    /// 건너뛴다. 위치를 못 구한 SQL 리터럴은 unlocated로 센다.
-    fn push_sql_literal(&mut self, loc: Option<BridgeLocation>, text: &str, trusted: bool) {
+    /// 건너뛴다. 위치(`loc`)는 SQL로 판정된 리터럴에만 구한다 — 리터럴 대부분
+    /// (문서 주석·산문)이 게이트에서 버려지는데 위치부터 구하면 버릴 리터럴마다
+    /// 줄을 찾는다. 위치를 못 구한 SQL 리터럴은 unlocated로 센다.
+    fn push_sql_literal(
+        &mut self,
+        text: &str,
+        trusted: bool,
+        loc: impl FnOnce(&SchemaScan) -> Option<BridgeLocation>,
+    ) {
         if !trusted && !looks_like_sql(text) {
             return;
         }
-        let Some(loc) = loc else {
+        let Some(loc) = loc(self) else {
             self.unlocated += 1;
             return;
         };
@@ -1175,7 +1233,13 @@ impl SchemaScan {
     /// 리터럴로 읽히지 않는 SQL 인자를 동적 사실로 보존한다.
     /// channel에는 잘린 원문 표현식을 실어 어느 위치의 호출인지 남긴다.
     /// 위치를 못 구한 동적 근거는 unlocated로 센다.
-    fn push_dynamic(&mut self, src: &str, expr: &Expr, loc: Option<BridgeLocation>, file: &Path) {
+    fn push_dynamic(
+        &mut self,
+        lines: &LineIndex,
+        expr: &Expr,
+        loc: Option<BridgeLocation>,
+        file: &Path,
+    ) {
         // 비문자열 리터럴 인자(`query!(1)`)는 SQL 근거가 될 수 없다 — 모든
         // 경로를 계수하는 계약에서 유일하게 "근거 없음"으로 버리는 예외다.
         if let Expr::Lit(el) = expr {
@@ -1183,11 +1247,11 @@ impl SchemaScan {
                 return;
             }
         }
-        let Some(loc) = loc.or_else(|| self.locate(src, expr.span(), file)) else {
+        let Some(loc) = loc.or_else(|| self.locate(lines, expr.span(), file)) else {
             self.unlocated += 1;
             return;
         };
-        let text = expr_text(src, expr);
+        let text = expr_text(lines, expr);
         self.push_dynamic_str(&text, loc);
     }
 
@@ -1240,13 +1304,15 @@ impl SchemaScan {
 
     /// 토큰 span을 프로젝트 상대의 계약 위치로 바꾼다.
     /// proc-macro2의 열은 문자 수라 그 줄의 UTF-8 바이트 열로 환산한다.
-    fn locate(&self, src: &str, span: Span, file: &Path) -> Option<BridgeLocation> {
+    fn locate(&self, lines: &LineIndex, span: Span, file: &Path) -> Option<BridgeLocation> {
+        #[cfg(test)]
+        self.located.set(self.located.get() + 1);
         let start = span.start();
         if start.line == 0 {
             return None;
         }
         let rel = file.strip_prefix(&self.root).ok()?;
-        let line_text = src.lines().nth(start.line - 1)?;
+        let line_text = lines.line(start.line)?;
         Some(BridgeLocation {
             path: rel.to_string_lossy().replace('\\', "/"),
             line: start.line as u32,
@@ -1376,31 +1442,23 @@ fn is_channel_control(c: char) -> bool {
 /// 표현식의 원문을 span 범위로 잘라낸다 — 토큰 재조합보다 소스 그대로가
 /// 진단 단서로 정확하다. 줄 오프셋은 실제 바이트로 계산해 CRLF에서도
 /// 어긋나지 않는다.
-fn expr_text(src: &str, expr: &Expr) -> String {
+fn expr_text(lines: &LineIndex, expr: &Expr) -> String {
     let span = expr.span();
     let (s, e) = (span.start(), span.end());
     if s.line == 0 || e.line == 0 {
         return "<dynamic expression>".to_string();
     }
-    let mut starts = vec![0usize];
-    for (i, b) in src.bytes().enumerate() {
-        if b == b'\n' {
-            starts.push(i + 1);
-        }
-    }
-    // proc-macro2 열은 문자 수다 — 바이트로 더하면 앞에 한글이 있는 줄에서 식
-    // 앞 글자로 밀린다. 줄 시작부터 그만큼의 문자를 바이트로 센다.
-    let get = |line: usize, col: usize| -> usize {
-        let start = starts.get(line - 1).copied().unwrap_or(src.len());
-        start
-            + src[start..]
-                .chars()
-                .take(col)
-                .map(char::len_utf8)
-                .sum::<usize>()
-    };
-    let (a, b) = (get(s.line, s.column), get(e.line, e.column));
-    src.get(a..b).unwrap_or("<dynamic expression>").to_string()
+    // 파일의 줄 색인을 재사용한다 — 사실마다 줄 시작을 다시 세지 않는다. proc-macro2
+    // 열은 문자 수라 색인이 바이트로 바꾼다.
+    let (a, b) = (
+        lines.offset(s.line, s.column),
+        lines.offset(e.line, e.column),
+    );
+    lines
+        .src
+        .get(a..b)
+        .unwrap_or("<dynamic expression>")
+        .to_string()
 }
 
 /// 문자열이 SQL로 보이는지 본다 — 강한 동사가 없고 문장 머리가
@@ -2312,6 +2370,89 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(20_000), (2024, 10, 4));
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
+    }
+
+    /// 원문 하나를 가짜 루트 아래 파일로 스캔한다 — 디스크를 읽지 않는다.
+    fn scan_source(src: &str) -> SchemaScan {
+        let root = PathBuf::from("/nonexistent-root");
+        let file = root.join("src/lib.rs");
+        let ast = syn::parse_file(src).expect("test source parses");
+        let mut scan = SchemaScan {
+            root,
+            ..Default::default()
+        };
+        scan_file(&mut scan, &file, src, &ast);
+        scan
+    }
+
+    /// 위치는 SQL로 판정된 리터럴에만 구한다 — 문서 주석·산문 리터럴마다 줄을 찾으면
+    /// 문서 주석이 수만 줄인 생성 파일에서 비용이 리터럴 × 줄로 커진다.
+    #[test]
+    fn only_sql_literals_are_located() {
+        let mut src: String = (0..50)
+            .map(|i| format!("/// 문서 {i}\npub const C{i}: &str = \"value {i}\";\n"))
+            .collect();
+        src.push_str("pub fn f() -> String { format!(\"not sql {}\", 1) }\n");
+        src.push_str("pub const Q: &str = \"SELECT * FROM t\";\n");
+        let scan = scan_source(&src);
+        let channels: Vec<&str> = scan.list.iter().map(|f| f.channel.as_str()).collect();
+        assert_eq!(channels, ["t"]);
+        assert_eq!(scan.located.get(), 1, "prose literals must not be located");
+    }
+
+    /// CRLF·멀티바이트 줄·개행 없는 마지막 줄에서도 위치(줄·열)가 LF 원문과 같다 —
+    /// 줄 색인이 `str::lines`의 `\r` 규칙을 지킨다.
+    #[test]
+    fn crlf_sources_locate_like_lf() {
+        let lf = "/// 설명\npub const A: &str = \"SELECT * FROM a_t\";\n\
+                  pub fn f() { let 이름 = 1; let _s = \"SELECT * FROM b_t\"; let _ = 이름; }\n\
+                  pub const Z: &str = \"DELETE FROM {} WHERE 😀 = 1\";";
+        let crlf = lf.replace('\n', "\r\n");
+        let at = |src: &str| -> Vec<(String, u32, u32)> {
+            scan_source(src)
+                .list
+                .iter()
+                .map(|f| (f.channel.clone(), f.location.line, f.location.column))
+                .collect()
+        };
+        let want = at(lf);
+        assert_eq!(
+            want.iter().map(|w| w.1).collect::<Vec<_>>(),
+            [2, 3, 4],
+            "{want:?}"
+        );
+        assert_eq!(at(&crlf), want);
+    }
+
+    /// 줄 색인은 바꾸기 전의 `str::lines().nth()`와 같은 줄을 돌려준다 — CRLF, 개행
+    /// 없는 마지막 줄, 끝의 빈 줄, 맨 끝 `\r`, 멀티바이트 줄. 오프셋은 문자 열을 바이트로
+    /// 센 자리이고, 없는 줄은 원문 끝이다.
+    #[test]
+    fn line_index_matches_str_lines() {
+        let sources = [
+            "",
+            "\n",
+            "a",
+            "a\n",
+            "a\r\nb\r\n",
+            "a\r\nb",
+            "a\n\n",
+            "a\r",
+            "x\r\r\n",
+            "\r\n\r\n",
+            "한글 줄\n😀\r\nend",
+        ];
+        for src in sources {
+            let ix = LineIndex::new(src);
+            for line in 0..src.lines().count() + 3 {
+                let want = line.checked_sub(1).and_then(|i| src.lines().nth(i));
+                assert_eq!(ix.line(line), want, "{src:?} line {line}");
+            }
+        }
+        let ix = LineIndex::new("한글 줄\n😀x");
+        assert_eq!(ix.offset(1, 3), "한글 ".len());
+        assert_eq!(ix.offset(2, 1), "한글 줄\n😀".len());
+        assert_eq!(ix.offset(9, 0), "한글 줄\n😀x".len());
     }
 
     /// 계약 시각은 밀리초 세 자리 `YYYY-MM-DDTHH:mm:ss.SSSZ`다 — 밀리초는 버림이라
