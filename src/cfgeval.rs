@@ -361,6 +361,12 @@ fn env_of(tok: &str) -> Option<(&'static str, Option<&'static str>, bool)> {
     })
 }
 
+/// 술어 중첩(`all`/`any`/`not` 괄호) 상한. pred가 중첩마다 재귀해 스택 프레임을
+/// 쓰므로, `not(`가 수만 번 겹친 조작 문서(--graph) 하나로 스레드 스택을 넘겨
+/// 프로세스가 abort했다(종료 코드 134). 실제 cfg는 몇 단계를 넘지 않는다. 넘으면
+/// 문법 오류와 같이 미지(None → keep)다 — 지우는 쪽으로 틀리면 오삭제다.
+const MAX_CFG_DEPTH: usize = 128;
+
 /// cfg 조건 문자열을 팩트로 평가한다.
 /// `Some(false)`는 "이 팩트에서 확실히 거짓" — 지워도 안전한 유일한 결과다.
 /// `Some(true)`는 확실히 참. `None`은 판정 불가(feature·미지의 키·
@@ -368,7 +374,7 @@ fn env_of(tok: &str) -> Option<(&'static str, Option<&'static str>, bool)> {
 /// 진짜 조건을 거짓으로 오판할 수 있다.
 pub fn eval(cond: &str, facts: &Facts) -> Option<bool> {
     let toks = lex(cond)?;
-    let (v, rest) = pred(&toks, facts)?;
+    let (v, rest) = pred(&toks, facts, 0)?;
     // 파싱이 안 끝나면 조건을 다 못 읽은 것 — 폐쇄적으로 판정 불가.
     rest.is_empty().then_some(v).flatten()
 }
@@ -482,8 +488,12 @@ fn lex(src: &str) -> Option<Vec<Tok>> {
     Some(out)
 }
 
-/// 술어 하나를 파싱·평가한다 — (결과, 남은 토큰).
-fn pred<'a>(toks: &'a [Tok], facts: &Facts) -> Option<(Option<bool>, &'a [Tok])> {
+/// 술어 하나를 파싱·평가한다 — (결과, 남은 토큰). depth는 이 술어를 감싼 괄호 수다.
+/// 상한을 넘으면 문법 오류와 같은 None이다(MAX_CFG_DEPTH 참고).
+fn pred<'a>(toks: &'a [Tok], facts: &Facts, depth: usize) -> Option<(Option<bool>, &'a [Tok])> {
+    if depth > MAX_CFG_DEPTH {
+        return None;
+    }
     let (Tok::Ident(name), rest) = toks.split_first()? else {
         return None;
     };
@@ -507,7 +517,7 @@ fn pred<'a>(toks: &'a [Tok], facts: &Facts) -> Option<(Option<bool>, &'a [Tok])>
                     break;
                 }
                 _ => {
-                    let (v, r) = pred(rest, facts)?;
+                    let (v, r) = pred(rest, facts, depth + 1)?;
                     vals.push(v);
                     rest = match r.split_first() {
                         Some((Tok::Comma, r)) => r,
@@ -809,5 +819,24 @@ mod tests {
         // 숫자 시작 토큰은 cfg 식별자가 아니다.
         assert_eq!(eval("123", &macos()), None);
         assert_eq!(eval("all(123 , unix)", &macos()), None);
+    }
+
+    /// pred는 괄호 중첩마다 재귀한다 — `not(`가 수만 번 겹친 저장 문서(--graph)의 cfg
+    /// 하나로 `--exclude-tests`·`--target` 평가가 스레드 스택을 넘겨 abort했다. 상한까지는
+    /// 지금처럼 평가하고, 넘으면 문법 오류처럼 미지(keep)로 닫는다.
+    #[test]
+    fn nesting_beyond_the_limit_is_unknown() {
+        let f = Facts::test_off();
+        let nested = |depth: usize| format!("{}test{}", "not(".repeat(depth), ")".repeat(depth));
+        // test_off에서 test는 거짓 — not을 홀수 번 감싸면 참, 짝수 번이면 거짓이다.
+        let odd = |depth: usize| Some(depth % 2 == 1);
+        assert_eq!(eval(&nested(MAX_CFG_DEPTH - 1), &f), odd(MAX_CFG_DEPTH - 1));
+        assert_eq!(eval(&nested(MAX_CFG_DEPTH), &f), odd(MAX_CFG_DEPTH));
+        assert_eq!(eval(&nested(MAX_CFG_DEPTH + 1), &f), None);
+        // 상한은 중첩 깊이다 — 얕고 넓은 술어는 길이와 무관하게 평가된다.
+        let wide = format!("any({} , true)", vec!["test"; 1_000].join(" , "));
+        assert_eq!(eval(&wide, &f), Some(true));
+        // 10만 단계도 스택을 넘기지 않고 미지로 끝난다.
+        assert_eq!(eval(&nested(100_000), &f), None);
     }
 }

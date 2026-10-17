@@ -92,6 +92,19 @@ awk -v n=100000 'BEGIN {
 	print "]}"
 }' > "$FIX/ring.json"
 check 1 "cycles deep ring"  cycles --level symbol --strict --graph "$FIX/ring.json"
+# cfg 평가기도 괄호 중첩마다 재귀했다 — not( 10만 겹 cfg 하나로 --exclude-tests가
+# abort(134)했다. 상한을 넘는 조건은 문법 오류처럼 미지라 정점이 남는다 — 루트에서
+# 안 닿는 정점이 남으니 dead --strict는 1이다(지워졌다면 0).
+awk -v n=100000 'BEGIN {
+	printf "{\"version\":1,\"tool\":\"rustograph\",\"level\":\"symbol\",\"root\":\".\",\"roots\":[\"c::root\"],\"vertices\":["
+	printf "{\"id\":\"c::root\",\"kind\":\"fn\",\"crate\":\"c\",\"module\":\"c\"},"
+	printf "{\"id\":\"c::kept\",\"kind\":\"fn\",\"crate\":\"c\",\"module\":\"c\",\"cfg\":\""
+	for (i = 0; i < n; i++) printf "not("
+	printf "test"
+	for (i = 0; i < n; i++) printf ")"
+	print "\"}],\"edges\":[]}"
+}' > "$FIX/deep-cfg.json"
+check 1 "dead deep cfg"     dead --strict --exclude-tests --graph "$FIX/deep-cfg.json"
 
 # rules baseline — 얼리기와 억눌림 계약. app이 core를 참조하지 못하게
 # 거꾸로 선 룰셋으로 위반을 만든다.
