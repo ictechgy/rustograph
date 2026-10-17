@@ -65,6 +65,10 @@ cargo build --release --features semantic
 rustograph graph --level symbol --semantic
 ```
 
+`--semantic` runs the analyzed workspace's build scripts and procedural
+macros — see [Security: trust boundary](#security-trust-boundary) before
+using it on code you do not trust.
+
 ## Usage
 
 ```bash
@@ -400,6 +404,36 @@ walked, and `dyn`/generic trait calls expand to workspace impl candidates
 vertices, edge kinds, `tentative`, `limitations` — is unchanged; only
 accuracy improves. Bodies the semantic engine cannot see (cfg-disabled,
 macro-generated) fall back to the syntactic path with measured counters.
+
+## Security: trust boundary
+
+rustograph parses source with syn, but harvesting a workspace (every analysis
+that does not load a saved graph with `--graph`) also runs the Rust toolchain.
+Analyzing an untrusted checkout can run programs that the checkout chooses:
+
+- rustograph runs `cargo metadata` (and, with `--target`, `rustc --print cfg`)
+  in the current directory. Cargo reads `.cargo/config.toml` from the current
+  directory and its parents, not from the `--dir` workspace, so running
+  rustograph inside a checkout lets that checkout's configuration — for
+  example `build.rustc-wrapper` or `build.rustc` — pick programs that run.
+  When `cargo` and `rustc` are rustup proxies, rustup also selects the
+  toolchain from a `rust-toolchain.toml` (or `rust-toolchain`) file found by
+  walking up from the current directory, and that file can name a custom
+  toolchain directory.
+- `--semantic` executes the analyzed code. rust-analyzer runs `cargo check` in
+  the analyzed workspace root, which builds and runs its build scripts
+  (`build.rs`) under that workspace's Cargo configuration, and then runs its
+  procedural macros to expand them — wherever you run rustograph from. Use
+  `--semantic` only on code you would build yourself.
+
+For untrusted repositories and pull requests from forks, run rustograph on an
+isolated runner or sandbox that holds no secrets, without `--semantic`, from a
+working directory outside the checkout (neither the checkout nor one of its
+subdirectories), and pass the checkout with `--dir`. The checkout's
+`.cargo/config.toml` and `rust-toolchain.toml` then do not apply to the
+toolchain commands rustograph runs; configuration in the working directory,
+its parents, and your Cargo home still does. rustograph does not sandbox these
+commands itself.
 
 ## License
 

@@ -52,6 +52,10 @@ cargo build --release --features semantic
 rustograph graph --level symbol --semantic
 ```
 
+`--semantic`은 분석 대상 워크스페이스의 빌드 스크립트와 proc 매크로를
+실행합니다 — 신뢰하지 않는 코드에 쓰기 전에 [보안: 신뢰 경계](#보안-신뢰-경계)를
+읽으세요.
+
 ## 사용
 
 ```bash
@@ -252,6 +256,33 @@ feature(`--features semantic` 빌드 후 `--semantic`)는 rust-analyzer
 추정 간선). 그래프 계약은 그대로이고 정확도만 올라갑니다 — 의미 해석이
 보지 못하는 본문(cfg 비활성·매크로 생성)은 syn 경로로 되돌아가고 그 수를
 셉니다.
+
+## 보안: 신뢰 경계
+
+rustograph는 소스를 syn으로 파싱하지만, 워크스페이스를 수확할 때(`--graph`로
+저장 그래프를 읽지 않는 모든 분석) Rust 툴체인도 실행합니다. 신뢰할 수 없는
+체크아웃을 분석하면 그 체크아웃이 고른 프로그램이 실행될 수 있습니다.
+
+- rustograph는 `cargo metadata`를(`--target`이면 `rustc --print cfg`도) 현재
+  디렉터리에서 실행합니다. Cargo는 `--dir` 워크스페이스가 아니라 현재
+  디렉터리와 그 부모의 `.cargo/config.toml`을 읽으므로, 체크아웃 안에서
+  실행하면 그 체크아웃의 설정(예: `build.rustc-wrapper`, `build.rustc`)이 고른
+  프로그램이 실행됩니다. `cargo`와 `rustc`가 rustup 프록시이면 rustup도 현재
+  디렉터리에서 위로 올라가며 찾은 `rust-toolchain.toml`(또는 `rust-toolchain`)
+  파일로 툴체인을 고르고, 이 파일은 사용자 지정 툴체인 디렉터리를 가리킬 수
+  있습니다.
+- `--semantic`은 분석 대상 코드를 실행합니다. rust-analyzer가 분석 대상
+  워크스페이스 루트에서 `cargo check`를 실행해, 그 워크스페이스의 Cargo 설정
+  아래에서 빌드 스크립트(`build.rs`)를 빌드·실행하고, 매크로를 펼치려고 proc
+  매크로를 실행합니다. rustograph를 어느 디렉터리에서 실행하든 같습니다.
+  `--semantic`은 직접 빌드해도 되는 코드에만 쓰세요.
+
+신뢰할 수 없는 저장소나 포크 PR은 비밀이 없는 격리 러너나 샌드박스에서
+`--semantic` 없이, 체크아웃 밖(체크아웃 자신도 그 하위 디렉터리도 아닌 곳)의
+작업 디렉터리에서 `--dir`로 체크아웃을 넘겨 분석하세요. 그러면 rustograph가
+실행하는 툴체인 명령에 체크아웃의 `.cargo/config.toml`과 `rust-toolchain.toml`이
+적용되지 않습니다. 작업 디렉터리와 그 부모, Cargo 홈의 설정은 여전히
+적용됩니다. rustograph가 이 명령들을 직접 격리하지는 않습니다.
 
 ## 라이선스
 
