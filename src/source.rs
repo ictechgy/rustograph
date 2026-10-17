@@ -583,6 +583,7 @@ fn harvest(
             tree.orphan_files.len()
         ));
     }
+    push_skipped_mods(&tree.skipped_mods, &mut limitations);
 
     // 스코프 2단계: 전 모듈의 아이템 표를 먼저 채우고(1단계), 그 다음
     // `use`를 해석한다(2단계). 임포트 해석이 다른 모듈의 아이템 표를 필요로
@@ -1159,6 +1160,37 @@ fn file_has_marker(file: &Path) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+/// 정점 없이 건너뛴 `mod` 선언을 사유별 limitation 문장으로 옮긴다 — 셀 것이 없는
+/// 사유는 조용하다. 순환 선언을 오류(2)로 만들지 않는 것은 cfg로 막혀 rustc가 받는
+/// 크레이트가 있어서다.
+fn push_skipped_mods(
+    skipped: &BTreeMap<String, modtree::SkippedMod>,
+    limitations: &mut Vec<String>,
+) {
+    for (reason, why) in [
+        (
+            modtree::SkippedMod::Circular,
+            "they re-enter an ancestor module's file (circular modules)".to_string(),
+        ),
+        (
+            modtree::SkippedMod::NotRegularFile,
+            "their file is not a regular file (device, FIFO, or directory)".to_string(),
+        ),
+        (
+            modtree::SkippedMod::TooDeep,
+            format!(
+                "module nesting exceeds {} levels",
+                modtree::MAX_MODULE_DEPTH
+            ),
+        ),
+    ] {
+        let n = skipped.values().filter(|r| **r == reason).count();
+        if n > 0 {
+            limitations.push(format!("{n} mod declarations were skipped because {why}"));
+        }
+    }
 }
 
 /// 수확 실측을 limitation 문장으로 옮긴다.

@@ -735,3 +735,209 @@ pub fn nested_fn() { let _ = { fn go(helper: u32) -> u32 { helper } go(1) }; }
         .iter()
         .any(|e| e.from == "locals::S::me" && e.to == "locals"));
 }
+
+/// src 아래 파일들로 임시 크레이트(`pathcycle` 패키지)를 만든다 — 공유 fixture의 계수를
+/// 건드리지 않고 모듈 트리 모양 하나만 검증할 때 쓴다. 파일 이름의 디렉터리도 만든다.
+fn temp_crate(tag: &str, files: &[(String, String)]) -> PathBuf {
+    let tmp = std::env::temp_dir().join(format!("rg-modtree-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("src")).unwrap();
+    std::fs::write(
+        tmp.join("Cargo.toml"),
+        "[package]\nname = \"pathcycle\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    for (name, text) in files {
+        let path = tmp.join("src").join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    tmp
+}
+
+/// (이름, 내용) 쌍 목록을 소유 문자열로 바꾼다 — 표 테스트를 짧게 쓰기 위한 도우미.
+fn owned(files: &[(&str, &str)]) -> Vec<(String, String)> {
+    files
+        .iter()
+        .map(|(name, text)| (name.to_string(), text.to_string()))
+        .collect()
+}
+
+/// 실제 CLI 경로(`graph --level symbol`)로 임시 크레이트를 수확해 (모듈 정점 ID 정렬
+/// 목록, limitation 목록)을 돌려준다. 종료 코드가 0이 아니면 그 코드와 stderr로 실패한다.
+/// 크레이트 디렉터리는 지운다.
+fn graph_modules(dir: &std::path::Path) -> (Vec<String>, Vec<String>) {
+    let argv: Vec<String> = ["graph", "--level", "symbol", "--dir"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(std::iter::once(dir.display().to_string()))
+        .collect();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = rustograph::cli::run(&argv, &mut out, &mut err);
+    let _ = std::fs::remove_dir_all(dir);
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+    let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let mut modules: Vec<String> = doc["vertices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|v| matches!(v["kind"].as_str(), Some("crate" | "module")))
+        .map(|v| v["id"].as_str().unwrap().to_string())
+        .collect();
+    modules.sort();
+    // 셀 것이 없으면 키가 빠진다 — 빈 목록과 같다.
+    let limitations = doc["limitations"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .map(|l| l.as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    (modules, limitations)
+}
+
+/// 건너뛴 `mod` 선언을 세는 limitation 줄만 고른다.
+fn skipped_mod_lines(limitations: &[String]) -> Vec<&str> {
+    limitations
+        .iter()
+        .filter(|l| l.contains("mod declarations were skipped"))
+        .map(String::as_str)
+        .collect()
+}
+
+/// `#[path]`가 자기 파일이나 조상 모듈의 파일을 다시 싣는 선언(rustc의 circular modules)은
+/// 정점 없이 한 번 센다. 방문 집합이 모듈 경로 기준이라 같은 파일이 `m`, `m::m`, …으로
+/// 끝없이 늘었다(2줄 크레이트로 수 초에 RSS 수 GB). cfg로 막힌 변형은 rustc가 받으므로
+/// 오류(2)가 아니라 limitation이다. 인라인 조상의 파일도 조상 파일이다.
+#[test]
+fn circular_path_modules_are_skipped_and_counted() {
+    assert_one_circular(
+        "self",
+        &[(
+            "lib.rs",
+            "#[path = \"lib.rs\"]\npub mod m;\npub fn f() {}\n",
+        )],
+        &["pathcycle"],
+    );
+    assert_one_circular(
+        "cfg",
+        &[(
+            "lib.rs",
+            "#[cfg(feature = \"never-enabled\")]\n#[path = \"lib.rs\"]\npub mod again;\npub fn f() {}\n",
+        )],
+        &["pathcycle"],
+    );
+    assert_one_circular(
+        "mutual",
+        &[
+            ("lib.rs", "pub mod a;\npub fn f() {}\n"),
+            ("a.rs", "#[path = \"b.rs\"]\npub mod b;\npub fn in_a() {}\n"),
+            ("b.rs", "#[path = \"a.rs\"]\npub mod a;\npub fn in_b() {}\n"),
+        ],
+        &["pathcycle", "pathcycle::a", "pathcycle::a::b"],
+    );
+    assert_one_circular(
+        "inline",
+        &[
+            (
+                "lib.rs",
+                "pub mod outer {\n    #[path = \"../lib.rs\"]\n    pub mod back;\n}\npub fn f() {}\n",
+            ),
+            // `src/outer/../lib.rs`가 풀리려면 디렉터리가 있어야 한다(rustc도 같다).
+            ("outer/.keep", ""),
+        ],
+        &["pathcycle", "pathcycle::outer"],
+    );
+}
+
+/// 임시 크레이트가 종료 코드 0으로 모듈 정점 `want`와 순환 limitation 한 줄을 내는지 본다.
+fn assert_one_circular(tag: &str, files: &[(&str, &str)], want: &[&str]) {
+    let (modules, limitations) = graph_modules(&temp_crate(tag, &owned(files)));
+    assert_eq!(modules, want, "{tag}");
+    assert_eq!(
+        skipped_mod_lines(&limitations),
+        ["1 mod declarations were skipped because they re-enter an ancestor module's file (circular modules)"],
+        "{tag}"
+    );
+}
+
+/// 정규 파일이 아닌 모듈 대상(FIFO, `/dev/zero`, 디렉터리)은 읽지 않고 센다 — FIFO는 여는
+/// 순간 쓰는 쪽을 영원히 기다리고 `/dev/zero`는 1초에 수 GB를 읽는다. cfg로 막혀 rustc가
+/// 읽지 않는 선언도 수확은 조건을 평가하지 않으니 같은 자리에서 걸러야 한다.
+#[cfg(unix)]
+#[test]
+fn non_regular_module_files_are_skipped_and_counted() {
+    let lib = "#[cfg(feature = \"never-enabled\")]\n#[path = \"pipe.rs\"]\nmod pipe;\n\
+               #[cfg(feature = \"never-enabled\")]\n#[path = \"/dev/zero\"]\nmod zero;\n\
+               #[cfg(feature = \"never-enabled\")]\n#[path = \"folder\"]\nmod folder;\n\
+               pub fn f() {}\n";
+    let dir = temp_crate("special", &owned(&[("lib.rs", lib), ("folder/.keep", "")]));
+    let status = std::process::Command::new("mkfifo")
+        .arg(dir.join("src/pipe.rs"))
+        .status()
+        .expect("mkfifo must run");
+    assert!(status.success());
+    let (modules, limitations) = graph_modules(&dir);
+    assert_eq!(modules, ["pathcycle"]);
+    assert_eq!(
+        skipped_mod_lines(&limitations),
+        ["3 mod declarations were skipped because their file is not a regular file (device, FIFO, or directory)"]
+    );
+}
+
+/// 순환이 아니어도 모듈 중첩은 `MAX_MODULE_DEPTH`에서 멈추고 넘는 선언을 센다 — 조상
+/// 파일 검사를 비껴가는 입력에도 트리 확장이 끝나게 하는 보조 상한이다. 서로 다른 정규
+/// 파일 600개가 차례로 다음 파일을 싣는다.
+#[test]
+fn module_nesting_beyond_the_depth_cap_is_counted() {
+    let cap = rustograph::modtree::MAX_MODULE_DEPTH;
+    let files: Vec<(String, String)> = (0..cap + 88)
+        .map(|i| {
+            let name = if i == 0 {
+                "lib.rs".to_string()
+            } else {
+                format!("f{i}.rs")
+            };
+            let next = i + 1;
+            (
+                name,
+                format!("#[path = \"f{next}.rs\"]\npub mod m;\npub fn g{i}() {{}}\n"),
+            )
+        })
+        .collect();
+    let (modules, limitations) = graph_modules(&temp_crate("deep", &files));
+    assert_eq!(modules.len(), cap);
+    let deepest = format!("pathcycle{}", "::m".repeat(cap - 1));
+    assert!(modules.contains(&deepest));
+    assert_eq!(
+        skipped_mod_lines(&limitations),
+        [
+            format!("1 mod declarations were skipped because module nesting exceeds {cap} levels")
+                .as_str()
+        ]
+    );
+}
+
+/// 같은 파일을 서로 다른(조상이 아닌) 모듈이 싣는 `#[path]`와 인라인·디렉터리 `#[path]`는
+/// 그대로 정점이다 — 조상 파일만 순환이다. 셀 것이 없으니 limitation도 조용하다.
+#[test]
+fn path_attribute_fixture_modules_are_kept() {
+    let d = doc(&Default::default());
+    let ids = d.vertex_ids();
+    for id in [
+        "fixture_core::gen",
+        "fixture_core::shared",
+        "fixture_core::nest::inner::leaf",
+        "fixture_core::outer_a::duplex",
+        "fixture_core::outer_b::inner",
+        "fixture_core::single::inner",
+        "fixture_core::single::pin::pin_leaf",
+        "fixture_core::single::pin::pin_plain",
+        "fixture_core::single::pmod::inline::leaf",
+    ] {
+        assert!(ids.contains(id), "missing module {id}");
+    }
+    assert_eq!(skipped_mod_lines(&d.limitations), Vec::<&str>::new());
+}
