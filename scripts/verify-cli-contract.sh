@@ -81,6 +81,18 @@ check 0 "graph exclude"     graph --exclude-tests
 check 2 "tests xor"         dead --tests --exclude-tests
 check 0 "graph target"      graph --target x86_64-pc-windows-msvc
 
+# 깊은 입력 — 재귀 Tarjan은 DFS 경로 길이만큼 스택을 써서 수만 정점 고리에서
+# 프로세스가 abort(134)했다. 계약 밖 종료 코드라 실제 바이너리로 본다 — 고리는
+# 순환 하나라 --strict는 1이다. --graph가 있으면 check()가 붙이는 --dir는 무시된다.
+awk -v n=100000 'BEGIN {
+	printf "{\"version\":1,\"tool\":\"rustograph\",\"level\":\"symbol\",\"root\":\".\",\"roots\":[\"r0\"],\"vertices\":["
+	for (i = 0; i < n; i++) printf "%s{\"id\":\"r%d\",\"kind\":\"fn\",\"crate\":\"r\",\"module\":\"r\"}", (i ? "," : ""), i
+	printf "],\"edges\":["
+	for (i = 0; i < n; i++) printf "%s{\"from\":\"r%d\",\"to\":\"r%d\",\"kind\":\"call\"}", (i ? "," : ""), i, (i + 1) % n
+	print "]}"
+}' > "$FIX/ring.json"
+check 1 "cycles deep ring"  cycles --level symbol --strict --graph "$FIX/ring.json"
+
 # rules baseline — 얼리기와 억눌림 계약. app이 core를 참조하지 못하게
 # 거꾸로 선 룰셋으로 위반을 만든다.
 cat > "$FIX/deny.yml" <<'EOF'

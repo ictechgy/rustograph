@@ -5,7 +5,7 @@
 
 use crate::graph::{Document, EdgeKind, Kind};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 /// 이웃 질의 한 건 — 정점과 그쪽으로의 간선 종류 전부.
 #[derive(Debug, Serialize)]
@@ -406,18 +406,150 @@ pub struct CycleEdge {
     pub kind: EdgeKind,
 }
 
-/// 의존 간선 중 확정분만의 outgoing 인접 목록 — 순환·규칙 검사용.
+/// 확정 의존 간선만 남긴 번호 그래프 — 순환 탐지가 ID 문자열 대신 번호로 돈다.
 /// tentative는 "이 중 하나일 수 있다"라는 추정이라 증거가 못 된다.
-fn firm_outgoing(doc: &Document) -> BTreeMap<&str, Vec<(&EdgeKind, &str)>> {
-    let mut map: BTreeMap<&str, Vec<(&EdgeKind, &str)>> = BTreeMap::new();
-    for e in &doc.edges {
-        if e.kind.is_dependency() && !e.tentative {
-            map.entry(e.from.as_str())
-                .or_default()
-                .push((&e.kind, e.to.as_str()));
+/// 번호 `0..roots`는 정렬된 정점 ID(Tarjan 시작점)이고, 그 뒤는 간선에만 나오는
+/// dangling 끝점이다. 저장 문서(`--graph`)에서 정점이 가리키는 dangling 끝점도
+/// 방문해 SCC 멤버로 내 왔다 — 그 출력을 지키려면 끝점에도 번호가 있어야 한다.
+struct FirmGraph<'a> {
+    /// 번호 → ID.
+    names: Vec<&'a str>,
+    /// Tarjan 시작점 수 — 앞쪽 번호가 정점이다.
+    roots: usize,
+    /// 번호 → 후속 번호. doc.edges 순서라 방문 순서가 입력만으로 정해진다.
+    successors: Vec<Vec<usize>>,
+}
+
+impl<'a> FirmGraph<'a> {
+    fn new(doc: &'a Document) -> FirmGraph<'a> {
+        let mut names: Vec<&str> = doc.vertex_ids().into_iter().collect();
+        let roots = names.len();
+        let mut numbers: HashMap<&str, usize> =
+            names.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        let mut pairs = Vec::new();
+        for e in doc
+            .edges
+            .iter()
+            .filter(|e| e.kind.is_dependency() && !e.tentative)
+        {
+            let from = number_of(&mut numbers, &mut names, &e.from);
+            let to = number_of(&mut numbers, &mut names, &e.to);
+            pairs.push((from, to));
+        }
+        let mut successors = vec![Vec::new(); names.len()];
+        for (from, to) in pairs {
+            successors[from].push(to);
+        }
+        FirmGraph {
+            names,
+            roots,
+            successors,
         }
     }
-    map
+}
+
+/// ID의 번호 — 처음 보는 ID(dangling 끝점)면 다음 번호를 준다.
+fn number_of<'a>(
+    numbers: &mut HashMap<&'a str, usize>,
+    names: &mut Vec<&'a str>,
+    id: &'a str,
+) -> usize {
+    *numbers.entry(id).or_insert_with(|| {
+        names.push(id);
+        names.len() - 1
+    })
+}
+
+/// 반복형 Tarjan의 상태 — 정점 번호로 색인한다.
+/// 재귀판은 DFS 경로 길이만큼 호출 스택을 써서, 수만 정점 고리나 긴 호출 사슬에서
+/// 스레드 스택을 넘겨 프로세스가 abort했다(종료 코드 134, MCP 서버 소멸). 그래서
+/// 호출 스택 대신 (정점, 다음 후속 위치) 프레임을 힙에 쌓는다. 시작점 순서(정렬된
+/// 정점 ID)와 후속 순서(doc.edges)가 재귀판과 같아 SCC와 그 안의 순서도 같다.
+struct Tarjan<'g> {
+    successors: &'g [Vec<usize>],
+    /// 방문 순번. `UNSEEN`이면 아직 안 봤다.
+    order: Vec<usize>,
+    /// DFS 부분 트리에서 Tarjan 스택 위 정점으로 닿는 가장 작은 순번.
+    low: Vec<usize>,
+    on_stack: Vec<bool>,
+    stack: Vec<usize>,
+    /// 다음에 매길 순번.
+    next: usize,
+    /// 완성된 SCC — 발견 순서, 멤버는 스택에서 꺼낸 순서.
+    found: Vec<Vec<usize>>,
+}
+
+impl Tarjan<'_> {
+    const UNSEEN: usize = usize::MAX;
+
+    /// 시작점마다 아직 안 본 것에서 DFS를 연다.
+    fn strongly_connected(firm: &FirmGraph) -> Vec<Vec<usize>> {
+        let n = firm.successors.len();
+        let mut state = Tarjan {
+            successors: &firm.successors,
+            order: vec![Self::UNSEEN; n],
+            low: vec![0; n],
+            on_stack: vec![false; n],
+            stack: Vec::new(),
+            next: 0,
+            found: Vec::new(),
+        };
+        for start in 0..firm.roots {
+            if state.order[start] == Self::UNSEEN {
+                state.visit(start);
+            }
+        }
+        state.found
+    }
+
+    /// start에서 닿는 끝점을 전부 방문한다 — 재귀 호출 하나가 프레임 하나다.
+    fn visit(&mut self, start: usize) {
+        self.enter(start);
+        let mut frames = vec![(start, 0usize)];
+        while let Some(frame) = frames.last_mut() {
+            let v = frame.0;
+            let Some(&w) = self.successors[v].get(frame.1) else {
+                frames.pop();
+                self.finish(v, frames.last().map(|parent| parent.0));
+                continue;
+            };
+            frame.1 += 1;
+            if self.order[w] == Self::UNSEEN {
+                self.enter(w);
+                frames.push((w, 0));
+            } else if self.on_stack[w] {
+                self.low[v] = self.low[v].min(self.order[w]);
+            }
+        }
+    }
+
+    /// 순번을 매기고 Tarjan 스택에 올린다.
+    fn enter(&mut self, v: usize) {
+        self.order[v] = self.next;
+        self.low[v] = self.next;
+        self.next += 1;
+        self.stack.push(v);
+        self.on_stack[v] = true;
+    }
+
+    /// v의 후속을 다 봤다 — 뿌리면 SCC를 꺼내고, 재귀판이 호출에서 돌아와 하던
+    /// 대로 부모의 low에 v의 low를 반영한다.
+    fn finish(&mut self, v: usize, parent: Option<usize>) {
+        if self.low[v] == self.order[v] {
+            let mut members = Vec::new();
+            while let Some(w) = self.stack.pop() {
+                self.on_stack[w] = false;
+                members.push(w);
+                if w == v {
+                    break;
+                }
+            }
+            self.found.push(members);
+        }
+        if let Some(p) = parent {
+            self.low[p] = self.low[p].min(self.low[v]);
+        }
+    }
 }
 
 /// 순환을 찾는다 — 확정 의존 간선만 따라간다(추정 간선은 제외하고 센다).
@@ -427,69 +559,11 @@ pub fn cycles(doc: &Document) -> CycleReport {
         .iter()
         .filter(|e| e.kind.is_dependency() && e.tentative)
         .count();
-    let out = firm_outgoing(doc);
-    let ids: Vec<&str> = doc.vertex_ids().into_iter().collect();
-    // Tarjan.
-    let mut index = 0usize;
-    let mut indices: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut low: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut on_stack: BTreeSet<&str> = BTreeSet::new();
-    let mut stack: Vec<&str> = Vec::new();
-    let mut sccs: Vec<Vec<String>> = Vec::new();
-
-    // Tarjan 상태 기계는 인자가 많다 — 구조체로 나누면 재귀가 더 읽기 어렵다.
-    #[allow(clippy::too_many_arguments)]
-    fn strongconnect<'a>(
-        v: &'a str,
-        out: &BTreeMap<&'a str, Vec<(&'a EdgeKind, &'a str)>>,
-        index: &mut usize,
-        indices: &mut BTreeMap<&'a str, usize>,
-        low: &mut BTreeMap<&'a str, usize>,
-        stack: &mut Vec<&'a str>,
-        on_stack: &mut BTreeSet<&'a str>,
-        sccs: &mut Vec<Vec<String>>,
-    ) {
-        indices.insert(v, *index);
-        low.insert(v, *index);
-        *index += 1;
-        stack.push(v);
-        on_stack.insert(v);
-        if let Some(succs) = out.get(v) {
-            for (_, w) in succs {
-                if !indices.contains_key(w) {
-                    strongconnect(w, out, index, indices, low, stack, on_stack, sccs);
-                    low.insert(v, low[v].min(low[w]));
-                } else if on_stack.contains(w) {
-                    low.insert(v, low[v].min(indices[w]));
-                }
-            }
-        }
-        if low[v] == indices[v] {
-            let mut scc = Vec::new();
-            while let Some(w) = stack.pop() {
-                on_stack.remove(w);
-                scc.push(w.to_string());
-                if w == v {
-                    break;
-                }
-            }
-            sccs.push(scc);
-        }
-    }
-    for id in &ids {
-        if !indices.contains_key(id) {
-            strongconnect(
-                id,
-                &out,
-                &mut index,
-                &mut indices,
-                &mut low,
-                &mut stack,
-                &mut on_stack,
-                &mut sccs,
-            );
-        }
-    }
+    let firm = FirmGraph::new(doc);
+    let sccs: Vec<Vec<String>> = Tarjan::strongly_connected(&firm)
+        .into_iter()
+        .map(|scc| scc.into_iter().map(|m| firm.names[m].to_string()).collect())
+        .collect();
     let mut result = Vec::new();
     for scc in sccs {
         let is_cycle = scc.len() > 1
@@ -751,6 +825,180 @@ mod tests {
         assert_eq!(rep.cycles.len(), 1);
         assert!(rep.cycles[0].members.contains(&"c::a".to_string()));
         assert!(!rep.cycles[0].evidence.is_empty());
+    }
+
+    /// 재귀 Tarjan은 DFS 경로 길이만큼 호출 스택을 써서 수만 정점 고리·사슬에서
+    /// 스레드 스택을 넘기고 프로세스를 abort시켰다(종료 코드 134, MCP 서버 소멸).
+    /// 재귀판이 수천 단계도 못 버티는 작은 스택에서 고리 하나·사슬 순환 없음을 낸다.
+    #[test]
+    fn cycles_survive_deep_paths_on_a_small_stack() {
+        let n = 5_000;
+        let ids: Vec<String> = (0..n).map(|i| format!("c::f{i:05}")).collect();
+        let mut ring = doc();
+        ring.vertices = ids.iter().map(|id| v(id, Kind::Fn)).collect();
+        ring.edges = (0..n)
+            .map(|i| Edge::new(ids[i].clone(), ids[(i + 1) % n].clone(), EdgeKind::Call))
+            .collect();
+        let mut chain = ring.clone();
+        // 마지막 간선(끝 → 처음)을 빼면 같은 깊이의 비순환 사슬이다.
+        chain.edges.pop();
+        let (ring_rep, chain_rep) = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || (cycles(&ring), cycles(&chain)))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(ring_rep.cycles.len(), 1);
+        assert_eq!(ring_rep.cycles[0].members.len(), n);
+        assert_eq!(ring_rep.cycles[0].evidence.len(), n);
+        assert!(chain_rep.cycles.is_empty());
+    }
+
+    /// 결정적 의사 난수(LCG) — 무작위 비교 테스트가 실행마다 같은 그래프를 본다.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) as usize % n
+        }
+    }
+
+    /// (멤버, 증거 (from, to, kind)) 목록과 제외한 추정 간선 수 — 비교용 평탄 형태.
+    type FlatCycles = (Vec<(Vec<String>, Vec<(String, String, EdgeKind)>)>, usize);
+
+    fn flatten(rep: &CycleReport) -> FlatCycles {
+        let found = rep
+            .cycles
+            .iter()
+            .map(|c| {
+                let evidence = c
+                    .evidence
+                    .iter()
+                    .map(|e| (e.from.clone(), e.to.clone(), e.kind))
+                    .collect();
+                (c.members.clone(), evidence)
+            })
+            .collect();
+        (found, rep.excluded_tentative)
+    }
+
+    /// 정의 그대로의 순환 판정 — Tarjan과 독립인 오라클. 확정 의존 간선의 도달 집합이
+    /// 서로를 품는 끝점끼리 SCC다. 후보는 정점에서 닿는 끝점뿐이고(dangling 끝점 포함 —
+    /// 정점에서 안 닿는 dangling 순환은 보고하지 않는다), 증거는 doc.edges 순서를
+    /// (from,to)로 안정 정렬한다. 재작성 전 구현의 출력 계약이 이것이다.
+    fn cycles_by_reachability(d: &Document) -> FlatCycles {
+        let firm: Vec<&Edge> = d
+            .edges
+            .iter()
+            .filter(|e| e.kind.is_dependency() && !e.tentative)
+            .collect();
+        let reach = |start: &str| -> BTreeSet<String> {
+            let mut seen = BTreeSet::from([start.to_string()]);
+            let mut queue = vec![start.to_string()];
+            while let Some(cur) = queue.pop() {
+                for e in firm.iter().filter(|e| e.from == cur) {
+                    if seen.insert(e.to.clone()) {
+                        queue.push(e.to.clone());
+                    }
+                }
+            }
+            seen
+        };
+        let mut candidates = BTreeSet::new();
+        for id in d.vertex_ids() {
+            candidates.extend(reach(id));
+        }
+        let mut placed: BTreeSet<String> = BTreeSet::new();
+        let mut found = Vec::new();
+        for u in &candidates {
+            if placed.contains(u) {
+                continue;
+            }
+            let members: Vec<String> = reach(u)
+                .into_iter()
+                .filter(|w| reach(w).contains(u))
+                .collect();
+            placed.extend(members.iter().cloned());
+            let looped = firm.iter().any(|e| e.from == *u && e.to == *u);
+            if members.len() < 2 && !looped {
+                continue;
+            }
+            let mut evidence: Vec<(String, String, EdgeKind)> = firm
+                .iter()
+                .filter(|e| members.contains(&e.from) && members.contains(&e.to))
+                .map(|e| (e.from.clone(), e.to.clone(), e.kind))
+                .collect();
+            evidence.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+            found.push((members, evidence));
+        }
+        found.sort();
+        let excluded = d
+            .edges
+            .iter()
+            .filter(|e| e.kind.is_dependency() && e.tentative)
+            .count();
+        (found, excluded)
+    }
+
+    /// 정렬되지 않은 저장 문서(`--graph`)처럼 간선 순서·중복·자기 루프·추정 간선만의
+    /// 순환·contains·정점이 아닌 dangling 끝점·같은 ID의 cfg 변형을 섞은 무작위
+    /// 그래프에서 cycles가 오라클과 같은 보고서를 낸다.
+    #[test]
+    fn cycles_match_reachability_oracle_on_random_graphs() {
+        let kinds = [
+            EdgeKind::Call,
+            EdgeKind::References,
+            EdgeKind::Uses,
+            EdgeKind::Contains,
+            EdgeKind::Implements,
+            EdgeKind::Depends,
+            EdgeKind::Signature,
+        ];
+        let mut rng = Lcg(0x5eed);
+        // 비교가 공허하지 않은지 — 여러 정점 순환, 자기 루프 단독, dangling 멤버를 실제로 봤다.
+        let (mut multi, mut looped, mut dangling) = (0, 0, 0);
+        for _ in 0..3_000 {
+            let vertex_count = 1 + rng.below(6);
+            let names: Vec<String> = (0..vertex_count)
+                .map(|i| format!("c::v{i}"))
+                .chain(["x::g0".to_string(), "x::g1".to_string()])
+                .collect();
+            let mut d = doc();
+            d.vertices = names[..vertex_count]
+                .iter()
+                .rev()
+                .map(|id| v(id, Kind::Fn))
+                .collect();
+            if rng.below(4) == 0 {
+                d.vertices.push(v(&names[0], Kind::Fn));
+            }
+            d.edges = (0..rng.below(14))
+                .map(|_| {
+                    let from = names[rng.below(names.len())].clone();
+                    let to = names[rng.below(names.len())].clone();
+                    let mut e = Edge::new(from, to, kinds[rng.below(kinds.len())]);
+                    e.tentative = rng.below(4) == 0;
+                    e
+                })
+                .collect();
+            let rep = cycles(&d);
+            assert_eq!(
+                flatten(&rep),
+                cycles_by_reachability(&d),
+                "edges: {:?}",
+                d.edges
+            );
+            for c in &rep.cycles {
+                multi += usize::from(c.members.len() > 1);
+                looped += usize::from(c.members.len() == 1);
+                dangling += usize::from(c.members.iter().any(|m| m.starts_with("x::")));
+            }
+        }
+        assert!(multi > 100 && looped > 100 && dangling > 100);
     }
 
     #[test]
