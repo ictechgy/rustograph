@@ -2067,20 +2067,21 @@ pub fn rfc3339_utc_now() -> String {
     rfc3339_utc(std::time::SystemTime::now())
 }
 
-/// SystemTime을 RFC 3339 UTC 문자열로 변환한다.
+/// SystemTime을 RFC 3339 UTC 문자열로 변환한다 — GRAPH-EXCHANGE가 정한 밀리초 세
+/// 자리(`YYYY-MM-DDTHH:mm:ss.SSSZ`)다. 초 단위로 내면 같은 초 안에 만든 문서의 순서를
+/// 시각 문자열로 가를 수 없다. 밀리초 아래는 버린다(반올림하면 초가 올라갈 수 있다).
 fn rfc3339_utc(t: std::time::SystemTime) -> String {
-    let secs = t
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let since_epoch = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let secs = since_epoch.as_secs() as i64;
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
     format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
         rem / 3600,
         rem % 3600 / 60,
-        rem % 60
+        rem % 60,
+        since_epoch.subsec_millis()
     )
 }
 
@@ -2311,6 +2312,19 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(20_000), (2024, 10, 4));
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
+    }
+
+    /// 계약 시각은 밀리초 세 자리 `YYYY-MM-DDTHH:mm:ss.SSSZ`다 — 밀리초는 버림이라
+    /// 초가 올라가지 않는다.
+    #[test]
+    fn timestamps_carry_three_millisecond_digits() {
+        let at = |secs: u64, nanos: u32| {
+            rfc3339_utc(std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos))
+        };
+        assert_eq!(at(0, 0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(at(1_727_654_400, 123_456_789), "2024-09-30T00:00:00.123Z");
+        assert_eq!(at(86_399, 999_999_999), "1970-01-01T23:59:59.999Z");
+        assert_eq!(at(1_790_000_000, 7_000_000), "2026-09-21T14:13:20.007Z");
     }
 
     #[test]

@@ -41,7 +41,28 @@ fn document_carries_persistence_contract() {
         d["project"],
         fixture().canonicalize().unwrap().display().to_string()
     );
-    assert!(d["generatedAt"].as_str().is_some_and(|s| s.ends_with('Z')));
+    // 두 시각 모두 계약 문법(UTC, 밀리초 세 자리)으로 정규화한다.
+    for key in ["generatedAt", "sourceModifiedAt"] {
+        assert!(
+            d[key].as_str().is_some_and(is_contract_timestamp),
+            "{key}: {}",
+            d[key]
+        );
+    }
+}
+
+/// `YYYY-MM-DDTHH:mm:ss.SSSZ`(GRAPH-EXCHANGE가 정한 UTC 밀리초 세 자리) 모양인가.
+fn is_contract_timestamp(text: &str) -> bool {
+    let b = text.as_bytes();
+    b.len() == 24
+        && b.iter().enumerate().all(|(i, c)| match i {
+            4 | 7 => *c == b'-',
+            10 => *c == b'T',
+            13 | 16 => *c == b':',
+            19 => *c == b'.',
+            23 => *c == b'Z',
+            _ => c.is_ascii_digit(),
+        })
 }
 
 #[test]
