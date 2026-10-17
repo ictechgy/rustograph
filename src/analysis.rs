@@ -3,7 +3,7 @@
 //! 여기서도 판정은 보수적이다: unreachable은 "보존 루트에서 도달 불가"라는
 //! 그래프 사실이지 삭제 권고가 아니다.
 
-use crate::graph::{Document, EdgeKind, Kind};
+use crate::graph::{Document, Edge, EdgeKind, Kind};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
@@ -418,6 +418,10 @@ struct FirmGraph<'a> {
     roots: usize,
     /// 번호 → 후속 번호. doc.edges 순서라 방문 순서가 입력만으로 정해진다.
     successors: Vec<Vec<usize>>,
+    /// 확정 의존 간선을 doc.edges 순서로 — (from 번호, to 번호, 간선). 증거 분배용.
+    edges: Vec<(usize, usize, &'a Edge)>,
+    /// 번호 → 확정 의존 자기 루프가 있는가. 정점 하나짜리 SCC의 순환 여부다.
+    self_loop: Vec<bool>,
 }
 
 impl<'a> FirmGraph<'a> {
@@ -426,7 +430,7 @@ impl<'a> FirmGraph<'a> {
         let roots = names.len();
         let mut numbers: HashMap<&str, usize> =
             names.iter().enumerate().map(|(i, id)| (*id, i)).collect();
-        let mut pairs = Vec::new();
+        let mut edges = Vec::new();
         for e in doc
             .edges
             .iter()
@@ -434,16 +438,20 @@ impl<'a> FirmGraph<'a> {
         {
             let from = number_of(&mut numbers, &mut names, &e.from);
             let to = number_of(&mut numbers, &mut names, &e.to);
-            pairs.push((from, to));
+            edges.push((from, to, e));
         }
         let mut successors = vec![Vec::new(); names.len()];
-        for (from, to) in pairs {
+        let mut self_loop = vec![false; names.len()];
+        for &(from, to, _) in &edges {
             successors[from].push(to);
+            self_loop[from] |= from == to;
         }
         FirmGraph {
             names,
             roots,
             successors,
+            edges,
+            self_loop,
         }
     }
 }
@@ -552,6 +560,13 @@ impl Tarjan<'_> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 순환 판정·증거 수집이 살핀 간선 수 — SCC마다 전체 간선을 다시 훑지 않는지
+    /// 단위 테스트가 센다(테스트 스레드마다 따로).
+    static CLASSIFIED_EDGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// 순환을 찾는다 — 확정 의존 간선만 따라간다(추정 간선은 제외하고 센다).
 pub fn cycles(doc: &Document) -> CycleReport {
     let excluded = doc
@@ -560,45 +575,54 @@ pub fn cycles(doc: &Document) -> CycleReport {
         .filter(|e| e.kind.is_dependency() && e.tentative)
         .count();
     let firm = FirmGraph::new(doc);
-    let sccs: Vec<Vec<String>> = Tarjan::strongly_connected(&firm)
+    let cyclic: Vec<Vec<usize>> = Tarjan::strongly_connected(&firm)
         .into_iter()
-        .map(|scc| scc.into_iter().map(|m| firm.names[m].to_string()).collect())
+        // SCC는 비지 않는다 — 뿌리 자신이 들어 있다.
+        .filter(|scc| scc.len() > 1 || firm.self_loop[scc[0]])
         .collect();
-    let mut result = Vec::new();
-    for scc in sccs {
-        let is_cycle = scc.len() > 1
-            || doc.edges.iter().any(|e| {
-                e.kind.is_dependency() && !e.tentative && e.from == scc[0] && e.to == scc[0]
-            });
-        if !is_cycle {
-            continue;
-        }
-        let member_set: BTreeSet<&str> = scc.iter().map(|s| s.as_str()).collect();
-        let mut evidence: Vec<CycleEdge> = doc
-            .edges
-            .iter()
-            .filter(|e| {
-                e.kind.is_dependency()
-                    && !e.tentative
-                    && member_set.contains(e.from.as_str())
-                    && member_set.contains(e.to.as_str())
-            })
-            .map(|e| CycleEdge {
-                from: e.from.clone(),
-                to: e.to.clone(),
-                kind: e.kind,
-            })
-            .collect();
-        evidence.sort_by(|a, b| (&a.from, &a.to).cmp(&(&b.from, &b.to)));
-        let mut members = scc;
-        members.sort();
-        result.push(Cycle { members, evidence });
-    }
+    let evidence = cycle_evidence(&firm, &cyclic);
+    let mut result: Vec<Cycle> = cyclic
+        .into_iter()
+        .zip(evidence)
+        .map(|(scc, mut evidence)| {
+            // 안정 정렬 — 같은 (from,to)의 여러 종류는 doc.edges 순서를 지킨다.
+            evidence.sort_by(|a, b| (&a.from, &a.to).cmp(&(&b.from, &b.to)));
+            let mut members: Vec<String> =
+                scc.into_iter().map(|m| firm.names[m].to_string()).collect();
+            members.sort();
+            Cycle { members, evidence }
+        })
+        .collect();
     result.sort_by(|a, b| a.members.cmp(&b.members));
     CycleReport {
         cycles: result,
         excluded_tentative: excluded,
     }
+}
+
+/// 순환 SCC마다 증거 간선(양 끝이 같은 SCC인 확정 의존 간선)을 doc.edges 순서로
+/// 모은다. 확정 간선을 한 번만 돈다 — SCC마다 전체 간선을 다시 훑으면 비순환
+/// 그래프(SCC 수 = 정점 수)에서 O(V·E)라 합성 심볼 그래프 8만 정점에서 1분을 넘겼다.
+fn cycle_evidence(firm: &FirmGraph, cyclic: &[Vec<usize>]) -> Vec<Vec<CycleEdge>> {
+    let mut owner: Vec<Option<usize>> = vec![None; firm.names.len()];
+    for (k, scc) in cyclic.iter().enumerate() {
+        for &m in scc {
+            owner[m] = Some(k);
+        }
+    }
+    let mut evidence: Vec<Vec<CycleEdge>> = cyclic.iter().map(|_| Vec::new()).collect();
+    for &(from, to, e) in &firm.edges {
+        #[cfg(test)]
+        CLASSIFIED_EDGES.with(|c| c.set(c.get() + 1));
+        if let Some(k) = owner[from].filter(|&k| owner[to] == Some(k)) {
+            evidence[k].push(CycleEdge {
+                from: e.from.clone(),
+                to: e.to.clone(),
+                kind: e.kind,
+            });
+        }
+    }
+    evidence
 }
 
 /// dead 질의의 finding 하나.
@@ -852,6 +876,40 @@ mod tests {
         assert_eq!(ring_rep.cycles[0].members.len(), n);
         assert_eq!(ring_rep.cycles[0].evidence.len(), n);
         assert!(chain_rep.cycles.is_empty());
+    }
+
+    /// 순환 판정이 SCC마다 전체 간선을 다시 훑으면 비순환 그래프(SCC 수 = 정점 수)에서
+    /// O(V·E)다 — 합성 심볼 그래프 8만 정점에서 1분을 넘겼다. 판정·증거 수집이 간선을
+    /// 한 번씩만 살피는지 센다.
+    #[test]
+    fn cycle_classification_examines_each_edge_once() {
+        let n = 1_000;
+        let ids: Vec<String> = (0..n).map(|i| format!("c::f{i:04}")).collect();
+        let mut d = doc();
+        d.vertices = ids.iter().map(|id| v(id, Kind::Fn)).collect();
+        d.edges = (0..n)
+            .flat_map(|i| (i + 1..n.min(i + 4)).map(move |j| (i, j)))
+            .map(|(i, j)| Edge::new(ids[i].clone(), ids[j].clone(), EdgeKind::Call))
+            .collect();
+        // 여러 정점 순환 하나와 자기 루프 하나 — 판정이 실제로 일을 하게 한다.
+        d.edges
+            .push(Edge::new(ids[10].clone(), ids[0].clone(), EdgeKind::Call));
+        d.edges.push(Edge::new(
+            ids[500].clone(),
+            ids[500].clone(),
+            EdgeKind::Uses,
+        ));
+        let before = CLASSIFIED_EDGES.with(std::cell::Cell::get);
+        let rep = cycles(&d);
+        let visits = CLASSIFIED_EDGES.with(std::cell::Cell::get) - before;
+        assert_eq!(rep.cycles.len(), 2);
+        assert_eq!(rep.cycles[0].members.len(), 11);
+        assert_eq!(rep.cycles[1].members, ["c::f0500"]);
+        assert!(
+            visits <= d.edges.len(),
+            "{visits} edge visits for {} edges",
+            d.edges.len()
+        );
     }
 
     /// 결정적 의사 난수(LCG) — 무작위 비교 테스트가 실행마다 같은 그래프를 본다.
