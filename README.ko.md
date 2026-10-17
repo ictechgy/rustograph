@@ -94,8 +94,9 @@ rustograph impact --format language-traversal --roots-from schema-facts.json  # 
 `rustograph mcp`는 개행 구분 JSON-RPC 2.0을 stdio로 말하고 도구 9종
 (`rustograph_summary`/`_query`/`_impact`/`_paths`/`_search`/`_cycles`/
 `_dead`/`_rules`/`_deps`)을 서빙합니다. 문서는 기동 시 한 번 수확해
-(또는 `--graph`로 읽어) 같은 스냅샷 위에서 답합니다. 부분 ID는 후보
-목록과 함께 거절됩니다 — `rustograph_search`로 정확한 ID를 찾으세요.
+(또는 `--graph`로 읽어) 같은 스냅샷 위에서 답합니다. 단 `rustograph_deps`는
+`--graph`를 써도 첫 호출 때 `--dir` 워크스페이스를 따로 수확합니다. 부분 ID는
+후보 목록과 함께 거절됩니다 — `rustograph_search`로 정확한 ID를 찾으세요.
 
 `--semantic` 문서는 `.rustograph/semantic-cache.json`에 캐시됩니다 —
 워크스페이스 소스와 매니페스트 지문이 키라, 오래되거나 깨진 캐시는
@@ -259,18 +260,20 @@ feature(`--features semantic` 빌드 후 `--semantic`)는 rust-analyzer
 
 ## 보안: 신뢰 경계
 
-rustograph는 소스를 syn으로 파싱하지만, 워크스페이스를 수확할 때(`--graph`로
-저장 그래프를 읽지 않는 모든 분석) Rust 툴체인도 실행합니다. 신뢰할 수 없는
-체크아웃을 분석하면 그 체크아웃이 고른 프로그램이 실행될 수 있습니다.
+rustograph는 소스를 syn으로 파싱하지만 Rust 툴체인도 실행합니다. 워크스페이스
+수확(`--graph`로 저장 그래프를 읽지 않는 모든 분석)은 `cargo metadata`를
+실행합니다. `--graph`를 써도 `--target`이면 `rustc --print cfg`를 실행하고,
+MCP `rustograph_deps` 도구는 첫 호출 때 `--dir` 워크스페이스를 대상으로
+`cargo metadata`를 실행합니다. 신뢰할 수 없는 체크아웃을 분석하면 그
+체크아웃이 고른 프로그램이 실행될 수 있습니다.
 
-- rustograph는 `cargo metadata`를(`--target`이면 `rustc --print cfg`도) 현재
-  디렉터리에서 실행합니다. Cargo는 `--dir` 워크스페이스가 아니라 현재
-  디렉터리와 그 부모의 `.cargo/config.toml`을 읽으므로, 체크아웃 안에서
-  실행하면 그 체크아웃의 설정(예: `build.rustc-wrapper`, `build.rustc`)이 고른
-  프로그램이 실행됩니다. `cargo`와 `rustc`가 rustup 프록시이면 rustup도 현재
-  디렉터리에서 위로 올라가며 찾은 `rust-toolchain.toml`(또는 `rust-toolchain`)
-  파일로 툴체인을 고르고, 이 파일은 사용자 지정 툴체인 디렉터리를 가리킬 수
-  있습니다.
+- rustograph는 이 명령들을 현재 디렉터리에서 실행합니다. Cargo는 `--dir`
+  워크스페이스가 아니라 현재 디렉터리와 그 부모의 `.cargo/config.toml`을
+  읽으므로, 체크아웃 안에서 실행하면 그 체크아웃의 설정(예:
+  `build.rustc-wrapper`, `build.rustc`)이 고른 프로그램이 실행됩니다.
+  `cargo`와 `rustc`가 rustup 프록시이면 rustup도 현재 디렉터리에서 위로
+  올라가며 찾은 `rust-toolchain.toml`(또는 `rust-toolchain`) 파일로 툴체인을
+  고르고, 이 파일은 사용자 지정 툴체인 디렉터리를 가리킬 수 있습니다.
 - `--semantic`은 분석 대상 코드를 실행합니다. rust-analyzer가 분석 대상
   워크스페이스 루트에서 `cargo check`를 실행해, 그 워크스페이스의 Cargo 설정
   아래에서 빌드 스크립트(`build.rs`)를 빌드·실행하고, 매크로를 펼치려고 proc

@@ -170,8 +170,10 @@ nine tools — `rustograph_summary`, `rustograph_query`, `rustograph_impact`,
 `rustograph_paths`, `rustograph_search`, `rustograph_cycles`,
 `rustograph_dead`, `rustograph_rules`, `rustograph_deps`. The document is
 harvested once at startup (or loaded via `--graph`), so every call answers
-over the same snapshot. Partial ids are refused with a candidate list —
-call `rustograph_search` or retry with an exact id.
+over the same snapshot. `rustograph_deps` is the exception: it harvests the
+`--dir` workspace itself on its first call, even with `--graph`. Partial ids
+are refused with a candidate list — call `rustograph_search` or retry with an
+exact id.
 
 Semantic-mode documents are cached under `.rustograph/semantic-cache.json`,
 keyed by a fingerprint of workspace sources and manifests — a stale or
@@ -407,15 +409,18 @@ macro-generated) fall back to the syntactic path with measured counters.
 
 ## Security: trust boundary
 
-rustograph parses source with syn, but harvesting a workspace (every analysis
-that does not load a saved graph with `--graph`) also runs the Rust toolchain.
-Analyzing an untrusted checkout can run programs that the checkout chooses:
+rustograph parses source with syn, but it also runs the Rust toolchain.
+Harvesting a workspace — every analysis that does not load a saved graph with
+`--graph` — runs `cargo metadata`. Even with `--graph`, `--target` runs
+`rustc --print cfg`, and the MCP `rustograph_deps` tool runs `cargo metadata`
+for the `--dir` workspace on its first call. Analyzing an untrusted checkout
+can run programs that the checkout chooses:
 
-- rustograph runs `cargo metadata` (and, with `--target`, `rustc --print cfg`)
-  in the current directory. Cargo reads `.cargo/config.toml` from the current
-  directory and its parents, not from the `--dir` workspace, so running
-  rustograph inside a checkout lets that checkout's configuration — for
-  example `build.rustc-wrapper` or `build.rustc` — pick programs that run.
+- rustograph runs these commands in the current directory. Cargo reads
+  `.cargo/config.toml` from the current directory and its parents, not from
+  the `--dir` workspace, so running rustograph inside a checkout lets that
+  checkout's configuration — for example `build.rustc-wrapper` or
+  `build.rustc` — pick programs that run.
   When `cargo` and `rustc` are rustup proxies, rustup also selects the
   toolchain from a `rust-toolchain.toml` (or `rust-toolchain`) file found by
   walking up from the current directory, and that file can name a custom
