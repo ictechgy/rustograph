@@ -623,7 +623,10 @@ fn facts_without_usr_are_counted_as_missing() {
 
 /// `generatedAt`만 뺀 문서 — 같은 입력이면 바이트까지 같아야 하는 나머지(사실·
 /// limitation·`sourceModifiedAt`)로 두 실행을 맞댄다. `sourceModifiedAt`은 읽은
-/// 파일들의 최신 mtime이라 읽은 파일 집합이 달라지면 함께 달라진다.
+/// 파일들의 최신 mtime이라 읽은 파일 집합이 달라지면 함께 달라진다. 쓰는 테스트가
+/// 링크·FIFO를 만드는 unix 전용이라 도우미도 unix에서만 컴파일한다(Windows CI의
+/// `cargo test export::tests`도 이 파일을 컴파일한다 — 안 쓰는 함수 경고를 피한다).
+#[cfg(unix)]
 fn facts_without_generated_at(dir: &std::path::Path) -> serde_json::Value {
     let mut d = serde_json::to_value(schema::facts(dir, "test").expect("schema facts")).unwrap();
     d.as_object_mut().unwrap().remove("generatedAt");
