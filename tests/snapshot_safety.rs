@@ -338,3 +338,39 @@ fn staged_output_never_truncates_a_hardlinked_input() {
         assert_eq!(std::fs::read_to_string(alias).unwrap(), "original input");
     }
 }
+
+/// 정규 파일이 아닌 include! 대상은 열지 않고 해석 못 한 경로로 센다 — FIFO는 여는 순간
+/// 쓰는 쪽을 영원히 기다리고 `/dev/zero`는 끝없이 읽혀 `--out`의 입력 보호 수집이 끝나지
+/// 않았다. 기존 출력 교체는 보수적으로 거부하고(2) 새 경로에는 그대로 쓴다.
+#[cfg(unix)]
+#[test]
+fn special_include_targets_fail_closed_without_reading_them() {
+    let fixture = Fixture::new("special-include");
+    let status = Command::new("mkfifo")
+        .arg(fixture.0.join("pipe.inc"))
+        .status()
+        .expect("mkfifo must run");
+    assert!(status.success());
+    for target in ["../pipe.inc", "/dev/zero"] {
+        std::fs::write(
+            fixture.0.join("src/lib.rs"),
+            format!("include!(\"{target}\");\npub fn entry() {{}}\n"),
+        )
+        .unwrap();
+        let existing = fixture.0.join("report.json");
+        std::fs::write(&existing, "previous report").unwrap();
+        let output = fixture.run(&["graph"], &existing);
+        assert_eq!(output.status.code(), Some(2), "{target}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unresolved include paths"),
+            "{target}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "previous report"
+        );
+        let fresh = fixture.0.join("new-report.json");
+        assert!(fixture.run(&["graph"], &fresh).status.success(), "{target}");
+        std::fs::remove_file(fresh).unwrap();
+    }
+}

@@ -123,7 +123,10 @@ pub fn facts(dir: &Path, tool_version: &str) -> Result<BridgeFactsDocument, Stri
     scan.limitations.extend(meta.limitations.iter().cloned());
     let mut files: Vec<(PathBuf, String, syn::File)> = Vec::new();
     for file in workspace_rs_files(&meta) {
-        let Ok(src) = std::fs::read_to_string(&file) else {
+        // 순회가 정규 파일만 모으지만 읽기도 상한을 둔다 — 못 읽거나 너무 큰 파일은
+        // 지금처럼 unparsed로 센다.
+        let Ok(src) = crate::source::read_source_bounded(&file, crate::source::MAX_SOURCE_BYTES)
+        else {
             scan.unparsed += 1;
             continue;
         };

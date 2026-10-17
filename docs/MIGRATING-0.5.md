@@ -38,8 +38,9 @@ Unix also rejects hard-linked output files; on other platforms staged replacemen
 does not truncate the original inode referenced by another hard link. Parent directories are created when needed.
 
 Literal include inputs are protected even with non-Rust extensions. When a
-direct include macro computes an unresolved path, or an include is nested in
-other macro tokens, replacing an existing output
+direct include macro computes an unresolved path, an `include!` target is not a
+regular file of at most 64 MiB (a device or FIFO is never opened), or an include
+is nested in other macro tokens, replacing an existing output
 is rejected conservatively; use a fresh output path or stdout. This protection
 does not claim that the syntax-only graph expands include macros.
 

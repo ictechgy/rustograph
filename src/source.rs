@@ -40,6 +40,36 @@ pub struct Options {
 /// 'static으로 누수시킨다. CLI는 짧게 살다 종료하므로 해제 비용이 없다.
 type Arena = BTreeMap<PathBuf, &'static [syn::Item]>;
 
+/// 분석 대상이 경로를 고르는 소스를 읽을 때의 크기 상한이다. 생성 코드(수 MB)는 넉넉히
+/// 덮되, 상한 없는 읽기가 거대한 sparse 파일을 통째로 메모리에 올리지 않게 한다.
+/// 판단값이다(rustc의 문서화된 한도가 아니다).
+pub(crate) const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 분석 대상 소스를 `max_bytes`까지만 읽는다 — 정규 파일만 연다. `metadata`는 stat이라
+/// FIFO에서도 막히지 않는다. FIFO는 여는 순간 쓰는 쪽을 영원히 기다리고 장치
+/// (`/dev/zero`)는 끝없이 읽혀, 정규 파일인지 보지 않고 읽으면 수확이 끝나지 않는다.
+/// 정규 파일이 아니면 `InvalidInput`, 상한을 넘으면 `InvalidData` 오류다.
+pub(crate) fn read_source_bounded(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::Read;
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let mut text = String::new();
+    std::fs::File::open(path)?
+        .take(max_bytes.saturating_add(1))
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is larger than {max_bytes} bytes", path.display()),
+        ));
+    }
+    Ok(text)
+}
+
 /// `dir`의 cargo 워크스페이스를 수확해 문서를 만든다.
 /// 실패는 문자열 오류 — 빈 그래프로 성공한 척하지 않는다.
 /// semantic 모드에서 cache가 켜져 있으면 소스 지문이 같은 이전 수확
@@ -231,7 +261,9 @@ fn include_inputs(arena: &Arena, files: &mut BTreeSet<PathBuf>) -> bool {
         if !code || !visited.insert(file.clone()) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&file) else {
+        // 리터럴 경로는 분석 대상이 고른다 — 장치·FIFO·거대 파일도 될 수 있다. 못 읽으면
+        // 읽은 입력인 척하지 않고 기존 산출물 교체를 보수적으로 막는다(보호 등록은 위에서 끝났다).
+        let Ok(text) = read_source_bounded(&file, MAX_SOURCE_BYTES) else {
             unresolved = true;
             continue;
         };
@@ -1349,6 +1381,39 @@ mod tests {
         // 캐시 파일이 워크스페이스 안에 있어도 지문을 바꾸지 않는다 —
         // .rustograph는 숨김 디렉터리라 지문 걷기에서 빠진다.
         assert_eq!(k2, fingerprint(&tmp, &meta, &opts).unwrap());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 상한 읽기는 정규 파일만 열고 상한을 넘으면 거부한다 — FIFO·장치·디렉터리는 열지
+    /// 않으니 막히거나 끝없이 읽지 않는다. 상한까지는 그대로 읽는다.
+    #[cfg(unix)]
+    #[test]
+    fn bounded_source_reads_only_regular_files_within_the_limit() {
+        let tmp = std::env::temp_dir().join(format!("rustograph-bounded-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let fits = tmp.join("fits.rs");
+        std::fs::write(&fits, "fn a() {}").unwrap();
+        assert_eq!(read_source_bounded(&fits, 9).unwrap(), "fn a() {}");
+        let over = read_source_bounded(&fits, 8).unwrap_err();
+        assert_eq!(over.kind(), std::io::ErrorKind::InvalidData);
+        let fifo = tmp.join("pipe.rs");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must run");
+        assert!(made.success());
+        for special in [fifo.as_path(), Path::new("/dev/zero"), tmp.as_path()] {
+            let err = read_source_bounded(special, MAX_SOURCE_BYTES).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{}",
+                special.display()
+            );
+        }
+        let missing = read_source_bounded(&tmp.join("missing.rs"), MAX_SOURCE_BYTES).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
         std::fs::remove_dir_all(&tmp).ok();
     }
 }
