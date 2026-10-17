@@ -253,11 +253,11 @@ fn workspace_rs_files(meta: &cargo_meta::Metadata) -> Vec<PathBuf> {
             }
         }
     }
-    let mut out: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut state = RsWalk::within(&meta.workspace_root);
     for root in roots {
-        walk_rs(&root, &mut out);
+        walk_rs(&root, &mut state);
     }
-    out.into_iter().collect()
+    state.sources.into_iter().collect()
 }
 
 /// 타깃 소스의 조상 중 Cargo.toml을 가진 디렉터리가 패키지 루트다.
@@ -270,24 +270,107 @@ fn package_root(target_src: &Path) -> Option<PathBuf> {
     None
 }
 
-/// 디렉터리를 재귀로 훑어 .rs를 모은다 — `target`·숨김 디렉터리 제외.
-fn walk_rs(dir: &Path, out: &mut BTreeSet<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        let name = e.file_name();
-        let name = name.to_string_lossy();
-        if p.is_dir() {
-            if name != "target" && !name.starts_with('.') {
-                walk_rs(&p, out);
-            }
-        } else if p.extension().is_some_and(|x| x == "rs") {
-            if let Ok(c) = p.canonicalize() {
-                out.insert(c);
+/// .rs 순회 상태 — 링크 순환과 루트 밖 탈출을 끊는 데 필요한 것만 든다.
+///
+/// 링크를 따라가는 순회는 `src/a -> .`·`src/b -> .` 두 개만으로 단계마다 경로가 두 배가
+/// 되어 OS 링크 한도(macOS 32단계)까지 사실상 끝나지 않는다. 루트 밖 링크는 locate가
+/// 어차피 버릴 파일을 읽어 unlocated·unparsed·`sourceModifiedAt`만 흐린다. 그래서 링크는
+/// 대상이 워크스페이스 루트 안이고 처음 보는 디렉터리일 때만 따른다 — 루트 안 링크로만
+/// 닿는 공유 소스는 전처럼 사실의 출처다.
+struct RsWalk {
+    /// 정규화한 워크스페이스 루트 — 링크 대상이 이 아래여야 따른다.
+    boundary: PathBuf,
+    /// 이미 걸은 디렉터리(정규 경로) — 같은 디렉터리를 두 번 걷지 않는다.
+    seen_dirs: BTreeSet<PathBuf>,
+    /// 모은 .rs 파일(정규 경로).
+    sources: BTreeSet<PathBuf>,
+}
+
+impl RsWalk {
+    /// 워크스페이스 루트를 경계로 쓰는 빈 순회 상태다. 루트를 정규화하지 못하면 그대로
+    /// 쓴다 — 정규 경로인 링크 대상과 맞지 않아 링크를 덜 따를 뿐 더 따르지는 않는다.
+    fn within(workspace_root: &Path) -> RsWalk {
+        RsWalk {
+            boundary: workspace_root
+                .canonicalize()
+                .unwrap_or_else(|_| workspace_root.to_path_buf()),
+            seen_dirs: BTreeSet::new(),
+            sources: BTreeSet::new(),
+        }
+    }
+}
+
+/// 순회 항목 하나의 판정이다.
+enum RsEntry {
+    /// 걸을 디렉터리(정규 경로).
+    Dir(PathBuf),
+    /// 모을 .rs 정규 파일(정규 경로).
+    Source(PathBuf),
+    /// 건너뛸 항목 — .rs가 아닌 파일, 정규 파일이 아닌 항목, 끊기거나 루트 밖인 링크.
+    Skip,
+}
+
+/// 디렉터리를 명시 스택으로 훑어 .rs를 모은다 — `target`·숨김 디렉터리 제외.
+/// 디렉터리마다 한 번만 걷는다. 이름 규칙은 링크든 아니든 항목 이름에 건다(전과 같다).
+fn walk_rs(start: &Path, state: &mut RsWalk) {
+    let mut stack = vec![start.canonicalize().unwrap_or_else(|_| start.to_path_buf())];
+    while let Some(dir) = stack.pop() {
+        if !state.seen_dirs.insert(dir.clone()) {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            match rs_entry(&e, &state.boundary) {
+                RsEntry::Dir(next) => {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    if name != "target" && !name.starts_with('.') {
+                        stack.push(next);
+                    }
+                }
+                RsEntry::Source(file) => {
+                    state.sources.insert(file);
+                }
+                RsEntry::Skip => continue,
             }
         }
+    }
+}
+
+/// 항목의 종류를 `file_type`(링크를 따라가지 않는다)으로 판정한다 — fingerprint·
+/// scan_orphans와 같은 규칙이다. 링크만 대상을 정규화해, 그 대상이 `boundary` 안일 때
+/// 대상의 종류로 본다. 정규 파일이 아닌 .rs(FIFO·장치)는 모으지 않는다 — 읽으면 영원히
+/// 막히거나 끝없이 읽힌다. 종류를 못 읽은 항목은 읽는 사이 사라진 것이라 건너뛴다.
+fn rs_entry(e: &std::fs::DirEntry, boundary: &Path) -> RsEntry {
+    let path = e.path();
+    let is_rs = path.extension().is_some_and(|x| x == "rs");
+    let Ok(kind) = e.file_type() else {
+        return RsEntry::Skip;
+    };
+    if kind.is_dir() {
+        // 정규 경로 디렉터리 아래의 실제 디렉터리라 이 경로도 정규 경로다.
+        return RsEntry::Dir(path);
+    }
+    if kind.is_file() && is_rs {
+        return path.canonicalize().map_or(RsEntry::Skip, RsEntry::Source);
+    }
+    if !kind.is_symlink() {
+        return RsEntry::Skip;
+    }
+    // 끊긴 링크와 루트 밖 링크는 따르지 않는다.
+    let Some(real) = path
+        .canonicalize()
+        .ok()
+        .filter(|real| real.starts_with(boundary))
+    else {
+        return RsEntry::Skip;
+    };
+    match std::fs::metadata(&real) {
+        Ok(md) if md.is_dir() => RsEntry::Dir(real),
+        Ok(md) if md.is_file() && is_rs => RsEntry::Source(real),
+        _ => RsEntry::Skip,
     }
 }
 
@@ -2578,5 +2661,70 @@ mod tests {
             .limitations()
             .iter()
             .any(|l| l.contains("could not be harvested")));
+    }
+
+    /// 링크가 얽힌 트리에서도 실제 디렉터리를 한 번씩만 걷고 루트 안 링크 대상만
+    /// 모은다 — `a -> .`·`b -> .` 두 링크를 따라가던 순회는 경로가 단계마다 두 배였다.
+    /// 루트 밖·끊긴·장치 링크와 FIFO는 모으지 않고, 이름 규칙(target·숨김)은 전과 같다.
+    #[cfg(unix)]
+    #[test]
+    fn walk_visits_each_real_directory_once() {
+        use std::os::unix::fs::symlink;
+        let tmp = std::env::temp_dir().join(format!("rg-walk-rs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let ws = tmp.join("ws");
+        for d in ["pkg/src/inner", "pkg/target", "pkg/.hidden", "shared"] {
+            std::fs::create_dir_all(ws.join(d)).unwrap();
+        }
+        std::fs::create_dir_all(tmp.join("outside")).unwrap();
+        for f in [
+            "ws/pkg/src/lib.rs",
+            "ws/pkg/src/inner/m.rs",
+            "ws/pkg/target/gen.rs",
+            "ws/pkg/.hidden/h.rs",
+            "ws/shared/s.rs",
+            "outside/o.rs",
+        ] {
+            std::fs::write(tmp.join(f), "").unwrap();
+        }
+        let src = ws.join("pkg/src");
+        for (link, target) in [
+            ("a", "."),
+            ("b", "."),
+            ("up", ".."),
+            ("inner/back", "../.."),
+            ("shared", "../../shared"),
+            ("out", "../../../outside"),
+            ("o.rs", "../../../outside/o.rs"),
+            ("zero.rs", "/dev/zero"),
+            ("gone.rs", "missing.rs"),
+        ] {
+            symlink(target, src.join(link)).unwrap();
+        }
+        let fifo = std::process::Command::new("mkfifo")
+            .arg(src.join("pipe.rs"))
+            .status()
+            .expect("mkfifo must run");
+        assert!(fifo.success());
+        let mut state = RsWalk::within(&ws);
+        walk_rs(&ws.join("pkg"), &mut state);
+        let real = ws.canonicalize().unwrap();
+        let rel = |set: &BTreeSet<PathBuf>| -> Vec<String> {
+            set.iter()
+                .map(|p| {
+                    p.strip_prefix(&real)
+                        .map_or_else(|_| p.display().to_string(), |r| r.display().to_string())
+                })
+                .collect()
+        };
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(
+            rel(&state.sources),
+            ["pkg/src/inner/m.rs", "pkg/src/lib.rs", "shared/s.rs"]
+        );
+        assert_eq!(
+            rel(&state.seen_dirs),
+            ["pkg", "pkg/src", "pkg/src/inner", "shared"]
+        );
     }
 }

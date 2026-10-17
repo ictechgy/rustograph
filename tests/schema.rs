@@ -620,3 +620,137 @@ fn facts_without_usr_are_counted_as_missing() {
         d["limitations"]
     );
 }
+
+/// `generatedAt`만 뺀 문서 — 같은 입력이면 바이트까지 같아야 하는 나머지(사실·
+/// limitation·`sourceModifiedAt`)로 두 실행을 맞댄다. `sourceModifiedAt`은 읽은
+/// 파일들의 최신 mtime이라 읽은 파일 집합이 달라지면 함께 달라진다.
+fn facts_without_generated_at(dir: &std::path::Path) -> serde_json::Value {
+    let mut d = serde_json::to_value(schema::facts(dir, "test").expect("schema facts")).unwrap();
+    d.as_object_mut().unwrap().remove("generatedAt");
+    d
+}
+
+/// 이름 붙은 파이프를 만든다 — 쓰는 쪽이 없으면 여는 순간 영원히 막힌다.
+#[cfg(unix)]
+fn mkfifo(path: &std::path::Path) {
+    let status = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("mkfifo must run");
+    assert!(status.success(), "mkfifo {}", path.display());
+}
+
+/// 패키지 안의 링크 순환(`src/a -> .`·`src/b -> .`·`src/up -> ..`)은 링크 없는 트리와
+/// 같은 문서를 낸다. 링크를 따라가는 순회는 단계마다 경로가 두 배가 되어 OS 링크
+/// 한도(macOS 32단계)까지 사실상 끝나지 않았다.
+#[cfg(unix)]
+#[test]
+fn symlink_cycles_do_not_change_facts() {
+    let dir = temp_workspace(
+        "link-cycle",
+        "pub fn q() -> &'static str { \"SELECT * FROM users\" }\n",
+    );
+    let plain = facts_without_generated_at(&dir);
+    for (link, target) in [("a", "."), ("b", "."), ("up", "..")] {
+        std::os::unix::fs::symlink(target, dir.join("app/src").join(link)).unwrap();
+    }
+    let linked = facts_without_generated_at(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(linked, plain);
+    assert!(plain["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["channel"] == "users"));
+}
+
+/// 워크스페이스 루트 안을 가리키는 링크는 전처럼 따른다 — 패키지 밖 공유 디렉터리·
+/// 파일의 SQL도 사실이 되고, 위치는 링크가 아니라 실제 경로다.
+#[cfg(unix)]
+#[test]
+fn links_inside_the_workspace_are_still_followed() {
+    let dir = temp_workspace("link-inside", "pub fn f() {}\n");
+    std::fs::create_dir_all(dir.join("shared/sql")).unwrap();
+    std::fs::write(
+        dir.join("shared/sql/q.rs"),
+        "pub fn q() -> &'static str { \"SELECT * FROM shared_dir_t\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("shared/one.rs"),
+        "pub fn o() -> &'static str { \"SELECT * FROM shared_file_t\" }\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("../../shared/sql", dir.join("app/src/sql")).unwrap();
+    std::os::unix::fs::symlink("../../shared/one.rs", dir.join("app/src/one.rs")).unwrap();
+    let d = facts_without_generated_at(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    let path_of = |channel: &str| {
+        d["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["channel"] == channel)
+            .and_then(|f| f["location"]["path"].as_str().map(str::to_string))
+    };
+    assert_eq!(path_of("shared_dir_t").as_deref(), Some("shared/sql/q.rs"));
+    assert_eq!(path_of("shared_file_t").as_deref(), Some("shared/one.rs"));
+}
+
+/// 루트 밖을 가리키는 디렉터리·.rs 링크는 따르지 않는다 — 그 아래 SQL은 위치가 루트
+/// 밖이라 사실이 될 수 없는데, 읽으면 `unlocated-references`·`unparsed-sources`와
+/// `sourceModifiedAt`(루트 밖 파일의 mtime)만 흐렸다.
+#[cfg(unix)]
+#[test]
+fn links_leaving_the_workspace_are_not_followed() {
+    let dir = temp_workspace(
+        "link-outside",
+        "pub fn q() -> &'static str { \"SELECT * FROM users\" }\n",
+    );
+    let outside =
+        std::env::temp_dir().join(format!("rustograph-schema-outside-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(outside.join("deep")).unwrap();
+    let leak = outside.join("deep/leak.rs");
+    let broken = outside.join("broken.rs");
+    std::fs::write(
+        &leak,
+        "pub fn leak() -> &'static str { \"SELECT * FROM secret_outside_table\" }\n",
+    )
+    .unwrap();
+    std::fs::write(&broken, "pub fn broken( {\n").unwrap();
+    // 루트 밖 파일이 읽히면 sourceModifiedAt이 이 미래 시각으로 끌려간다.
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(86_400);
+    for file in [&leak, &broken] {
+        std::fs::File::options()
+            .write(true)
+            .open(file)
+            .and_then(|f| f.set_modified(later))
+            .unwrap();
+    }
+    let plain = facts_without_generated_at(&dir);
+    std::os::unix::fs::symlink(&outside, dir.join("app/src/ext")).unwrap();
+    std::os::unix::fs::symlink(&broken, dir.join("app/src/broken.rs")).unwrap();
+    let linked = facts_without_generated_at(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&outside);
+    assert_eq!(linked, plain);
+}
+
+/// 정규 파일이 아닌 `.rs` 항목(FIFO, FIFO를 가리키는 링크, `/dev/zero` 링크)은 읽지
+/// 않는다 — FIFO는 여는 순간 쓰는 쪽을 영원히 기다리고 `/dev/zero`는 끝없이 읽힌다.
+#[cfg(unix)]
+#[test]
+fn special_rs_entries_are_not_read() {
+    let dir = temp_workspace(
+        "special-entries",
+        "pub fn q() -> &'static str { \"SELECT * FROM users\" }\n",
+    );
+    let plain = facts_without_generated_at(&dir);
+    mkfifo(&dir.join("app/src/pipe.rs"));
+    std::os::unix::fs::symlink("pipe.rs", dir.join("app/src/pipe_link.rs")).unwrap();
+    std::os::unix::fs::symlink("/dev/zero", dir.join("app/src/zero.rs")).unwrap();
+    let special = facts_without_generated_at(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(special, plain);
+}
