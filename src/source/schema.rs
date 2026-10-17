@@ -58,7 +58,8 @@ pub struct FactSymbol {
     pub usr: String,
 }
 
-/// 계약의 1 기반 소스 위치다 — 열은 UTF-16 코드 단위다.
+/// 계약의 1 기반 소스 위치다 — 열은 그 줄의 UTF-8 바이트 오프셋 + 1이다
+/// (GRAPH-EXCHANGE). 환산은 생산자 모두 `utf8_column` 하나를 쓴다.
 #[derive(Serialize, Clone)]
 pub struct BridgeLocation {
     pub path: String,
@@ -67,6 +68,18 @@ pub struct BridgeLocation {
     /// 파일 안 바이트 오프셋 — 직렬화하지 않고 감싸는 정점을 찾는 데만 쓴다.
     #[serde(skip)]
     pub byte: usize,
+}
+
+/// proc-macro2 열(줄 시작부터의 문자 수)을 계약 열(그 줄의 UTF-8 바이트 오프셋 + 1)로
+/// 바꾼다. GRAPH-EXCHANGE는 문자 수·UTF-16 열을 그대로 내보내지 말라고 한다 — schema·
+/// routes·client가 이 함수 하나를 써야 같은 줄의 사실 열이 갈라지지 않는다.
+pub(crate) fn utf8_column(line_text: &str, chars: usize) -> u32 {
+    line_text
+        .chars()
+        .take(chars)
+        .map(|c| c.len_utf8() as u32)
+        .sum::<u32>()
+        + 1
 }
 
 /// 문서를 생산한 도구 식별자다.
@@ -1226,7 +1239,7 @@ impl SchemaScan {
     }
 
     /// 토큰 span을 프로젝트 상대의 계약 위치로 바꾼다.
-    /// proc-macro2의 열은 바이트라 UTF-16 열로 환산한다.
+    /// proc-macro2의 열은 문자 수라 그 줄의 UTF-8 바이트 열로 환산한다.
     fn locate(&self, src: &str, span: Span, file: &Path) -> Option<BridgeLocation> {
         let start = span.start();
         if start.line == 0 {
@@ -1234,23 +1247,10 @@ impl SchemaScan {
         }
         let rel = file.strip_prefix(&self.root).ok()?;
         let line_text = src.lines().nth(start.line - 1)?;
-        // 열이 바이트 오프셋이 아니거나 문자 경계와 어긋나면 문자 수로
-        // 재해석한다 — 실패 시 0 대신 그만큼의 문자열을 센 값을 쓴다.
-        let column = line_text
-            .get(..start.column)
-            .map(|s| s.chars().map(|c| c.len_utf16() as u32).sum::<u32>())
-            .unwrap_or_else(|| {
-                line_text
-                    .chars()
-                    .take(start.column)
-                    .map(|c| c.len_utf16() as u32)
-                    .sum()
-            })
-            + 1;
         Some(BridgeLocation {
             path: rel.to_string_lossy().replace('\\', "/"),
             line: start.line as u32,
-            column,
+            column: utf8_column(line_text, start.column),
             byte: span.byte_range().start,
         })
     }
@@ -1388,13 +1388,16 @@ fn expr_text(src: &str, expr: &Expr) -> String {
             starts.push(i + 1);
         }
     }
-    // 열이 문자 경계와 어긋나면 경계까지 보정한다.
+    // proc-macro2 열은 문자 수다 — 바이트로 더하면 앞에 한글이 있는 줄에서 식
+    // 앞 글자로 밀린다. 줄 시작부터 그만큼의 문자를 바이트로 센다.
     let get = |line: usize, col: usize| -> usize {
-        let mut p = starts.get(line - 1).copied().unwrap_or(src.len()) + col;
-        while p < src.len() && !src.is_char_boundary(p) {
-            p += 1;
-        }
-        p.min(src.len())
+        let start = starts.get(line - 1).copied().unwrap_or(src.len());
+        start
+            + src[start..]
+                .chars()
+                .take(col)
+                .map(char::len_utf8)
+                .sum::<usize>()
     };
     let (a, b) = (get(s.line, s.column), get(e.line, e.column));
     src.get(a..b).unwrap_or("<dynamic expression>").to_string()

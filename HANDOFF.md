@@ -70,8 +70,10 @@ README 설치 태그를 올렸다. 태그·Release·탭 갱신은 머지 뒤 별
   간선이 사라졌다(자기 분석 기준 109개). `graph`·`dead`·`cycles`·`query`·`impact` 결과가 달라질 수 있다.
 - **소비자 요건** — route-decl·route-call·language-traversal 문서는 isthmus `3a45450` 이후(차기 isthmus-cli 0.10.0)가
   있어야 받는다. 발행된 isthmus-cli 0.9.0은 거부한다. 벤더링한 공유 벡터 lock은 `3a45450`.
-- **알려진 결함** — 서버 `route-decl`의 위치 열(`Ctx::locate`)이 UTF-16 코드 단위로 세어진다. GRAPH-EXCHANGE는 UTF-8
-  바이트를 요구하므로 경로 인자 앞에 비ASCII 문자가 있는 줄에서 열이 어긋난다. 클라이언트 `route-call`은 UTF-8 바이트다.
+- **알려진 결함(이후 수정됨)** — 서버 `route-decl`의 위치 열(`Ctx::locate`)이 UTF-16 코드 단위로 세어졌다. GRAPH-EXCHANGE는
+  UTF-8 바이트를 요구하므로 경로 인자 앞에 비ASCII 문자가 있는 줄에서 열이 어긋났다. 0.4.1(`560e529`)에서 UTF-8 바이트로
+  고쳤고, `schema` relation-use 열의 같은 결함(문자 수 열을 바이트로 잘라 UTF-16으로 센 값)도 뒤에 고쳐 지금은 schema·
+  routes·client가 같은 환산(`schema::utf8_column`)을 쓴다.
 
 ## 직전 — feature/client-routes (2026-09-30, PR #24 머지됨)
 
@@ -80,8 +82,8 @@ README 설치 태그를 올렸다. 태그·Release·탭 갱신은 머지 뒤 별
 - **코드** — `src/source/routes/client.rs`(멤버·의존 버전, 문서 조립, 한계) + `client/{index,scan}.rs`(색인과 두 단계
   스캐너: 구조체 필드 값 수집 → 호출 사실), `compose.rs`(url-compose 규칙의 순수 구현 — `UrlVal`, WHATWG concat/join,
   `http::Uri` concat, 마스킹), `wrappers.rs`(http-wrappers v1 파싱·동사 바인딩). 위치 열은 계약대로 UTF-8 바이트다
-  (`Ctx::locate_utf8`). **서버 `route-decl`의 `Ctx::locate`는 UTF-16 열을 낸다 — GRAPH-EXCHANGE는 UTF-8 바이트를
-  요구하므로 비ASCII 줄에서 어긋난다(이번 범위 밖, 후속 수정 후보).**
+  (`Ctx::locate_utf8`). 당시 서버 `route-decl`의 `Ctx::locate`는 UTF-16 열을 냈다 — 0.4.1(`560e529`)에서 UTF-8 바이트로
+  고쳤다.
 - **인식** — reqwest(`get`·`blocking::get`·Client 동사·`request`·`Request::new`), ureq 2/3 자유 함수·Agent, 선언된
   래퍼(`owner::name` = 정점 ID, 구조체 리터럴 생성자는 이름 = 타입 이름). 수신자는 구문 타입 추론(생성자·주석·필드
   타입·반환 타입·static 타입, `Arc`·`LazyLock` 등 벗김). 증명하지 못한 수신자는 사실 없이 센다.

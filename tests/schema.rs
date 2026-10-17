@@ -355,6 +355,58 @@ pub fn wide() {
         .any(|f| f["channel"] == "users" && f["dynamic"] == false));
 }
 
+/// 위치 열은 그 줄의 UTF-8 바이트 오프셋 + 1이다(GRAPH-EXCHANGE) — proc-macro2 열은
+/// 문자 수라 앞에 한글·이모지가 있는 줄에서는 바이트로 환산해야 한다. ASCII 줄은
+/// 전과 같다. dynamic 원문도 같은 열로 잘라야 식 앞 글자로 밀리지 않는다.
+#[test]
+fn locations_use_utf8_byte_columns() {
+    let lib = r#"
+pub fn korean() {
+    let 이름 = 1; let _s = "SELECT * FROM users";
+    let _e = "😀"; let _s = "SELECT * FROM emoji_t";
+    let _ = 이름;
+}
+
+pub fn ascii() {
+    let name = 1; let _s = "SELECT * FROM orders";
+    let _ = name;
+}
+
+pub fn korean_dyn(sql_text: &str) {
+    let 이름 = 1; let _r = sqlx::query(&sql_text);
+    let _ = 이름;
+}
+"#;
+    let dir = temp_workspace("utf8-columns", lib);
+    let d = serde_json::to_value(schema::facts(&dir, "test").expect("schema facts")).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let at = |channel: &str| -> (u64, u64) {
+        let f = d["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["channel"] == channel)
+            .unwrap_or_else(|| panic!("no fact {channel}: {}", d["facts"]));
+        (
+            f["location"]["line"].as_u64().unwrap(),
+            f["location"]["column"].as_u64().unwrap(),
+        )
+    };
+    // 기대 열 = 원문 줄에서 그 토큰의 바이트 위치 + 1.
+    let byte_column = |needle: &str| -> (u64, u64) {
+        lib.lines()
+            .enumerate()
+            .find_map(|(i, l)| l.find(needle).map(|b| (i as u64 + 1, b as u64 + 1)))
+            .unwrap()
+    };
+    // `    let 이름 = 1; let _s = ` = 25자·29바이트(UTF-16으로는 26).
+    assert_eq!(at("users"), (3, 30));
+    assert_eq!(at("users"), byte_column("\"SELECT * FROM users\""));
+    assert_eq!(at("emoji_t"), byte_column("\"SELECT * FROM emoji_t\""));
+    assert_eq!(at("orders"), byte_column("\"SELECT * FROM orders\""));
+    assert_eq!(at("&sql_text"), byte_column("sqlx::query(&sql_text)"));
+}
+
 #[test]
 fn cli_schema_prints_document_and_writes_out() {
     let mut out = Cursor::new(Vec::new());
