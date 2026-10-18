@@ -9,8 +9,11 @@ on:
         description: "Tag to build and release (vX.Y.Z)"
         required: true
 
+# 기본 토큰은 읽기 전용이다. 릴리스와 자산을 쓰는 release 잡만 contents: write를 받는다.
+# 게시는 gh와 GH_TOKEN으로 하므로 checkout은 토큰을 .git/config에 남기지 않는다.
+# 액션은 커밋 SHA로 고정한다(주석은 고정 시점의 태그) — 갱신은 Dependabot이 제안한다.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -26,9 +29,10 @@ jobs:
           - { name: windows-amd64, os: windows-latest, target: x86_64-pc-windows-msvc }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
 
       - name: Resolve version and exact source commit
         env:
@@ -58,8 +62,9 @@ jobs:
           fi
           echo "RELEASE_COMMIT=$commit" >> "$GITHUB_ENV"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Linux arm64 cross linker
@@ -106,7 +111,7 @@ jobs:
           NAME: ${{ matrix.name }}
         run: bash scripts/release-build-manifest.sh record "$VERSION" "$RELEASE_COMMIT" "$NAME"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rustograph-${{ matrix.name }}
           path: |
@@ -119,12 +124,17 @@ jobs:
     name: Publish release
     needs: build
     runs-on: macos-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
 
       - name: Resolve version and exact source commit
         env:
@@ -154,7 +164,7 @@ jobs:
           fi
           echo "RELEASE_COMMIT=$commit" >> "$GITHUB_ENV"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: rustograph-*
           merge-multiple: true

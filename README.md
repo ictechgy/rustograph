@@ -65,6 +65,10 @@ cargo build --release --features semantic
 rustograph graph --level symbol --semantic
 ```
 
+`--semantic` runs the analyzed workspace's build scripts and procedural
+macros — see [Security: trust boundary](#security-trust-boundary) before
+using it on code you do not trust.
+
 ## Usage
 
 ```bash
@@ -166,8 +170,10 @@ nine tools — `rustograph_summary`, `rustograph_query`, `rustograph_impact`,
 `rustograph_paths`, `rustograph_search`, `rustograph_cycles`,
 `rustograph_dead`, `rustograph_rules`, `rustograph_deps`. The document is
 harvested once at startup (or loaded via `--graph`), so every call answers
-over the same snapshot. Partial ids are refused with a candidate list —
-call `rustograph_search` or retry with an exact id.
+over the same snapshot. `rustograph_deps` is the exception: it harvests the
+`--dir` workspace itself on its first call, even with `--graph`. Partial ids
+are refused with a candidate list — call `rustograph_search` or retry with an
+exact id.
 
 Semantic-mode documents are cached under `.rustograph/semantic-cache.json`,
 keyed by a fingerprint of workspace sources and manifests — a stale or
@@ -400,6 +406,43 @@ walked, and `dyn`/generic trait calls expand to workspace impl candidates
 vertices, edge kinds, `tentative`, `limitations` — is unchanged; only
 accuracy improves. Bodies the semantic engine cannot see (cfg-disabled,
 macro-generated) fall back to the syntactic path with measured counters.
+
+## Security: trust boundary
+
+rustograph parses source with syn, but it also runs the Rust toolchain.
+Harvesting a workspace — every analysis that does not load a saved graph with
+`--graph` — runs `cargo metadata`. Even with `--graph`, `--target` runs
+`rustc --print cfg`, and the MCP `rustograph_deps` tool runs `cargo metadata`
+for the `--dir` workspace on its first call. Analyzing an untrusted checkout
+can run programs that the checkout chooses:
+
+- rustograph runs these commands in the current directory. Cargo reads
+  `.cargo/config.toml` from the current directory and its parents, not from
+  the `--dir` workspace, so running rustograph inside a checkout lets that
+  checkout's configuration — for example `build.rustc-wrapper` or
+  `build.rustc` — pick programs that run.
+  When `cargo` and `rustc` are rustup proxies, rustup also selects the
+  toolchain from a `rust-toolchain.toml` (or `rust-toolchain`) file found by
+  walking up from the current directory, and that file can name a custom
+  toolchain directory.
+- `--semantic` executes the analyzed code. rust-analyzer runs `cargo check` in
+  the analyzed workspace root, which builds and runs its build scripts
+  (`build.rs`) under that workspace's Cargo configuration, and then runs its
+  procedural macros to expand them — wherever you run rustograph from. Use
+  `--semantic` only on code you would build yourself.
+
+For untrusted repositories and pull requests from forks, run rustograph on an
+isolated runner or sandbox that holds no secrets, without `--semantic`, from a
+working directory outside the checkout (neither the checkout nor one of its
+subdirectories), and pass the checkout with `--dir`. The checkout's
+`.cargo/config.toml` and `rust-toolchain.toml` then do not apply to the
+toolchain commands rustograph runs; configuration in the working directory,
+its parents, and your Cargo home still does. `cargo metadata` resolves the
+checkout's dependencies wherever it runs. It can write `Cargo.lock` into the
+checkout, and the analysis fails if that write fails; it can also fetch
+registry and git dependencies named in the checkout's manifests, so limit the
+sandbox's network access if that matters. rustograph does not sandbox these
+commands itself.
 
 ## License
 
