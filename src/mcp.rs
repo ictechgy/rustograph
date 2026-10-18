@@ -325,10 +325,7 @@ impl Server {
                 let Some(cfg_path) = &self.cfg_path else {
                     return Err("no .rustograph.yml found — pass --config".to_string());
                 };
-                let src = std::fs::read_to_string(cfg_path)
-                    .map_err(|e| format!("cannot read {}: {e}", cfg_path.display()))?;
-                let cfg: config::Config = serde_yml::from_str(&src)
-                    .map_err(|e| format!("bad {}: {e}", cfg_path.display()))?;
+                let cfg = config::load_file(cfg_path)?;
                 let mut rep = rules::check(&self.doc, &cfg);
                 // 설정에 선언된 기준선을 적용한다 — CLI rules와 같은 계약.
                 // NotFound만 도입 전으로 본다 — 권한 오류나 깨진 파일을
@@ -597,6 +594,42 @@ mod tests {
         for r in &res {
             assert_eq!(r["result"]["isError"], true, "{r}");
         }
+    }
+
+    /// rules 도구 호출 하나를 보내고 결과 객체를 돌려준다.
+    fn call_rules(srv: &Server) -> serde_json::Value {
+        let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rustograph_rules","arguments":{}}}"#;
+        session(srv, &[call]).remove(0)["result"].take()
+    }
+
+    /// rules 도구도 CLI와 같은 config::load_file로 설정을 읽는다 — 올바른 설정은
+    /// 보고서, YAML 형식 오류는 경로를 담은 isError다.
+    #[test]
+    fn rules_tool_reads_config_and_reports_bad_yaml() {
+        let dir = std::env::temp_dir().join(format!("rg-mcp-rules-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("rules.yml");
+        std::fs::write(&good, "components:\n  all: [\"c/**\"]\ndeps:\n  all: []\n").unwrap();
+        let bad = dir.join("bad.yml");
+        std::fs::write(&bad, "components: [unclosed\n").unwrap();
+        let mut srv = test_server();
+        srv.cfg_path = Some(good);
+        let result = call_rules(&srv);
+        assert_eq!(result["isError"], serde_json::Value::Null, "{result}");
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"violations\""));
+        srv.cfg_path = Some(bad.clone());
+        let result = call_rules(&srv);
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with(&format!("bad {}: ", bad.display())),
+            "{text}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

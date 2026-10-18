@@ -30,14 +30,19 @@ pub fn load(dir: &Path) -> Result<Option<Config>, String> {
     for name in [".rustograph.yml", ".rustograph.yaml"] {
         let path = dir.join(name);
         if path.exists() {
-            let src = std::fs::read_to_string(&path)
-                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-            let cfg: Config =
-                serde_yml::from_str(&src).map_err(|e| format!("bad {}: {e}", path.display()))?;
-            return Ok(Some(cfg));
+            return load_file(&path).map(Some);
         }
     }
     Ok(None)
+}
+
+/// 설정 파일 하나를 읽어 파싱한다 — `rules --config`·MCP rules·디렉터리 탐색이 모두 쓴다.
+/// YAML 파서 호출을 이 함수 하나에 두는 이유: 파서가 config 밖에서도 불리면 파서
+/// 교체·보안 수정이 여러 모듈로 퍼지고, 외부 크레이트 사용은 `rules --strict`가 보지 못한다.
+pub fn load_file(path: &Path) -> Result<Config, String> {
+    let src = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    serde_yml::from_str(&src).map_err(|e| format!("bad {}: {e}", path.display()))
 }
 
 /// 패턴 매칭 — 정확 일치, `x/**` 재귀 접두사, `*` 한 세그먼트 글롭.
@@ -79,6 +84,43 @@ signature:
         assert_eq!(c.components.len(), 2);
         assert_eq!(c.deps["ui"], vec!["core"]);
         assert_eq!(c.deny["core"], vec!["ui"]);
+    }
+
+    /// `--config FILE`·MCP·디렉터리 탐색이 모두 load_file 하나로 읽는다 — 오류는
+    /// 경로와 원인을 싣고, 읽기 실패와 형식 오류를 구분한다.
+    #[test]
+    fn load_file_parses_one_config_and_names_the_failure() {
+        let dir = std::env::temp_dir().join(format!("rg-config-load-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("rules.yml");
+        std::fs::write(
+            &good,
+            "components:\n  core: [\"c::core/**\"]\nbaseline: base.txt\n",
+        )
+        .unwrap();
+        let cfg = load_file(&good).unwrap();
+        assert_eq!(cfg.components["core"], vec!["c::core/**"]);
+        assert_eq!(cfg.baseline.as_deref(), Some("base.txt"));
+        let bad = dir.join("bad.yml");
+        std::fs::write(&bad, "components: [unclosed\n").unwrap();
+        let err = load_file(&bad).unwrap_err();
+        assert!(
+            err.starts_with(&format!("bad {}: ", bad.display())),
+            "{err}"
+        );
+        let missing = dir.join("missing.yml");
+        let err = load_file(&missing).unwrap_err();
+        assert!(
+            err.starts_with(&format!("cannot read {}: ", missing.display())),
+            "{err}"
+        );
+        // 디렉터리 탐색도 같은 경로로 읽는다.
+        assert!(load(&dir).unwrap().is_none());
+        std::fs::copy(&good, dir.join(".rustograph.yml")).unwrap();
+        let found = load(&dir).unwrap().unwrap();
+        assert_eq!(found.baseline.as_deref(), Some("base.txt"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

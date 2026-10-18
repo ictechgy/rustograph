@@ -360,10 +360,7 @@ fn cmd_rules(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
         .map(|f| Path::new(f).parent().unwrap_or(dir.as_path()).to_path_buf())
         .unwrap_or_else(|| dir.clone());
     let cfg: config::Config = match a.get("config") {
-        Some(f) => {
-            let src = std::fs::read_to_string(f).map_err(|e| format!("cannot read {f}: {e}"))?;
-            serde_yml::from_str(&src).map_err(|e| format!("bad {f}: {e}"))?
-        }
+        Some(f) => config::load_file(Path::new(f))?,
         None => match config::load(&dir)? {
             Some(c) => c,
             None => return Err(format!("no .rustograph.yml in {}", dir.display())),
