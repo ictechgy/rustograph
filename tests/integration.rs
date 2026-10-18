@@ -497,6 +497,88 @@ mod cli_tests {
         let _ = std::fs::remove_file(&cfg);
         let _ = std::fs::remove_file(&base);
     }
+
+    /// README의 기준선 흐름 — 설정 옆 `.rustograph/rules-baseline.txt`가 아직 없으면 도입
+    /// 전으로 보고, `--write-baseline`이 디렉터리째 만들어 얼린 뒤 strict가 억누른다.
+    #[test]
+    fn rules_baseline_under_dot_rustograph_round_trips() {
+        let tmp = std::env::temp_dir().join(format!("rg-dot-base-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cfg = tmp.join(".rustograph.yml");
+        std::fs::write(
+            &cfg,
+            "components:\n  app: [\"fixture_app/**\"]\n  core: [\"fixture_core/**\"]\n\
+             deps:\n  app: []\n  core: []\nbaseline: .rustograph/rules-baseline.txt\n",
+        )
+        .unwrap();
+        let cfgp = cfg.to_str().unwrap();
+        let (code, _, err) = run(&["rules", "--strict", "--config", cfgp]);
+        assert_eq!(code, 1, "{err}");
+        let (code, out, err) = run(&["rules", "--config", cfgp, "--write-baseline"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("wrote baseline"));
+        let frozen = std::fs::read_to_string(tmp.join(".rustograph/rules-baseline.txt")).unwrap();
+        assert!(frozen.contains("allow|fixture_app"), "{frozen}");
+        let (code, out, err) = run(&["rules", "--strict", "--config", cfgp]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("suppressed by baseline"));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 설정·기준선 경로는 분석 대상 저장소가 고른다 — FIFO는 여는 순간 쓰는 쪽을 영원히
+    /// 기다리고 장치는 끝없이 읽힌다. rules는 막히거나 메모리를 다 쓰지 않고 원인을 담은
+    /// 오류(2)로 끝나야 한다.
+    #[cfg(unix)]
+    #[test]
+    fn rules_refuses_special_config_and_baseline_files() {
+        let tmp = std::env::temp_dir().join(format!("rg-special-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let fifo = tmp.join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must run");
+        assert!(made.success());
+        let cfg = tmp.join("rules.yml");
+        std::fs::write(
+            &cfg,
+            "components:\n  app: [\"fixture_app/**\"]\ndeps:\n  app: []\nbaseline: pipe\n",
+        )
+        .unwrap();
+        let cfgp = cfg.to_str().unwrap();
+        let fifop = fifo.to_str().unwrap();
+        for (args, cause) in [
+            // 명시 --baseline이 장치, 설정의 baseline이 FIFO, --config 자체가 FIFO.
+            (
+                vec!["rules", "--config", cfgp, "--baseline", "/dev/zero"],
+                "cannot read baseline /dev/zero: ",
+            ),
+            (vec!["rules", "--config", cfgp], "cannot read baseline "),
+            (vec!["rules", "--config", fifop], "cannot read "),
+        ] {
+            let (code, _, err) = run(&args);
+            assert_eq!(code, 2, "{args:?}: {err}");
+            assert!(
+                err.contains(cause) && err.contains("not a regular file"),
+                "{args:?}: {err}"
+            );
+        }
+        // --dir에서 찾은 .rustograph.yml이 FIFO여도 같다 — 설정을 읽은 뒤에야 수확한다.
+        std::fs::remove_file(&cfg).unwrap();
+        std::fs::rename(&fifo, tmp.join(".rustograph.yml")).unwrap();
+        let argv: Vec<String> = ["rules", "--dir", tmp.to_str().unwrap()]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = cli::run(&argv, &mut out, &mut err);
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(code, 2, "{err}");
+        assert!(err.contains("not a regular file"), "{err}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 }
 
 #[test]

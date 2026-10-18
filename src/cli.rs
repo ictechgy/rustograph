@@ -399,7 +399,8 @@ fn cmd_rules(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
         return Ok(0);
     }
     if let Some(path) = &baseline_path {
-        match std::fs::read_to_string(path) {
+        // 기준선 경로는 분석 대상의 설정이 고른다 — 장치·FIFO는 열지 않고 상한까지만 읽는다.
+        match config::read_bounded_text(path, config::MAX_FILE_BYTES) {
             Ok(src) => rules::apply_baseline(&mut report, &rules::Baseline::parse(&src)),
             // 명시 --baseline은 없는 파일을 가리키면 오타일 가능성이 높다 — 오류.
             // cfg.baseline은 NotFound만 도입 전으로 본다 — 권한 오류나

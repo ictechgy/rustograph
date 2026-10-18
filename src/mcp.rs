@@ -329,10 +329,11 @@ impl Server {
                 let mut rep = rules::check(&self.doc, &cfg);
                 // 설정에 선언된 기준선을 적용한다 — CLI rules와 같은 계약.
                 // NotFound만 도입 전으로 본다 — 권한 오류나 깨진 파일을
-                // 조용히 넘기면 억제가 안 먹힌 채로 지나간다.
+                // 조용히 넘기면 억제가 안 먹힌 채로 지나간다. 장치·FIFO는
+                // 열지 않고 상한까지만 읽는다 — 서버가 멈추면 안 된다.
                 if let Some(b) = &cfg.baseline {
                     let path = cfg_path.parent().unwrap_or(self.dir.as_path()).join(b);
-                    match std::fs::read_to_string(&path) {
+                    match config::read_bounded_text(&path, config::MAX_FILE_BYTES) {
                         Ok(src) => rules::apply_baseline(&mut rep, &rules::Baseline::parse(&src)),
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         Err(e) => {
@@ -629,6 +630,46 @@ mod tests {
             text.starts_with(&format!("bad {}: ", bad.display())),
             "{text}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// rules 도구도 설정·기준선을 상한 읽기로 연다 — 장치를 가리키는 baseline과 FIFO
+    /// 설정 파일은 서버를 멈추거나 메모리를 다 쓰지 않고 isError로 답한다.
+    #[cfg(unix)]
+    #[test]
+    fn rules_tool_refuses_special_config_and_baseline_files() {
+        let dir = std::env::temp_dir().join(format!("rg-mcp-special-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe.yml");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must run");
+        assert!(made.success());
+        let device_baseline = dir.join("rules.yml");
+        std::fs::write(
+            &device_baseline,
+            "components:\n  all: [\"c/**\"]\nbaseline: /dev/zero\n",
+        )
+        .unwrap();
+        let mut srv = test_server();
+        for (cfg, cause) in [
+            (
+                device_baseline,
+                "cannot read baseline /dev/zero: ".to_string(),
+            ),
+            (fifo.clone(), format!("cannot read {}: ", fifo.display())),
+        ] {
+            srv.cfg_path = Some(cfg);
+            let result = call_rules(&srv);
+            assert_eq!(result["isError"], true, "{result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.starts_with(&cause) && text.contains("not a regular file"),
+                "{text}"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

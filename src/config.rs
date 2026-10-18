@@ -40,9 +40,54 @@ pub fn load(dir: &Path) -> Result<Option<Config>, String> {
 /// YAML 파서 호출을 이 함수 하나에 두는 이유: 파서가 config 밖에서도 불리면 파서
 /// 교체·보안 수정이 여러 모듈로 퍼지고, 외부 크레이트 사용은 `rules --strict`가 보지 못한다.
 pub fn load_file(path: &Path) -> Result<Config, String> {
-    let src = std::fs::read_to_string(path)
+    let src = read_bounded_text(path, MAX_FILE_BYTES)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     serde_yml::from_str(&src).map_err(|e| format!("bad {}: {e}", path.display()))
+}
+
+/// 설정·기준선 파일의 크기 상한(바이트). 기준선은 위반 하나가 한 줄이라 큰 레거시
+/// 저장소도 수 MB 안이다 — 정상 파일은 넉넉히 덮되 장치를 끝없이 읽지 않게 한다.
+/// 판단값이다(형식이 정한 한도가 아니다). 분석 대상 소스의 상한과 같은 64MiB다.
+pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 설정·기준선 파일을 `max_bytes`까지만 읽는다 — 정규 파일만 연다. `.rustograph.yml`과
+/// 그 `baseline:` 경로는 분석 대상 저장소가 정하므로 신뢰할 수 없다. FIFO는 여는 순간
+/// 쓰는 쪽을 영원히 기다리고 장치(`/dev/zero`)는 끝없이 읽혀, 보지 않고 읽으면 rules·MCP가
+/// 멈추거나 메모리를 다 쓴다. `metadata`는 stat이라 FIFO에서도 막히지 않는다.
+/// 없으면 `NotFound` 그대로다(호출자가 "기준선 도입 전"으로 본다). 정규 파일이 아니면
+/// `InvalidInput`, 상한을 넘으면 `InvalidData`이고 문구에 해결 방향을 싣는다 — 호출자가
+/// 앞에 경로를 붙인다.
+pub fn read_bounded_text(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::Read;
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file (devices, FIFOs and directories are not read); \
+             point it at a regular text file",
+        ));
+    }
+    let too_large = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "larger than {max_bytes} bytes, the limit for rustograph configuration and \
+                 baseline files; point it at a smaller regular text file"
+            ),
+        )
+    };
+    if metadata.len() > max_bytes {
+        return Err(too_large());
+    }
+    let mut text = String::new();
+    // stat 뒤에 파일이 자라도 상한 너머는 읽지 않는다.
+    std::fs::File::open(path)?
+        .take(max_bytes.saturating_add(1))
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > max_bytes {
+        return Err(too_large());
+    }
+    Ok(text)
 }
 
 /// 패턴 매칭 — 정확 일치, `x/**` 재귀 접두사, `*` 한 세그먼트 글롭.
@@ -120,6 +165,41 @@ signature:
         std::fs::copy(&good, dir.join(".rustograph.yml")).unwrap();
         let found = load(&dir).unwrap().unwrap();
         assert_eq!(found.baseline.as_deref(), Some("base.txt"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 상한 읽기는 정규 파일만 상한까지 읽는다 — 없으면 NotFound 그대로(기준선 도입 전
+    /// 판정용), FIFO·장치·디렉터리는 열지 않으니 막히거나 끝없이 읽지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn bounded_text_reads_only_regular_files_within_the_limit() {
+        let dir = std::env::temp_dir().join(format!("rg-config-bounded-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let fits = dir.join("base.txt");
+        std::fs::write(&fits, "allow|a|b|call\n").unwrap();
+        assert_eq!(read_bounded_text(&fits, 15).unwrap(), "allow|a|b|call\n");
+        let over = read_bounded_text(&fits, 14).unwrap_err();
+        assert_eq!(over.kind(), std::io::ErrorKind::InvalidData);
+        assert!(over.to_string().contains("larger than 14 bytes"), "{over}");
+        let fifo = dir.join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must run");
+        assert!(made.success());
+        for special in [fifo.as_path(), Path::new("/dev/zero"), dir.as_path()] {
+            let err = read_bounded_text(special, MAX_FILE_BYTES).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{}",
+                special.display()
+            );
+            assert!(err.to_string().contains("not a regular file"), "{err}");
+        }
+        let missing = read_bounded_text(&dir.join("missing.txt"), MAX_FILE_BYTES).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
         std::fs::remove_dir_all(&dir).ok();
     }
 

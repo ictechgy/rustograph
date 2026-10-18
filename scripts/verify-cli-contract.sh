@@ -120,6 +120,8 @@ check 1 "rules deny"        rules --strict --config "$FIX/deny.yml"
 check 0 "baseline write"    rules --config "$FIX/deny.yml" --baseline "$FIX/base.txt" --write-baseline
 check 0 "baseline strict"   rules --strict --config "$FIX/deny.yml" --baseline "$FIX/base.txt"
 check 2 "baseline missing"  rules --config "$FIX/deny.yml" --baseline /nonexistent-xyz.txt
+# 기준선·설정 경로는 분석 대상 저장소가 고른다 — 장치를 가리켜도 끝없이 읽지 않고 2다.
+check 2 "baseline device"   rules --config "$FIX/deny.yml" --baseline /dev/zero
 grep -q "allow|fixture_app" "$FIX/base.txt" || {
 	echo "FAIL baseline file: no violation key written" >&2
 	fails=$((fails+1))
