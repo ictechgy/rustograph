@@ -14,7 +14,7 @@ pub fn to_json<T: serde::Serialize>(v: &T) -> String {
     s
 }
 
-/// Mermaid 그래프 — 사람이 보는 용도. 정점 ID는 그대로 라벨이 된다.
+/// Mermaid 그래프 — 사람이 보는 용도. 정점 ID가 라벨이 되고, 렌더된 라벨은 ID 그대로다.
 pub fn to_mermaid(doc: &Document) -> String {
     let mut out = String::from("graph TD\n");
     let ids: std::collections::BTreeSet<&str> = doc.vertex_ids();
@@ -22,16 +22,47 @@ pub fn to_mermaid(doc: &Document) -> String {
         if !ids.contains(e.from.as_str()) || !ids.contains(e.to.as_str()) {
             continue;
         }
-        out.push_str(&format!(
-            "    {}[\"{}\"] -->|{}| {}[\"{}\"]\n",
-            node_id(&e.from),
-            e.from,
-            edge_label(e.kind),
-            node_id(&e.to),
-            e.to
-        ));
+        out.push_str(&mermaid_edge(e));
     }
     out
+}
+
+/// 간선 한 줄. 엔터티 코드를 쓴 줄은 `;`(문장 끝)로 맺는다 — Mermaid는 파싱 전에 `style`·
+/// `classDef`가 든 줄에서 `:` 뒤 `#…;`를 색 값으로 보고 그 줄의 마지막 `;`를 지운다.
+/// 덧붙인 `;`가 없으면 마지막 엔터티(`#gt;`)의 `;`가 지워져 `#gt`가 글자로 남는다.
+fn mermaid_edge(e: &crate::graph::Edge) -> String {
+    let (from, to) = (mermaid_label(&e.from), mermaid_label(&e.to));
+    let end = if from != e.from || to != e.to {
+        ";"
+    } else {
+        ""
+    };
+    format!(
+        "    {}[\"{from}\"] -->|{}| {}[\"{to}\"]{end}\n",
+        node_id(&e.from),
+        edge_label(e.kind),
+        node_id(&e.to)
+    )
+}
+
+/// 따옴표 라벨 텍스트. `"`는 라벨을 닫아 뒤에 문장(`;click … href`)을 끼울 수 있고, `%`는
+/// 라벨 안에서도 감지되는 `%%{init: …}%%` 지시문을 열며, `<`·`>`·`&`는 HTML 라벨의 태그·
+/// 엔터티로 읽힌다(트레이트 impl ID `Type::<Trait>::m`의 `<Trait>`가 태그로 사라졌다).
+/// Mermaid 엔터티 코드는 렌더할 때 그 글자로 돌아온다. 수확 ID에 없는 `%`·`&`·`"`는
+/// 다른 도구가 만든 `--graph` 문서에서만 바뀐다.
+fn mermaid_label(id: &str) -> String {
+    let mut label = String::with_capacity(id.len());
+    for c in id.chars() {
+        match c {
+            '"' => label.push_str("#quot;"),
+            '%' => label.push_str("#37;"),
+            '<' => label.push_str("#lt;"),
+            '>' => label.push_str("#gt;"),
+            '&' => label.push_str("#amp;"),
+            c => label.push(c),
+        }
+    }
+    label
 }
 
 fn node_id(id: &str) -> String {
@@ -331,5 +362,65 @@ mod tests {
         assert!(m.contains("graph"));
         assert!(m.contains("c__m"));
         assert!(m.contains("contains"));
+    }
+
+    /// Mermaid 따옴표 라벨은 Mermaid에서 뜻을 갖는 글자를 엔터티 코드로 바꾼다 — 트레이트 impl
+    /// ID의 `<Tr>`가 HTML 태그로 사라지지 않고, 다른 도구 문서의 `"`·`%%{`가 문장·지시문을
+    /// 끼우지 못한다. 엔터티를 쓴 줄은 `;`로 끝나고(`style`이 든 줄의 마지막 `;`를 Mermaid가
+    /// 지운다), 바꿀 글자가 없는 줄은 그대로다.
+    #[test]
+    fn mermaid_labels_escape_markup_and_directives() {
+        let fn_vertex = |id: &str| Vertex {
+            id: id.into(),
+            kind: Kind::Fn,
+            krate: "c".into(),
+            module: "c".into(),
+            position: None,
+            exported: false,
+            generated: false,
+            cfg: None,
+            unsafe_: false,
+        };
+        let quote = r#"c::q"];click c href "javascript:alert(1)";x[""#;
+        let directive = "c::%%{init: {'theme':'dark'}}%%";
+        let ids = [
+            "c",
+            "c::T",
+            "c::T::<Tr>::m",
+            "c::a&b",
+            "c::style::f",
+            quote,
+            directive,
+        ];
+        let edges = [
+            ("c", "c::T", EdgeKind::Contains),
+            ("c::T", "c::T::<Tr>::m", EdgeKind::Contains),
+            ("c::style::f", "c::T::<Tr>::m", EdgeKind::Call),
+            ("c", quote, EdgeKind::Contains),
+            ("c", directive, EdgeKind::Contains),
+            ("c", "c::a&b", EdgeKind::Contains),
+        ];
+        let d = document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec![],
+            ids.into_iter().map(fn_vertex).collect(),
+            edges
+                .into_iter()
+                .map(|(from, to, k)| Edge::new(from.into(), to.into(), k))
+                .collect(),
+            vec![],
+        );
+        let expected = concat!(
+            "graph TD\n",
+            "    c[\"c\"] -->|contains| c_____init____theme___dark_____[\"c::#37;#37;{init: {'theme':'dark'}}#37;#37;\"];\n",
+            "    c[\"c\"] -->|contains| c__T[\"c::T\"]\n",
+            "    c[\"c\"] -->|contains| c__a_b[\"c::a#amp;b\"];\n",
+            "    c[\"c\"] -->|contains| c__q___click_c_href__javascript_alert_1___x__[\"c::q#quot;];click c href #quot;javascript:alert(1)#quot;;x[#quot;\"];\n",
+            "    c__T[\"c::T\"] -->|contains| c__T___Tr___m[\"c::T::#lt;Tr#gt;::m\"];\n",
+            "    c__style__f[\"c::style::f\"] -->|call| c__T___Tr___m[\"c::T::#lt;Tr#gt;::m\"];\n",
+        );
+        assert_eq!(to_mermaid(&d), expected);
     }
 }

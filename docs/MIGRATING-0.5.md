@@ -54,6 +54,14 @@ The rename is a single-file publication, not a multi-file transaction or a
 power-loss durability guarantee. On systems that reject replacing an open or
 existing destination, publication fails without truncating the original.
 
+## Mermaid output
+
+Mermaid labels write `"`, `%`, `<`, `>` and `&` as Mermaid entity codes
+(`#quot;`, `#37;`, `#lt;`, `#gt;`, `#amp;`), and an edge line that uses one ends
+with `;`. Rendered labels still read as the vertex ids, and trait implementation
+methods such as `Type::<Trait>::method` keep `<Trait>` instead of losing it as an
+HTML tag. Lines without those characters are unchanged.
+
 ## Path budgets
 
 The path expansion budget also limits queued partial-path copies. Completed
