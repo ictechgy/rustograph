@@ -1,6 +1,6 @@
 //! `.rustograph.yml` — 컴포넌트 매핑과 의존 규칙.
 //!
-//! serde_yml은 이 모듈에만 격리한다 — 도메인이 설정 형식을 모르게.
+//! YAML 파서(serde_norway)는 이 모듈에만 격리한다 — 도메인이 설정 형식을 모르게.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -42,7 +42,7 @@ pub fn load(dir: &Path) -> Result<Option<Config>, String> {
 pub fn load_file(path: &Path) -> Result<Config, String> {
     let src = read_bounded_text(path, MAX_FILE_BYTES)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    serde_yml::from_str(&src).map_err(|e| format!("bad {}: {e}", path.display()))
+    serde_norway::from_str(&src).map_err(|e| format!("bad {}: {e}", path.display()))
 }
 
 /// 설정·기준선 파일의 크기 상한(바이트). 기준선은 위반 하나가 한 줄이라 큰 레거시
@@ -125,7 +125,7 @@ deny:
 signature:
   ui: [ui, core]
 "#;
-        let c: Config = serde_yml::from_str(src).unwrap();
+        let c: Config = serde_norway::from_str(src).unwrap();
         assert_eq!(c.components.len(), 2);
         assert_eq!(c.deps["ui"], vec!["core"]);
         assert_eq!(c.deny["core"], vec!["ui"]);

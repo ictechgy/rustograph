@@ -66,7 +66,7 @@ cargo run -- cycles --level symbol --strict
   전체를 cargo/syn 없이 테스트할 수 있습니다. `serde`만 허용됩니다.
 - **`syn`과 `cargo`를 `harvest`/`modtree`/`cargo_meta`/`source` 밖에서
   쓰지 마세요.** `ra_ap_*`는 `sem` 안에만 있습니다(semantic feature).
-  마찬가지로 `serde_yml`은 `config` 안에만 있습니다(YAML 파싱은
+  마찬가지로 YAML 파서 `serde_norway`는 `config` 안에만 있습니다(YAML 파싱은
   `config::load_file` 하나로).
   `.rustograph.yml`이 모듈 사이 경계를 스스로 강제합니다 — `rules --strict`가
   0이어야 합니다. 단 자기 분석은 syn이 수확한 경로만 봅니다. 표현식 목록으로
