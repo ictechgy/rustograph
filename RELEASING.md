@@ -8,7 +8,7 @@
 그 뒤 기존 macOS arm64 압축 바이너리의 전체 CLI 계약과 체크섬 생성 관문을 통과해야 한다.
 태그·버전 대조와 Homebrew 갱신 순서는 그대로다. 태그를 만들거나 옮기는 일은 게시 helper가 하지 않는다.
 workflow 기본 토큰은 `contents: read`이고 게시 job만 `contents: write`를 받는다. 모든 checkout은
-`persist-credentials: false`로 토큰을 남기지 않고, 액션은 커밋 SHA로 고정한다.
+`persist-credentials: false`로 토큰을 남기지 않고, 액션은 커밋 SHA로 고정해 Dependabot(github-actions)이 갱신을 제안한다.
 
 GitHub UI에서 먼저 릴리스를 만드는 경우에는 정확한 대상 커밋을 선택하고, 노트에 바이너리 게시가
 아직 진행 중임을 적는다. 릴리스 페이지가 생겼다는 이유만으로 바이너리 배포 완료로 보지 않는다.

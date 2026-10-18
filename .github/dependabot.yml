@@ -1,0 +1,12 @@
+# 워크플로 액션의 커밋 SHA 고정을 갱신하는 경로다. github-actions 생태계만 둔다.
+# cargo 생태계는 넣지 않는다 — ra_ap_* exact pin(0.0.349)과 Cargo.lock의
+# salsa·salsa-macro-rules·unicode-ident 핀은 함께 맞춘 세트라 개별 갱신으로 깨진다
+# (Cargo.toml의 ra_ap 주석 참고).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
