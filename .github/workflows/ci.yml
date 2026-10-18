@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# CI는 저장소에 쓰지 않는다 — 토큰은 읽기 전용이고 checkout은 토큰을 .git/config에 남기지 않는다.
+# 액션은 커밋 SHA로 고정한다(주석은 고정 시점의 태그) — 갱신은 Dependabot이 제안한다.
+permissions:
+  contents: read
+
 jobs:
   release-assets:
     strategy:
@@ -12,7 +17,9 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - if: runner.os == 'Windows'
         run: bash scripts/test-release-build-manifest.sh
         shell: bash
@@ -25,11 +32,16 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-llvm-cov
 
       - run: cargo build --all-targets
       - run: cargo clippy --all-targets -- -D warnings
@@ -44,7 +56,11 @@ jobs:
   windows-output-safety:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
       - run: cargo test --locked --test snapshot_safety
       - run: cargo test --locked export::tests
