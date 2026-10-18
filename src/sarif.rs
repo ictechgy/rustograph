@@ -7,8 +7,11 @@ use crate::graph::Document;
 use crate::rules::Violation;
 use serde_json::{json, Map, Value};
 
-/// 위반 목록을 SARIF 로그로 직렬화한다.
-pub fn rules_sarif(doc: &Document, violations: &[Violation]) -> String {
+/// 위반 목록을 SARIF 로그로 직렬화한다. `version`은 `tool.driver.version`에 싣는 도구
+/// 버전이다 — 호출자(진입점)가 넘긴다. 출력 계층이 `crate::cli::VERSION`을 직접 읽으면
+/// cli ↔ sarif 모듈 순환인데, `json!` 매크로 토큰 안의 경로는 수확되지 않아 자기 분석
+/// (`cycles --strict`)도 이 순환을 보지 못한다(cli::reach와 같은 방식).
+pub fn rules_sarif(doc: &Document, violations: &[Violation], version: &str) -> String {
     let mut results = Vec::new();
     for v in violations {
         let mut result = Map::new();
@@ -39,7 +42,7 @@ pub fn rules_sarif(doc: &Document, violations: &[Violation]) -> String {
             "tool": {
                 "driver": {
                     "name": "rustograph",
-                    "version": crate::cli::VERSION,
+                    "version": version,
                     "informationUri": "https://github.com/ictechgy/rustograph",
                     "rules": [
                         {"id": "rustograph/allow", "name": "AllowlistViolation"},
@@ -110,9 +113,11 @@ mod tests {
             forbidden: "ui".into(),
             kind: EdgeKind::Call,
         };
-        let s = rules_sarif(&doc, &[v]);
+        let s = rules_sarif(&doc, &[v], "9.9.9-test");
         let j: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(j["version"], "2.1.0");
+        // 도구 버전은 호출자가 넘긴 값 그대로다 — sarif가 cli를 읽지 않는다.
+        assert_eq!(j["runs"][0]["tool"]["driver"]["version"], "9.9.9-test");
         assert_eq!(j["runs"][0]["results"][0]["ruleId"], "rustograph/deny");
         // 위치는 정점의 file:line에서 온다.
         let loc = &j["runs"][0]["results"][0]["locations"][0]["physicalLocation"];

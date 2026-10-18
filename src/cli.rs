@@ -412,7 +412,12 @@ fn cmd_rules(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     }
     match a.get("format").unwrap_or("text") {
         "json" => write!(out, "{}", export::to_json(&report)).ok(),
-        "sarif" => write!(out, "{}", sarif::rules_sarif(&doc, &report.violations)).ok(),
+        "sarif" => write!(
+            out,
+            "{}",
+            sarif::rules_sarif(&doc, &report.violations, VERSION)
+        )
+        .ok(),
         "text" => {
             for v in &report.violations {
                 writeln!(
