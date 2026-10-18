@@ -15,6 +15,25 @@ pub fn is_zero(n: &usize) -> bool {
     *n == 0
 }
 
+/// 정점 ID·모듈·크레이트 이름에 올 수 없는 문자인가 — C0·DEL·C1(NEL 포함) 제어 문자와
+/// U+2028·U+2029. isthmus 안전 문자열 규칙과 같은 집합이다. 수확한 ID는 Rust 경로라
+/// 이 문자가 없다. 다른 도구가 만든 문서의 ID에 섞이면 텍스트 출력이 터미널을 조작하고
+/// Mermaid 문장이 끊긴다 — 저장 문서를 읽을 때와 reach가 받는 id가 같은 판정을 쓴다.
+pub fn is_forbidden_id_char(c: char) -> bool {
+    matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}' | '\u{2028}' | '\u{2029}')
+}
+
+/// (필드 이름, 값) 가운데 금지 문자를 품은 첫 필드와 그 문자.
+fn first_forbidden<'a>(
+    fields: impl IntoIterator<Item = (&'static str, &'a str)>,
+) -> Option<(&'static str, char)> {
+    fields.into_iter().find_map(|(field, text)| {
+        text.chars()
+            .find(|&c| is_forbidden_id_char(c))
+            .map(|c| (field, c))
+    })
+}
+
 /// 수확·투영 깊이. 얕은 레벨은 깊은 레벨의 투영이다 — 수확 결과가 다르면
 /// 같은 입력이 레벨에 따라 다른 그래프가 되어 신뢰가 깨진다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -217,6 +236,27 @@ impl Document {
         self.roots.dedup();
         self.limitations.sort();
         self.limitations.dedup();
+    }
+
+    /// 금지 문자([`is_forbidden_id_char`])를 품은 첫 ID 필드와 그 문자 — 정점의 id·module·crate,
+    /// 간선의 from·to를 파일 순서대로 보고, 필드는 JSON 이름(`vertices[3].id`)으로 가리켜
+    /// 문서에서 바로 찾게 한다. position·cfg·limitations는 파일 이름·cfg 리터럴 원문이라
+    /// 수확 문서에도 이런 문자가 담길 수 있어 보지 않는다 — 정상 문서는 다시 읽혀야 한다.
+    pub fn forbidden_id_char(&self) -> Option<(String, char)> {
+        let in_vertices = self.vertices.iter().enumerate().find_map(|(i, v)| {
+            first_forbidden([
+                ("id", v.id.as_str()),
+                ("module", &v.module),
+                ("crate", &v.krate),
+            ])
+            .map(|(field, c)| (format!("vertices[{i}].{field}"), c))
+        });
+        in_vertices.or_else(|| {
+            self.edges.iter().enumerate().find_map(|(i, e)| {
+                first_forbidden([("from", e.from.as_str()), ("to", &e.to)])
+                    .map(|(field, c)| (format!("edges[{i}].{field}"), c))
+            })
+        })
     }
 
     /// 정점 ID 집합 — 존재 확인과 인덱스 구축용.
@@ -625,6 +665,31 @@ mod tests {
             ],
             vec![],
         )
+    }
+
+    /// ID 필드(정점 id·module·crate, 간선 from·to)의 금지 문자는 파일 순서상 첫 필드를
+    /// JSON 이름으로 가리킨다. 수확 ID 모양(트레이트 impl·`<T as Tr>`·유니코드·raw 식별자)과
+    /// 집합 밖 공백(NBSP·폭 없는 공백)은 통과해야 정상 문서가 그대로 읽힌다.
+    #[test]
+    fn forbidden_id_char_names_the_first_offending_field() {
+        let mut d = doc();
+        d.vertices[5].id = "c::b::T::<Tr>::m".into();
+        d.vertices[4].id = "c::b::<T as Tr>::이름".into();
+        d.vertices[3].module = "c::r#type\u{a0}\u{200b}".into();
+        assert_eq!(d.forbidden_id_char(), None);
+        let found = |d: &Document| d.forbidden_id_char().map(|(f, c)| (f, u32::from(c)));
+        d.edges[1].to.push('\u{2029}');
+        assert_eq!(found(&d), Some(("edges[1].to".into(), 0x2029)));
+        d.edges[0].from.push('\u{9f}');
+        assert_eq!(found(&d), Some(("edges[0].from".into(), 0x9f)));
+        d.vertices[2].krate.push('\u{85}');
+        assert_eq!(found(&d), Some(("vertices[2].crate".into(), 0x85)));
+        d.vertices[2].module.push('\u{7f}');
+        assert_eq!(found(&d), Some(("vertices[2].module".into(), 0x7f)));
+        d.vertices[2].id.push('\n');
+        assert_eq!(found(&d), Some(("vertices[2].id".into(), 0x0a)));
+        d.vertices[0].id.push('\u{0}');
+        assert_eq!(found(&d), Some(("vertices[0].id".into(), 0)));
     }
 
     #[test]

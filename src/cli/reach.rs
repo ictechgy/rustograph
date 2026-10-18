@@ -162,11 +162,9 @@ fn revision_of(a: &Args) -> Result<Option<String>, String> {
 }
 
 /// id·revision에 올 수 없는 문자다(제어 문자, U+2028/2029) — isthmus의 안전 문자열 규칙과 같다.
+/// 판정은 저장 문서의 ID 검사(`export::load_file`)와 같은 graph 규칙 하나다.
 fn has_forbidden(s: &str) -> bool {
-    s.chars().any(|c| {
-        let u = c as u32;
-        u <= 0x1f || (0x7f..=0x9f).contains(&u) || u == 0x2028 || u == 0x2029
-    })
+    s.chars().any(crate::graph::is_forbidden_id_char)
 }
 
 /// 위치 인자 다음에 `--roots-from`의 id를 잇고, 중복은 처음 나온 순서로 하나만 남긴다

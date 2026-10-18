@@ -28,6 +28,12 @@ symbol analyses. CLI analysis errors return 2 with empty stdout. MCP summary,
 search, and supported coarse cycle views remain usable on a coarse snapshot;
 symbol-level tools return an explicit error. No missing detail is manufactured.
 
+A snapshot whose vertex `id`, `module` or `crate`, or edge `from`/`to`, contains
+a control character (C0, DEL or C1, including NEL) or U+2028/U+2029 is rejected
+with exit 2 before any output, and `mcp --graph` fails to start. rustograph never
+writes such ids, so the error names the field and code point; regenerate the
+snapshot instead of passing another tool's ids to the terminal or to Mermaid.
+
 ## File output
 
 Graph JSON/Mermaid, schema, route, and rules-baseline files are prepared in the

@@ -579,6 +579,48 @@ mod cli_tests {
         assert!(err.contains("not a regular file"), "{err}");
         std::fs::remove_dir_all(&tmp).ok();
     }
+
+    /// 다른 도구가 만든 `--graph` 문서의 ID에 ESC·개행이 섞여 있으면 어떤 명령도 그 ID를
+    /// 텍스트·Mermaid·순회 출력에 옮기지 않고 입력 오류(2)로 끝난다. 오류는 한 줄이고
+    /// 그 문자를 싣지 않는다 — 터미널 화면 지우기나 Mermaid `click` 줄이 끼어들 수 없다.
+    #[test]
+    fn tainted_graph_documents_are_input_errors() {
+        let tmp = std::env::temp_dir().join(format!("rg-tainted-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("g.json");
+        // JSON 이스케이프(\u001b·\n·\")로 싣는다 — 읽으면 실제 ESC·개행·따옴표다.
+        let tainted = r#"c::\u001b[2Jx\"]\n    click x"#;
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"tool":"rustograph","level":"symbol","root":".","roots":["c::r"],
+"vertices":[{{"id":"c::r","kind":"fn","crate":"c","module":"c"}},
+{{"id":"{tainted}","kind":"fn","crate":"c","module":"c"}}],
+"edges":[{{"from":"c::r","to":"{tainted}","kind":"call"}},{{"from":"{tainted}","to":"c::r","kind":"call"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let g = path.to_str().unwrap();
+        for args in [
+            vec![
+                "graph", "--level", "symbol", "--format", "mermaid", "--graph", g,
+            ],
+            vec!["cycles", "--level", "symbol", "--graph", g],
+            vec!["dead", "--explain", "c::r", "--graph", g],
+            vec!["reach", "c::r", "--graph", g],
+        ] {
+            let (code, out, err) = run(&args);
+            assert_eq!(code, 2, "{args:?}: {err:?}");
+            assert!(out.is_empty(), "{args:?}: {out:?}");
+            assert!(
+                err.contains("vertices[1].id contains U+001B"),
+                "{args:?}: {err:?}"
+            );
+            assert_eq!(err.lines().count(), 1, "{args:?}: {err:?}");
+            assert!(!err.contains('\u{1b}'), "{args:?}: {err:?}");
+        }
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
 }
 
 #[test]

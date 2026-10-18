@@ -105,6 +105,11 @@ awk -v n=100000 'BEGIN {
 	print "\"}],\"edges\":[]}"
 }' > "$FIX/deep-cfg.json"
 check 1 "dead deep cfg"     dead --strict --exclude-tests --graph "$FIX/deep-cfg.json"
+# 다른 도구가 만든 문서의 ID에 제어 문자(JSON \u001b = ESC)가 있으면 텍스트·순회 출력에
+# 옮기지 않고 입력 오류(2)다 — reach도 root 인자 오류(64)가 아니라 문서 오류라 2다.
+printf '%s' '{"version":1,"tool":"rustograph","level":"symbol","root":".","roots":["c::r"],"vertices":[{"id":"c::r","kind":"fn","crate":"c","module":"c"},{"id":"c::\u001b[2Jx","kind":"fn","crate":"c","module":"c"}],"edges":[{"from":"c::r","to":"c::\u001b[2Jx","kind":"call"},{"from":"c::\u001b[2Jx","to":"c::r","kind":"call"}]}' > "$FIX/tainted.json"
+check 2 "cycles tainted id" cycles --level symbol --graph "$FIX/tainted.json"
+check 2 "reach tainted id"  reach c::r --graph "$FIX/tainted.json"
 
 # rules baseline — 얼리기와 억눌림 계약. app이 core를 참조하지 못하게
 # 거꾸로 선 룰셋으로 위반을 만든다.

@@ -180,6 +180,9 @@ fn write_file_with(
 }
 
 /// 저장된 문서를 읽는다. 미래 버전은 거부한다 — 모르는 필드보다 버전 불일치가 위험하다.
+/// ID 필드에 제어 문자·U+2028/2029가 있으면 거부한다 — 다른 도구가 만든 문서의 그런 ID는
+/// cycles·dead·rules 텍스트로 터미널을 조작하고 Mermaid 문장을 끊는다. 오류에는 문자 대신
+/// 코드 포인트를 싣는다(오류도 터미널에 나간다).
 pub fn load_file(path: &Path) -> Result<Document, String> {
     let src = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -190,6 +193,13 @@ pub fn load_file(path: &Path) -> Result<Document, String> {
             "graph document version {} is newer than this tool understands ({})",
             doc.version,
             crate::graph::DOCUMENT_VERSION
+        ));
+    }
+    if let Some((field, c)) = doc.forbidden_id_char() {
+        return Err(format!(
+            "bad {}: {field} contains U+{:04X}; ids may not hold control characters or U+2028/U+2029 — regenerate the document with `rustograph graph --level symbol --out <file>`",
+            path.display(),
+            u32::from(c)
         ));
     }
     Ok(doc)
@@ -292,6 +302,27 @@ mod tests {
         std::fs::write(&p, r#"{"version":999,"tool":"rustograph","level":"module","root":".","roots":[],"vertices":[],"edges":[]}"#).unwrap();
         assert!(load_file(&p).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 다른 도구가 만든 문서의 ID에 제어 문자가 섞이면 텍스트 출력이 터미널을 조작하고
+    /// Mermaid 문장이 끊긴다 — 읽을 때 필드·코드 포인트와 해결 방향을 담아 거부한다.
+    /// 오류 문구는 그 문자를 그대로 싣지 않는다(오류도 터미널에 나간다).
+    #[test]
+    fn load_rejects_ids_with_control_characters() {
+        let dir = std::env::temp_dir().join(format!("rg-export3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("g.json");
+        let mut tainted = doc();
+        tainted.edges[0].to = "c::m\u{1b}[2J".into();
+        std::fs::write(&p, to_json(&tainted)).unwrap();
+        let err = load_file(&p).unwrap_err();
+        assert!(err.contains("edges[0].to contains U+001B"), "{err}");
+        assert!(
+            err.contains("rustograph graph --level symbol --out"),
+            "{err}"
+        );
+        assert!(!err.contains('\u{1b}'), "{err:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
