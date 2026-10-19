@@ -12,6 +12,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 /// 사용법 오류 종료 코드(BSD sysexits `EX_USAGE`) — 계열 순회 명령과 같다.
 pub(crate) const EXIT_USAGE: i32 = 64;
@@ -435,6 +436,7 @@ fn build(doc: &Document, opts: &Options, project: &Path, version: &'static str) 
     }
     reasons.sort_unstable();
     reasons.dedup();
+    let (revision, unverified) = revision_for(opts, project);
     let mut limitations = doc.limitations.clone();
     if missing > 0 {
         limitations.push(format!(
@@ -447,6 +449,7 @@ fn build(doc: &Document, opts: &Options, project: &Path, version: &'static str) 
                 .to_string(),
         );
     }
+    limitations.extend(unverified.map(|Unverified(note)| note));
     let roots = opts
         .roots
         .iter()
@@ -484,7 +487,7 @@ fn build(doc: &Document, opts: &Options, project: &Path, version: &'static str) 
             generated_at: opts.generated_at.clone(),
             platform: "rust",
             project: project.display().to_string(),
-            revision: opts.revision.clone().or_else(|| git_revision(project)),
+            revision,
             graph_revision: graph_revision(doc, project),
             direction: opts.direction.as_str(),
             roots,
@@ -610,52 +613,215 @@ impl<'a> RootedGraph<'a> {
     }
 }
 
-/// 작업 트리가 깨끗할 때만 git HEAD를 돌려준다. 커밋하지 않은 변경·추적하지 않는 파일이
-/// 있으면 HEAD는 분석한 소스가 아니므로 싣지 않는다 — isthmus trace가 revision 없는 분석을
-/// `analysis-revision-unknown`으로 드러낸다. 선택 잠금·fsmonitor 없이 실행해 저장소를 고치지 않는다.
-fn git_revision(project: &Path) -> Option<String> {
-    let status = git(
-        project,
-        &[
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=normal",
-            "--ignore-submodules=none",
-        ],
-    )?;
-    if !status.trim().is_empty() {
-        return None;
+/// 문서의 revision — `--revision`, 없으면 깨끗한 작업 트리의 git HEAD. 두 번째 값은 작업 트리를
+/// 일부러 보지 않아 revision을 싣지 못한 이유다(limitation으로 간다).
+fn revision_for(opts: &Options, project: &Path) -> (Option<String>, Option<Unverified>) {
+    match &opts.revision {
+        Some(given) => (Some(given.clone()), None),
+        None => match git_revision(project) {
+            Ok(head) => (head, None),
+            Err(unverified) => (None, Some(unverified)),
+        },
     }
-    let head = git(project, &["rev-parse", "--verify", "HEAD"])?;
-    let head = head.trim();
-    let hex = head
-        .bytes()
-        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    (hex && (head.len() == 40 || head.len() == 64)).then(|| head.to_string())
 }
 
-/// git 명령 하나 — 실패(없음·저장소 아님)는 None이다. revision 없음이 곧 신호다.
-fn git(project: &Path, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git")
+/// 작업 트리를 일부러 보지 않아 revision을 싣지 못한 이유 — 순회 문서의 `revision-unverified:`
+/// limitation 문구다. 더러운 트리나 git·저장소가 없는 경우는 revision이 없다는 것 자체가 신호라
+/// 이 값을 만들지 않는다(없는 것과 확인하지 못한 것을 가른다).
+struct Unverified(String);
+
+impl Unverified {
+    /// `-c`로 덮을 수 없는 filter 드라이버 이름이 설정에 있다. 이름 원문은 싣지 않는다 — 신뢰하지
+    /// 않는 설정 값이고 제어 문자가 섞일 수 있다.
+    fn driver_name() -> Unverified {
+        Unverified(
+            "revision-unverified: the git configuration defines a filter driver whose name contains '=', a control character or invalid UTF-8, which git cannot be told to skip, so no git command read the work tree; pass --revision to record the analyzed revision"
+                .to_string(),
+        )
+    }
+
+    /// index가 서브모듈(gitlink)을 기록한다 — 서브모듈 작업 트리를 보려면 git이 그 안에서 서브모듈
+    /// 저장소 자신의 설정을 따른다.
+    fn submodules(count: usize) -> Unverified {
+        Unverified(format!(
+            "revision-unverified: the work tree has {count} git submodule(s); rustograph does not run git inside them (that would follow their repositories' configuration, such as filter commands), so it cannot tell whether the analyzed source is HEAD; pass --revision to record the analyzed revision"
+        ))
+    }
+}
+
+/// 작업 트리가 깨끗할 때만 git HEAD를 돌려준다. 커밋하지 않은 변경·추적하지 않는 파일이
+/// 있으면 HEAD는 분석한 소스가 아니므로 싣지 않는다(`Ok(None)`, git이 없거나 저장소가 아니거나
+/// git이 실패해도 같다) — isthmus trace가 revision 없는 분석을 `analysis-revision-unknown`으로
+/// 드러낸다. 모든 호출이 `git`의 격리를 지난다. 그래서 git-lfs처럼 filter로 정규화되던 파일은 stat
+/// 캐시가 낡으면 바뀐 것으로 보이고, 그때는 깨끗하다고 주장하지 않는다(fail-safe, DECISIONS D1).
+/// index에 서브모듈(gitlink)이 있으면 status를 돌리지 않는다 — 서브모듈 작업 트리가 깨끗한지 보려면
+/// git이 그 안에서 서브모듈 저장소 자신의 설정(filter 등)을 따르므로, 깨끗함을 증명할 수 없어 `Err`로
+/// 이유를 알린다.
+fn git_revision(project: &Path) -> Result<Option<String>, Unverified> {
+    // index만 읽는다 — 작업 트리 파일을 읽지 않아 filter를 거치지 않는다.
+    let Some(entries) = git(project, &["ls-files", "--stage", "-z"])? else {
+        return Ok(None);
+    };
+    let submodules = count_gitlinks(&entries);
+    if submodules > 0 {
+        return Err(Unverified::submodules(submodules));
+    }
+    let status = [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=normal",
+        "--ignore-submodules=all",
+    ];
+    let Some(changes) = git(project, &status)? else {
+        return Ok(None);
+    };
+    if !changes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    let Some(head) = git(project, &["rev-parse", "--verify", "HEAD"])? else {
+        return Ok(None);
+    };
+    Ok(object_id(&head))
+}
+
+/// `git rev-parse` 출력이 커밋 id(소문자 16진 40자 SHA-1 또는 64자 SHA-256)면 그 문자열이다.
+fn object_id(output: &[u8]) -> Option<String> {
+    let id = std::str::from_utf8(output).ok()?.trim();
+    let hex = id
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    (hex && (id.len() == 40 || id.len() == 64)).then(|| id.to_string())
+}
+
+/// `git ls-files --stage -z` 출력에서 gitlink(mode 160000, 서브모듈) 경로 수를 센다. 레코드는
+/// `<mode> <object> <stage>\t<path>`이고, 충돌 중인 gitlink는 stage마다 한 줄이라 경로로 센다.
+fn count_gitlinks(entries: &[u8]) -> usize {
+    entries
+        .split(|&b| b == 0)
+        .filter(|entry| entry.starts_with(b"160000 "))
+        .filter_map(|entry| {
+            let tab = entry.iter().position(|&b| b == b'\t')?;
+            Some(&entry[tab + 1..])
+        })
+        .collect::<BTreeSet<&[u8]>>()
+        .len()
+}
+
+/// 분석 대상 작업 트리에서 git 명령 하나를 실행한다. 분석 대상 `.git`(과 사용자·시스템 설정)이 정한
+/// 명령을 이 읽기 전용 조회가 실행하지 않게 격리한다(DECISIONS D1): 바로 앞에서 설정된 filter 드라이버
+/// 이름을 다시 모아(`filter_driver_names`) 이름마다 명령을 빈 값으로 덮는다(`analysis_command`).
+/// 조회를 호출마다 다시 하는 것은 앞선 호출 뒤에 바뀐 설정도 따라가기 위해서다. 모든 git 호출이 이
+/// 함수를 지난다 — 호출마다 따로 쓰면 한쪽만 설정의 명령을 실행하는 어긋남이 생긴다.
+/// `Ok(Some)`은 성공한 명령의 표준 출력, `Ok(None)`은 git 없음·저장소 아님·명령이나 설정 조회 실패
+/// (revision이 없다는 것이 신호다), `Err`는 덮을 수 없는 드라이버 이름이 있어 실행하지 않은 경우다
+/// (fail-closed).
+fn git(project: &Path, args: &[&str]) -> Result<Option<Vec<u8>>, Unverified> {
+    let Some(drivers) = filter_driver_names(project)? else {
+        return Ok(None);
+    };
+    Ok(run_git(analysis_command(project, &drivers, args)))
+}
+
+/// git이 이 디렉터리에서 읽는 설정 전체(시스템·사용자·저장소·worktree·include·`-c`)에 정의된 filter
+/// 드라이버 이름을 모은다. `Ok(None)`은 조회 실패다(git 없음, 설정 오류 — 그때는 분석용 git도 이
+/// 저장소에서 돌지 않는다). 덮을 수 없는 이름이 하나라도 있으면 `Err`다 — 그 드라이버는 실행될 수 있다.
+/// D1 문구의 `--get-regexp` 대신 이름 목록 전체를 바이트로 읽는다: UTF-8 로캘의 git 정규식은 깨진
+/// UTF-8 이름을 결과에서 빼지만 속성 대조는 바이트로 해 그 드라이버를 실행한다(계열 isthmus 실험).
+fn filter_driver_names(project: &Path) -> Result<Option<Vec<String>>, Unverified> {
+    let mut listing = git_command(project);
+    listing.args(["config", "-z", "--includes", "--name-only", "--list"]);
+    match run_git(listing) {
+        Some(keys) => parse_filter_driver_names(&keys).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// `git config -z --name-only --list` 출력(키마다 NUL로 끝난다)에서 드라이버 이름을 정렬·중복 제거해
+/// 뽑는다 — 정렬은 `-c` 인자 순서를 결정적으로 만든다. 덮을 수 없는 이름이 있으면 `Err`다.
+fn parse_filter_driver_names(keys: &[u8]) -> Result<Vec<String>, Unverified> {
+    let mut drivers = BTreeSet::new();
+    for key in keys.split(|&b| b == 0) {
+        let Some(name) = filter_driver_name(key) else {
+            continue;
+        };
+        let name = std::str::from_utf8(name)
+            .ok()
+            .filter(|n| can_override(n))
+            .ok_or_else(Unverified::driver_name)?;
+        drivers.insert(name.to_string());
+    }
+    Ok(drivers.into_iter().collect())
+}
+
+/// 설정 키가 filter 드라이버의 명령 키(`filter.<이름>.clean|smudge|process`)면 그 이름(바이트)이다.
+/// 이름은 `filter.`과 마지막 `.<키>` 사이 전체다 — 점이 들어갈 수 있고 빈 이름(`[filter ""]`)도 git이
+/// 쓴다. git은 섹션·변수 이름을 소문자로 주지만 둘 다 대소문자를 가리지 않는 이름이라 그렇게 비교한다.
+/// 이름(subsection)은 대소문자를 가린다. subsection 없는 `filter.clean`은 드라이버가 아니다.
+fn filter_driver_name(key: &[u8]) -> Option<&[u8]> {
+    const SECTION: &[u8] = b"filter.";
+    if !key.get(..SECTION.len())?.eq_ignore_ascii_case(SECTION) {
+        return None;
+    }
+    let rest = &key[SECTION.len()..];
+    let dot = rest.iter().rposition(|&b| b == b'.')?;
+    let variable = &rest[dot + 1..];
+    ["clean", "smudge", "process"]
+        .iter()
+        .any(|command| variable.eq_ignore_ascii_case(command.as_bytes()))
+        .then_some(&rest[..dot])
+}
+
+/// 이름을 `-c filter.<이름>.<키>=`로 덮을 수 있는가 — git은 `-c`를 첫 `=`에서 키와 값으로 나누므로
+/// `=`가 든 이름은 다른 키가 된다. 제어 문자(와 U+2028/2029)가 든 이름은 정상 설정에서 나오지 않아
+/// 인자로 옮기지 않는다(id와 같은 금지 문자 판정).
+fn can_override(name: &str) -> bool {
+    !name.contains('=') && !has_forbidden(name)
+}
+
+/// 모든 git 호출(드라이버 조회 포함)의 공통 부분 — 분석 대상 설정이 명령을 실행하거나 저장소를 고치지
+/// 못하게 끈다: fsmonitor 훅, untracked cache 기록, log 계열의 서명 확인(gpg 실행). 선택 잠금을 꺼
+/// index를 다시 쓰지 않고(그래서 `post-index-change` 훅도 돌지 않는다), 프롬프트를 막고 메시지를 C
+/// 로캘로 고정한다. `GIT_CONFIG`는 `git config`만 따르는 옛 변수라(그 파일만 읽는다) 드라이버 조회가
+/// 분석용 명령과 다른 설정을 보지 않게 뺀다.
+fn git_command(project: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
         .args([
             "-c",
             "core.fsmonitor=false",
             "-c",
             "core.untrackedCache=false",
+            "-c",
+            "log.showSignature=false",
         ])
-        .args(args)
         .current_dir(project)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("LC_ALL", "C")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+        .env_remove("GIT_CONFIG")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+/// 분석용 git 명령 — 공통 부분 뒤에 드라이버마다 명령 세 키를 빈 값으로, required를 false로 덮는다.
+/// 빈 명령은 git이 실행하지 않고(filter 없이 원문을 쓴다), required=false라야 "filter 실패"로 끝나지
+/// 않는다. `--attr-source`는 `.git/info/attributes`를 막지 못해 쓰지 않는다.
+fn analysis_command(project: &Path, drivers: &[String], args: &[&str]) -> Command {
+    let mut command = git_command(project);
+    for name in drivers {
+        for setting in ["clean=", "smudge=", "process=", "required=false"] {
+            command.arg("-c").arg(format!("filter.{name}.{setting}"));
+        }
     }
-    String::from_utf8(out.stdout).ok()
+    command.args(args);
+    command
+}
+
+/// 명령을 실행해 성공하면 표준 출력을 돌려준다 — git이 없거나 실패하면 None이다.
+fn run_git(mut command: Command) -> Option<Vec<u8>> {
+    let out = command.output().ok()?;
+    out.status.success().then_some(out.stdout)
 }
 
 #[cfg(test)]
@@ -795,5 +961,107 @@ mod tests {
         ])));
         assert!(!is_traversal_argv(&v(&["impact", "x"])));
         assert!(!is_traversal_argv(&v(&[])));
+    }
+
+    #[test]
+    fn filter_driver_names_come_from_every_command_key() {
+        // git이 주는 키 목록 그대로 — 점이 든 이름, 대소문자를 가리는 이름, 빈 이름, 같은 드라이버의
+        // 여러 키를 모은다. subsection 없는 `filter.clean`, 명령 키가 아닌 `required`·`cleanup`,
+        // 다른 섹션은 드라이버가 아니다.
+        let keys = b"core.bare\0filter.lfs.clean\0filter.lfs.smudge\0filter.lfs.process\0\
+filter.lfs.required\0filter.evil.name.clean\0filter.Evil.process\0filter..smudge\0\
+filter.clean\0filter.x.cleanup\0myfilter.y.clean\0FILTER.Up.CLEAN\0";
+        let drivers = parse_filter_driver_names(keys).ok().unwrap();
+        assert_eq!(drivers, ["", "Evil", "Up", "evil.name", "lfs"]);
+        assert_eq!(
+            parse_filter_driver_names(b"").ok().unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn filter_driver_names_git_cannot_override_are_refused() {
+        // `=`는 -c가 키를 가르는 자리이고, 깨진 UTF-8·제어 문자(NEL 포함)는 인자로 옮기지 않는다.
+        for keys in [
+            &b"filter.ok.clean\0filter.a=b.clean\0"[..],
+            b"filter.\xff\xfe.smudge\0",
+            b"filter.a\tb.process\0",
+            b"filter.a\xc2\x85b.clean\0",
+        ] {
+            let Err(Unverified(note)) = parse_filter_driver_names(keys) else {
+                panic!("{keys:?} must be refused");
+            };
+            assert!(note.starts_with("revision-unverified: "), "{note}");
+            assert!(!note.contains("a=b"), "the driver name is not echoed");
+        }
+        // 명령 키가 아니면 이름이 이상해도 드라이버가 아니다.
+        assert!(parse_filter_driver_names(b"filter.a=b.required\0").is_ok());
+    }
+
+    #[test]
+    fn analysis_commands_override_every_listed_driver() {
+        let drivers = ["evil.name".to_string(), String::new()];
+        let command = analysis_command(Path::new("/p"), &drivers, &["status"]);
+        let args: Vec<&str> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+        let mut expected = vec![
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "log.showSignature=false",
+        ];
+        for setting in [
+            "filter.evil.name.clean=",
+            "filter.evil.name.smudge=",
+            "filter.evil.name.process=",
+            "filter.evil.name.required=false",
+            "filter..clean=",
+            "filter..smudge=",
+            "filter..process=",
+            "filter..required=false",
+        ] {
+            expected.extend(["-c", setting]);
+        }
+        expected.push("status");
+        assert_eq!(args, expected);
+        assert_eq!(command.get_current_dir(), Some(Path::new("/p")));
+        let envs: BTreeMap<_, _> = command.get_envs().collect();
+        let value = |k: &str| envs.get(std::ffi::OsStr::new(k)).copied();
+        assert_eq!(
+            value("GIT_OPTIONAL_LOCKS"),
+            Some(Some(std::ffi::OsStr::new("0")))
+        );
+        assert_eq!(value("LC_ALL"), Some(Some(std::ffi::OsStr::new("C"))));
+        // 드라이버 조회가 분석용 명령과 같은 설정을 읽도록 `git config` 전용 변수를 뺀다.
+        assert_eq!(value("GIT_CONFIG"), Some(None));
+    }
+
+    #[test]
+    fn gitlinks_are_counted_once_per_path() {
+        // 충돌 중인 gitlink는 stage마다 한 줄이다. 경로가 숫자로 시작하는 일반 파일은 gitlink가 아니다.
+        let records = [
+            "100644 aaaa 0\tsrc/lib.rs",
+            "160000 bbbb 0\tvendored",
+            "160000 cccc 1\tclash",
+            "160000 dddd 3\tclash",
+            "100644 eeee 0\t160000 x",
+        ];
+        let entries: Vec<u8> = records.iter().flat_map(|r| r.bytes().chain([0])).collect();
+        assert_eq!(count_gitlinks(&entries), 2);
+        assert_eq!(count_gitlinks(b""), 0);
+    }
+
+    #[test]
+    fn object_ids_are_full_lowercase_hex() {
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            object_id(format!("{sha1}\n").as_bytes()).as_deref(),
+            Some(sha1)
+        );
+        assert_eq!(object_id(&[b'a'; 64]).map(|id| id.len()), Some(64));
+        for bad in [&b"0123ABCDEF"[..], b"", b"\xff", &[b'a'; 39]] {
+            assert_eq!(object_id(bad), None, "{bad:?}");
+        }
     }
 }

@@ -353,8 +353,12 @@ strings as `symbol.usr` in `schema`.
   `--max-reached` 1–100,000; cuts set `truncated` with `depth` /
   `max-reached`.
 - **Identity**: `project` is the same realpath `schema` writes; `revision`
-  is `--revision` or git `HEAD` when the work tree is clean; `graphRevision`
-  is the SHA-256 of the graph JSON (with `root` normalized to the project).
+  is `--revision` or git `HEAD` when the work tree is clean (omitted, with a
+  `revision-unverified:` limitation, when a clean tree cannot be checked
+  without running the repository's git configuration — a work tree with
+  submodules, see [Security: trust boundary](#security-trust-boundary));
+  `graphRevision` is the SHA-256 of the graph JSON (with `root` normalized to
+  the project).
 - **root-not-found**: ids that are not graph vertices are listed without
   `symbol`, a `root-not-found:` limitation is added, and the command exits
   `64` after writing the document.
@@ -443,6 +447,36 @@ checkout, and the analysis fails if that write fails; it can also fetch
 registry and git dependencies named in the checkout's manifests, so limit the
 sandbox's network access if that matters. rustograph does not sandbox these
 commands itself.
+
+`reach` and `impact --format language-traversal` without `--revision` also run
+`git` in the `--dir` directory, only to read `revision` (`git config`,
+`git ls-files`, `git status`, `git rev-parse`). These calls keep the analyzed
+repository's git configuration from running commands:
+
+- Right before each call, rustograph lists the filter drivers git sees
+  (`git config -z --includes --name-only --list`, which covers the repository,
+  your own and the system configuration) and overrides each with empty
+  `clean`, `smudge`, and `process` commands and `required=false`, so git runs
+  none of them, whether `.gitattributes` or `.git/info/attributes` names the
+  driver.
+- `core.fsmonitor`, the untracked cache, `log.showSignature`, and optional
+  locks (`GIT_OPTIONAL_LOCKS=0`) are off, so no fsmonitor hook runs and the
+  index is not rewritten (rewriting it would run the `post-index-change` hook).
+- git never runs inside a submodule: when the index records one, rustograph
+  does not run `git status` at all (`--ignore-submodules=all` otherwise).
+- When a driver name contains `=`, a control character, or invalid UTF-8,
+  rustograph runs no other git command — git's `-c` splits at the first `=`,
+  so such a driver cannot be overridden.
+
+What this changes for `revision`: a file that a filter normalizes (git-lfs and
+the like) is compared as raw content, so when git's stat cache is stale for it
+the tree looks modified and `revision` is omitted rather than claiming a clean
+`HEAD` that rustograph could not verify; in a checkout you trust, run
+`git status` first to refresh git's stat cache. A work tree with submodules, or
+a configuration with a driver name that cannot be overridden, gets no
+automatic `revision` and a `revision-unverified:` limitation. Pass `--revision`
+to record the analyzed revision yourself. The rest of your git configuration
+applies as usual.
 
 ## License
 

@@ -229,7 +229,10 @@ isthmus [`language-traversal` v1](https://github.com/ictechgy/isthmus/blob/main/
   싣지 않습니다.
 - `--max-depth` 1~128(기본 128, `--depth 0`은 128), `--max-reached` 1~100,000.
 - `project`는 `schema`와 같은 realpath, `revision`은 `--revision` 또는 작업
-  트리가 깨끗할 때의 git HEAD, `graphRevision`은 그래프 JSON의 SHA-256입니다.
+  트리가 깨끗할 때의 git HEAD(저장소의 git 설정을 실행하지 않고는 깨끗한지 확인할
+  수 없는 작업 트리 — 서브모듈이 있는 트리, [보안: 신뢰 경계](#보안-신뢰-경계) 절 — 는 생략하고
+  `revision-unverified:` limitation으로 알립니다), `graphRevision`은 그래프 JSON의
+  SHA-256입니다.
 - 그래프 정점이 아닌 root는 `symbol` 없이 싣고 `root-not-found:` limitation을
   더한 문서를 쓴 뒤 64로 끝납니다.
 
@@ -290,6 +293,32 @@ MCP `rustograph_deps` 도구는 첫 호출 때 `--dir` 워크스페이스를 대
 체크아웃의 매니페스트에 적힌 레지스트리·git 의존을 네트워크로 가져올 수도
 있으니, 필요하면 샌드박스의 네트워크 접근을 제한하세요. rustograph가 이
 명령들을 직접 격리하지는 않습니다.
+
+`--revision` 없는 `reach`·`impact --format language-traversal`은 `revision`을
+읽으려고만 `--dir` 디렉터리에서 `git`도 실행합니다(`git config`, `git ls-files`,
+`git status`, `git rev-parse`). 이 호출은 분석 대상 저장소의 git 설정이 명령을
+실행하지 못하게 합니다.
+
+- 호출 바로 앞에서 git이 보는 filter 드라이버를 모읍니다
+  (`git config -z --includes --name-only --list` — 저장소·사용자·시스템 설정을
+  모두 봅니다). 드라이버마다 `clean`·`smudge`·`process`를 빈 명령으로,
+  `required`를 `false`로 덮어 git이 하나도 실행하지 않게 합니다.
+  `.gitattributes`와 `.git/info/attributes` 어느 쪽에서 건 드라이버든 같습니다.
+- `core.fsmonitor`, untracked cache, `log.showSignature`, 선택 잠금
+  (`GIT_OPTIONAL_LOCKS=0`)을 꺼서 fsmonitor 훅이 돌지 않고 index를 다시 쓰지
+  않습니다(다시 쓰면 `post-index-change` 훅이 돕니다).
+- 서브모듈 안에서는 git을 띄우지 않습니다. index에 서브모듈이 있으면 `git status`를
+  아예 실행하지 않습니다(없으면 `--ignore-submodules=all`).
+- 이름에 `=`·제어 문자·깨진 UTF-8이 든 드라이버가 있으면 다른 git 명령을 실행하지
+  않습니다. git의 `-c`는 첫 `=`에서 나누므로 그런 드라이버는 덮을 수 없습니다.
+
+그래서 `revision`이 달라집니다. filter가 정규화하던 파일(git-lfs 등)은 원문으로
+비교하므로, git의 stat 캐시가 낡으면 바뀐 파일로 보여 확인하지 못한 깨끗한 `HEAD`를
+주장하지 않고 `revision`을 싣지 않습니다. 신뢰하는 checkout이면 먼저 `git status`로
+git의 stat 캐시를 새로 고치세요. 서브모듈이 있는 작업 트리나 덮을 수 없는 드라이버
+이름이 있는 설정은 `revision`을 자동으로 싣지 않고 `revision-unverified:`
+limitation으로 알립니다. 분석한 revision은 `--revision`으로 직접 줄 수 있습니다.
+나머지 git 설정은 평소대로 적용됩니다.
 
 ## 라이선스
 
