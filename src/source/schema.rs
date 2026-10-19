@@ -149,6 +149,9 @@ pub fn facts(dir: &Path, tool_version: &str) -> Result<BridgeFactsDocument, Stri
     for (file, src, ast) in &files {
         scan_file(&mut scan, file, src, ast);
     }
+    // 스캔한 원문·AST는 여기서 끝이다. 아래 정점 귀속 수확이 같은 파일을 다시 읽어
+    // 파싱하므로, 쥔 채로 부르면 두 집합이 함께 살아 최대 메모리가 둘의 합이 된다.
+    drop(files);
     let mut facts = std::mem::take(&mut scan.list);
     // 감싸는 정점 귀속 — impact와 같은 syn 수확을 돌려 정점 ID와 범위를
     // 얻는다(간선은 귀속에 필요 없어 만들지 않는다). 그래프를 못 만들면 사실은
