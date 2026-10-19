@@ -50,6 +50,14 @@ is nested in other macro tokens, replacing an existing output
 is rejected conservatively; use a fresh output path or stdout. This protection
 does not claim that the syntax-only graph expands include macros.
 
+A declared module file that cannot be read or parsed no longer makes `--out`
+fail for a command that still produces its document on stdout: `schema` counts
+the file under `unparsed-sources` and writes the same document to a fresh output
+path. The unreadable file is protected, but the modules and include inputs it
+declares are unknown, so replacing an existing output is rejected conservatively
+with an error that names the file. Commands that need the symbol graph, such as
+`graph` and `rules`, still exit 2 on such a file.
+
 The rename is a single-file publication, not a multi-file transaction or a
 power-loss durability guarantee. On systems that reject replacing an open or
 existing destination, publication fails without truncating the original.

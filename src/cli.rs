@@ -251,16 +251,33 @@ fn write_output(
         }
     }
     if a.get("graph").is_none() {
-        let (files, unresolved_includes) = match harvested {
+        let listed = match harvested {
             Some(inputs) => inputs.protected_files(),
             None => source::input_files(directory)?,
         };
-        protected.extend(files);
-        if unresolved_includes && path.exists() {
-            return Err("cannot safely replace an existing output with unresolved include paths; choose a new output path or write to stdout".into());
+        if path.exists() {
+            if let Some(refusal) = replacement_refusal(&listed) {
+                return Err(refusal);
+            }
         }
+        protected.extend(listed.files);
     }
     export::write_file(path, text.as_bytes(), &protected)
+}
+
+/// 보호 목록에 빠진 입력이 있을 수 있으면 기존 출력을 교체하지 않는 이유 — 기존 파일이
+/// 그 빠진 입력일 수 있다. 새 경로와 표준 출력은 덮어쓸 원본이 없어 막지 않는다.
+fn replacement_refusal(listed: &source::ProtectedInputs) -> Option<String> {
+    if let Some(first) = listed.unloaded_modules.first() {
+        return Some(format!(
+            "cannot safely replace an existing output: {} module file(s) could not be read or parsed (first: {}), so the modules and include inputs they declare are unknown; fix them, choose a new output path or write to stdout",
+            listed.unloaded_modules.len(),
+            first.display()
+        ));
+    }
+    listed.unresolved_includes.then(|| {
+        "cannot safely replace an existing output with unresolved include paths; choose a new output path or write to stdout".to_string()
+    })
 }
 
 fn cmd_graph(a: &Args, out: &mut dyn Write) -> Result<i32, String> {

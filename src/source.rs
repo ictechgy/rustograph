@@ -260,24 +260,43 @@ pub(crate) fn harvest_parts(dir: &Path, meta: &Metadata) -> Result<Parts, String
 pub(crate) struct HarvestInputs {
     arena: Arena,
     orphan_files: Vec<PathBuf>,
+    /// 읽거나 파싱하지 못한 모듈 파일 — 끝까지 간 수확에는 없다(수확은 그런 파일에서
+    /// 실패한다). 관대 모드로 트리만 다시 찾은 [`input_files`]만 채운다.
+    unloaded: Vec<PathBuf>,
     workspace_root: PathBuf,
 }
 
+/// `--out` 입력 보호 목록 — 덮어쓰면 안 되는 파일과, 목록에 빠진 입력이 있을 수 있는
+/// 이유다. 이유가 있으면 호출자가 기존 출력 교체를 보수적으로 거부한다.
+pub(crate) struct ProtectedInputs {
+    /// 산출물이 덮어쓰면 안 되는 파일.
+    pub(crate) files: Vec<PathBuf>,
+    /// 리터럴로 풀지 못한 include 경로가 있다 — 그 대상은 목록에 없다.
+    pub(crate) unresolved_includes: bool,
+    /// 읽거나 파싱하지 못한 모듈 파일(경로순) — 파일은 목록에 있지만 그 파일이 선언한
+    /// 하위 모듈·include 입력은 없다.
+    pub(crate) unloaded_modules: Vec<PathBuf>,
+}
+
 impl HarvestInputs {
-    /// 산출물 경로가 실제 수확 입력을 덮어쓰지 않도록 파일 목록을 돌려준다 — 두 번째 값은
-    /// include 경로를 다 풀지 못했는가다. 모듈·사용자 지정 타깃은 수확 아레나를, include
-    /// 계열은 별도 경로 검사를 쓴다.
-    pub(crate) fn protected_files(&self) -> (Vec<PathBuf>, bool) {
+    /// 산출물 경로가 실제 수확 입력을 덮어쓰지 않도록 보호 목록을 만든다. 모듈·사용자 지정
+    /// 타깃은 수확 아레나를, include 계열은 별도 경로 검사를 쓴다.
+    pub(crate) fn protected_files(&self) -> ProtectedInputs {
         let mut files: BTreeSet<PathBuf> = self.arena.keys().cloned().collect();
         let unresolved_includes = include_inputs(&self.arena, &mut files);
         files.extend(self.orphan_files.iter().cloned());
+        files.extend(self.unloaded.iter().cloned());
         let manifests = manifests_above(
             files
                 .iter()
                 .chain(std::iter::once(&self.workspace_root.join("Cargo.toml"))),
         );
         files.extend(manifests);
-        (files.into_iter().collect(), unresolved_includes)
+        ProtectedInputs {
+            files: files.into_iter().collect(),
+            unresolved_includes,
+            unloaded_modules: self.unloaded.clone(),
+        }
     }
 }
 
@@ -312,13 +331,16 @@ fn manifests_above<'a>(paths: impl Iterator<Item = &'a PathBuf>) -> Vec<PathBuf>
 
 /// 문서를 만든 수확의 입력을 넘겨받지 못한 `--out`(schema·routes, semantic 캐시 적중)이
 /// 보호 목록을 다시 만든다. 모듈 트리만 키운다 — 이름 해석·정점 수확은 보호 목록에 쓰이지
-/// 않는다. 파일 목록은 [`HarvestInputs::protected_files`]와 같다.
-pub(crate) fn input_files(dir: &Path) -> Result<(Vec<PathBuf>, bool), String> {
+/// 않는다. 파일 목록은 [`HarvestInputs::protected_files`]와 같다. 읽거나 파싱하지 못한
+/// 모듈 파일은 오류가 아니라 `unloaded_modules`다 — 그런 파일을 limitation으로 세고 문서를
+/// 내는 명령(`schema`)이 출력 대상에 따라 성공·실패가 갈리지 않게 한다.
+pub(crate) fn input_files(dir: &Path) -> Result<ProtectedInputs, String> {
     let metadata = cargo_meta::load(dir)?;
-    let found = input_tree(&metadata)?;
+    let found = input_tree(&metadata, true)?;
     let inputs = HarvestInputs {
         arena: found.arena,
         orphan_files: found.tree.orphan_files,
+        unloaded: found.unloaded.into_iter().flatten().collect(),
         workspace_root: metadata.workspace_root,
     };
     Ok(inputs.protected_files())
@@ -720,7 +742,8 @@ fn harvest(
         arena,
         conditional_mods,
         uses_include,
-    } = input_tree(meta)?;
+        ..
+    } = input_tree(meta, false)?;
     for t in source_targets(meta).filter(|t| t.kind == "bin") {
         entry_roots.push(format!("{}::main", t.name));
     }
@@ -927,6 +950,7 @@ fn harvest(
             k.inputs = Some(HarvestInputs {
                 arena: arena.clone(),
                 orphan_files: tree.orphan_files.clone(),
+                unloaded: Vec::new(),
                 workspace_root: meta.workspace_root.clone(),
             });
         }
@@ -1076,6 +1100,25 @@ struct InputTree {
     conditional_mods: usize,
     /// 수확 파일 중 include! 계열 매크로를 쓰는 파일이 있는가 — 캐시 판정에 쓴다.
     uses_include: bool,
+    /// 읽거나 파싱하지 못한 모듈 파일 — Some이면 관대 모드다. 수확(None)은 그런 파일에서
+    /// 오류로 끝나지만, `--out` 입력 보호는 파일을 적고 나머지 트리를 계속 찾는다. `schema`는
+    /// 그런 파일을 unparsed-sources로 세고 문서를 내는데, 보호 목록 수집이 실패하면 `--out`일
+    /// 때만 종료 2가 됐다.
+    unloaded: Option<BTreeSet<PathBuf>>,
+}
+
+impl InputTree {
+    /// 모듈 파일을 싣지 못한 오류를 처리한다 — 엄격 모드는 오류를 그대로 돌려주고, 관대
+    /// 모드는 파일을 적고 넘어간다(그 파일이 선언한 하위 모듈은 트리에 실리지 않는다).
+    fn tolerate(&mut self, file: &Path, error: String) -> Result<(), String> {
+        match self.unloaded.as_mut() {
+            Some(unloaded) => {
+                unloaded.insert(file.to_path_buf());
+                Ok(())
+            }
+            None => Err(error),
+        }
+    }
 }
 
 /// 수확 대상 타깃 — 워크스페이스 멤버의 lib·bin이다. example/test/bench 타깃은
@@ -1090,9 +1133,13 @@ fn source_targets(meta: &Metadata) -> impl Iterator<Item = &cargo_meta::Target> 
 
 /// 수확 대상 타깃마다 mod 선언을 따라 모듈 트리를 키우고, 어느 선언에도 닿지 않는
 /// .rs를 orphan으로 센다. 이름 해석·정점 수확은 하지 않는다 — `--out` 입력 보호는
-/// 읽은 파일만 알면 된다. 오류는 grow_tree가 낸 그대로다.
-fn input_tree(meta: &Metadata) -> Result<InputTree, String> {
-    let mut found = InputTree::default();
+/// 읽은 파일만 알면 된다. `tolerant`가 false면 오류는 grow_tree가 낸 그대로고, true면
+/// 싣지 못한 모듈 파일을 `unloaded`에 적는다.
+fn input_tree(meta: &Metadata, tolerant: bool) -> Result<InputTree, String> {
+    let mut found = InputTree {
+        unloaded: tolerant.then(BTreeSet::new),
+        ..Default::default()
+    };
     let mut scan_roots: BTreeSet<PathBuf> = BTreeSet::new();
     for t in source_targets(meta) {
         if let Ok(f) = t.src.canonicalize() {
@@ -1100,14 +1147,7 @@ fn input_tree(meta: &Metadata) -> Result<InputTree, String> {
                 scan_roots.insert(d.to_path_buf());
             }
         }
-        grow_tree(
-            &mut found.tree,
-            &mut found.arena,
-            &t.name,
-            &t.src,
-            &mut found.conditional_mods,
-            &mut found.uses_include,
-        )?;
+        grow_tree(&mut found, &t.name, &t.src)?;
     }
     // orphan .rs — 전 타깃 처리 후에 스캔한다. lib의 스캔이 bin 병합 전에
     // 돌면 main.rs가 orphan으로 오인된다. known은 공유 루트의 extra_files까지.
@@ -1124,45 +1164,50 @@ fn input_tree(meta: &Metadata) -> Result<InputTree, String> {
 }
 
 /// 타깃의 모듈 트리를 키운다 — mod 선언을 따라 파일을 발견한다.
-/// `uses_include`는 수확 파일 중 하나라도 include! 계열 매크로를
+/// `found.uses_include`는 수확 파일 중 하나라도 include! 계열 매크로를
 /// 쓰면 true가 된다 — 그 입력은 정점 위치에 안 나타나 지문이 못 본다.
-fn grow_tree(
-    tree: &mut ModTree,
-    arena: &mut Arena,
-    root_path: &str,
-    root_file: &Path,
-    conditional_count: &mut usize,
-    uses_include: &mut bool,
-) -> Result<(), String> {
-    let root_file = root_file
-        .canonicalize()
-        .map_err(|e| format!("cannot read {}: {e}", root_file.display()))?;
-    match tree.modules.get_mut(root_path) {
+/// 싣지 못한 파일은 [`InputTree::tolerate`]가 모드에 따라 오류로 내거나 적는다.
+fn grow_tree(found: &mut InputTree, root_path: &str, root_file: &Path) -> Result<(), String> {
+    let root_file = match root_file.canonicalize() {
+        Ok(file) => file,
+        Err(e) => {
+            let error = format!("cannot read {}: {e}", root_file.display());
+            return found.tolerate(root_file, error);
+        }
+    };
+    match found.tree.modules.get_mut(root_path) {
         // lib와 같은 이름의 bin — 두 크레이트 인스턴스가 루트 경로를 공유한다.
         Some(m) => m.extra_files.push(root_file.clone()),
         None => {
-            tree.modules.insert(
+            found.tree.modules.insert(
                 root_path.to_string(),
                 modtree::Module::new(root_file.clone(), true, true),
             );
         }
     }
-    parse_into(arena, &root_file, uses_include)?;
+    if let Err(e) = parse_into(&mut found.arena, &root_file, &mut found.uses_include) {
+        found.tolerate(&root_file, e)?;
+    }
     let mut queue = vec![root_path.to_string()];
     let mut visited: BTreeSet<String> = BTreeSet::new();
     while let Some(mp) = queue.pop() {
         if !visited.insert(mp.clone()) {
             continue;
         }
-        let Some(groups) = module_items(tree, arena, &mp) else {
+        let Some(groups) = module_items(&found.tree, &found.arena, &mp) else {
             continue;
         };
-        for sub in
-            modtree::collect_submodules(&flatten_items(&groups), &mp, tree, conditional_count)
-        {
-            let file = tree.modules[&sub].file.clone();
-            if tree.modules[&sub].file_module {
-                parse_into(arena, &file, uses_include)?;
+        for sub in modtree::collect_submodules(
+            &flatten_items(&groups),
+            &mp,
+            &mut found.tree,
+            &mut found.conditional_mods,
+        ) {
+            let file = found.tree.modules[&sub].file.clone();
+            if found.tree.modules[&sub].file_module {
+                if let Err(e) = parse_into(&mut found.arena, &file, &mut found.uses_include) {
+                    found.tolerate(&file, e)?;
+                }
             }
             queue.push(sub);
         }
@@ -1723,10 +1768,22 @@ mod tests {
             let probed_before = PROBED_DIRS.with(std::cell::Cell::get);
             let rebuilt = input_files(&dir).unwrap();
             let probed = PROBED_DIRS.with(std::cell::Cell::get) - probed_before;
-            assert_eq!(rebuilt, expected, "{name}");
+            assert!(rebuilt.unloaded_modules.is_empty(), "{name}");
+            assert_eq!(
+                (rebuilt.files, rebuilt.unresolved_includes),
+                expected,
+                "{name}"
+            );
             let (_, inputs) = load_with_inputs(&dir, &span_options()).unwrap();
-            let inputs = inputs.expect("a harvest hands over what it read");
-            assert_eq!(inputs.protected_files(), expected, "{name}");
+            let reused = inputs
+                .expect("a harvest hands over what it read")
+                .protected_files();
+            assert!(reused.unloaded_modules.is_empty(), "{name}");
+            assert_eq!(
+                (reused.files, reused.unresolved_includes),
+                expected,
+                "{name}"
+            );
             let directories: BTreeSet<&Path> = expected
                 .0
                 .iter()
@@ -1734,6 +1791,75 @@ mod tests {
                 .collect();
             assert_eq!(probed, directories.len(), "{name}");
         }
+    }
+
+    /// 테스트용 단일 패키지 크레이트를 만들고 정규화한 루트를 돌려준다. `lib_path`가 있으면
+    /// `[lib] path`로 쓴다(없는 파일이어도 cargo metadata는 받는다).
+    fn write_crate(
+        root: &Path,
+        name: &str,
+        lib_path: Option<&str>,
+        files: &[(&str, &[u8])],
+    ) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let lib = lib_path
+            .map(|path| format!("[lib]\npath = \"{path}\"\n"))
+            .unwrap_or_default();
+        let manifest =
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{lib}");
+        std::fs::write(dir.join("Cargo.toml"), manifest).unwrap();
+        for (path, text) in files {
+            let file = dir.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        }
+        dir.canonicalize().unwrap()
+    }
+
+    /// 보호 목록 수집은 싣지 못한 모듈 파일(파싱 실패·UTF-8이 아닌 파일·없는 타깃 루트)에서
+    /// 멈추지 않는다 — 그 파일을 보호 목록과 unloaded_modules에 두고, 하위 모듈을 못 봐도
+    /// orphan으로 잡히는 파일은 보호한다. 같은 입력의 수확(graph 등)은 그대로 오류다.
+    #[test]
+    fn output_protection_lists_module_files_it_cannot_load() {
+        let tmp = std::env::temp_dir().join(format!("rustograph-unloaded-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let broken: [(&str, &[u8]); 3] = [
+            ("src/lib.rs", b"pub mod broken;\n"),
+            ("src/broken.rs", b"pub mod child;\npub fn oops( {\n"),
+            ("src/broken/child.rs", b"pub fn child() {}\n"),
+        ];
+        let not_utf8: [(&str, &[u8]); 2] = [
+            ("src/lib.rs", b"pub mod data;\n"),
+            ("src/data.rs", b"pub fn d() {}\n// \xff\n"),
+        ];
+        let cases = [
+            (
+                write_crate(&tmp, "parse_failure", None, &broken),
+                "src/broken.rs",
+                vec!["src/lib.rs", "src/broken/child.rs"],
+            ),
+            (
+                write_crate(&tmp, "not_utf8", None, &not_utf8),
+                "src/data.rs",
+                vec!["src/lib.rs"],
+            ),
+            (
+                write_crate(&tmp, "missing_root", Some("src/nope.rs"), &[]),
+                "src/nope.rs",
+                vec![],
+            ),
+        ];
+        for (dir, unloaded, loaded) in cases {
+            let listed = input_files(&dir).unwrap();
+            assert_eq!(listed.unloaded_modules, [dir.join(unloaded)], "{unloaded}");
+            assert!(!listed.unresolved_includes, "{unloaded}");
+            for file in std::iter::once(unloaded).chain(loaded) {
+                assert!(listed.files.contains(&dir.join(file)), "{unloaded}: {file}");
+            }
+            assert!(load(&dir, &span_options()).is_err(), "{unloaded}");
+        }
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// 상한 읽기는 정규 파일만 열고 상한을 넘으면 거부한다 — FIFO·장치·디렉터리는 열지

@@ -323,6 +323,77 @@ fn macro_body_include_inputs_are_not_certified_safe_to_replace() {
     assert_eq!(std::fs::read_to_string(asset).unwrap(), "source asset");
 }
 
+/// 선언된 모듈 파일을 읽거나 파싱하지 못해도 `schema`는 그 파일을 unparsed-sources로 세고
+/// 문서를 낸다(그래프를 수확하지 않는 `routes --role server`도 같다) — 입력 보호 목록
+/// 수집이 그 파일에서 실패하면 `--out`일 때만 종료 2였다. 그 파일은 보호하되 그 파일이
+/// 선언한 하위 모듈·include 입력은 모르므로 기존 출력 교체만 보수적으로 거부하고, 새
+/// 경로에는 표준 출력과 같은 문서를 쓴다. 심볼 그래프가 필요한 graph는 그대로 실패한다.
+#[test]
+fn unparsable_modules_refuse_only_replacing_existing_outputs() {
+    let fixture = Fixture::new("unparsable-module");
+    std::fs::write(
+        fixture.0.join("src/lib.rs"),
+        "pub mod broken;\npub fn entry() { let _q = \"SELECT id FROM users\"; }\n",
+    )
+    .unwrap();
+    let broken = fixture.0.join("src/broken.rs");
+    std::fs::write(&broken, "pub mod child;\npub fn oops( {\n").unwrap();
+    std::fs::create_dir_all(fixture.0.join("src/broken")).unwrap();
+    let child = fixture.0.join("src/broken/child.rs");
+    std::fs::write(&child, "pub fn child() {}\n").unwrap();
+    let existing = fixture.0.join("report.json");
+    std::fs::write(&existing, "previous report").unwrap();
+    let fresh = fixture.0.join("facts.json");
+    let without_clock = |bytes: &[u8]| {
+        let mut doc: Value = serde_json::from_slice(bytes).unwrap();
+        doc.as_object_mut().unwrap().remove("generatedAt");
+        doc
+    };
+    for args in [vec!["schema"], vec!["routes", "--role", "server"]] {
+        let stdout = Command::new(env!("CARGO_BIN_EXE_rustograph"))
+            .args(&args)
+            .arg("--dir")
+            .arg(&fixture.0)
+            .output()
+            .unwrap();
+        assert_eq!(stdout.status.code(), Some(0), "{args:?}");
+        let output = fixture.run(&args, &fresh);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let written = without_clock(&std::fs::read(&fresh).unwrap());
+        assert_eq!(written, without_clock(&stdout.stdout), "{args:?}");
+        if args[0] == "schema" {
+            let limitations = written["limitations"].as_array().unwrap();
+            assert!(
+                limitations
+                    .iter()
+                    .any(|l| l.as_str().unwrap().starts_with("unparsed-sources: 1 ")),
+                "{limitations:?}"
+            );
+        }
+        std::fs::remove_file(&fresh).unwrap();
+        for target in [&existing, &broken, &child] {
+            let before = std::fs::read(target).unwrap();
+            let output = fixture.run(&args, target);
+            assert_eq!(output.status.code(), Some(2), "{args:?} {target:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("could not be read or parsed"),
+                "{args:?} {target:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::fs::read(target).unwrap(), before);
+        }
+    }
+    let output = fixture.run(&["graph"], &fresh);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("parse error"));
+    assert!(!fresh.exists());
+}
+
 #[test]
 fn staged_output_never_truncates_a_hardlinked_input() {
     let fixture = Fixture::new("hardlink-preservation");
