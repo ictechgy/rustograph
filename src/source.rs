@@ -45,18 +45,11 @@ type Arena = BTreeMap<PathBuf, &'static [syn::Item]>;
 /// 판단값이다(rustc의 문서화된 한도가 아니다).
 pub(crate) const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// 분석 대상 소스를 `max_bytes`까지만 읽는다 — 정규 파일만 연다. `metadata`는 stat이라
-/// FIFO에서도 막히지 않는다. FIFO는 여는 순간 쓰는 쪽을 영원히 기다리고 장치
-/// (`/dev/zero`)는 끝없이 읽혀, 정규 파일인지 보지 않고 읽으면 수확이 끝나지 않는다.
+/// 분석 대상 소스를 `max_bytes`까지만 읽는다 — 정규 파일만 연다([`require_regular_file`]).
 /// 정규 파일이 아니면 `InvalidInput`, 상한을 넘으면 `InvalidData` 오류다.
 pub(crate) fn read_source_bounded(path: &Path, max_bytes: u64) -> std::io::Result<String> {
     use std::io::Read;
-    if !std::fs::metadata(path)?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} is not a regular file", path.display()),
-        ));
-    }
+    require_regular_file(path)?;
     let mut text = String::new();
     std::fs::File::open(path)?
         .take(max_bytes.saturating_add(1))
@@ -68,6 +61,22 @@ pub(crate) fn read_source_bounded(path: &Path, max_bytes: u64) -> std::io::Resul
         ));
     }
     Ok(text)
+}
+
+/// 분석 대상이 경로를 고른 소스가 정규 파일인지 연기 전에 본다 — `metadata`는 stat이라
+/// FIFO에서도 막히지 않는다. FIFO는 여는 순간 쓰는 쪽을 영원히 기다리고 장치(`/dev/zero`,
+/// 그것을 가리키는 링크)는 끝없이 읽혀, 보지 않고 읽으면 수확이 끝나지 않거나 메모리를 다
+/// 쓴다. 정규 파일이 아니면 `InvalidInput`이고 문구에 해결 방향을 싣는다 — 호출자가 앞에
+/// 경로를 붙인다.
+fn require_regular_file(path: &Path) -> std::io::Result<()> {
+    if std::fs::metadata(path)?.is_file() {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "not a regular file (devices, FIFOs and directories are not read); \
+         point it at a regular .rs file",
+    ))
 }
 
 /// `dir`의 cargo 워크스페이스를 수확해 문서를 만든다.
@@ -1210,7 +1219,11 @@ fn input_tree(meta: &Metadata, tolerant: bool) -> Result<InputTree, String> {
 /// 쓰면 true가 된다 — 그 입력은 정점 위치에 안 나타나 지문이 못 본다.
 /// 싣지 못한 파일은 [`InputTree::tolerate`]가 모드에 따라 오류로 내거나 적는다.
 fn grow_tree(found: &mut InputTree, root_path: &str, root_file: &Path) -> Result<(), String> {
-    let root_file = match root_file.canonicalize() {
+    // 타깃 루트는 cargo metadata가 준 경로라 mod 대상처럼 미리 걸러지지 않는다 — 정규 파일이
+    // 아니면(FIFO, `/dev/zero`를 가리키는 링크) 열지 않는다. 링크를 따라간 정규 경로로는 어느
+    // 타깃인지 알 수 없어, 판정은 정규화 전 경로로 하고 오류에도 그 경로를 싣는다.
+    let checked = require_regular_file(root_file).and_then(|()| root_file.canonicalize());
+    let root_file = match checked {
         Ok(file) => file,
         Err(e) => {
             let error = format!("cannot read {}: {e}", root_file.display());
@@ -1292,13 +1305,18 @@ fn scan_orphans(dir: &Path, known: &BTreeSet<PathBuf>, tree: &mut ModTree) {
 /// 파일을 파싱해 아레나에 넣고, 같은 원문으로 생성 코드 마커를 판정해 둔다. 파싱 실패는
 /// limitation이 아니라 오류 — 읽은 파일을 못 읽는 것과 해석 못 하는 것은 다르다…지만
 /// 실전에서는 조건부 생성 파일이 깨진 문법을 가질 수 있어 빈 목록으로 둔다.
+/// 정규 파일이 아니면 열지 않고 "cannot read" 오류다 — `mod` 대상은 collect_submodules가,
+/// 타깃 루트는 grow_tree가 미리 거르지만, stat이 실패해 걸러지지 않은 대상과 검사 뒤에 바뀐
+/// 파일도 여기서 막는다. 크기 상한은 두지 않는다(정상인 거대 생성 파일을 오류로 할지
+/// limitation으로 할지 정하지 않았다 — 정규 파일은 끝이 있다).
 fn parse_into(found: &mut InputTree, file: &Path) -> Result<(), String> {
     if found.arena.contains_key(file) {
         return Ok(());
     }
     #[cfg(test)]
     PARSED_FILES.with(|c| c.set(c.get() + 1));
-    let src = std::fs::read_to_string(file)
+    let src = require_regular_file(file)
+        .and_then(|()| std::fs::read_to_string(file))
         .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
     // include! 계열은 파일 경로 인자를 받아 별도 입력을 읽는다 —
     // 그 입력 파일은 정점 위치에 안 나타나 지문 밖이다.

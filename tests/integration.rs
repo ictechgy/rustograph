@@ -1196,6 +1196,72 @@ fn non_regular_module_files_are_skipped_and_counted() {
     );
 }
 
+/// 타깃 루트 파일(cargo metadata가 준 src/lib.rs)이 정규 파일이 아니면 읽지 않고, 그 경로와
+/// 원인을 담은 오류(2)로 끝난다. FIFO는 여는 순간 쓰는 쪽을 영원히 기다리고 `/dev/zero`를
+/// 가리키는 링크(git이 담을 수 있다)는 끝없이 읽혀, 수확을 거치는 graph·rules·MCP 기동이
+/// 멈추거나 메모리를 다 썼다. 회귀해도 테스트가 멈추지 않게 실제 바이너리를 시간 제한 안에서
+/// 돌린다.
+#[cfg(unix)]
+#[test]
+fn non_regular_target_roots_are_input_errors() {
+    for (tag, link_to_device) in [("rootfifo", false), ("rootzero", true)] {
+        let dir = temp_crate(tag, &owned(&[("lib.rs", "pub fn f() {}\n")]));
+        let lib = dir.join("src/lib.rs");
+        std::fs::remove_file(&lib).unwrap();
+        if link_to_device {
+            std::os::unix::fs::symlink("/dev/zero", &lib).unwrap();
+        } else {
+            let made = std::process::Command::new("mkfifo")
+                .arg(&lib)
+                .status()
+                .expect("mkfifo must run");
+            assert!(made.success());
+        }
+        let (code, err) = run_with_deadline(&["graph", "--dir", dir.to_str().unwrap()], 10);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(code, Some(2), "{tag}: {err}");
+        // 링크를 따라간 `/dev/zero`가 아니라 타깃 경로를 말해야 어느 타깃인지 안다.
+        assert!(
+            err.contains("src/lib.rs: not a regular file"),
+            "{tag}: {err}"
+        );
+    }
+}
+
+/// 실제 바이너리를 돌려 (종료 코드, stderr)를 돌려준다 — `seconds` 안에 끝나지 않으면 죽이고
+/// 실패한다(멈추는 회귀가 테스트 전체를 멈추지 않게).
+#[cfg(unix)]
+fn run_with_deadline(args: &[&str], seconds: u64) -> (Option<i32>, String) {
+    use std::io::Read;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rustograph"))
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("rustograph binary must start");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    loop {
+        match child.try_wait().expect("polling the child must work") {
+            Some(status) => {
+                let mut err = String::new();
+                child
+                    .stderr
+                    .take()
+                    .expect("stderr is piped")
+                    .read_to_string(&mut err)
+                    .expect("stderr must be UTF-8");
+                return (status.code(), err);
+            }
+            None if std::time::Instant::now() >= deadline => {
+                child.kill().expect("killing the stuck child must work");
+                child.wait().expect("reaping the killed child must work");
+                panic!("rustograph {args:?} did not finish within {seconds}s");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+}
+
 /// 순환이 아니어도 모듈 중첩은 `MAX_MODULE_DEPTH`에서 멈추고 넘는 선언을 센다 — 조상
 /// 파일 검사를 비껴가는 입력에도 트리 확장이 끝나게 하는 보조 상한이다. 서로 다른 정규
 /// 파일 600개가 차례로 다음 파일을 싣는다.
