@@ -11,6 +11,8 @@
 //! - 구현은 모든 root를 한 번에 출발시키는 단계 동기 너비 우선 패스다. 정점이 자기 자신이 아닌 더 작은
 //!   인덱스 root를 65개 이상 가졌으면 더 큰 인덱스 root는 그 정점에서 전파를 멈춘다 — 그 정점을 지나는
 //!   경로는 작은 root들도 같거나 짧은 거리로 지나므로 출력(작은 인덱스 64개·depth·via)을 바꿀 수 없다.
+//!   한 단계가 끝난 정점의 기록은 그 단계에 온 root를 인덱스 오름차순으로 처리한 결과와 같다 — 멈출지가
+//!   정점 처리 순서(id 순서)에 기대지 않고 root 인덱스로만 정해진다.
 //! - `evidence`는 root별 하한이다: 정점에 닿는 모든 root 각각의 가장 강한 등급 중 가장 약한 것.
 //!   추정 간선(`tentative` — 이름 팬아웃·`dyn`/제네릭 트레이트 impl 후보)은 `candidate`, 나머지는
 //!   `direct`다. 비트 집합이 메모리 상한을 넘으면 약하게 적을 수는 있어도 부풀리지 않는 근사로 바꾼다.
@@ -20,7 +22,8 @@
 pub mod sha256;
 
 use crate::graph::{Document, EdgeKind};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 
 /// 정점 하나가 싣는 root 인덱스의 상한이다(계약의 `rootsTruncated`).
 pub const MAX_ROOTS_PER_NODE: usize = 64;
@@ -301,10 +304,19 @@ pub fn traverse(doc: &Document, req: &Request) -> Outcome {
     }
 }
 
+/// 정점별 자기 자신이 아닌 root 인덱스 중 가장 작은 65개(최대 힙)다. 자기 아닌 기록이 65개인
+/// 정점에 root가 또 올 때 처음 만든다 — 대부분의 정점은 root가 적거나 그 뒤로 더 오지 않는다.
+type Smallest = HashMap<usize, BinaryHeap<usize>>;
+
 /// 모든 root에서 단계 동기로 전파한다. (단계 기록, 깊이 잘림, 전파 중단 여부)를 돌려준다.
+/// 한 단계가 끝난 정점의 기록은 그 단계에 온 root를 인덱스 오름차순으로 처리한 결과와 같다
+/// (`spread`) — 가지치기가 요청 순서와 정점 id 순서의 관계에 기대지 않는다. 도착 순서대로 멈추면
+/// root 인덱스가 id 순서와 반대일 때 가지치기가 전혀 일어나지 않아, 정점마다 root를 모두 싣고
+/// 도착마다 기록 전체를 셌다(root 2000개 팬 그래프에서 오름차순 요청 0.1초, 내림차순 요청
+/// 21초·1.2GB).
 fn propagate(g: &Graph, roots: &[usize], max_depth: usize) -> (Levels, bool, bool) {
     let mut levels: Levels = vec![HashMap::new(); g.ids.len()];
-    let owners: HashMap<usize, usize> = roots.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+    let mut smallest = Smallest::new();
     let mut frontier: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (i, &n) in roots.iter().enumerate() {
         levels[n].insert(i, 0);
@@ -318,14 +330,9 @@ fn propagate(g: &Graph, roots: &[usize], max_depth: usize) -> (Levels, bool, boo
         let mut next: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (&node, held_roots) in &frontier {
             for &nb in &g.full[node] {
-                pruned |= spread(
-                    &mut levels,
-                    owners.get(&nb).copied(),
-                    nb,
-                    held_roots,
-                    level + 1,
-                    &mut next,
-                );
+                for &r in held_roots {
+                    pruned |= spread(&mut levels, &mut smallest, nb, r, level + 1, &mut next);
+                }
             }
         }
         frontier = next;
@@ -338,39 +345,77 @@ fn propagate(g: &Graph, roots: &[usize], max_depth: usize) -> (Levels, bool, boo
     (levels, cut, pruned)
 }
 
-/// 한 간선으로 root 인덱스들을 이웃에 전파한다. 전파를 멈춘 쌍이 있었으면 true다.
+/// 한 간선으로 root 하나를 이웃에 전파한다. 전파를 멈추거나 되돌린 root가 있었으면 true다.
+///
+/// 이웃이 자기 아닌 root를 65개 넘게 가지면 그 가운데 가장 작은 65개만 남긴다: 가장 작은 65개보다
+/// 큰 root는 멈추고, 새 root가 들어와 65번째 밖으로 밀린 root가 같은 단계에 기록된 것이면 기록과
+/// 다음 경계에서 되돌린다(이전 단계 기록은 그대로 둔다). 그러면 한 단계가 끝난 기록은 이전 기록과
+/// 이번에 온 root 가운데 자기 아닌 가장 작은 65개에 드는 것 — root를 인덱스 오름차순으로 처리해
+/// "더 작은 root 65개"를 센 결과와 같고, 처리 순서와 무관하다. 정점 순서로 처리하므로 한 정점의
+/// 기록을 이어서 읽고 쓴다.
 fn spread(
     levels: &mut Levels,
-    owner: Option<usize>,
+    smallest: &mut Smallest,
     nb: usize,
-    roots: &[usize],
+    root: usize,
     level: usize,
     next: &mut BTreeMap<usize, Vec<usize>>,
 ) -> bool {
-    let mut pruned = false;
-    for &r in roots {
-        if levels[nb].contains_key(&r) {
-            continue;
-        }
-        if dominated(&levels[nb], owner, r) {
-            pruned = true;
-            continue;
-        }
-        levels[nb].insert(r, level);
-        next.entry(nb).or_default().push(r);
-    }
-    pruned
-}
-
-/// 정점이 자기 자신이 아닌 root 중 이 root보다 작은 인덱스를 이미 65개 이상 가졌는지 본다.
-fn dominated(held: &HashMap<usize, usize>, owner: Option<usize>, root: usize) -> bool {
-    if held.len() - usize::from(owner.is_some_and(|o| held.contains_key(&o))) < DOMINATING_ROOTS {
+    let held = &mut levels[nb];
+    if held.contains_key(&root) {
         return false;
     }
-    held.keys()
-        .filter(|&&i| Some(i) != owner && i < root)
-        .count()
-        >= DOMINATING_ROOTS
+    let Some(heap) = contested(smallest, held, nb) else {
+        held.insert(root, level);
+        next.entry(nb).or_default().push(root);
+        return false;
+    };
+    // 더 작은 root 65개가 이미 같거나 이른 단계에 닿았다.
+    if heap.peek().is_some_and(|&top| root > top) {
+        return true;
+    }
+    held.insert(root, level);
+    next.entry(nb).or_default().push(root);
+    heap.push(root);
+    let Some(evicted) = heap.pop() else {
+        return false;
+    };
+    if held.get(&evicted) != Some(&level) {
+        return false;
+    }
+    held.remove(&evicted);
+    if let Some(reached) = next.get_mut(&nb) {
+        reached.retain(|&r| r != evicted);
+    }
+    true
+}
+
+/// 정점의 자기 아닌 기록이 65개 이상이면 그 가운데 가장 작은 65개(최대 힙)를 돌려준다. 처음이면
+/// 기록에서 모은다 — 단계 0 기록은 정점 자신의 root라 뺀다. 단계 1 이상 기록은 늘 자기 아닌
+/// root이고, 힙이 생긴 뒤의 기록은 `spread`가 힙에도 넣는다.
+fn contested<'a>(
+    smallest: &'a mut Smallest,
+    held: &HashMap<usize, usize>,
+    nb: usize,
+) -> Option<&'a mut BinaryHeap<usize>> {
+    if held.len() < DOMINATING_ROOTS {
+        return None;
+    }
+    let slot = match smallest.entry(nb) {
+        Entry::Occupied(heap) => return Some(heap.into_mut()),
+        Entry::Vacant(slot) => slot,
+    };
+    let mut others: Vec<usize> = held
+        .iter()
+        .filter(|&(_, &level)| level > 0)
+        .map(|(&i, _)| i)
+        .collect();
+    if others.len() < DOMINATING_ROOTS {
+        return None;
+    }
+    others.sort_unstable();
+    others.truncate(DOMINATING_ROOTS);
+    Some(slot.insert(BinaryHeap::from(others)))
 }
 
 /// 출력 전 도달 행.

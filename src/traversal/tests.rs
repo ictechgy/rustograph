@@ -222,20 +222,42 @@ fn single_pass_matches_per_root_oracle() {
         } else {
             Direction::Dependents
         };
-        check_case(&doc, &roots, dir, 1 + rng.below(6));
+        let depth = 1 + rng.below(6);
+        check_case(&doc, &roots, dir, depth);
+        let reversed: Vec<String> = roots.iter().rev().cloned().collect();
+        check_case(&doc, &reversed, dir, depth);
     }
+}
+
+/// 같은 root의 요청 순서 세 가지 — 주어진 순서, 역순, 섞은 순서. 섞기는 별도 난수라 호출자의
+/// 무작위 사례 열을 바꾸지 않는다.
+fn root_orders(roots: &[String], seed: u64) -> [Vec<String>; 3] {
+    let mut shuffled = roots.to_vec();
+    let mut rng = Rng(seed);
+    for i in (1..shuffled.len()).rev() {
+        shuffled.swap(i, rng.below(i + 1));
+    }
+    [
+        roots.to_vec(),
+        roots.iter().rev().cloned().collect(),
+        shuffled,
+    ]
 }
 
 #[test]
 fn many_roots_prune_without_changing_output() {
     // 65개 넘는 root가 한 정점에 모이면 큰 인덱스 root는 전파를 멈춘다 — 출력은 오라클과 같아야 한다.
+    // 가지치기는 처리 순서에 기대면 안 되므로 요청 순서(역순·섞음)를 바꿔도 같아야 한다.
     let mut rng = Rng(42);
-    for _ in 0..20 {
+    for case in 0..20u64 {
         let n = 90 + rng.below(20);
         let doc = random_doc(&mut rng, n, n * 4);
         let k = 70 + rng.below(15);
         let roots: Vec<String> = (0..k).map(name).collect();
-        check_case(&doc, &roots, Direction::Dependencies, 1 + rng.below(4));
+        let depth = 1 + rng.below(4);
+        for order in root_orders(&roots, case) {
+            check_case(&doc, &order, Direction::Dependencies, depth);
+        }
     }
     // 허브 하나에 root 80개가 모이는 결정적 경우 — rootsTruncated가 선다.
     let mut vertices: Vec<Vertex> = (0..80).map(|i| vertex(&name(i))).collect();
@@ -255,7 +277,170 @@ fn many_roots_prune_without_changing_output() {
         vec![],
     );
     let roots: Vec<String> = (0..80).map(name).collect();
-    check_case(&doc, &roots, Direction::Dependencies, 8);
+    for order in root_orders(&roots, 80) {
+        check_case(&doc, &order, Direction::Dependencies, 8);
+    }
+}
+
+/// root `r`개 → root마다 중간 정점 하나 → `c::hub` → 자식 `c`개 팬 문서와 root id(오름차순).
+/// 허브에는 둘째 단계에 닿는다 — 처음 경계(root마다 자기 정점)가 아니라 전파가 쌓은 경계에서 root가
+/// 허브로 몰릴 때도 가지치기가 요청 순서에 기대지 않는지 본다.
+fn fan_doc(r: usize, c: usize) -> (Document, Vec<String>) {
+    let roots: Vec<String> = (0..r).map(|i| format!("c::r{i:03}")).collect();
+    let middles: Vec<String> = (0..r).map(|i| format!("c::m{i:03}")).collect();
+    let kids: Vec<String> = (0..c).map(|j| format!("c::k{j:02}")).collect();
+    let mut vertices: Vec<Vertex> = roots
+        .iter()
+        .chain(&middles)
+        .chain(&kids)
+        .map(|id| vertex(id))
+        .collect();
+    vertices.push(vertex("c::hub"));
+    let mut edges: Vec<Edge> = roots
+        .iter()
+        .zip(&middles)
+        .map(|(x, m)| Edge::new(x.clone(), m.clone(), EdgeKind::Call))
+        .collect();
+    edges.extend(
+        middles
+            .iter()
+            .map(|m| Edge::new(m.clone(), "c::hub".into(), EdgeKind::Call)),
+    );
+    edges.extend(
+        kids.iter()
+            .map(|k| Edge::new("c::hub".into(), k.clone(), EdgeKind::Call)),
+    );
+    let doc = graph::document(
+        Level::Symbol,
+        ".".into(),
+        None,
+        vec![],
+        vertices,
+        edges,
+        vec![],
+    );
+    (doc, roots)
+}
+
+/// 정점 번호별 기록한 root 수와 전파 중단 여부 — 기록 수가 곧 순회 메모리와 이웃 방문 수다.
+fn held_counts(doc: &Document, roots: &[String]) -> (Vec<usize>, bool) {
+    let g = Graph::new(doc, Direction::Dependencies);
+    let starts: Vec<usize> = roots.iter().map(|r| g.index[r]).collect();
+    let (levels, _, pruned) = propagate(&g, &starts, MAX_DEPTH);
+    (levels.iter().map(HashMap::len).collect(), pruned)
+}
+
+#[test]
+fn pruning_does_not_depend_on_root_request_order() {
+    // root 200개가 허브 하나로 모인다. 어떤 순서로 요청해도 허브와 그 아래 정점은 root를 65개만
+    // 싣는다. 도착 순서대로 지배를 따지면 root 인덱스가 정점 id 순서와 반대일 때 가지치기가 전혀
+    // 일어나지 않아, 정점마다 root 200개를 싣고 그 수만큼 이웃에 전파했다.
+    let (doc, roots) = fan_doc(200, 10);
+    let [ascending, reversed, shuffled] = root_orders(&roots, 5);
+    let want = held_counts(&doc, &ascending);
+    // root·중간 정점은 하나씩, 허브와 자식 10개는 65개씩.
+    assert_eq!(want.0.iter().sum::<usize>(), 400 + 11 * DOMINATING_ROOTS);
+    assert!(want.1, "the hub prunes");
+    assert_eq!(held_counts(&doc, &reversed), want, "reversed request");
+    assert_eq!(held_counts(&doc, &shuffled), want, "shuffled request");
+}
+
+#[test]
+fn each_level_keeps_what_ascending_root_order_would_keep() {
+    // 한 단계에 정점으로 오는 root(중복 포함)를 어떤 순서로 보내도, 단계가 끝난 기록은 root를 인덱스
+    // 오름차순으로 처리한 결과 — 이전 기록에, 이번에 온 root 가운데 자기 아닌 기록과 합쳐 가장 작은
+    // 65개에 드는 것을 더한 것 — 와 같다. 다음 경계에는 새로 남은 root만 있고, 멈춤 신호는 이번에 온
+    // root 가운데 떨어진 것이 있을 때만 선다. 정점이 root 자신인 경우와 아닌 경우 모두 본다.
+    let mut rng = Rng(23);
+    for case in 0..60 {
+        let total = 70 + rng.below(150);
+        let owner = (case % 2 == 0).then(|| rng.below(total));
+        let mut levels: Levels = vec![owner.map(|o| (o, 0)).into_iter().collect()];
+        let mut smallest = Smallest::new();
+        for level in 1..=5 {
+            let arrivals: Vec<usize> = (0..rng.below(120)).map(|_| rng.below(total)).collect();
+            let before: BTreeSet<usize> = levels[0].keys().copied().collect();
+            let fresh: BTreeSet<usize> = arrivals
+                .iter()
+                .copied()
+                .filter(|r| !before.contains(r))
+                .collect();
+            let mut pool: Vec<usize> = before
+                .iter()
+                .copied()
+                .filter(|&i| Some(i) != owner)
+                .chain(fresh.iter().copied())
+                .collect();
+            pool.sort_unstable();
+            let smallest_65: BTreeSet<usize> = pool.into_iter().take(DOMINATING_ROOTS).collect();
+            let kept: BTreeSet<usize> = fresh.intersection(&smallest_65).copied().collect();
+            let mut next = BTreeMap::new();
+            let mut stopped = false;
+            for r in arrivals {
+                stopped |= spread(&mut levels, &mut smallest, 0, r, level, &mut next);
+            }
+            let got: BTreeSet<usize> = levels[0].keys().copied().collect();
+            assert_eq!(got, &before | &kept, "case {case} level {level}");
+            let reached: BTreeSet<usize> = next.get(&0).into_iter().flatten().copied().collect();
+            assert_eq!(reached, kept, "case {case} level {level} next");
+            assert!(kept.iter().all(|r| levels[0][r] == level));
+            assert_eq!(
+                stopped,
+                kept.len() < fresh.len(),
+                "case {case} level {level}"
+            );
+        }
+    }
+}
+
+#[test]
+fn depth_cut_survives_pruning_in_every_root_order() {
+    // 깊이 2에서 허브(root 200개, 65개만 전파)까지 닿고 자식은 상한 밖이다 — 전파를 멈춘 root가
+    // 있어도 도달 정점 집합이 깊이에 잘렸으면 depth를 알린다.
+    let (doc, roots) = fan_doc(200, 10);
+    for order in root_orders(&roots, 13) {
+        let out = traverse(
+            &doc,
+            &Request {
+                roots: &order,
+                direction: Direction::Dependencies,
+                max_depth: 2,
+                max_reached: MAX_REACHED,
+                evidence_memory_bytes: EVIDENCE_MEMORY_BYTES,
+            },
+        );
+        assert_eq!(out.truncation_reasons, vec!["depth"]);
+        assert!(out.roots_truncated);
+        assert!(out.reached.iter().all(|r| !r.id.starts_with("c::k")));
+    }
+}
+
+#[test]
+fn max_reached_cut_keeps_roots_truncated_in_every_root_order() {
+    // 허브에 root 80개가 모이지만 max-reached 1이 허브 행을 자른다(깊이 1에서 id가 가장 앞인 c::a만
+    // 남는다). 허브에서 전파를 멈췄으니 rootsTruncated는 참이다 — 오름차순 요청에서 늘 그랬고, 요청
+    // 순서가 바뀌어도 같아야 한다.
+    let (mut doc, roots) = fan_doc(80, 1);
+    doc.vertices.push(vertex("c::a"));
+    doc.edges
+        .push(Edge::new(roots[0].clone(), "c::a".into(), EdgeKind::Call));
+    doc.sort();
+    for order in root_orders(&roots, 9) {
+        let out = traverse(
+            &doc,
+            &Request {
+                roots: &order,
+                direction: Direction::Dependencies,
+                max_depth: MAX_DEPTH,
+                max_reached: 1,
+                evidence_memory_bytes: EVIDENCE_MEMORY_BYTES,
+            },
+        );
+        assert_eq!(out.reached.len(), 1);
+        assert_eq!(out.reached[0].id, "c::a");
+        assert_eq!(out.truncation_reasons, vec!["max-reached"]);
+        assert!(out.roots_truncated, "request starting with {}", order[0]);
+    }
 }
 
 /// 작은 손 그래프 — A(0)·R(1), A→W→V→R, R→V. 계약 문서의 root 항목 예와 같다.
