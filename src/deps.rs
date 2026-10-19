@@ -49,8 +49,10 @@ pub struct DepsReport {
 /// 그래서 deps는 항상 자체 syn 수확으로 만든다.
 pub fn report(dir: &Path) -> Result<DepsReport, String> {
     let meta = cargo_meta::load(dir)?;
-    let doc = crate::source::load(
+    // 같은 메타데이터로 수확한다 — source::load는 cargo metadata를 한 번 더 돌린다.
+    let doc = crate::source::load_with(
         dir,
+        &meta,
         &crate::source::Options {
             symbol_level: true,
             include_deps: true,
@@ -58,6 +60,25 @@ pub fn report(dir: &Path) -> Result<DepsReport, String> {
         },
     )?;
     Ok(report_from(&meta, &doc))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 보고서가 정점·간선을 살핀 수 — 선언 의존·외부 패키지마다 문서 전체를 다시 훑지
+    /// 않는지 단위 테스트가 센다(테스트 스레드마다 따로).
+    static VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 테스트용 — 이 스레드에서 지금까지 살핀 정점·간선 수.
+#[cfg(test)]
+fn visits() -> usize {
+    VISITS.with(std::cell::Cell::get)
+}
+
+/// 테스트용 — 정점·간선 하나를 살폈다고 센다.
+#[cfg(test)]
+fn note_visit() {
+    VISITS.with(|c| c.set(c.get() + 1));
 }
 
 /// 이미 로드된 메타데이터와 문서로 보고서를 만든다 — 캐시·테스트용.
@@ -68,14 +89,20 @@ pub fn report_from(meta: &Metadata, doc: &Document) -> DepsReport {
     let krate_of: BTreeMap<&str, &str> = doc
         .vertices
         .iter()
-        .map(|v| (v.id.as_str(), v.krate.as_str()))
+        .map(|v| {
+            #[cfg(test)]
+            note_visit();
+            (v.id.as_str(), v.krate.as_str())
+        })
         .collect();
-    // 외부 정점의 존재 — 없으면 사용 간선은 수확 자체가 안 됐다.
+    // 외부 정점의 존재 — 없으면 사용 간선은 수확 자체가 안 됐다. krate_of의 키가 곧
+    // 정점 ID 전부다 — 외부 패키지마다 정점 ID 집합을 새로 만들면 O(P·V)다.
     let has_dep_vertices = meta
         .packages
         .iter()
         .filter(|p| !p.workspace_member)
-        .any(|p| doc.vertex_ids().contains(p.name.as_str()));
+        .any(|p| krate_of.contains_key(p.name.as_str()));
+    let evidence = usage_evidence(doc, &krate_of);
 
     let mut unused = Vec::new();
     let mut build_skipped = 0usize;
@@ -160,17 +187,7 @@ pub fn report_from(meta: &Metadata, doc: &Document) -> DepsReport {
         // 비-depends 간선 중 이 멤버의 크레이트가 보낸 것. tentative
         // 팬아웃은 "이 중 하나일 수 있다"는 추정이라 증거가 아니다 —
         // 추정을 증거로 쓰면 미사용 의존이 우연히 숨겨진다.
-        let used = doc.edges.iter().any(|e2| {
-            e2.kind != EdgeKind::Depends
-                && !e2.tentative
-                && to_vertices
-                    .iter()
-                    .any(|v| e2.to == *v || e2.to.starts_with(&format!("{v}::")))
-                && krate_of
-                    .get(e2.from.as_str())
-                    .is_some_and(|k| member_krates.contains(k))
-        });
-        if !used {
+        if !is_used(&evidence, &member_krates, &to_vertices) {
             let proc_macro = meta.packages[meta.by_id[&e.to]].proc_macro;
             unused.push(UnusedDep {
                 package: from.to_string(),
@@ -234,6 +251,44 @@ pub fn report_from(meta: &Metadata, doc: &Document) -> DepsReport {
         duplicates,
         limitations,
     }
+}
+
+/// 사용 증거 색인 — 확정 비-depends 간선마다 (보낸 정점의 크레이트, 도착 ID의 첫 `::`
+/// 세그먼트) 한 쌍. dep 정점 이름(패키지·lib/bin 타깃 이름)에는 `::`가 없으니 "도착이 dep
+/// 정점이거나 `dep::`로 시작한다"는 "도착의 첫 세그먼트가 dep 이름이다"와 같다. 선언
+/// 의존마다 전 간선을 다시 훑으면(간선마다 `format!` 할당까지) O(D·E)라, 간선을 한 번만
+/// 돌아 색인한다. 보낸 쪽이 정점이 아닌 간선은 소유 크레이트를 몰라 증거가 아니다.
+fn usage_evidence<'a>(
+    doc: &'a Document,
+    krate_of: &BTreeMap<&str, &'a str>,
+) -> BTreeSet<(&'a str, &'a str)> {
+    let mut evidence = BTreeSet::new();
+    for e in &doc.edges {
+        #[cfg(test)]
+        note_visit();
+        if e.kind == EdgeKind::Depends || e.tentative {
+            continue;
+        }
+        if let Some(krate) = krate_of.get(e.from.as_str()) {
+            let head =
+                e.to.split_once("::")
+                    .map_or(e.to.as_str(), |(head, _)| head);
+            evidence.insert((*krate, head));
+        }
+    }
+    evidence
+}
+
+/// 선언 의존 하나가 쓰였는가 — 멤버의 그래프상 크레이트 하나가 dep 정점 하나로 보낸
+/// 사용 증거([`usage_evidence`])가 있으면 참이다.
+fn is_used<'a>(
+    evidence: &BTreeSet<(&'a str, &'a str)>,
+    member_krates: &BTreeSet<&'a str>,
+    to_vertices: &BTreeSet<&'a str>,
+) -> bool {
+    to_vertices
+        .iter()
+        .any(|v| member_krates.iter().any(|k| evidence.contains(&(*k, *v))))
 }
 
 #[cfg(test)]
@@ -474,6 +529,253 @@ mod tests {
             "renamed member lib must match by target name: {:?}",
             rep.unused
         );
+    }
+
+    /// 라이브러리 타깃 하나인 패키지 — 이름이 곧 타깃 이름이다.
+    fn lib_package(name: &str, workspace_member: bool) -> Package {
+        Package {
+            name: name.into(),
+            version: "1.0.0".into(),
+            workspace_member,
+            proc_macro: false,
+            targets: vec![crate::cargo_meta::Target {
+                name: name.into(),
+                kind: "lib".into(),
+                src: PathBuf::from("x.rs"),
+            }],
+        }
+    }
+
+    /// 멤버 `app` 하나가 외부 `ext0..ext{n}`을 선언하고 짝수 번째만 쓰는 메타데이터·문서.
+    /// 외부 정점이 없는 전이 의존 `t0..t9`가 패키지 목록 앞쪽에 있다 — cargo metadata는
+    /// 패키지를 이름순으로 주므로 외부 정점 탐색이 그 앞의 패키지들을 먼저 지난다.
+    fn wide_workspace(n: usize) -> (Metadata, Document) {
+        let mut packages = vec![lib_package("app", true)];
+        packages.extend((0..10).map(|i| lib_package(&format!("t{i}"), false)));
+        packages.extend((0..n).map(|i| lib_package(&format!("ext{i}"), false)));
+        let by_id = (0..packages.len()).map(|i| (format!("p{i}"), i)).collect();
+        let dep_edges = (0..n)
+            .map(|i| DepEdge {
+                from: "p0".into(),
+                to: format!("p{}", 11 + i),
+                kind: String::new(),
+                lib_name: format!("ext{i}"),
+            })
+            .collect();
+        let meta = Metadata {
+            packages,
+            by_id,
+            dep_edges,
+            workspace_root: PathBuf::from("."),
+            limitations: vec![],
+        };
+        let mut vertices = vec![v("app", Kind::Crate)];
+        let mut edges = Vec::new();
+        for i in 0..n {
+            vertices.push(v(&format!("app::f{i}"), Kind::Fn));
+            vertices.push(Vertex {
+                position: None,
+                ..v(&format!("ext{i}"), Kind::Crate)
+            });
+            edges.push(Edge::new(
+                "app".into(),
+                format!("ext{i}"),
+                EdgeKind::Depends,
+            ));
+            if i > 0 {
+                edges.push(Edge::new(
+                    format!("app::f{}", i - 1),
+                    format!("app::f{i}"),
+                    EdgeKind::Call,
+                ));
+            }
+            if i % 2 == 0 {
+                edges.push(Edge::new(
+                    format!("app::f{i}"),
+                    format!("ext{i}"),
+                    EdgeKind::References,
+                ));
+            }
+        }
+        let doc = document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec![],
+            vertices,
+            edges,
+            vec![],
+        );
+        (meta, doc)
+    }
+
+    /// 선언 의존마다 전 간선을 다시 훑고(간선마다 `format!` 할당까지) 외부 패키지마다 정점
+    /// ID 집합을 새로 만들면 O(D·E + P·V)다 — 선언 1080개·함수 4만 합성 워크스페이스의
+    /// `deps`가 7.7초였다. 보고서가 정점·간선을 한 번씩만 살피는지 센다.
+    #[test]
+    fn report_visits_each_vertex_and_edge_once() {
+        let n = 40;
+        let (meta, doc) = wide_workspace(n);
+        let before = visits();
+        let rep = report_from(&meta, &doc);
+        let visited = visits() - before;
+        let unused: Vec<&str> = rep.unused.iter().map(|u| u.dep.as_str()).collect();
+        let odd: Vec<String> = (1..n).step_by(2).map(|i| format!("ext{i}")).collect();
+        let mut odd: Vec<&str> = odd.iter().map(String::as_str).collect();
+        odd.sort();
+        assert_eq!(unused, odd);
+        let bound = doc.vertices.len() + doc.edges.len();
+        assert!(
+            visited <= bound,
+            "{visited} vertex/edge visits for {bound} vertices and edges"
+        );
+    }
+
+    /// deps 보고서는 cargo metadata를 한 번만 돌린다 — 수확이 메타데이터를 다시 읽으면
+    /// tests/fixture 같은 작은 워크스페이스에서 실행 시간의 4할이 두 번째 cargo 실행이었다.
+    #[test]
+    fn report_runs_cargo_metadata_once() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture");
+        let before = crate::cargo_meta::loads();
+        let rep = report(&dir).unwrap();
+        assert_eq!(crate::cargo_meta::loads() - before, 1);
+        // 수확이 같은 메타데이터를 받아도 판정은 그대로다 — fixture_unused는 선언만 됐다.
+        assert!(
+            rep.unused
+                .iter()
+                .any(|u| u.package == "fixture_app" && u.dep == "fixture_unused"),
+            "{:?}",
+            rep.unused
+        );
+    }
+
+    /// 결정적 의사 난수(LCG) — 무작위 비교 테스트가 실행마다 같은 문서를 본다.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) as usize % n
+        }
+    }
+
+    /// 색인 전 구현 그대로의 사용 판정 — 선언 의존마다 간선 전체를 훑어 dep 정점(또는
+    /// `dep::…`)에 닿는 이 멤버의 확정 비-depends 간선을 찾는다. 색인 판정의 오라클이다.
+    fn used_by_scan(
+        doc: &Document,
+        krate_of: &BTreeMap<&str, &str>,
+        member_krates: &BTreeSet<&str>,
+        to_vertices: &BTreeSet<&str>,
+    ) -> bool {
+        doc.edges.iter().any(|e2| {
+            e2.kind != EdgeKind::Depends
+                && !e2.tentative
+                && to_vertices
+                    .iter()
+                    .any(|v| e2.to == *v || e2.to.starts_with(&format!("{v}::")))
+                && krate_of
+                    .get(e2.from.as_str())
+                    .is_some_and(|k| member_krates.contains(k))
+        })
+    }
+
+    /// 접두사가 겹치는 크레이트 이름(`a`·`ab`·`a_b`), 경로 중간의 같은 이름(`b::a`), 트레이트
+    /// 경로(`c::<a as b>::m`), 정점이 아닌 출발점, 같은 ID의 크레이트가 다른 변형, 모든 간선
+    /// 종류·추정 간선을 섞은 무작위 문서에서 색인 판정이 간선 전체 탐색과 같다.
+    #[test]
+    fn usage_index_matches_edge_scan_on_random_documents() {
+        let names = ["a", "ab", "a_b", "b", "c"];
+        let ids = [
+            "a",
+            "a::x",
+            "a::x::y",
+            "ab",
+            "ab::y",
+            "a_b::z",
+            "b",
+            "b::a",
+            "b::a::w",
+            "c::<a as b>::m",
+            "zz::q",
+        ];
+        let kinds = [
+            EdgeKind::Depends,
+            EdgeKind::Uses,
+            EdgeKind::Contains,
+            EdgeKind::Call,
+            EdgeKind::References,
+            EdgeKind::Implements,
+            EdgeKind::Signature,
+        ];
+        let mut rng = Lcg(0xdeb5);
+        // 크레이트 이름 대개 1~2개, 가끔 빈 집합 — 멤버의 크레이트 집합과 dep 정점 집합에 쓴다.
+        let pick = |rng: &mut Lcg| -> BTreeSet<&str> {
+            let count = if rng.below(8) == 0 {
+                0
+            } else {
+                1 + rng.below(2)
+            };
+            (0..count).map(|_| names[rng.below(names.len())]).collect()
+        };
+        let (mut used, mut unused) = (0, 0);
+        for _ in 0..3_000 {
+            let vertices: Vec<Vertex> = (0..1 + rng.below(8))
+                .map(|_| Vertex {
+                    krate: names[rng.below(names.len())].into(),
+                    ..v(ids[rng.below(ids.len())], Kind::Fn)
+                })
+                .collect();
+            let edges: Vec<Edge> = (0..rng.below(10))
+                .map(|_| {
+                    // 출발점은 대개 정점이고 가끔 정점이 아닌 ID다.
+                    let from = if rng.below(4) == 0 {
+                        ids[rng.below(ids.len())].to_string()
+                    } else {
+                        vertices[rng.below(vertices.len())].id.clone()
+                    };
+                    let mut e = Edge::new(
+                        from,
+                        ids[rng.below(ids.len())].into(),
+                        kinds[rng.below(kinds.len())],
+                    );
+                    e.tentative = rng.below(4) == 0;
+                    e
+                })
+                .collect();
+            let doc = document(
+                Level::Symbol,
+                ".".into(),
+                None,
+                vec![],
+                vertices,
+                edges,
+                vec![],
+            );
+            // report_from과 같은 수집 — 같은 ID가 여럿이면 나중 정점의 크레이트가 남는다.
+            let krate_of: BTreeMap<&str, &str> = doc
+                .vertices
+                .iter()
+                .map(|v| (v.id.as_str(), v.krate.as_str()))
+                .collect();
+            let evidence = usage_evidence(&doc, &krate_of);
+            for _ in 0..4 {
+                let (member_krates, to_vertices) = (pick(&mut rng), pick(&mut rng));
+                let expected = used_by_scan(&doc, &krate_of, &member_krates, &to_vertices);
+                assert_eq!(
+                    is_used(&evidence, &member_krates, &to_vertices),
+                    expected,
+                    "members {member_krates:?}, deps {to_vertices:?}, edges {:?}",
+                    doc.edges
+                );
+                used += usize::from(expected);
+                unused += usize::from(!expected);
+            }
+        }
+        // 비교가 공허하지 않은지 — 양쪽 판정을 충분히 봤다.
+        assert!(used > 500 && unused > 500, "used {used}, unused {unused}");
     }
 
     #[test]

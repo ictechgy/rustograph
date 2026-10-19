@@ -159,9 +159,24 @@ pub fn rustc_version() -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 이 스레드가 `cargo metadata`를 실행한 횟수 — 한 보고서가 메타데이터를 두 번 읽지
+    /// 않는지 단위 테스트가 센다(테스트 스레드마다 따로).
+    static LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 테스트용 — 이 스레드에서 지금까지 `cargo metadata`를 실행한 횟수.
+#[cfg(test)]
+pub(crate) fn loads() -> usize {
+    LOADS.with(std::cell::Cell::get)
+}
+
 /// `cargo metadata`를 실행해 워크스페이스 사실을 읽는다.
 /// dir이 cargo 프로젝트가 아니면 오류 — 빈 그래프로 속이지 않는다.
 pub fn load(dir: &Path) -> Result<Metadata, String> {
+    #[cfg(test)]
+    LOADS.with(|c| c.set(c.get() + 1));
     let out = Command::new("cargo")
         .args(["metadata", "--format-version", "1", "--manifest-path"])
         .arg(dir.join("Cargo.toml"))

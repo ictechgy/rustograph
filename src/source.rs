@@ -75,18 +75,30 @@ pub(crate) fn read_source_bounded(path: &Path, max_bytes: u64) -> std::io::Resul
 /// semantic 모드에서 cache가 켜져 있으면 소스 지문이 같은 이전 수확
 /// 문서를 재사용한다 — ra_ap 로드가 수십 초라 반복 질의의 실제 병목이다.
 pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
-    // feature가 꺼진 빌드는 여기서 오류 — 조용히 syn으로 떨어지면
-    // --semantic이 받은 결과가 의미 해석이 아니게 되어 거짓이 된다.
+    require_semantic_build(opts)?;
+    let meta = cargo_meta::load(dir)?;
+    load_with(dir, &meta, opts)
+}
+
+/// feature가 꺼진 빌드는 여기서 오류 — 조용히 syn으로 떨어지면
+/// --semantic이 받은 결과가 의미 해석이 아니게 되어 거짓이 된다.
+fn require_semantic_build(opts: &Options) -> Result<(), String> {
     if opts.semantic && !cfg!(feature = "semantic") {
         return Err(
             "--semantic requires a build with the `semantic` feature (cargo build --features semantic)"
                 .to_string(),
         );
     }
-    let meta = cargo_meta::load(dir)?;
+    Ok(())
+}
+
+/// 이미 읽은 메타데이터로 [`load`]와 같은 문서를 만든다 — deps 보고서처럼 메타데이터를
+/// 따로 쓰는 호출자가 한 실행에서 `cargo metadata`를 두 번 돌리지 않게 한다.
+pub fn load_with(dir: &Path, meta: &Metadata, opts: &Options) -> Result<Document, String> {
+    require_semantic_build(opts)?;
     // 캐시 키는 모든 입력의 지문 — 지문을 못 재면 캐시를 끈다(실패는 부가적).
     let cache = if opts.semantic && opts.cache {
-        fingerprint(dir, &meta, opts).map(|key| (key, cache_path(&meta)))
+        fingerprint(dir, meta, opts).map(|key| (key, cache_path(meta)))
     } else {
         None
     };
@@ -95,7 +107,7 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
             return Ok(doc);
         }
     }
-    let (doc, uses_include) = harvest(dir, &meta, opts, None)?;
+    let (doc, uses_include) = harvest(dir, meta, opts, None)?;
     if let Some((key, path)) = &cache {
         // 지문이 못 보는 입력을 소비한 문서는 캐시에 쓰지 않는다 —
         // include!/OUT_DIR 생성 파일과 루트 밖 #[path] 파일, 지문이
