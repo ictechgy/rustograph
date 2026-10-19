@@ -23,7 +23,7 @@ use ra_ap_load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice
 use ra_ap_proc_macro_api::ProcMacroClient;
 use ra_ap_project_model::{CargoConfig, RustLibSource, TargetDirectoryConfig};
 use ra_ap_syntax::ast::{self, AstNode, HasAttrs, HasName};
-use ra_ap_syntax::{SyntaxNode, TextRange, TextSize};
+use ra_ap_syntax::{NodeOrToken, SyntaxElement, SyntaxNode, TextRange, TextSize};
 use ra_ap_vfs::{FileId, Vfs, VfsPath};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::Range;
@@ -31,6 +31,26 @@ use std::path::{Path, PathBuf};
 
 /// 매크로 확장 재귀 한계 — 재귀 매크로(`m!() => { m!() }`류)는 유한해야 한다.
 const MAX_EXPANSION_DEPTH: usize = 16;
+
+#[cfg(test)]
+thread_local! {
+    /// 사이트 선언 탐색(site_def) 횟수와 load가 등록한 syn 사이트 수 — 본문 간선이 load의
+    /// 해석을 다시 쓰는지(사이트마다 한 번만 찾는지) 단위 테스트가 센다(테스트 스레드마다 따로).
+    static SITE_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LOADED_SITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// 사이트 선언 탐색(first_in_range)이 살핀 구문 원소 수 — 한 사이트를 찾는 비용이 앞선
+    /// 형제 수에 비례하지 않는지 단위 테스트가 센다.
+    static SITE_ELEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 테스트용 — 이 스레드에서 지금까지의 (사이트 선언 탐색 수, load가 등록한 syn 사이트 수).
+#[cfg(test)]
+pub(crate) fn site_search_counts() -> (usize, usize) {
+    (
+        SITE_SEARCHES.with(std::cell::Cell::get),
+        LOADED_SITES.with(std::cell::Cell::get),
+    )
+}
 
 /// 의미 해석 실측 — 호출자가 limitation 문장으로 번역한다.
 #[derive(Debug, Default)]
@@ -234,6 +254,8 @@ impl Engine {
                 });
             }
         }
+        #[cfg(test)]
+        LOADED_SITES.with(|c| c.set(c.get() + site_map.values().map(Vec::len).sum::<usize>()));
         // 타입 소속(self_ty)·트레이트 쿼리는 next-solver의 스레드 로컬
         // attached db를 요구한다 — 인덱스 빌드·사이트 서명 해석부터 붙인다.
         let (sites, index) = ra_ap_hir::attach_db(&db, || {
@@ -285,13 +307,22 @@ impl Engine {
             return None;
         };
         let want = TextRange::new(TextSize::from(start), TextSize::from(end));
+        // load가 같은 (파일, 범위, 모듈)로 이미 해석해 둔 사이트 — 입력이 같아 결과도
+        // 같으니 본문마다 파일 루트부터 선언을 다시 찾지 않는다.
+        let registered = self.sites.get(site.id).and_then(|ss| {
+            ss.iter()
+                .find(|s| s.file == file_id && s.range == want && s.module == site.module)
+        });
         ra_ap_hir::attach_db(&self.db, || {
             let sema = Semantics::new(&self.db);
             // 사이트 선언이 가리키는 hir 정의 — def 정체가 곧 정체다.
             // syn이 못 잡는 외부 트레이트·별칭·섀도잉된 인자도 같은 def면
             // 같은 아이템이고, span을 재사용한 생성 정의는 다른 def라
             // 걸러진다.
-            let site_def = site_def(&sema, file_id, want, site.module);
+            let declared = match registered {
+                Some(s) => s.def,
+                None => site_def(&sema, file_id, want, site.module),
+            };
             // 같은 ID의 정의가 여럿이면(제네릭 인자가 다른 impl·cfg 변형)
             // 파일·이름 앵커로 진짜 소유자를 고른다 — intersect는 맞닿은
             // 범위도 성공시키므로 이름 토큰의 포함 여부로 대조한다.
@@ -305,7 +336,7 @@ impl Engine {
                 e.file == file_id
                     && want.contains_range(e.anchor.unwrap_or(e.range))
                     && e.krate == site.krate
-                    && site_def == Some(e.def)
+                    && declared == Some(e.def)
             });
             let entry = match (matched.next(), matched.next()) {
                 (Some(e), None) => e,
@@ -481,6 +512,8 @@ fn site_def(
     range: TextRange,
     want_module: &str,
 ) -> Option<BodyDef> {
+    #[cfg(test)]
+    SITE_SEARCHES.with(|c| c.set(c.get() + 1));
     let parsed = sema.parse(sema.attach_first_edition_opt(file)?);
     // preorder라 바깥 아이템이 먼저 온다 — 이름 토큰이 사이트 범위 안에
     // 있는 가장 바깥 선언이 사이트 아이템이다. `const C: () = { impl .. {
@@ -488,7 +521,7 @@ fn site_def(
     // 먼저 잡힌다.
     let anchored =
         |n: Option<ast::Name>| n.is_some_and(|nm| range.contains_range(nm.syntax().text_range()));
-    let def = parsed.syntax().descendants().find_map(|n| {
+    let def = first_in_range(parsed.syntax(), range, |n| {
         if let Some(f) = ast::Fn::cast(n.clone()) {
             if !anchored(f.name()) {
                 return None;
@@ -513,6 +546,65 @@ fn site_def(
     // 임의의 하나의 문맥으로 def를 묶을 수 있다 — 소유 모듈이 syn이
     // 수확한 모듈과 다르면 이 문맥의 선언이 아니므로 버린다.
     (module_path(sema.db, def.module(sema.db)) == want_module).then_some(def)
+}
+
+/// `root` 아래를 preorder로 걸어 `item`이 Some을 주는 첫 노드의 값을 돌려준다 — 단 `range`와
+/// 겹치는(맞닿음 포함, `intersect`가 Some인) 노드만 본다. 사이트 선언은 이름 토큰이 `range`
+/// 안에 있어야 하고 이름은 선언 노드 범위 안에 있으므로, 겹치지 않는 서브트리에는 찾는 선언이
+/// 없다. 남은 노드의 방문 순서는 전체 preorder와 같아 첫 일치(바깥 선언 우선)도 같다.
+/// 자식은 부모 범위를 빈틈없이 순서대로 나누므로 겹치는 형제는 연속 구간이다 — 그 첫 형제를
+/// 이분 탐색으로 찾고, 범위 끝을 지난 형제에서 그 수준을 멈춘다. 파일 루트부터 모든 노드를
+/// 훑거나 앞선 형제를 하나씩 건너뛰면 생성 바인딩처럼 아이템이 수만 개인 파일에서 파일당
+/// 비용이 사이트 수 × 아이템 수가 된다.
+fn first_in_range<T>(
+    root: &SyntaxNode,
+    range: TextRange,
+    mut item: impl FnMut(SyntaxNode) -> Option<T>,
+) -> Option<T> {
+    // 범위와 겹치지 않는 뿌리 아래에는 후보가 없다.
+    root.text_range().intersect(range)?;
+    #[cfg(test)]
+    SITE_ELEMENTS.with(|c| c.set(c.get() + 1));
+    if let Some(found) = item(root.clone()) {
+        return Some(found);
+    }
+    // 수준마다 다음에 볼 형제 — 꼭대기가 가장 깊은 수준이라 꺼내는 순서가 preorder다.
+    let mut pending: Vec<SyntaxElement> =
+        first_overlapping_child(root, range).into_iter().collect();
+    while let Some(element) = pending.pop() {
+        #[cfg(test)]
+        SITE_ELEMENTS.with(|c| c.set(c.get() + 1));
+        // 겹치는 형제는 연속이다 — 범위 끝을 지난 형제가 나오면 이 수준은 끝났다.
+        if element.text_range().start() > range.end() {
+            continue;
+        }
+        pending.extend(element.next_sibling_or_token());
+        if let NodeOrToken::Node(node) = element {
+            if let Some(found) = item(node.clone()) {
+                return Some(found);
+            }
+            pending.extend(first_overlapping_child(&node, range));
+        }
+    }
+    None
+}
+
+/// `range`와 겹치는 노드의 자식(토큰 포함) 중 겹치는 첫 원소 — 자식이 없으면 None.
+fn first_overlapping_child(node: &SyntaxNode, range: TextRange) -> Option<SyntaxElement> {
+    // 범위가 노드보다 앞에서 시작하면 노드 시작으로 당긴다 — 노드 밖 오프셋은 받지 않는다.
+    let at = range.start().max(node.text_range().start());
+    let mut first = node.child_or_token_at_range(TextRange::empty(at))?;
+    // 오프셋이 형제 경계면 이분 탐색은 거기서 끝나는 마지막 형제를 준다 — 같은 경계에서
+    // 끝나는 앞 형제(빈 원소)도 맞닿아 겹치므로 거기까지 물린다.
+    while let Some(prev) = first.prev_sibling_or_token() {
+        if prev.text_range().end() < range.start() {
+            break;
+        }
+        #[cfg(test)]
+        SITE_ELEMENTS.with(|c| c.set(c.get() + 1));
+        first = prev;
+    }
+    Some(first)
 }
 
 /// fn 사이트의 hir 정의 — 아이템 트리에 있으면 그 def가 곧 정체다.
@@ -1661,5 +1753,154 @@ impl<'a, 'b> Walker<'a, 'b> {
             self.st.expanded += 1;
         }
         self.walk(&res.value, un, depth + 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ra_ap_syntax::{Edition, SourceFile, SyntaxKind, SyntaxTreeBuilder};
+
+    /// site_def와 같은 후보 규칙(이름 토큰이 범위 안에 든 fn·const·static)의 구문 부분 —
+    /// 의미 DB 없이 탐색 순서만 시험한다.
+    fn names_decl_inside(n: &SyntaxNode, range: TextRange) -> bool {
+        let name = ast::Fn::cast(n.clone())
+            .map(|f| f.name())
+            .or_else(|| ast::Const::cast(n.clone()).map(|c| c.name()))
+            .or_else(|| ast::Static::cast(n.clone()).map(|s| s.name()))
+            .flatten();
+        name.is_some_and(|nm| range.contains_range(nm.syntax().text_range()))
+    }
+
+    /// 생성 바인딩처럼 최상위 아이템이 많은 파일 + 바깥 선언 안에 이름이 든 안쪽 선언들.
+    fn many_items_source() -> String {
+        let mut src = String::new();
+        for i in 0..120 {
+            src.push_str(&format!(
+                "/// doc {i}\npub const C{i}: [u32; 4] = [{i}, 1, 2, 3];\n"
+            ));
+        }
+        src.push_str("const WRAP: () = { struct S; impl S { fn inner() -> u8 { 0 } } };\n");
+        src.push_str("impl Tr for T { fn m(&self) -> u32 { let x = 1; x + 2 } }\n");
+        src.push_str("mod nested { pub fn deep() { fn local() {} } static S: u8 = 0; }\n");
+        src.push_str("#[inline]\npub fn last() {}\n");
+        src
+    }
+
+    /// 사이트 선언 탐색은 사이트 범위와 겹치는 노드만 살피고, 한 사이트를 찾으려고 살피는 구문
+    /// 원소 수가 앞선 형제 수와 무관하다 — 아이템이 수만 개인 생성 파일에서 사이트마다 파일
+    /// 루트부터 앞선 아이템(본문이든 아이템 노드 자신이든)을 하나씩 거치면 파일당 비용이 사이트
+    /// 수 × 아이템 수가 된다. 고르는 선언은 파일 전체를 preorder로 훑을 때와 같아야 한다(바깥
+    /// 선언 우선).
+    #[test]
+    fn site_search_examines_only_nodes_overlapping_the_site() {
+        let src = many_items_source();
+        let file = SourceFile::parse(&src, Edition::CURRENT).tree();
+        let root = file.syntax();
+        // (선언을 찾았는가, 살핀 구문 원소 수) — 결과는 전체 preorder 탐색과 같아야 하고
+        // item에는 범위와 겹치는 노드만 넘어와야 한다.
+        let search = |range: TextRange| {
+            let mut strays = 0;
+            let before = SITE_ELEMENTS.with(std::cell::Cell::get);
+            let got = first_in_range(root, range, |n| {
+                if n.text_range().intersect(range).is_none() {
+                    strays += 1;
+                }
+                names_decl_inside(&n, range).then_some(n)
+            });
+            let examined = SITE_ELEMENTS.with(std::cell::Cell::get) - before;
+            let want = root.descendants().find(|n| names_decl_inside(n, range));
+            assert_eq!(got, want, "first declaration named inside {range:?}");
+            assert_eq!(
+                strays, 0,
+                "site search for {range:?} examined {strays} nodes outside the site"
+            );
+            (got.is_some(), examined)
+        };
+        // 실제 사이트처럼 아이템 전체·이름 범위 — 몇 번째 아이템이든 살피는 원소가 몇 개뿐이다.
+        let sites: Vec<TextRange> = root
+            .descendants()
+            .filter(|n| ast::Item::can_cast(n.kind()) || ast::Name::can_cast(n.kind()))
+            .map(|n| n.text_range())
+            .collect();
+        let mut found = 0;
+        for &range in &sites {
+            let (hit, examined) = search(range);
+            assert!(
+                examined <= 32,
+                "{examined} syntax elements examined to find the site {range:?}"
+            );
+            found += usize::from(hit);
+        }
+        assert!(found >= 2 * 120, "only {found} sites found a declaration");
+        // 아이템 경계와 어긋난 범위 — 경계의 빈 범위, 아이템 끝에 맞닿은 범위, 여러 아이템에 걸친
+        // 의사 난수 범위에서도 결과가 같다.
+        let len = TextSize::of(src.as_str());
+        let mut odd: Vec<TextRange> = sites
+            .iter()
+            .flat_map(|r| {
+                let touching = TextRange::new(r.end(), (r.end() + TextSize::from(8)).min(len));
+                [
+                    TextRange::empty(r.start()),
+                    TextRange::empty(r.end()),
+                    touching,
+                ]
+            })
+            .collect();
+        let mut seed = 0x2545_f491_u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            TextSize::from(seed % (u32::from(len) + 1))
+        };
+        for _ in 0..200 {
+            let (a, b) = (next(), next());
+            odd.push(TextRange::new(a.min(b), a.max(b)));
+        }
+        for range in odd {
+            search(range);
+        }
+    }
+
+    /// 형제 경계에 빈 노드가 몰려 있어도(오류 복구가 만드는 빈 노드) 겹치는 첫 형제부터 걷는다 —
+    /// 이분 탐색은 경계에서 끝나는 마지막 형제를 주므로, 같은 경계에서 끝나는 앞 형제로 물려야
+    /// 전체 preorder에서 범위와 겹치는 노드 가운데 첫 일치를 똑같이 만난다.
+    #[test]
+    fn site_search_keeps_preorder_order_among_empty_siblings() {
+        let mut builder = SyntaxTreeBuilder::default();
+        builder.start_node(SyntaxKind::SOURCE_FILE);
+        builder.token(SyntaxKind::IDENT, "ab");
+        for _ in 0..2 {
+            builder.start_node(SyntaxKind::ERROR);
+            builder.start_node(SyntaxKind::ERROR);
+            builder.finish_node();
+            builder.finish_node();
+        }
+        for (i, text) in ["cd", "ef"].into_iter().enumerate() {
+            if i > 0 {
+                builder.token(SyntaxKind::WHITESPACE, " ");
+            }
+            builder.start_node(SyntaxKind::NAME);
+            builder.token(SyntaxKind::IDENT, text);
+            builder.finish_node();
+        }
+        builder.finish_node();
+        let root = builder.finish().syntax_node();
+        let len = u32::from(root.text_range().end());
+        // 빈 ERROR 노드가 같은 오프셋에 여럿이라 (부모 안 위치, 종류)로 어느 노드인지 가린다.
+        let key = |n: &SyntaxNode| (n.index(), n.kind());
+        for kind in [SyntaxKind::ERROR, SyntaxKind::NAME, SyntaxKind::SOURCE_FILE] {
+            for start in 0..=len {
+                for end in start..=len {
+                    let range = TextRange::new(start.into(), end.into());
+                    let got = first_in_range(&root, range, |n| (n.kind() == kind).then(|| key(&n)));
+                    let want = root
+                        .descendants()
+                        .filter(|n| n.text_range().intersect(range).is_some())
+                        .find(|n| n.kind() == kind)
+                        .map(|n| key(&n));
+                    assert_eq!(got, want, "first {kind:?} overlapping {range:?}");
+                }
+            }
+        }
     }
 }

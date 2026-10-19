@@ -1726,6 +1726,40 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// semantic 본문 간선은 load가 사이트마다 해석해 둔 선언 정의를 다시 쓴다 — 본문마다 같은
+    /// (파일, 범위, 모듈)로 파일 루트부터 다시 찾으면 사이트 탐색이 사이트 수의 두 배가 된다.
+    /// 대조: 확정 메서드 호출이 그대로 나온다(재사용한 정의로 본문 소유자를 고르지 못하면
+    /// syn 이름 팬아웃의 추정 간선으로 떨어진다).
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn semantic_bodies_reuse_site_definitions_resolved_at_load() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture");
+        let (searches_before, sites_before) = sem::site_search_counts();
+        let doc = load(
+            &fixture,
+            &Options {
+                symbol_level: true,
+                semantic: true,
+                ..Default::default()
+            },
+        )
+        .expect("semantic fixture load");
+        let (searches, sites) = sem::site_search_counts();
+        let (searches, sites) = (searches - searches_before, sites - sites_before);
+        assert!(sites > 0, "the fixture registers body sites");
+        assert_eq!(
+            searches, sites,
+            "{searches} site searches for {sites} sites"
+        );
+        assert!(
+            doc.edges.iter().any(|e| e.from == "fixture_app::main"
+                && e.to == "fixture_core::Used::<Greet>::greet"
+                && e.kind == EdgeKind::Call
+                && !e.tentative),
+            "the concrete method call must stay a firm semantic edge"
+        );
+    }
+
     /// 정점 범위·모듈 트리만 쓰는 명령(schema·routes 서버·클라이언트)과 `--out` 입력 보호는
     /// 본문·속성 간선을 해석하지 않는다 — 대형 저장소에서 버려질 이름 팬아웃 본문 간선이
     /// 그 명령들의 시간·메모리 대부분이었다. 전체 수확은 그대로 해석한다(대조군).
