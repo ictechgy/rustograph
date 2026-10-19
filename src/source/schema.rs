@@ -1492,15 +1492,19 @@ fn fact_cmp(a: &RelationFact, b: &RelationFact) -> std::cmp::Ordering {
         ))
 }
 
-/// dynamic 사실의 channel에 실을 원문 요약이다 — 공백류 연속을 한 칸으로 접어 앞뒤를
-/// 다듬고, 남은 제어 문자(C0·DEL·C1·U+2028·U+2029)를 지운다. 남는 글자가 없으면
-/// `<dynamic>`이다.
+/// dynamic 사실의 channel에 실을 원문 요약이다 — 공백류(`char::is_whitespace`) 연속을 한
+/// 칸으로 접어 앞뒤를 다듬고, 남은 제어 문자(C0·DEL·C1·U+2028·U+2029)를 지운다. 지운 제어
+/// 문자는 공백 연속을 끊지 않는다. 남는 글자가 없으면 `<dynamic>`이다.
 ///
 /// 원문 식은 rustfmt가 여러 줄로 나눈 인자나 여러 줄 raw SQL이 흔한데, isthmus는
 /// dynamic 사실이어도 채널에 제어 문자가 하나라도 있으면 문서 전체를 거부한다
 /// (GRAPH-EXCHANGE 채널 규칙). 계열 생산자(dartograph `_dynamicChannel`, tsograph
-/// `dynamicChannel`)와 같은 규칙이다. 길이 상한은 호출자가 이 결과에 건다 — 정화 전에
-/// 자르면 접힐 공백이 상한을 먼저 써 버린다.
+/// `dynamicChannel`)와 목적은 같지만 규칙이 같지는 않다. 그쪽은 정규식 `\s+`(NEL 제외, U+FEFF
+/// 포함)를 한 칸으로 접고 다듬은 뒤 제어 문자를 지워서, `"x\u{85}y"`는 그쪽 `xy`·여기 `x y`,
+/// `"a \u{1} b"`는 `a  b`·`a b`, `"\u{1} a"`는 ` a`·`a`, `"a\u{feff}b"`는 `a b`·그대로다. 어느 쪽
+/// 결과도 isthmus 제어 문자 검사를 통과하고, dynamic 채널은 조인 키가 아니라 진단 문자열만
+/// 다르다. 길이 상한도 계열(UTF-16 160)과 다르며 호출자가 이 결과에 건다(schema 120자, routes
+/// 템플릿 상한) — 정화 전에 자르면 접힐 공백이 상한을 먼저 써 버린다.
 pub(crate) fn dynamic_channel(text: &str) -> String {
     let mut summary = String::with_capacity(text.len());
     let mut pending_space = false;
