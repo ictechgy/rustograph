@@ -151,11 +151,12 @@ pub fn facts(dir: &Path, tool_version: &str) -> Result<BridgeFactsDocument, Stri
     }
     let mut facts = std::mem::take(&mut scan.list);
     // 감싸는 정점 귀속 — impact와 같은 syn 수확을 돌려 정점 ID와 범위를
-    // 얻는다. 그래프를 못 만들면 사실은 그대로 내되 usr는 싣지 않는다 —
-    // 사실 수확을 그래프 성공에 묶으면 파싱 실패 하나로 문서 전체를 잃는다.
-    let graph = crate::source::owner_spans(dir, &meta);
+    // 얻는다(간선은 귀속에 필요 없어 만들지 않는다). 그래프를 못 만들면 사실은
+    // 그대로 내되 usr는 싣지 않는다 — 사실 수확을 그래프 성공에 묶으면 파싱
+    // 실패 하나로 문서 전체를 잃는다.
+    let graph = crate::source::vertex_spans(dir, &meta);
     let index = match &graph {
-        Ok((doc, spans)) => Some(OwnerIndex::new(doc, spans)),
+        Ok((ids, spans)) => Some(OwnerIndex::new(ids, spans)),
         Err(_) => {
             scan.graph_failed = true;
             None
@@ -193,8 +194,7 @@ struct OwnerIndex {
 impl OwnerIndex {
     /// 범위의 파일 경로를 정규화해 사실 경로(정규화된 루트 기준)와 맞춘다.
     /// 정점 집합에 없는 ID는 버린다 — usr는 그래프 정점이어야 한다.
-    fn new(doc: &crate::graph::Document, spans: &[crate::harvest::OwnerSpan]) -> OwnerIndex {
-        let ids = doc.vertex_ids();
+    fn new(ids: &BTreeSet<String>, spans: &[crate::harvest::OwnerSpan]) -> OwnerIndex {
         let mut canon: BTreeMap<&Path, PathBuf> = BTreeMap::new();
         let mut by_file: BTreeMap<PathBuf, Vec<(std::ops::Range<usize>, String)>> = BTreeMap::new();
         for sp in spans {
@@ -2594,28 +2594,10 @@ mod tests {
 
     #[test]
     fn owner_index_picks_innermost_vertex_and_skips_non_vertices() {
-        let doc = crate::graph::document(
-            crate::graph::Level::Symbol,
-            ".".into(),
-            None,
-            vec![],
-            ["c::T", "c::T::m"]
-                .iter()
-                .map(|id| crate::graph::Vertex {
-                    id: id.to_string(),
-                    kind: crate::graph::Kind::Fn,
-                    krate: "c".into(),
-                    module: "c".into(),
-                    position: None,
-                    exported: false,
-                    generated: false,
-                    cfg: None,
-                    unsafe_: false,
-                })
-                .collect(),
-            vec![],
-            vec![],
-        );
+        let ids: BTreeSet<String> = ["c::T", "c::T::m"]
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
         let file = PathBuf::from("/nonexistent-root/src/lib.rs");
         let span = |id: &str, r: std::ops::Range<usize>| crate::harvest::OwnerSpan {
             id: id.into(),
@@ -2628,7 +2610,7 @@ mod tests {
             // 정점이 아닌 ID는 usr가 될 수 없다.
             span("c::Ghost", 30..40),
         ];
-        let ix = OwnerIndex::new(&doc, &spans);
+        let ix = OwnerIndex::new(&ids, &spans);
         let root = Path::new("/nonexistent-root");
         let mut facts = vec![
             fact_at("src/lib.rs", 15),

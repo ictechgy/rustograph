@@ -149,7 +149,7 @@ pub(super) struct Ctx<'a> {
 impl<'a> Ctx<'a> {
     /// 수확 산출물로 문맥을 만든다. 정점 범위는 그래프에 실제로 있는 ID만 담는다.
     pub fn new(parts: &'a Parts, root: PathBuf) -> Ctx<'a> {
-        let ids = parts.doc.vertex_ids();
+        let ids: BTreeSet<&str> = parts.vertex_ids.iter().map(String::as_str).collect();
         let mut owners: BTreeMap<PathBuf, Vec<(std::ops::Range<usize>, String)>> = BTreeMap::new();
         for sp in &parts.spans {
             if ids.contains(sp.id.as_str()) && !sp.range.is_empty() {

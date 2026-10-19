@@ -119,24 +119,54 @@ pub fn load_with(dir: &Path, meta: &Metadata, opts: &Options) -> Result<Document
     Ok(doc)
 }
 
-/// syn 심볼 그래프와 정점별 소스 범위를 함께 돌려준다 — `schema`가
-/// relation-use 사실을 impact와 같은 정점 ID로 귀속하는 데 쓴다.
+/// syn 심볼 그래프와 정점별 소스 범위를 함께 돌려준다 — 소스 위치를 impact와
+/// 같은 정점 ID로 귀속하려는 라이브러리 호출자용이다.
 /// 기본 옵션(심볼 레벨, 외부 크레이트 정점 없음, semantic 없음)으로
-/// 수확한다 — 정점 집합은 `impact`/`reach` 기본 실행과 같다.
+/// 수확한다 — 정점 집합은 `impact`/`reach` 기본 실행과 같다. 간선까지 만든
+/// 완전한 문서다. 정점 ID만 쓰는 `schema`는 간선 해석을 건너뛰는 같은 수확을 쓴다.
 pub fn owner_spans(
     dir: &Path,
     meta: &Metadata,
 ) -> Result<(Document, Vec<harvest::OwnerSpan>), String> {
-    let opts = Options {
-        symbol_level: true,
-        ..Default::default()
-    };
     let mut sink = Sink {
         spans: Some(Vec::new()),
+        want_edges: true,
         ..Default::default()
     };
-    let (doc, _) = harvest(dir, meta, &opts, Some(&mut sink))?;
+    let (doc, _) = harvest(dir, meta, &span_options(), Some(&mut sink))?;
     Ok((doc, sink.spans.unwrap_or_default()))
+}
+
+/// 정점 ID 집합과 정점별 소스 범위만 돌려준다 — `schema`가 relation-use 사실을
+/// impact와 같은 정점 ID로 귀속하는 데 쓴다. 간선은 해석하지 않는다: 본문 이름
+/// 팬아웃 간선이 대형 저장소에서 이 수확 시간·메모리의 대부분인데 귀속에는 정점과
+/// 범위만 필요하다. 정점·범위는 1패스가 다 만들므로 [`owner_spans`]와 같다.
+pub(crate) fn vertex_spans(
+    dir: &Path,
+    meta: &Metadata,
+) -> Result<(BTreeSet<String>, Vec<harvest::OwnerSpan>), String> {
+    let mut sink = Sink {
+        spans: Some(Vec::new()),
+        want_edges: false,
+        ..Default::default()
+    };
+    let (doc, _) = harvest(dir, meta, &span_options(), Some(&mut sink))?;
+    Ok((vertex_id_set(doc), sink.spans.unwrap_or_default()))
+}
+
+/// 정점 범위를 쓰는 수확의 옵션 — 심볼 레벨, 외부 크레이트 정점 없음, semantic 없음.
+/// 정점 집합이 `impact`/`reach` 기본 실행과 같아야 사실의 usr가 그래프 정점이 된다.
+fn span_options() -> Options {
+    Options {
+        symbol_level: true,
+        ..Default::default()
+    }
+}
+
+/// 간선 없이 만든 문서에서 정점 ID만 남긴다 — 간선이 빈 문서가 완전한 그래프처럼
+/// 다른 질의로 흘러가지 않게 호출자에게는 ID 집합만 넘긴다.
+fn vertex_id_set(doc: Document) -> BTreeSet<String> {
+    doc.vertices.into_iter().map(|v| v.id).collect()
 }
 
 /// 수확 부산물을 받는 그릇 — 필요한 칸만 Some으로 채워 넘긴다.
@@ -150,11 +180,16 @@ struct Sink {
     tree: Option<ModTree>,
     arena: Option<Arena>,
     want_tree: bool,
+    /// 2패스(본문·속성 간선)를 돌릴지 — 정점 ID·범위·트리만 쓰는 호출자는 false다.
+    /// sink 유무로 추정하지 않고 명시한다: 간선이 필요한 sink 호출자가 생겼을 때
+    /// 조용히 간선 없는 문서를 받지 않게 하려는 것이다.
+    want_edges: bool,
 }
 
-/// `routes`가 쓰는 수확 산출물 — 문서·정점 범위·모듈 트리·AST 아레나.
+/// `routes`가 쓰는 수확 산출물 — 정점 ID·정점 범위·모듈 트리·AST 아레나.
+/// 간선은 만들지 않으므로 문서 대신 정점 ID 집합만 싣는다.
 pub(crate) struct Parts {
-    pub(crate) doc: Document,
+    pub(crate) vertex_ids: BTreeSet<String>,
     pub(crate) spans: Vec<harvest::OwnerSpan>,
     pub(crate) tree: ModTree,
     arena: Arena,
@@ -168,23 +203,21 @@ impl Parts {
     }
 }
 
-/// 기본 옵션(심볼 레벨)으로 수확하고 트리·아레나까지 돌려준다.
+/// 기본 옵션(심볼 레벨)으로 수확하고 트리·아레나까지 돌려준다. 라우트 추출과
+/// `--out` 입력 보호는 간선을 읽지 않으므로 간선 해석을 건너뛴다.
 pub(crate) fn harvest_parts(dir: &Path, meta: &Metadata) -> Result<Parts, String> {
-    let opts = Options {
-        symbol_level: true,
-        ..Default::default()
-    };
     let mut sink = Sink {
         spans: Some(Vec::new()),
         want_tree: true,
+        want_edges: false,
         ..Default::default()
     };
-    let (doc, _) = harvest(dir, meta, &opts, Some(&mut sink))?;
+    let (doc, _) = harvest(dir, meta, &span_options(), Some(&mut sink))?;
     let (Some(tree), Some(arena)) = (sink.tree, sink.arena) else {
         return Err("internal error: harvest did not return its module tree".to_string());
     };
     Ok(Parts {
-        doc,
+        vertex_ids: vertex_id_set(doc),
         spans: sink.spans.unwrap_or_default(),
         tree,
         arena,
@@ -495,10 +528,25 @@ fn write_cache(path: &Path, key: u64, doc: &Document) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 2패스가 간선을 해석한 본문·속성 참조 수 — 정점 범위·모듈 트리만 쓰는 수확이 버릴
+    /// 간선을 만들지 않는지 단위 테스트가 센다(테스트 스레드마다 따로).
+    static LINKED_ITEMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 테스트용 — 이 스레드에서 지금까지 2패스가 간선을 해석한 본문·속성 참조 수.
+#[cfg(test)]
+fn linked_items() -> usize {
+    LINKED_ITEMS.with(std::cell::Cell::get)
+}
+
 /// 실제 수확 — 메타데이터 위에서 모듈 트리·간선을 조립한다.
 /// (문서, include! 계열 매크로 사용 여부)를 돌린다 — include!는
 /// 정점 위치에 안 나타나는 입력이라 캐시 판정이 별도로 필요하다.
 /// `sink`가 주어지면 정점별 소스 범위(OwnerSpan)와 모듈 트리·아레나도 넘긴다.
+/// sink가 간선을 원하지 않으면(`want_edges = false`) 2패스(본문·속성 간선)를 건너뛴다 —
+/// 그 문서에는 간선과 2패스가 센 limitation이 없어 정점 ID만 믿을 수 있다.
 fn harvest(
     dir: &Path,
     meta: &Metadata,
@@ -676,75 +724,90 @@ fn harvest(
         collect_owner_spans(&tree, &impls, &bodies, item_spans, out);
     }
 
-    // 메서드 이름 → ID 인덱스 — 이름 팬아웃 폴백에 쓴다(semantic에서는
-    // ra가 해석하지 못한 호출에만 쓰인다).
-    let mut method_index: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for v in &vertices {
-        if v.kind == Kind::Method {
-            if let Some(name) = v.id.rsplit("::").next() {
-                method_index
-                    .entry(name.to_string())
-                    .or_default()
-                    .push(v.id.clone());
+    // 2패스 전체(메서드 색인·본문·속성 간선)는 간선을 쓰는 수확만 돈다 — 정점 ID·범위·
+    // 트리만 쓰는 sink(schema·routes·--out 입력 보호)에는 버려질 일이라 건너뛴다.
+    let want_edges = sink.as_ref().is_none_or(|k| k.want_edges);
+    if want_edges {
+        #[cfg(test)]
+        LINKED_ITEMS.with(|c| c.set(c.get() + bodies.len() + attr_refs.len()));
+        // 메서드 이름 → ID 인덱스 — 이름 팬아웃 폴백에 쓴다(semantic에서는
+        // ra가 해석하지 못한 호출에만 쓰인다).
+        let mut method_index: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for v in &vertices {
+            if v.kind == Kind::Method {
+                if let Some(name) = v.id.rsplit("::").next() {
+                    method_index
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(v.id.clone());
+                }
             }
         }
-    }
 
-    // 2패스: 본문 — 모든 정점이 준비된 뒤에 해석한다.
-    // semantic 엔진이 붙어 있으면 hir이 아는 본문은 타입 해석으로 정확히
-    // 잡고, 모르는 본문(cfg 비활성·매크로 생성)만 syn 팬아웃으로 돌아간다.
-    #[cfg(feature = "semantic")]
-    let engine = if opts.semantic {
-        // syn이 수확한 선언 위치 — 의미 해석 쪽에서 정규 ID 문자열이
-        // 가리키는 정점의 provenance 검증에 쓴다(생성 정의 충돌 방지).
-        let mut sites: BTreeMap<String, Vec<sem::Site>> = BTreeMap::new();
-        for b in &bodies {
-            sites.entry(b.id.clone()).or_default().push(sem::Site {
-                file: b.file.clone(),
-                range: b.range.clone(),
-                module: b.module.clone(),
-            });
-        }
-        Some(sem::Engine::load(&meta.workspace_root, &sites)?)
-    } else {
-        None
-    };
-    #[cfg(feature = "semantic")]
-    if let Some(eng) = &engine {
-        let ids: BTreeSet<&str> = vertices.iter().map(|v| v.id.as_str()).collect();
-        let mut st = sem::Stats::default();
-        for b in &bodies {
-            let site = sem::OwnerSite {
-                id: &b.id,
-                cfg: &b.cfg,
-                file: &b.file,
-                range: &b.range,
-                // 소유 크레이트·모듈 — 같은 파일을 둘이 넘는 문맥이
-                // 공유해도(공유 include!·`#[path]`) 선언 문맥으로 정확한
-                // 항목을 고른다.
-                krate: b.module.split("::").next().unwrap_or_default(),
-                module: &b.module,
-            };
-            match eng.body_edges(&site, &ids, &method_index, &mut st) {
-                Some(es) => {
-                    // 시그니처 간선은 엔진과 무관하게 syn이 권위다.
-                    edges.extend(harvest::signature_edges(b, &tree, &dep_crates));
-                    edges.extend(es);
-                }
-                None => {
-                    st.unmapped += 1;
-                    edges.extend(harvest::bodies(
-                        std::slice::from_ref(b),
-                        &tree,
-                        &dep_crates,
-                        &method_index,
-                        &mut harvest,
-                    ));
+        // 2패스: 본문 — 모든 정점이 준비된 뒤에 해석한다.
+        // semantic 엔진이 붙어 있으면 hir이 아는 본문은 타입 해석으로 정확히
+        // 잡고, 모르는 본문(cfg 비활성·매크로 생성)만 syn 팬아웃으로 돌아간다.
+        #[cfg(feature = "semantic")]
+        let engine = if opts.semantic {
+            // syn이 수확한 선언 위치 — 의미 해석 쪽에서 정규 ID 문자열이
+            // 가리키는 정점의 provenance 검증에 쓴다(생성 정의 충돌 방지).
+            let mut sites: BTreeMap<String, Vec<sem::Site>> = BTreeMap::new();
+            for b in &bodies {
+                sites.entry(b.id.clone()).or_default().push(sem::Site {
+                    file: b.file.clone(),
+                    range: b.range.clone(),
+                    module: b.module.clone(),
+                });
+            }
+            Some(sem::Engine::load(&meta.workspace_root, &sites)?)
+        } else {
+            None
+        };
+        #[cfg(feature = "semantic")]
+        if let Some(eng) = &engine {
+            let ids: BTreeSet<&str> = vertices.iter().map(|v| v.id.as_str()).collect();
+            let mut st = sem::Stats::default();
+            for b in &bodies {
+                let site = sem::OwnerSite {
+                    id: &b.id,
+                    cfg: &b.cfg,
+                    file: &b.file,
+                    range: &b.range,
+                    // 소유 크레이트·모듈 — 같은 파일을 둘이 넘는 문맥이
+                    // 공유해도(공유 include!·`#[path]`) 선언 문맥으로 정확한
+                    // 항목을 고른다.
+                    krate: b.module.split("::").next().unwrap_or_default(),
+                    module: &b.module,
+                };
+                match eng.body_edges(&site, &ids, &method_index, &mut st) {
+                    Some(es) => {
+                        // 시그니처 간선은 엔진과 무관하게 syn이 권위다.
+                        edges.extend(harvest::signature_edges(b, &tree, &dep_crates));
+                        edges.extend(es);
+                    }
+                    None => {
+                        st.unmapped += 1;
+                        edges.extend(harvest::bodies(
+                            std::slice::from_ref(b),
+                            &tree,
+                            &dep_crates,
+                            &method_index,
+                            &mut harvest,
+                        ));
+                    }
                 }
             }
+            push_sem_stats(&st, eng.has_proc_macros(), &mut limitations, &mut harvest);
+        } else {
+            edges.extend(harvest::bodies(
+                &bodies,
+                &tree,
+                &dep_crates,
+                &method_index,
+                &mut harvest,
+            ));
         }
-        push_sem_stats(&st, eng.has_proc_macros(), &mut limitations, &mut harvest);
-    } else {
+        #[cfg(not(feature = "semantic"))]
         edges.extend(harvest::bodies(
             &bodies,
             &tree,
@@ -752,24 +815,16 @@ fn harvest(
             &method_index,
             &mut harvest,
         ));
-    }
-    #[cfg(not(feature = "semantic"))]
-    edges.extend(harvest::bodies(
-        &bodies,
-        &tree,
-        &dep_crates,
-        &method_index,
-        &mut harvest,
-    ));
 
-    // 속성 경로 참조 — 모드와 무관하게 syn이 권위다. `#[dep::attr]`나
-    // `#[derive(dep::X)]`는 의미 해석이 더 잘 아는 것이 없다.
-    edges.extend(harvest::attr_edges(
-        &attr_refs,
-        &tree,
-        &dep_crates,
-        &mut harvest,
-    ));
+        // 속성 경로 참조 — 모드와 무관하게 syn이 권위다. `#[dep::attr]`나
+        // `#[derive(dep::X)]`는 의미 해석이 더 잘 아는 것이 없다.
+        edges.extend(harvest::attr_edges(
+            &attr_refs,
+            &tree,
+            &dep_crates,
+            &mut harvest,
+        ));
+    }
 
     push_limitations(&harvest, &mut limitations);
 
@@ -1394,6 +1449,100 @@ mod tests {
         // .rustograph는 숨김 디렉터리라 지문 걷기에서 빠진다.
         assert_eq!(k2, fingerprint(&tmp, &meta, &opts).unwrap());
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 정점 범위·모듈 트리만 쓰는 명령(schema·routes 서버·클라이언트·`--out` 입력 보호)은
+    /// 본문·속성 간선을 해석하지 않는다 — 대형 저장소에서 버려질 이름 팬아웃 본문 간선이
+    /// 그 명령들의 시간·메모리 대부분이었다. 전체 수확은 그대로 해석한다(대조군).
+    #[test]
+    fn span_only_commands_resolve_no_edges() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let resolved_during = |run: &dyn Fn()| {
+            let before = linked_items();
+            run();
+            linked_items() - before
+        };
+        let full = resolved_during(&|| {
+            load(&repo.join("tests/fixture"), &span_options()).unwrap();
+        });
+        assert!(full > 0, "the full harvest must resolve body edges");
+        let commands = [
+            (
+                "schema",
+                resolved_during(&|| {
+                    schema::facts(&repo.join("tests/fixture-schema"), "test").unwrap();
+                }),
+            ),
+            (
+                "routes server",
+                resolved_during(&|| {
+                    let dir = repo.join("tests/fixture-routes/axum08");
+                    routes::routes(&dir, "test", &Default::default()).unwrap();
+                }),
+            ),
+            (
+                "routes client",
+                resolved_during(&|| {
+                    let dir = repo.join("tests/fixture-client/app");
+                    routes::client::client_routes(&dir, "test", &Default::default()).unwrap();
+                }),
+            ),
+            (
+                "output inputs",
+                resolved_during(&|| {
+                    input_files(&repo.join("tests/fixture")).unwrap();
+                }),
+            ),
+        ];
+        assert!(commands.iter().all(|(_, n)| *n == 0), "{commands:?}");
+    }
+
+    /// 정점 범위 비교 키 — OwnerSpan은 비교 연산이 없어 필드를 그대로 늘어놓는다.
+    fn span_keys(spans: &[harvest::OwnerSpan]) -> Vec<(String, PathBuf, std::ops::Range<usize>)> {
+        spans
+            .iter()
+            .map(|s| (s.id.clone(), s.file.clone(), s.range.clone()))
+            .collect()
+    }
+
+    /// 간선을 건너뛴 수확도 정점 ID·정점 범위·모듈 트리·아레나는 간선까지 만든 수확과
+    /// 같다 — schema의 usr와 routes의 핸들러 ID가 impact와 같은 정점을 가리켜야 한다.
+    #[test]
+    fn edgeless_harvests_keep_vertices_spans_and_tree() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for name in [
+            "tests/fixture",
+            "tests/fixture-schema",
+            "tests/fixture-client/app",
+        ] {
+            let dir = repo.join(name);
+            let meta = cargo_meta::load(&dir).unwrap();
+            let mut sink = Sink {
+                spans: Some(Vec::new()),
+                want_tree: true,
+                want_edges: true,
+                ..Default::default()
+            };
+            let (full, _) = harvest(&dir, &meta, &span_options(), Some(&mut sink)).unwrap();
+            assert!(!full.edges.is_empty(), "{name}");
+            let full_ids: BTreeSet<String> = full.vertices.iter().map(|v| v.id.clone()).collect();
+            let full_spans = span_keys(sink.spans.as_deref().unwrap());
+            let (tree, arena) = (sink.tree.unwrap(), sink.arena.unwrap());
+            let (ids, spans) = vertex_spans(&dir, &meta).unwrap();
+            assert_eq!(ids, full_ids, "{name}");
+            assert_eq!(span_keys(&spans), full_spans, "{name}");
+            // 공개 owner_spans는 그대로 간선까지 만든 완전한 문서다.
+            let (doc, owners) = owner_spans(&dir, &meta).unwrap();
+            let json = |d: &Document| serde_json::to_string(d).unwrap();
+            assert_eq!(json(&doc), json(&full), "{name}");
+            assert_eq!(span_keys(&owners), full_spans, "{name}");
+            let parts = harvest_parts(&dir, &meta).unwrap();
+            assert_eq!(parts.vertex_ids, full_ids, "{name}");
+            assert_eq!(span_keys(&parts.spans), full_spans, "{name}");
+            assert!(parts.tree.modules.keys().eq(tree.modules.keys()), "{name}");
+            assert_eq!(parts.tree.orphan_files, tree.orphan_files, "{name}");
+            assert!(parts.arena.keys().eq(arena.keys()), "{name}");
+        }
     }
 
     /// 상한 읽기는 정규 파일만 열고 상한을 넘으면 거부한다 — FIFO·장치·디렉터리는 열지
