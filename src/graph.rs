@@ -196,6 +196,13 @@ pub struct Document {
     /// cargo 워크스페이스 루트 — root와 다를 수 있다.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// 이 문서를 만든 수확 시점의 소스 revision(작업 트리가 깨끗할 때의 git HEAD) — 저장 스냅샷의
+    /// 출처다. 저장한 그래프를 다시 읽는 실행은 그사이 커밋이 움직였을 수 있어 지금의 HEAD로 출처를
+    /// 짐작할 수 없다. 그래서 `graph --out`이 저장할 때 적고 순회 명령이 `--graph`로 읽을 때 이 값을
+    /// 쓴다. 표준 출력 문서·이 필드 이전의 문서에는 없고 키가 빠진다 — 문서 버전은 그대로다(모르는
+    /// 필드를 무시하는 옛 판독기도 읽는다). 투영·필터는 같은 소스의 문서라 값을 그대로 옮긴다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
     /// 도달성 분석의 보존 루트 ID.
     pub roots: Vec<String>,
     pub vertices: Vec<Vertex>,
@@ -358,6 +365,7 @@ impl Document {
             level,
             root: self.root.clone(),
             workspace: self.workspace.clone(),
+            revision: self.revision.clone(),
             roots: self
                 .roots
                 .iter()
@@ -599,7 +607,8 @@ fn chain_unknown(
     })
 }
 
-/// 정렬·중복 제거된 최종 문서를 만든다.
+/// 정렬·중복 제거된 최종 문서를 만든다. 수확 결과라 `revision`은 비어 있다 — 출처를 기록하는
+/// 쪽(`graph --out`)이 따로 채운다.
 pub fn document(
     level: Level,
     root: String,
@@ -615,6 +624,7 @@ pub fn document(
         level,
         root,
         workspace,
+        revision: None,
         roots,
         vertices,
         edges,
@@ -800,6 +810,32 @@ mod tests {
         let d: Document = serde_json::from_str(j).unwrap();
         assert!(!d.edges[0].tentative);
         assert!(!d.vertices[0].exported);
+        // revision 이전의 문서도 읽히고, 기록이 없으면 다시 쓸 때도 키가 빠진다.
+        assert_eq!(d.revision, None);
+        assert!(!serde_json::to_string(&d).unwrap().contains("\"revision\""));
+    }
+
+    /// 스냅샷의 출처(revision)는 같은 소스에서 나온 파생 문서에 그대로 남는다 — 레벨 투영(새 문서를
+    /// 만든다)과 부분 그래프 필터 모두. 기록은 workspace 다음 키다.
+    #[test]
+    fn recorded_revision_survives_projections_and_filters() {
+        assert_eq!(doc().revision, None, "a harvest records no revision");
+        let mut d = doc();
+        d.revision = Some("c1".into());
+        let facts = crate::cfgeval::Facts::from_triple("aarch64-apple-darwin");
+        let derived = [
+            d.view(Level::Symbol).unwrap(),
+            d.view(Level::Module).unwrap(),
+            d.view(Level::Crate).unwrap(),
+            d.focus(&["c::a".into()]),
+            d.without_tests(),
+            d.for_target("aarch64-apple-darwin", &facts),
+        ];
+        for derived in derived {
+            assert_eq!(derived.revision.as_deref(), Some("c1"));
+        }
+        let text = serde_json::to_string(&d).unwrap();
+        assert!(text.contains(r#""level":"symbol","root":".","revision":"c1","roots""#));
     }
 
     /// module·cfg를 지정하는 헬퍼 — 필터 테스트는 cfg 사슬이 필요하다.

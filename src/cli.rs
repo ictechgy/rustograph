@@ -282,10 +282,15 @@ fn replacement_refusal(listed: &source::ProtectedInputs) -> Option<String> {
 
 fn cmd_graph(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     let level = cli_args::level_of(a)?;
+    let format = a.get("format").unwrap_or("json");
     // 수확은 항상 최대 깊이로 — 얕은 레벨은 투영이다.
     let (doc, inputs) = cli_args::document_with_inputs(a, true, a.get("out").is_some())?;
-    let doc = doc.view(level)?;
-    let text = match a.get("format").unwrap_or("json") {
+    let mut doc = doc.view(level)?;
+    // `--graph` 입력은 그 문서의 기록을 그대로 옮긴다(다시 판독하지 않는다).
+    if a.get("graph").is_none() {
+        doc.revision = recorded_revision(a, format);
+    }
+    let text = match format {
         "json" => export::to_json(&doc),
         "mermaid" => export::to_mermaid(&doc),
         f => return Err(format!("unknown format {f} (json|mermaid)")),
@@ -307,6 +312,17 @@ fn cmd_graph(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
         }
     }
     Ok(0)
+}
+
+/// 수확한 그래프에 기록할 출처 revision — 파일로 저장하는 JSON 스냅샷(`--out`)에만 싣는다. 순회 명령이
+/// `--graph`로 그 스냅샷을 읽을 때 지금의 HEAD 대신 이 값을 쓴다. 표준 출력 문서는 지금과 같은 바이트라
+/// git을 실행하지 않고, Mermaid에는 실을 자리가 없다. 값은 `--dir` 작업 트리가 깨끗할 때의 git HEAD다
+/// (순회 문서의 revision과 같은 판정). 캐시에서 온 문서도 이 값으로 덮어 수확 경로가 출처를 정한다.
+fn recorded_revision(a: &Args, format: &str) -> Option<String> {
+    if format != "json" || a.get("out").is_none() {
+        return None;
+    }
+    reach::clean_head(Path::new(a.get("dir").unwrap_or(".")))
 }
 
 fn cmd_cycles(a: &Args, out: &mut dyn Write) -> Result<i32, String> {

@@ -151,6 +151,18 @@ fn graph_revision_is_the_sha256_of_the_project_rooted_symbol_graph() {
         assert_eq!(code, 0, "{err}");
         assert_eq!(json(&out)["graphRevision"], hex_digest(text.as_bytes()));
     }
+    // 스냅샷이 기록한 revision은 해시하지 않는다 — 같은 커밋에서 새로 수확한 그래프(revision 없음)와
+    // 같은 값이라야 isthmus가 같은 플랫폼 분석끼리 stale로 보지 않는다. 기록은 revision으로 간다.
+    let text = rustograph::export::to_json(&saved_document(&canon, None, vec![]));
+    let mut recorded = json(&text);
+    recorded["revision"] = "0123456789abcdef0123456789abcdef01234567".into();
+    let file = project.join("recorded.json");
+    std::fs::write(&file, recorded.to_string()).unwrap();
+    let path = file.display().to_string();
+    let (code, out, err) = run(&["reach", "--graph", &path, "--dir", &canon, "c::a"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(json(&out)["revision"], recorded["revision"]);
+    assert_eq!(json(&out)["graphRevision"], hex_digest(text.as_bytes()));
 }
 
 /// root가 `root`인 두 정점 a→b 심볼 문서.
@@ -464,7 +476,6 @@ fn git(dir: &Path, args: &[&str]) -> bool {
 }
 
 /// fixture git의 표준 출력(앞뒤 공백 제거) — 실패하면 테스트가 멈춘다.
-#[cfg(unix)]
 fn git_stdout(dir: &Path, args: &[&str]) -> String {
     let out = fixture_git(dir).args(args).output().unwrap();
     assert!(out.status.success(), "fixture git {args:?} failed");
@@ -654,12 +665,17 @@ fn traverse_with_path(
 /// 문서의 `revision-unverified:` limitation.
 #[cfg(unix)]
 fn unverified(d: &serde_json::Value) -> Vec<String> {
+    labeled_limitations(d, "revision-unverified:")
+}
+
+/// 문서의 limitation 가운데 `label`로 시작하는 것.
+fn labeled_limitations(d: &serde_json::Value, label: &str) -> Vec<String> {
     d["limitations"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|l| l.as_str())
-        .filter(|l| l.starts_with("revision-unverified:"))
+        .filter(|l| l.starts_with(label))
         .map(str::to_string)
         .collect()
 }
@@ -879,4 +895,229 @@ fn git_is_never_resolved_from_relative_path_entries() {
             );
         }
     }
+}
+
+// ── 저장 스냅샷의 revision(arch#1) ─────────────────────────────────────────
+// `--graph`로 읽은 그래프의 소스는 지금의 작업 트리가 아니라 저장할 때의 트리다. 순회 명령은 git HEAD를
+// 보지 않고 스냅샷이 기록한 revision(`graph --out`이 수확 시점의 깨끗한 HEAD를 적는다)을 쓴다.
+
+/// 저장한 JSON 파일.
+fn read_json(path: &str) -> serde_json::Value {
+    json(&std::fs::read_to_string(path).unwrap())
+}
+
+#[test]
+fn snapshot_traversal_reports_the_revision_the_snapshot_records() {
+    let dir = git_workspace("snap-rev");
+    if !git(&dir, &["init", "-q"]) {
+        eprintln!("git unavailable — skipping snapshot revision test");
+        return;
+    }
+    assert!(git(&dir, &["add", "-A"]) && git(&dir, &["commit", "-q", "-m", "c1"]));
+    let c1 = git_stdout(&dir, &["rev-parse", "HEAD"]);
+    let d = dir.display().to_string();
+    // 스냅샷은 저장소 밖에 둔다 — 작업 트리 안에 두면 추적하지 않는 파일이 생긴다.
+    let saved = temp_dir("snap-rev-out");
+    let snapshot = saved.join("graph.json").display().to_string();
+    let (code, _, err) = run(&[
+        "graph", "--level", "symbol", "--dir", &d, "--out", &snapshot,
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(read_json(&snapshot)["revision"], c1.as_str());
+    // 같은 커밋에서 새로 수확한 순회와 graphRevision이 같다 — 기록한 revision은 해시에 들지 않는다.
+    let (_, fresh, _) = run(&["reach", "--dir", &d, "app::a"]);
+    let (_, from_snapshot, _) = run(&["reach", "--graph", &snapshot, "--dir", &d, "app::a"]);
+    assert_eq!(
+        json(&from_snapshot)["graphRevision"],
+        json(&fresh)["graphRevision"]
+    );
+    // 소스를 고쳐 C2로 커밋한다 — 지금의 깨끗한 HEAD는 C2지만 스냅샷은 C1의 그래프다.
+    std::fs::write(
+        dir.join("app/src/lib.rs"),
+        "pub fn a() { b(); c() }\npub fn b() {}\npub fn c() {}\n",
+    )
+    .unwrap();
+    assert!(git(&dir, &["commit", "-q", "-am", "c2"]));
+    let c2 = git_stdout(&dir, &["rev-parse", "HEAD"]);
+    let (_, fresh, _) = run(&["reach", "--dir", &d, "app::a"]);
+    assert_eq!(json(&fresh)["revision"], c2.as_str());
+    for command in [
+        vec!["reach", "app::a"],
+        vec!["impact", "--format", "language-traversal", "app::b"],
+    ] {
+        let mut args = command.clone();
+        args.extend(["--graph", snapshot.as_str(), "--dir", d.as_str()]);
+        let (code, out, err) = run(&args);
+        assert_eq!(code, 0, "{command:?}: {err}");
+        let doc = json(&out);
+        assert_eq!(doc["revision"], c1.as_str(), "{command:?}: {doc}");
+        assert!(
+            labeled_limitations(&doc, "revision-").is_empty(),
+            "{command:?}: {doc}"
+        );
+    }
+    // 명시 --revision이 이긴다.
+    let (_, out, _) = run(&[
+        "reach",
+        "--graph",
+        &snapshot,
+        "--dir",
+        &d,
+        "--revision",
+        "rev-7",
+        "app::a",
+    ]);
+    assert_eq!(json(&out)["revision"], "rev-7");
+    // --graph 입력을 다시 저장해도(레벨 투영 포함) 기록을 옮긴다 — 지금의 HEAD로 다시 읽지 않는다.
+    let copy = saved.join("module.json").display().to_string();
+    let (code, _, err) = run(&[
+        "graph", "--graph", &snapshot, "--level", "module", "--out", &copy,
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(read_json(&copy)["revision"], c1.as_str());
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&saved);
+}
+
+#[test]
+fn snapshot_traversal_without_a_usable_recorded_revision_omits_it_and_says_why() {
+    let dir = git_workspace("snap-norev");
+    if !git(&dir, &["init", "-q"]) {
+        eprintln!("git unavailable — skipping snapshot revision test");
+        return;
+    }
+    assert!(git(&dir, &["add", "-A"]) && git(&dir, &["commit", "-q", "-m", "init"]));
+    let d = dir.display().to_string();
+    let saved = temp_dir("snap-norev-out");
+    // 표준 출력 그래프는 지금과 같은 바이트다 — revision을 싣지 않는다. 리디렉트한 스냅샷도 그렇다.
+    let (code, graph, err) = run(&["graph", "--level", "symbol", "--dir", &d]);
+    assert_eq!(code, 0, "{err}");
+    assert!(json(&graph).get("revision").is_none(), "{graph}");
+    let mut snapshots = vec![saved.join("redirected.json")];
+    std::fs::write(&snapshots[0], &graph).unwrap();
+    // 기록이 --revision 규칙(1~256자, 제어 문자·U+2028/2029 없음)을 어기면 쓰지 않는다.
+    let bad_records = [
+        "a\nb".to_string(),
+        String::new(),
+        "r".repeat(257),
+        "r\u{2028}".to_string(),
+    ];
+    for (i, bad) in bad_records.into_iter().enumerate() {
+        let mut tampered = json(&graph);
+        tampered["revision"] = bad.into();
+        let file = saved.join(format!("tampered-{i}.json"));
+        std::fs::write(&file, tampered.to_string()).unwrap();
+        snapshots.push(file);
+    }
+    // 더러운 트리에서 저장한 스냅샷 — HEAD가 분석한 소스가 아니라 기록하지 않는다.
+    std::fs::write(dir.join("app/src/extra.rs"), "pub fn c() {}\n").unwrap();
+    let dirty = saved.join("dirty.json").display().to_string();
+    let (code, _, err) = run(&["graph", "--level", "symbol", "--dir", &d, "--out", &dirty]);
+    assert_eq!(code, 0, "{err}");
+    assert!(read_json(&dirty).get("revision").is_none());
+    snapshots.push(PathBuf::from(dirty));
+    // 트리를 다시 깨끗하게 둔다 — 그래도 스냅샷 순회는 지금의 HEAD를 싣지 않는다.
+    std::fs::remove_file(dir.join("app/src/extra.rs")).unwrap();
+    for snapshot in &snapshots {
+        let path = snapshot.display().to_string();
+        let (code, out, err) = run(&["reach", "--graph", &path, "--dir", &d, "app::a"]);
+        assert_eq!(code, 0, "{path}: {err}");
+        let doc = json(&out);
+        assert!(doc.get("revision").is_none(), "{path}: {doc}");
+        let notes = labeled_limitations(&doc, "revision-unknown:");
+        assert_eq!(notes.len(), 1, "{path}: {doc}");
+        assert!(notes[0].contains("--revision"), "{notes:?}");
+        // 명시 --revision은 그대로 싣고 이유를 달지 않는다.
+        let (_, out, _) = run(&[
+            "reach",
+            "--graph",
+            &path,
+            "--dir",
+            &d,
+            "--revision",
+            "rev-7",
+            "app::a",
+        ]);
+        let doc = json(&out);
+        assert_eq!(doc["revision"], "rev-7", "{path}: {doc}");
+        assert!(
+            labeled_limitations(&doc, "revision-").is_empty(),
+            "{path}: {doc}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&saved);
+}
+
+/// 실제 바이너리를 PATH `path`로 분석 대상 밖에서 실행해(종료 코드 0이어야 한다) 흔적을 남기는 `git`이
+/// 돌았는지 본다.
+#[cfg(unix)]
+fn runs_git(kit: &MarkerKit, path: &std::ffi::OsStr, args: &[&str]) -> bool {
+    kit.reset();
+    let status = Command::new(env!("CARGO_BIN_EXE_rustograph"))
+        .args(args)
+        .current_dir(&kit.dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("PATH", path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(0), "{args:?}");
+    !kit.fired().is_empty()
+}
+
+#[cfg(unix)]
+#[test]
+fn only_runs_that_read_a_revision_from_the_work_tree_run_git() {
+    let kit = MarkerKit::new("snap-git");
+    let Some(repo) = commit_all(git_workspace("snap-git")) else {
+        return;
+    };
+    let dir = repo.display().to_string();
+    let (code, graph, err) = run(&["graph", "--level", "symbol", "--dir", &dir]);
+    assert_eq!(code, 0, "{err}");
+    let snapshot = kit.dir.join("graph.json").display().to_string();
+    std::fs::write(&snapshot, graph).unwrap();
+    // PATH 맨 앞의 절대 경로 항목에 흔적을 남기는 `git`을 둔다 — rustograph가 git을 띄우면 이것이 돈다.
+    let bin = kit.dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::copy(kit.script("git", "exit 1"), bin.join("git")).unwrap();
+    let mut path = bin.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    let mermaid = kit.dir.join("graph.mmd").display().to_string();
+    let copy = kit.dir.join("copy.json").display().to_string();
+    // 저장 스냅샷을 읽는 순회와 표준 출력·Mermaid 그래프는 revision을 판독하지 않는다.
+    for args in [
+        vec!["reach", "--graph", &snapshot, "--dir", &dir, "app::a"],
+        vec![
+            "impact",
+            "--format",
+            "language-traversal",
+            "--graph",
+            &snapshot,
+            "--dir",
+            &dir,
+            "app::b",
+        ],
+        vec!["graph", "--level", "symbol", "--dir", &dir],
+        vec![
+            "graph", "--format", "mermaid", "--dir", &dir, "--out", &mermaid,
+        ],
+        vec!["graph", "--graph", &snapshot, "--out", &copy],
+    ] {
+        assert!(!runs_git(&kit, &path, &args), "{args:?} ran git");
+    }
+    // 대조 — 작업 트리에서 revision을 판독하는 실행은 git을 띄운다(흔적 git이 실패해 revision은 빠진다).
+    let fresh = kit.dir.join("fresh.json").display().to_string();
+    for args in [
+        vec!["reach", "--dir", &dir, "app::a"],
+        vec!["graph", "--level", "symbol", "--dir", &dir, "--out", &fresh],
+    ] {
+        assert!(runs_git(&kit, &path, &args), "{args:?} did not run git");
+    }
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&kit.dir);
 }

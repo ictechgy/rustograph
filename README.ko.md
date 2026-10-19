@@ -61,7 +61,7 @@ rustograph graph --level symbol --semantic
 ```bash
 rustograph graph --level crate --deps    # 크레이트 + 의존 그래프
 rustograph graph --level symbol          # call/references/implements/signature
-rustograph graph --out .rustograph/graph.json
+rustograph graph --out .rustograph/graph.json  # 저장(트리가 깨끗하면 git HEAD를 revision으로 기록)
 rustograph cycles --graph .rustograph/graph.json --strict
 rustograph dead --retain-public --tests
 rustograph dead --explain mycrate::f     # 왜 살아 있나 — 도달 경로
@@ -228,11 +228,19 @@ isthmus [`language-traversal` v1](https://github.com/ictechgy/isthmus/blob/main/
   미해석 호출 수가 완전하다고 말할 수 없어 `dispatch`·`unresolvedCalls`는
   싣지 않습니다.
 - `--max-depth` 1~128(기본 128, `--depth 0`은 128), `--max-reached` 1~100,000.
-- `project`는 `schema`와 같은 realpath, `revision`은 `--revision` 또는 작업
+- `project`는 `schema`와 같은 realpath, `revision`은 `--revision` 또는 수확한 작업
   트리가 깨끗할 때의 git HEAD(저장소의 git 설정을 실행하지 않고는 깨끗한지 확인할
   수 없는 작업 트리 — 서브모듈이 있는 트리, [보안: 신뢰 경계](#보안-신뢰-경계) 절 — 는 생략하고
-  `revision-unverified:` limitation으로 알립니다), `graphRevision`은 그래프 JSON의
-  SHA-256입니다.
+  `revision-unverified:` limitation으로 알립니다), `graphRevision`은 그래프 JSON(root는
+  project로, 스냅샷의 `revision`은 빼고)의 SHA-256입니다.
+- `--graph`로 읽은 스냅샷은 저장한 뒤 HEAD가 움직였을 수 있어 git을 보지 않습니다.
+  `revision`은 `--revision` 또는 스냅샷이 기록한 값입니다. `graph --out`이 `--dir` 작업
+  트리가 깨끗할 때의 git HEAD를 그래프 문서의 선택 필드 `revision`으로 기록합니다(표준
+  출력에는 싣지 않으니 리디렉트한 스냅샷에는 없습니다). 쓸 수 있는 기록이 없으면
+  `revision`을 싣지 않고 `revision-unknown:` limitation으로 알립니다. 같은 커밋의
+  스냅샷과 새 수확은 같은 `graphRevision`입니다. 스냅샷은 작업 트리 밖이나
+  `.rustograph/`처럼 git이 무시하는 경로에 두세요 — 추적하지 않는 스냅샷이 있으면 다음
+  실행의 트리가 바뀐 것으로 보입니다.
 - 그래프 정점이 아닌 root는 `symbol` 없이 싣고 `root-not-found:` limitation을
   더한 문서를 쓴 뒤 64로 끝납니다.
 
@@ -294,10 +302,11 @@ MCP `rustograph_deps` 도구는 첫 호출 때 `--dir` 워크스페이스를 대
 있으니, 필요하면 샌드박스의 네트워크 접근을 제한하세요. rustograph가 이
 명령들을 직접 격리하지는 않습니다.
 
-`--revision` 없는 `reach`·`impact --format language-traversal`은 `revision`을
-읽으려고만 `--dir` 디렉터리에서 `git`도 실행합니다(`git config`, `git ls-files`,
-`git status`, `git rev-parse`). 이 호출은 분석 대상 체크아웃이 `PATH`로든 git
-설정으로든 실행할 프로그램을 고르지 못하게 합니다.
+`--revision`·`--graph` 없는 `reach`·`impact --format language-traversal`과, 수확한
+그래프를 JSON으로 저장하는 `graph --out`은 소스 revision을 읽으려고만 `--dir`
+디렉터리에서 `git`도 실행합니다(`git config`, `git ls-files`, `git status`,
+`git rev-parse`). 이 호출은 분석 대상 체크아웃이 `PATH`로든 git 설정으로든 실행할
+프로그램을 고르지 못하게 합니다.
 
 - `PATH`의 절대 경로 항목(`PATH`가 없으면 `/bin:/usr/bin`)에서 처음 찾은 `git`을
   그 절대 경로로 실행합니다. 빈 항목과 `.`·`bin` 같은 상대 항목은 건너뜁니다.
@@ -317,12 +326,13 @@ MCP `rustograph_deps` 도구는 첫 호출 때 `--dir` 워크스페이스를 대
 - 이름에 `=`·제어 문자·깨진 UTF-8이 든 드라이버가 있으면 다른 git 명령을 실행하지
   않습니다. git의 `-c`는 첫 `=`에서 나누므로 그런 드라이버는 덮을 수 없습니다.
 
-그래서 `revision`이 달라집니다. filter가 정규화하던 파일(git-lfs 등)은 원문으로
-비교하므로, git의 stat 캐시가 낡으면 바뀐 파일로 보여 확인하지 못한 깨끗한 `HEAD`를
-주장하지 않고 `revision`을 싣지 않습니다. 신뢰하는 checkout이면 먼저 `git status`로
-git의 stat 캐시를 새로 고치세요. 서브모듈이 있는 작업 트리나 덮을 수 없는 드라이버
-이름이 있는 설정은 `revision`을 자동으로 싣지 않고 `revision-unverified:`
-limitation으로 알립니다. 분석한 revision은 `--revision`으로 직접 줄 수 있습니다.
+그래서 `revision`(과 `graph --out`이 기록하는 revision)이 달라집니다. filter가
+정규화하던 파일(git-lfs 등)은 원문으로 비교하므로, git의 stat 캐시가 낡으면 바뀐
+파일로 보여 확인하지 못한 깨끗한 `HEAD`를 주장하지 않고 `revision`을 싣지 않습니다.
+신뢰하는 checkout이면 먼저 `git status`로 git의 stat 캐시를 새로 고치세요. 서브모듈이
+있는 작업 트리나 덮을 수 없는 드라이버 이름이 있는 설정은 `revision`을 자동으로 싣지
+않고 `revision-unverified:` limitation으로 알립니다(`graph --out`도 기록하지 않습니다).
+분석한 revision은 `--revision`으로 직접 줄 수 있습니다.
 나머지 git 설정과, 설정한 그대로의 `PATH` 절대 경로 항목(체크아웃 안을 가리키는
 항목이라도)은 평소대로 적용됩니다.
 

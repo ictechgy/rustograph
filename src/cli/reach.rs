@@ -86,6 +86,8 @@ struct Options {
     max_depth: usize,
     max_reached: usize,
     revision: Option<String>,
+    /// 문서를 `--graph` 저장 파일에서 읽는가 — 그러면 revision을 작업 트리가 아니라 문서의 기록에서 찾는다.
+    snapshot: bool,
     generated_at: String,
 }
 
@@ -114,6 +116,7 @@ impl Options {
             max_reached: bounded(a.get("max-reached"), traversal::MAX_REACHED, "max-reached")
                 .map_err(Failure::Usage)?,
             revision: revision_of(a).map_err(Failure::Usage)?,
+            snapshot: a.get("graph").is_some(),
             generated_at: match a.get("generated-at") {
                 Some(t) if is_timestamp(t) => t.to_string(),
                 Some(_) => {
@@ -150,17 +153,21 @@ fn bounded(value: Option<&str>, limit: usize, name: &str) -> Result<usize, Strin
     }
 }
 
-/// `--revision` — 없으면 작업 트리가 깨끗할 때의 git HEAD.
+/// `--revision` — 없으면 수확한 작업 트리가 깨끗할 때의 git HEAD, `--graph`면 문서의 기록(`revision_for`).
 fn revision_of(a: &Args) -> Result<Option<String>, String> {
     match a.get("revision") {
-        Some(r) if r.is_empty() || r.chars().count() > MAX_REVISION_CHARS || has_forbidden(r) => {
-            Err(format!(
-                "--revision must be 1-{MAX_REVISION_CHARS} characters without control characters"
-            ))
-        }
+        Some(r) if !is_valid_revision(r) => Err(format!(
+            "--revision must be 1-{MAX_REVISION_CHARS} characters without control characters"
+        )),
         Some(r) => Ok(Some(r.to_string())),
         None => Ok(None),
     }
+}
+
+/// 순회 문서에 실을 수 있는 revision인가 — 1~`MAX_REVISION_CHARS`자, 제어 문자·U+2028/2029 없음.
+/// `--revision`과 저장 문서가 기록한 revision이 같은 규칙 하나를 쓴다(저장 문서도 신뢰하지 않는 입력이다).
+fn is_valid_revision(r: &str) -> bool {
+    !r.is_empty() && r.chars().count() <= MAX_REVISION_CHARS && !has_forbidden(r)
 }
 
 /// id·revision에 올 수 없는 문자다(제어 문자, U+2028/2029) — isthmus의 안전 문자열 규칙과 같다.
@@ -437,7 +444,7 @@ fn build(doc: &Document, opts: &Options, project: &Path, version: &'static str) 
     }
     reasons.sort_unstable();
     reasons.dedup();
-    let (revision, unverified) = revision_for(opts, project);
+    let (revision, revision_note) = revision_for(opts, doc, project);
     let mut limitations = doc.limitations.clone();
     if missing > 0 {
         limitations.push(format!(
@@ -450,7 +457,7 @@ fn build(doc: &Document, opts: &Options, project: &Path, version: &'static str) 
                 .to_string(),
         );
     }
-    limitations.extend(unverified.map(|Unverified(note)| note));
+    limitations.extend(revision_note);
     let roots = opts
         .roots
         .iter()
@@ -550,7 +557,7 @@ impl Locator {
     }
 }
 
-/// 그래프 산출물의 신원 — root를 project로 맞춘 그래프 JSON의 SHA-256.
+/// 그래프 산출물의 신원 — root를 project로 맞추고 저장 스냅샷의 `revision`을 뺀 그래프 JSON의 SHA-256.
 /// `--dir .`과 절대 경로처럼 같은 그래프를 다른 문자열로 연 실행이 같은 값을 내야
 /// isthmus가 같은 플랫폼 분석끼리 stale로 오판하지 않는다.
 /// JSON은 `export::to_json`과 같은 바이트(pretty + 끝 개행)를 해셔로 흘려 보낸다 — 문서를
@@ -568,8 +575,8 @@ fn graph_revision(doc: &Document, project: &Path) -> String {
 }
 
 /// root만 바꾼 그래프 문서의 차용 뷰 — graphRevision이 해시하는 JSON이다. 필드 이름·순서·
-/// 생략 규칙이 `graph::Document`의 serde 정의와 같아야 `graph --level symbol` 출력과 같은
-/// 바이트가 된다(tests/traversal.rs가 해시로 대조한다).
+/// 생략 규칙이 `graph::Document`의 serde 정의와 같아야 `graph --level symbol` 출력(revision을
+/// 싣지 않는다)과 같은 바이트가 된다(tests/traversal.rs가 해시로 대조한다).
 #[derive(Serialize)]
 struct RootedGraph<'a> {
     version: u32,
@@ -587,7 +594,9 @@ struct RootedGraph<'a> {
 
 impl<'a> RootedGraph<'a> {
     /// 문서를 `..` 없이 구조 분해한다 — `Document`에 필드가 늘면 여기서 컴파일이 멈춰, 새 필드가
-    /// 해시 입력에서 조용히 빠지지 않는다.
+    /// 해시 입력에서 조용히 빠지지 않는다. `revision`은 일부러 뺀다: 그래프 내용이 아니라 출처라,
+    /// 넣으면 같은 커밋의 스냅샷(`graph --out`이 기록한다)과 새 수확(기록 없음)의 graphRevision이
+    /// 달라진다. 출처는 순회 문서의 `revision`으로 따로 간다.
     fn new(doc: &'a Document, root: &'a str) -> RootedGraph<'a> {
         let Document {
             version,
@@ -595,6 +604,7 @@ impl<'a> RootedGraph<'a> {
             level,
             root: _,
             workspace,
+            revision: _,
             roots,
             vertices,
             edges,
@@ -614,16 +624,53 @@ impl<'a> RootedGraph<'a> {
     }
 }
 
-/// 문서의 revision — `--revision`, 없으면 깨끗한 작업 트리의 git HEAD. 두 번째 값은 작업 트리를
-/// 일부러 보지 않아 revision을 싣지 못한 이유다(limitation으로 간다).
-fn revision_for(opts: &Options, project: &Path) -> (Option<String>, Option<Unverified>) {
+/// 문서의 revision — `--revision`이 이긴다. 없으면 수확한 문서는 깨끗한 작업 트리의 git HEAD, 저장
+/// 문서(`--graph`)는 그 문서가 기록한 revision이다(`snapshot_revision`). 두 번째 값은 revision을 싣지
+/// 못한 이유를 알리는 limitation이다(더러운 트리처럼 revision이 없다는 것 자체가 신호면 없다).
+fn revision_for(
+    opts: &Options,
+    doc: &Document,
+    project: &Path,
+) -> (Option<String>, Option<String>) {
     match &opts.revision {
         Some(given) => (Some(given.clone()), None),
+        None if opts.snapshot => snapshot_revision(doc),
         None => match git_revision(project) {
             Ok(head) => (head, None),
-            Err(unverified) => (None, Some(unverified)),
+            Err(Unverified(note)) => (None, Some(note)),
         },
     }
+}
+
+/// 저장 문서의 revision — 그 문서를 저장할 때 기록한 값(`graph --out`이 수확 시점의 깨끗한 HEAD를
+/// 적는다)이다. git은 실행하지 않는다: 지금의 HEAD는 스냅샷을 만든 뒤 움직였을 수 있어, 붙이면 옛
+/// 그래프의 순회가 최신 분석으로 보인다. 기록은 신뢰하지 않는 입력이라 `--revision`과 같은 규칙으로
+/// 검사하고, 없거나 규칙에 맞지 않으면 revision을 싣지 않고 `revision-unknown:` limitation으로 알린다
+/// (값은 싣지 않는다 — 제어 문자가 섞일 수 있다).
+fn snapshot_revision(doc: &Document) -> (Option<String>, Option<String>) {
+    let problem = match doc.revision.as_deref() {
+        Some(recorded) if is_valid_revision(recorded) => {
+            return (Some(recorded.to_string()), None);
+        }
+        Some(_) => format!(
+            "records a revision that is not 1-{MAX_REVISION_CHARS} characters without control characters, so it is not used"
+        ),
+        None => "does not record the source revision it was harvested from, and rustograph does not attribute a saved graph to the current git HEAD".to_string(),
+    };
+    let note = format!(
+        "revision-unknown: the --graph snapshot {problem}; pass --revision to record the analyzed revision, or regenerate the snapshot with `rustograph graph --level symbol --out FILE` from a clean git work tree"
+    );
+    (None, Some(note))
+}
+
+/// `graph --out`이 저장 스냅샷의 출처로 기록할 revision — `dir`의 작업 트리가 깨끗할 때의 git HEAD다.
+/// 순회 문서의 revision과 같은 판정·같은 git 격리(`git_revision`)라, 서브모듈이나 덮을 수 없는
+/// 드라이버 이름처럼 확인하지 못한 트리도 기록하지 않는다. 기록이 없는 이유는 그 스냅샷을 읽는 순회가
+/// `revision-unknown:`으로 알린다 — 그래프 문서의 limitations에 싣지 않는 것은 그것이 graphRevision의
+/// 해시 입력이라 같은 커밋의 새 수확과 값이 달라지기 때문이다.
+pub(super) fn clean_head(dir: &Path) -> Option<String> {
+    let project = std::fs::canonicalize(dir).ok()?;
+    git_revision(&project).ok().flatten()
 }
 
 /// 작업 트리를 일부러 보지 않아 revision을 싣지 못한 이유 — 순회 문서의 `revision-unverified:`
@@ -927,10 +974,12 @@ mod tests {
     }
 
     /// 옛 graphRevision — 문서를 복제해 root를 바꾸고 pretty JSON 전체를 만든 뒤 해시했다.
-    /// 해시를 흘려 계산하는 지금 구현이 같은 바이트를 해시하는지 재는 기준이다.
+    /// 해시를 흘려 계산하는 지금 구현이 같은 바이트를 해시하는지 재는 기준이다. 저장 스냅샷이
+    /// 기록한 revision은 그래프 내용이 아니라 출처라 지운 뒤 해시한다.
     fn graph_revision_by_copy(doc: &Document, project: &Path) -> String {
         let mut canonical = doc.clone();
         canonical.root = project.display().to_string();
+        canonical.revision = None;
         traversal::sha256::hex_digest(export::to_json(&canonical).as_bytes())
     }
 
@@ -987,7 +1036,9 @@ mod tests {
             ],
             vec!["limit: \"x\"\n\ttab\u{1}".into()],
         );
-        vec![bare, full]
+        let mut recorded = full.clone();
+        recorded.revision = Some("0123456789abcdef0123456789abcdef01234567".into());
+        vec![bare, full, recorded]
     }
 
     #[test]
@@ -998,6 +1049,43 @@ mod tests {
                 graph_revision(&doc, project),
                 graph_revision_by_copy(&doc, project)
             );
+        }
+    }
+
+    #[test]
+    fn graph_revision_leaves_out_the_recorded_revision() {
+        // 같은 커밋의 스냅샷(기록 있음)과 새 수확(기록 없음)은 같은 그래프다.
+        let project = Path::new("/p");
+        for mut doc in sample_documents() {
+            doc.revision = None;
+            let unrecorded = graph_revision(&doc, project);
+            doc.revision = Some("rev-7".into());
+            assert_eq!(graph_revision(&doc, project), unrecorded);
+        }
+    }
+
+    #[test]
+    fn snapshot_revisions_follow_the_revision_flag_rules() {
+        let mut doc = sample_documents().remove(0);
+        let longest = "r".repeat(MAX_REVISION_CHARS);
+        doc.revision = Some(longest.clone());
+        assert_eq!(snapshot_revision(&doc), (Some(longest), None));
+        for (recorded, why) in [
+            (
+                Some("r".repeat(MAX_REVISION_CHARS + 1)),
+                "records a revision",
+            ),
+            (Some(String::new()), "records a revision"),
+            (Some("a\u{85}b".to_string()), "records a revision"),
+            (None, "does not record"),
+        ] {
+            doc.revision = recorded;
+            let (revision, note) = snapshot_revision(&doc);
+            assert_eq!(revision, None);
+            let note = note.expect("a missing snapshot revision is explained");
+            assert!(note.starts_with("revision-unknown: "), "{note}");
+            assert!(note.contains(why), "{note}");
+            assert!(!note.contains('\u{85}'), "the recorded value is not echoed");
         }
     }
 

@@ -79,7 +79,7 @@ rustograph graph --level crate --deps     # include external crates
 rustograph graph --level symbol           # call/references/implements/signature
 rustograph graph --level symbol --semantic  # + type-resolved calls (feature build)
 rustograph graph --level type --format mermaid
-rustograph graph --out .rustograph/graph.json   # persist, then reuse:
+rustograph graph --out .rustograph/graph.json   # persist (records git HEAD if the tree is clean), then reuse:
 
 rustograph cycles --graph .rustograph/graph.json --strict
 
@@ -162,6 +162,13 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
   or contain an `unsafe {}` block carry `unsafe: true`, and an edge made
   inside an `unsafe {}` block is an entry edge — `unsafe impl` marks its
   `implements` edge too.
+- `revision` (optional) is the source revision a saved graph was harvested
+  from: `graph --out` writes git `HEAD` when the `--dir` work tree is clean
+  (the same check, with the same git isolation, as the traversal `revision`).
+  Standard output never carries it, so a snapshot redirected from stdout has
+  none. Projections and filters keep it, and `graph --graph` copies it as is.
+  Keep snapshots outside the work tree or in a git-ignored path such as
+  `.rustograph/`: an untracked snapshot makes the next tree look modified.
 
 ## MCP server
 
@@ -353,12 +360,17 @@ strings as `symbol.usr` in `schema`.
   `--max-reached` 1–100,000; cuts set `truncated` with `depth` /
   `max-reached`.
 - **Identity**: `project` is the same realpath `schema` writes; `revision`
-  is `--revision` or git `HEAD` when the work tree is clean (omitted, with a
-  `revision-unverified:` limitation, when a clean tree cannot be checked
-  without running the repository's git configuration — a work tree with
-  submodules, see [Security: trust boundary](#security-trust-boundary));
+  is `--revision` or git `HEAD` when the harvested work tree is clean
+  (omitted, with a `revision-unverified:` limitation, when a clean tree cannot
+  be checked without running the repository's git configuration — a work tree
+  with submodules, see [Security: trust boundary](#security-trust-boundary)).
+  With `--graph`, rustograph does not look at git, whose `HEAD` may have moved
+  since the snapshot was saved: `revision` is `--revision` or the one the
+  snapshot records (see [Graph model](#graph-model)), and a snapshot without a
+  usable one gets no `revision` and a `revision-unknown:` limitation.
   `graphRevision` is the SHA-256 of the graph JSON (with `root` normalized to
-  the project).
+  the project and the snapshot's `revision` left out, so a snapshot and a fresh
+  harvest of the same commit match).
 - **root-not-found**: ids that are not graph vertices are listed without
   `symbol`, a `root-not-found:` limitation is added, and the command exits
   `64` after writing the document.
@@ -448,11 +460,12 @@ registry and git dependencies named in the checkout's manifests, so limit the
 sandbox's network access if that matters. rustograph does not sandbox these
 commands itself.
 
-`reach` and `impact --format language-traversal` without `--revision` also run
-`git` in the `--dir` directory, only to read `revision` (`git config`,
-`git ls-files`, `git status`, `git rev-parse`). These calls keep the analyzed
-checkout from choosing the programs that run, whether through `PATH` or
-through its git configuration:
+`reach` and `impact --format language-traversal` without `--revision` or
+`--graph`, and `graph --out` when it writes a harvested graph as JSON, also run
+`git` in the `--dir` directory, only to read the source revision
+(`git config`, `git ls-files`, `git status`, `git rev-parse`). These calls keep
+the analyzed checkout from choosing the programs that run, whether through
+`PATH` or through its git configuration:
 
 - rustograph runs the first `git` found in an absolute `PATH` entry
   (`/bin:/usr/bin` when `PATH` is unset), by that absolute path. Empty and
@@ -475,16 +488,17 @@ through its git configuration:
   rustograph runs no other git command — git's `-c` splits at the first `=`,
   so such a driver cannot be overridden.
 
-What this changes for `revision`: a file that a filter normalizes (git-lfs and
-the like) is compared as raw content, so when git's stat cache is stale for it
-the tree looks modified and `revision` is omitted rather than claiming a clean
-`HEAD` that rustograph could not verify; in a checkout you trust, run
-`git status` first to refresh git's stat cache. A work tree with submodules, or
-a configuration with a driver name that cannot be overridden, gets no
-automatic `revision` and a `revision-unverified:` limitation. Pass `--revision`
-to record the analyzed revision yourself. The rest of your git configuration,
-and absolute `PATH` entries as you set them (even one that points into the
-checkout), apply as usual.
+What this changes for `revision` (and for the one `graph --out` records): a
+file that a filter normalizes (git-lfs and the like) is compared as raw
+content, so when git's stat cache is stale for it the tree looks modified and
+`revision` is omitted rather than claiming a clean `HEAD` that rustograph could
+not verify; in a checkout you trust, run `git status` first to refresh git's
+stat cache. A work tree with submodules, or a configuration with a driver name
+that cannot be overridden, gets no automatic `revision` and a
+`revision-unverified:` limitation (`graph --out` records none for it). Pass
+`--revision` to record the analyzed revision yourself. The rest of your git
+configuration, and absolute `PATH` entries as you set them (even one that
+points into the checkout), apply as usual.
 
 ## License
 

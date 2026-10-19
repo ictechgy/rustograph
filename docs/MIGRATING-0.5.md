@@ -21,7 +21,7 @@ errors with `?` or handle them explicitly.
 This source compatibility change is the reason for the 0.5 minor version rather
 than a 0.4 patch. The serialized graph document remains version 1.
 
-Two library changes after 0.5.0 are source-incompatible for some callers:
+Three library changes after 0.5.0 are source-incompatible for some callers:
 
 - `rustograph::modtree::ModTree` has a new public field, `skipped_mods`.
   `collect_submodules` no longer loads a `mod` declaration whose file re-enters
@@ -33,6 +33,13 @@ Two library changes after 0.5.0 are source-incompatible for some callers:
 - `rustograph::mcp::Server` now borrows the document it serves and is
   `Server<'d>`. It has no public constructor or methods, so only code that names
   the type is affected.
+- `rustograph::graph::Document` has a new public field, `revision`
+  (`Option<String>`): the source revision a saved graph was harvested from.
+  `graph::document` leaves it `None`, and `graph --out` fills it (see below).
+  Code that builds a `Document` with a struct literal must add the field, and
+  code that destructures every field must add it or `..`. The serialized
+  document stays version 1: the key is omitted when empty, and readers that
+  ignore unknown fields still load snapshots that have it.
 
 ## Saved snapshots and MCP
 
@@ -46,6 +53,16 @@ a control character (C0, DEL or C1, including NEL) or U+2028/U+2029 is rejected
 with exit 2 before any output, and `mcp --graph` fails to start. rustograph never
 writes such ids, so the error names the field and code point; regenerate the
 snapshot instead of passing another tool's ids to the terminal or to Mermaid.
+
+`graph --out` records the source revision of a harvested graph as `revision`:
+git `HEAD` when the `--dir` work tree is clean. `reach` and
+`impact --format language-traversal` with `--graph` use that value instead of
+the current git `HEAD`, which may have moved since the snapshot was saved, and
+run no git. A snapshot that records none (written before this change,
+redirected from stdout, or saved from a modified work tree), or whose
+`revision` breaks the `--revision` rules, gets no `revision` and a
+`revision-unknown:` limitation. Pass `--revision`, or regenerate the snapshot
+with `rustograph graph --level symbol --out FILE`.
 
 ## File output
 
