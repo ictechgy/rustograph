@@ -10,6 +10,7 @@ use crate::source::Parts;
 use proc_macro2::Span;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use syn::spanned::Spanned;
 
@@ -135,6 +136,19 @@ pub(super) struct FnSite {
     pub item: &'static syn::ItemFn,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// `resolve_vertex`가 트레이트 impl 메서드 후보를 찾으며 살핀 정점 ID 수 — 호출마다
+    /// 정점 집합 전체를 훑지 않는지 단위 테스트가 센다(테스트 스레드마다 따로).
+    static EXAMINED_IDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 테스트용 — 이 스레드에서 지금까지 `resolve_vertex`가 살핀 정점 ID 수.
+#[cfg(test)]
+fn examined_ids() -> usize {
+    EXAMINED_IDS.with(std::cell::Cell::get)
+}
+
 /// 추출기 공용 문맥 — 수확 산출물, 정점 집합, 파일 원문 캐시.
 pub(super) struct Ctx<'a> {
     pub parts: &'a Parts,
@@ -247,10 +261,17 @@ impl<'a> Ctx<'a> {
         }
         let prefix = format!("{ty}::<");
         let suffix = format!(">::{name}");
+        // 접두사가 같은 ID는 사전순으로 붙어 있다 — 접두사부터 범위로 읽고 벗어나면 멈춘다.
+        // 집합 전체를 훑으면 워크스페이스 경로 호출마다 O(V)라 client 스캔이 제곱으로 는다.
         let mut hits = self
             .ids
-            .iter()
-            .filter(|id| id.starts_with(&prefix) && id.ends_with(&suffix));
+            .range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded))
+            .take_while(|id| {
+                #[cfg(test)]
+                EXAMINED_IDS.with(|c| c.set(c.get() + 1));
+                id.starts_with(&prefix)
+            })
+            .filter(|id| id.ends_with(&suffix));
         match (hits.next(), hits.next()) {
             (Some(one), None) => Some(one.to_string()),
             _ => None,
@@ -710,5 +731,98 @@ mod tests {
         );
         assert_eq!(order_group("actix:", "a::b"), "actix:a::b");
         assert_eq!(take_utf16("a\u{10300}b", 2), "a");
+    }
+
+    /// 의존 없는 임시 크레이트 `app`(lib.rs 하나) — 자기 `[workspace]`라 바깥 워크스페이스에
+    /// 끌려 들어가지 않는다.
+    fn temp_app(tag: &str, lib_rs: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rustograph-common-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), lib_rs).unwrap();
+        dir
+    }
+
+    /// `resolve_vertex`가 받는 경로 세그먼트 목록.
+    fn owned_segments(path: &[&str]) -> Vec<String> {
+        path.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 트레이트 impl 메서드 조회는 그 타입 접두사의 정점 ID만 본다 — 정점 집합 전체를 훑으면
+    /// 워크스페이스 경로 호출(열거형 variant 생성 등)마다 O(V)라 client 스캔이 제곱으로
+    /// 늘었다. 후보가 하나면 그 ID, 둘이면 모호해 None, 접두사만 닮은 `T2`는 후보가 아니다.
+    #[test]
+    fn trait_method_lookup_reads_only_the_type_prefix() {
+        let mut src = String::from(
+            "pub trait Tr { fn f(); fn g(); }\n\
+             pub trait Tr2 { fn g(); }\n\
+             pub struct T;\n\
+             impl Tr for T { fn f() {} fn g() {} }\n\
+             impl Tr2 for T { fn g() {} }\n\
+             pub struct T2;\n\
+             impl Tr for T2 { fn f() {} fn g() {} }\n\
+             pub enum E { V(u8) }\n",
+        );
+        for i in 0..200 {
+            src.push_str(&format!("pub fn f{i}() {{}}\n"));
+        }
+        let dir = temp_app("lookup", &src);
+        let meta = crate::cargo_meta::load(&dir).unwrap();
+        let parts = crate::source::harvest_parts(&dir, &meta).unwrap();
+        let ctx = Ctx::new(&parts, dir.canonicalize().unwrap());
+        let before = examined_ids();
+        let found = ctx.resolve_vertex("app", &owned_segments(&["T", "f"]));
+        assert_eq!(found.as_deref(), Some("app::T::<Tr>::f"));
+        // `app::T::<`로 시작하는 정점 셋(Tr::f·Tr::g·Tr2::g)과 범위를 끝내는 다음 ID 하나.
+        let examined = examined_ids() - before;
+        assert!(examined <= 4, "{examined} ids examined for 3 candidates");
+        assert_eq!(
+            ctx.resolve_vertex("app", &owned_segments(&["T", "g"])),
+            None
+        );
+        let found = ctx.resolve_vertex("app", &owned_segments(&["T2", "g"]));
+        assert_eq!(found.as_deref(), Some("app::T2::<Tr>::g"));
+        let before = examined_ids();
+        assert_eq!(
+            ctx.resolve_vertex("app", &owned_segments(&["E", "V"])),
+            None
+        );
+        let examined = examined_ids() - before;
+        assert!(examined <= 1, "{examined} ids examined for no candidate");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// client 스캔은 함수·연관 함수 래퍼 선언이 없으면 워크스페이스 경로 호출의 정점을
+    /// 찾지 않는다 — 찾은 정점은 래퍼 표 조회에만 쓰여 버려졌다. 선언이 있으면 찾는다(대조군).
+    #[test]
+    fn client_scan_skips_vertex_lookup_without_function_wrappers() {
+        use crate::source::routes::client::{client_routes, ClientOptions};
+        let src = "pub enum E { V(u32) }\n\
+                   pub struct Api;\n\
+                   impl Api { pub fn call(&self, path: &str) {} }\n\
+                   pub fn go(api: &Api) { let _ = E::V(1); let _ = E::V(2); api.call(\"/a\"); }\n";
+        let dir = temp_app("wrappers", src);
+        let before = examined_ids();
+        client_routes(&dir, "test", &ClientOptions::default()).unwrap();
+        assert_eq!(examined_ids() - before, 0);
+        let wrappers = crate::source::routes::wrappers::parse(
+            r#"{"format":"http-wrappers","version":1,"wrappers":[{"language":"rust","kind":"function","owner":"app::Api","name":"call","pathArg":{"index":0},"defaultMethod":"GET","pathAnchor":"root"}]}"#,
+        )
+        .unwrap();
+        let opts = ClientOptions {
+            wrappers,
+            service: None,
+        };
+        let before = examined_ids();
+        let doc = client_routes(&dir, "test", &opts).unwrap();
+        assert!(examined_ids() - before > 0);
+        assert_eq!(doc.facts.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

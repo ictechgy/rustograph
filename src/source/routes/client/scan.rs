@@ -1180,6 +1180,11 @@ impl Scanner<'_, '_> {
             self.emit_wrapper(i, c.span(), &args, &exprs);
             return;
         }
+        // 찾은 정점은 아래 함수 래퍼 표 조회에만 쓰인다 — 표가 비면 찾지 않는다. 인자 평가
+        // (call_arg)는 상수 평가 캐시를 채우는 순서가 출력에 닿을 수 있어 위에 그대로 둔다.
+        if self.sh.fn_wrappers.is_empty() {
+            return;
+        }
         let vertex = self.sh.ctx.resolve_vertex(&self.module, segs).unwrap_or(id);
         let Some(&i) = self.sh.fn_wrappers.get(&vertex) else {
             return;
