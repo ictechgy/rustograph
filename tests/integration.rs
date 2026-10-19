@@ -192,6 +192,20 @@ fn kinds_cover_traits_and_methods() {
     assert_eq!(m.kind, Kind::Method);
 }
 
+/// 라이브러리 호출자가 쓰는 0.5.0 공개 시그니처 그대로다 — 인자를 늘리면 이 외부 크레이트
+/// 테스트가 컴파일되지 않는다. 드라이버 버전은 호출자가 넘기지 않아도 이 크레이트의 버전이다.
+#[test]
+fn sarif_keeps_its_published_library_signature() {
+    let render: fn(&rustograph::graph::Document, &[rustograph::rules::Violation]) -> String =
+        rustograph::sarif::rules_sarif;
+    let log: serde_json::Value =
+        serde_json::from_str(&render(&doc(&Default::default()), &[])).expect("SARIF must be JSON");
+    assert_eq!(
+        log["runs"][0]["tool"]["driver"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
 #[test]
 fn deterministic_across_runs() {
     let a = rustograph::export::to_json(&doc(&Default::default()));

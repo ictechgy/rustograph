@@ -73,7 +73,10 @@ cargo run -- cycles --level symbol --strict
   파싱되지 않는 매크로 토큰(`json!({...})` 등) 안의 경로와 외부 크레이트
   (`syn`·`ra_ap_*`·YAML 파서) 사용은 규칙이 강제하지 못하니 리뷰에서 직접
   확인하세요. `json!` 안에서 `crate::cli::VERSION`을 읽은 sarif가 숨은
-  cli ↔ sarif 순환을 만든 적이 있습니다 — 도구 버전은 호출자가 넘깁니다.
+  cli ↔ sarif 순환을 만든 적이 있습니다 — 도구 버전은 진입점이 넘기거나
+  (reach·schema·routes) 그 모듈에서 `env!("CARGO_PKG_VERSION")`을 바로 씁니다
+  (sarif·mcp). 공개 함수 시그니처를 바꾸면 라이브러리 호출자가 깨지니
+  `docs/MIGRATING-*.md`의 Rust library callers 절에 적으세요.
 - **유령 정점을 만들지 마세요.** 해석 불가한 경로는 간선이 아니라
   `unresolved_paths` 카운터로 갑니다. 타깃 루트 모듈이 크레이트 정점을
   겸합니다 — 별도 루트 정점은 ID 충돌을 만듭니다. 같은 이름의 lib/bin은

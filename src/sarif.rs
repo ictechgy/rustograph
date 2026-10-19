@@ -8,11 +8,13 @@ use crate::rules::Violation;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
-/// 위반 목록을 SARIF 로그로 직렬화한다. `version`은 `tool.driver.version`에 싣는 도구
-/// 버전이다 — 호출자(진입점)가 넘긴다. 출력 계층이 `crate::cli::VERSION`을 직접 읽으면
-/// cli ↔ sarif 모듈 순환인데, `json!` 매크로 토큰 안의 경로는 수확되지 않아 자기 분석
-/// (`cycles --strict`)도 이 순환을 보지 못한다(cli::reach와 같은 방식).
-pub fn rules_sarif(doc: &Document, violations: &[Violation], version: &str) -> String {
+/// 위반 목록을 SARIF 로그로 직렬화한다. `tool.driver.version`은 이 크레이트의 버전이다 —
+/// `env!("CARGO_PKG_VERSION")`을 여기서 바로 읽는다(mcp의 serverInfo와 같은 방식). 출력 계층이
+/// `crate::cli::VERSION`을 읽으면 cli ↔ sarif 모듈 순환인데, `json!` 매크로 토큰 안의 경로는
+/// 수확되지 않아 자기 분석(`cycles --strict`)도 이 순환을 보지 못한다. 버전을 인자로 받지 않는
+/// 것은 0.5.0 공개 시그니처(라이브러리 호출자)를 지키기 위해서다 — 드라이버 이름이 rustograph라
+/// 버전도 늘 이 크레이트의 것이다.
+pub fn rules_sarif(doc: &Document, violations: &[Violation]) -> String {
     // 위치 조회는 규칙 검사와 같은 색인(같은 ID의 첫 cfg 변형)을 한 번 만들어 쓴다 —
     // 위반마다 정점 배열을 훑으면 O(위반·V)다.
     let by_id = crate::rules::vertices_by_id(doc);
@@ -46,7 +48,7 @@ pub fn rules_sarif(doc: &Document, violations: &[Violation], version: &str) -> S
             "tool": {
                 "driver": {
                     "name": "rustograph",
-                    "version": version,
+                    "version": env!("CARGO_PKG_VERSION"),
                     "informationUri": "https://github.com/ictechgy/rustograph",
                     "rules": [
                         {"id": "rustograph/allow", "name": "AllowlistViolation"},
@@ -113,11 +115,14 @@ mod tests {
             forbidden: "ui".into(),
             kind: EdgeKind::Call,
         };
-        let s = rules_sarif(&doc, &[v], "9.9.9-test");
+        let s = rules_sarif(&doc, &[v]);
         let j: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(j["version"], "2.1.0");
-        // 도구 버전은 호출자가 넘긴 값 그대로다 — sarif가 cli를 읽지 않는다.
-        assert_eq!(j["runs"][0]["tool"]["driver"]["version"], "9.9.9-test");
+        // 도구 버전은 이 크레이트의 버전이다 — sarif가 cli 상수를 읽지 않고 같은 값을 낸다.
+        assert_eq!(
+            j["runs"][0]["tool"]["driver"]["version"],
+            env!("CARGO_PKG_VERSION")
+        );
         assert_eq!(j["runs"][0]["results"][0]["ruleId"], "rustograph/deny");
         // 위치는 정점의 file:line에서 온다.
         let loc = &j["runs"][0]["results"][0]["locations"][0]["physicalLocation"];
@@ -177,7 +182,7 @@ mod tests {
             vec![],
             vec![],
         );
-        let j: Value = serde_json::from_str(&rules_sarif(&doc, &[violation("c::a")], "t")).unwrap();
+        let j: Value = serde_json::from_str(&rules_sarif(&doc, &[violation("c::a")])).unwrap();
         assert_eq!(
             place(&j["runs"][0]["results"][0]),
             (json!("src/unix.rs"), json!(10))
@@ -213,7 +218,7 @@ mod tests {
             .map(|i| violation(&format!("c::f{i:03}")))
             .collect();
         let before = crate::rules::examined_vertices();
-        let s = rules_sarif(&doc, &violations, "t");
+        let s = rules_sarif(&doc, &violations);
         let examined = crate::rules::examined_vertices() - before;
         let j: Value = serde_json::from_str(&s).unwrap();
         let results = j["runs"][0]["results"].as_array().unwrap();
