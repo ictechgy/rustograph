@@ -302,7 +302,26 @@ impl ModTree {
 /// ast 아이템들에서 `mod` 선언을 찾아 트리에 심는다.
 /// 반환값: 큐에 넣을 서브모듈 경로들 — 파일·인라인 모두 큐에 넣고,
 /// 아이템 목록은 module_items가 파일/인라인을 구분해 찾는다.
+/// 선언이 어느 타깃(크레이트 인스턴스)에 속하는지 모르는 호출이라, 순환 판정에서 크레이트
+/// 루트의 파일을 모두 조상으로 본다(lib과 같은 이름의 bin이 서로의 루트 파일을 싣는 선언도
+/// 순환으로 센다 — 보수적이다). 수확은 타깃을 아는 변형으로 루트 파일 하나만 조상으로 본다.
 pub fn collect_submodules(
+    items: &[&syn::Item],
+    parent_path: &str,
+    tree: &mut ModTree,
+    conditional_count: &mut usize,
+) -> Vec<String> {
+    collect_target_submodules(None, items, parent_path, tree, conditional_count)
+}
+
+/// [`collect_submodules`]와 같되, 선언이 루트 파일 `target_root`인 타깃 하나의 모듈 트리에
+/// 속한다. lib과 같은 이름의 bin은 트리에서 루트 모듈 하나를 함께 쓰지만(file + extra_files)
+/// rustc에게는 루트가 다른 두 크레이트다 — bin의 `mod lib;`(lib.rs)와 lib의
+/// `#[path = "main.rs"] mod m;`은 순환이 아니라 rustc가 받는 선언이다(special_module_name
+/// 경고뿐). 그래서 순환 판정에서 크레이트 루트는 이 타깃의 루트 파일만 조상이다. None이면
+/// 루트의 파일을 모두 조상으로 본다.
+pub(crate) fn collect_target_submodules(
+    target_root: Option<&Path>,
     items: &[&syn::Item],
     parent_path: &str,
     tree: &mut ModTree,
@@ -369,7 +388,7 @@ pub fn collect_submodules(
             };
             match mod_file(base, &name, path_attr.as_deref()) {
                 Some(f) => {
-                    if let Some(reason) = file_module_skip(tree, parent_path, &f) {
+                    if let Some(reason) = file_module_skip(tree, parent_path, &f, target_root) {
                         tree.skipped_mods.insert(path, reason);
                         continue;
                     }
@@ -415,8 +434,13 @@ pub fn collect_submodules(
 /// 순환은 조상 사슬만 본다 — 조상이 아닌 두 모듈이 같은 파일을 싣는 `#[path]`는
 /// rustc도 받는다. 종류는 stat으로 본다(FIFO에서도 막히지 않는다). stat이 실패하면
 /// None이다 — 읽기는 parse_into가 원인을 담은 오류로 낸다(지금과 같다).
-fn file_module_skip(tree: &ModTree, parent_path: &str, file: &Path) -> Option<SkippedMod> {
-    if reenters_ancestor(tree, parent_path, file) {
+fn file_module_skip(
+    tree: &ModTree,
+    parent_path: &str,
+    file: &Path,
+    target_root: Option<&Path>,
+) -> Option<SkippedMod> {
+    if reenters_ancestor(tree, parent_path, file, target_root) {
         return Some(SkippedMod::Circular);
     }
     match std::fs::metadata(file) {
@@ -425,20 +449,31 @@ fn file_module_skip(tree: &ModTree, parent_path: &str, file: &Path) -> Option<Sk
     }
 }
 
-/// `file`이 `parent_path`부터 크레이트 루트까지 어느 조상 모듈의 파일인가 — 병합
-/// 루트의 extra_files도 조상 파일이다. 인라인 조상은 감싼 파일을 file로 가진다.
+/// `file`이 `parent_path`부터 크레이트 루트까지 어느 조상 모듈의 파일인가 — 인라인 조상은
+/// 감싼 파일을 file로 가진다. 크레이트 루트는 `target_root`가 있으면 그 파일만, 없으면 병합
+/// 루트의 extra_files까지 조상 파일이다. 다른 타깃의 루트 파일을 거쳐 돌아오는 진짜 순환도
+/// 그 파일이 루트 아래 모듈의 file로 다시 나타나는 자리에서 끊긴다.
 /// 경로는 둘 다 mod_file·grow_tree가 정규화한 것이라 그대로 비교한다.
-fn reenters_ancestor(tree: &ModTree, parent_path: &str, file: &Path) -> bool {
+fn reenters_ancestor(
+    tree: &ModTree,
+    parent_path: &str,
+    file: &Path,
+    target_root: Option<&Path>,
+) -> bool {
     let mut current = Some(parent_path);
     while let Some(path) = current {
-        if tree
-            .modules
-            .get(path)
-            .is_some_and(|m| m.file == file || m.extra_files.iter().any(|f| f == file))
-        {
+        let up = path.rsplit_once("::").map(|(up, _)| up);
+        let ancestor_file = match (up, target_root) {
+            (None, Some(root)) => root == file,
+            _ => tree
+                .modules
+                .get(path)
+                .is_some_and(|m| m.file == file || m.extra_files.iter().any(|f| f == file)),
+        };
+        if ancestor_file {
             return true;
         }
-        current = path.rsplit_once("::").map(|(up, _)| up);
+        current = up;
     }
     false
 }

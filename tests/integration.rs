@@ -887,10 +887,9 @@ fn owned(files: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// 실제 CLI 경로(`graph --level symbol`)로 임시 크레이트를 수확해 (모듈 정점 ID 정렬
-/// 목록, limitation 목록)을 돌려준다. 종료 코드가 0이 아니면 그 코드와 stderr로 실패한다.
-/// 크레이트 디렉터리는 지운다.
-fn graph_modules(dir: &std::path::Path) -> (Vec<String>, Vec<String>) {
+/// 실제 CLI 경로(`graph --level symbol`)로 임시 크레이트를 수확한 JSON 문서다. 종료 코드가
+/// 0이 아니면 그 코드와 stderr로 실패한다. 크레이트 디렉터리는 지운다.
+fn graph_json(dir: &std::path::Path) -> serde_json::Value {
     let argv: Vec<String> = ["graph", "--level", "symbol", "--dir"]
         .iter()
         .map(|s| s.to_string())
@@ -901,7 +900,12 @@ fn graph_modules(dir: &std::path::Path) -> (Vec<String>, Vec<String>) {
     let code = rustograph::cli::run(&argv, &mut out, &mut err);
     let _ = std::fs::remove_dir_all(dir);
     assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
-    let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    serde_json::from_slice(&out).unwrap()
+}
+
+/// [`graph_json`]으로 수확해 (모듈 정점 ID 정렬 목록, limitation 목록)을 돌려준다.
+fn graph_modules(dir: &std::path::Path) -> (Vec<String>, Vec<String>) {
+    let doc = graph_json(dir);
     let mut modules: Vec<String> = doc["vertices"]
         .as_array()
         .unwrap()
@@ -973,6 +977,112 @@ fn circular_path_modules_are_skipped_and_counted() {
             ("outer/.keep", ""),
         ],
         &["pathcycle", "pathcycle::outer"],
+    );
+}
+
+/// lib과 같은 이름의 bin은 트리에서 루트 모듈 하나를 함께 쓰지만 rustc에게는 루트가 다른 두
+/// 크레이트다. bin의 `mod lib;`(lib.rs를 `lib` 모듈로 싣는다 — rustc는 special_module_name
+/// 경고만 낸다)와 lib의 `#[path = "main.rs"] mod m;`은 순환이 아니다 — 정점·간선이 그대로
+/// 실리고 순환 limitation이 없어야 한다. 루트 파일을 모두 조상으로 보던 판정은 두 선언을
+/// 순환으로 세어 `lib` 모듈과 `main → lib::run` 호출을 버렸다.
+#[test]
+fn bin_and_lib_of_one_name_may_load_each_others_root_file() {
+    let doc = graph_json(&temp_crate(
+        "binlib",
+        &owned(&[
+            (
+                "lib.rs",
+                "pub fn run() -> u32 {\n    helper()\n}\nfn helper() -> u32 {\n    1\n}\n",
+            ),
+            (
+                "main.rs",
+                "mod lib;\nfn main() {\n    println!(\"{}\", lib::run());\n}\n",
+            ),
+        ]),
+    ));
+    let ids: Vec<&str> = doc["vertices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_str().unwrap())
+        .collect();
+    for id in [
+        "pathcycle::lib",
+        "pathcycle::lib::run",
+        "pathcycle::lib::helper",
+    ] {
+        assert!(ids.contains(&id), "missing {id} in {ids:?}");
+    }
+    let calls_lib_run = doc["edges"].as_array().unwrap().iter().any(|e| {
+        e["from"] == "pathcycle::main" && e["to"] == "pathcycle::lib::run" && e["kind"] == "call"
+    });
+    assert!(calls_lib_run, "main must call lib::run");
+    let limitations: Vec<String> = doc["limitations"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .map(|l| l.as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(skipped_mod_lines(&limitations), Vec::<&str>::new());
+    assert!(
+        !limitations
+            .iter()
+            .any(|l| l.contains("could not be resolved")),
+        "{limitations:?}"
+    );
+
+    let (modules, limitations) = graph_modules(&temp_crate(
+        "libpath",
+        &owned(&[
+            (
+                "lib.rs",
+                "#[path = \"main.rs\"]\nmod m;\npub fn run() -> u32 {\n    m::helper()\n}\n",
+            ),
+            (
+                "main.rs",
+                "pub fn helper() -> u32 {\n    1\n}\nfn main() {}\n",
+            ),
+        ]),
+    ));
+    assert_eq!(modules, ["pathcycle", "pathcycle::m"]);
+    assert_eq!(skipped_mod_lines(&limitations), Vec::<&str>::new());
+}
+
+/// 같은 이름의 lib·bin에서도 진짜 순환은 끊긴다 — rustc가 circular modules로 거부하는
+/// 입력이다. 서로의 루트 파일을 싣는 두 선언은 각 타깃의 사슬에서 자기 루트로 돌아오고,
+/// bin 루트가 자기 파일을 싣는 선언은 bin 루트에서 끊긴다.
+#[test]
+fn circular_modules_across_one_name_lib_and_bin_are_still_cut() {
+    let (modules, limitations) = graph_modules(&temp_crate(
+        "crossroots",
+        &owned(&[
+            (
+                "lib.rs",
+                "#[path = \"main.rs\"]\nmod m;\npub fn run() -> u32 {\n    1\n}\n",
+            ),
+            (
+                "main.rs",
+                "mod lib;\nfn main() {\n    println!(\"{}\", lib::run());\n}\n",
+            ),
+        ]),
+    ));
+    assert_eq!(modules, ["pathcycle", "pathcycle::lib", "pathcycle::m"]);
+    assert_eq!(
+        skipped_mod_lines(&limitations),
+        ["2 mod declarations were skipped because they re-enter an ancestor module's file (circular modules)"]
+    );
+    assert_one_circular(
+        "binself",
+        &[
+            ("lib.rs", "pub fn run() -> u32 {\n    1\n}\n"),
+            (
+                "main.rs",
+                "#[path = \"main.rs\"]\nmod again;\nfn main() {}\n",
+            ),
+        ],
+        &["pathcycle"],
     );
 }
 

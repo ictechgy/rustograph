@@ -1236,10 +1236,18 @@ fn grow_tree(found: &mut InputTree, root_path: &str, root_file: &Path) -> Result
         if !visited.insert(mp.clone()) {
             continue;
         }
-        let Some(groups) = module_items(&found.tree, &found.arena, &mp) else {
+        let Some(mut groups) = module_items(&found.tree, &found.arena, &mp) else {
             continue;
         };
-        for sub in modtree::collect_submodules(
+        // 루트에서는 이 타깃의 루트 파일에 든 선언만 훑는다. lib과 같은 이름의 bin이 함께 쓰는
+        // 루트의 다른 파일 선언은 그 타깃의 grow_tree가 훑는다(타깃 순서와 무관) — 여기서도
+        // 훑으면 그 선언과 하위 트리를 이 타깃의 루트 파일을 조상으로 둔 사슬로 잘못 판정한다
+        // (거짓 순환).
+        if mp == root_path {
+            groups.retain(|(file, _)| *file == root_file);
+        }
+        for sub in modtree::collect_target_submodules(
+            Some(&root_file),
             &flatten_items(&groups),
             &mp,
             &mut found.tree,
