@@ -654,6 +654,13 @@ pub(crate) fn parsed_files() -> usize {
 
 #[cfg(test)]
 thread_local! {
+    /// 모듈 정점 규칙으로 생성 코드 마커를 판정한 횟수 — 모듈마다가 아니라 파싱한 파일마다
+    /// 한 번인지 단위 테스트가 센다(테스트 스레드마다 따로).
+    static MODULE_MARKER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// 캐시 커버리지 검사가 canonicalize한 파일 수 — 정점마다가 아니라 고유 파일마다
     /// 한 번만 재는지 단위 테스트가 센다(테스트 스레드마다 따로).
     static COVERAGE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -753,6 +760,7 @@ fn harvest(
     let InputTree {
         mut tree,
         arena,
+        markers,
         conditional_mods,
         uses_include,
         ..
@@ -796,7 +804,14 @@ fn harvest(
     // 지역명이 fn owner_spans와 같으면 이름 해석이 함수 정점으로 읽어 거짓 순환이 된다.
     let mut item_spans: Vec<harvest::OwnerSpan> = Vec::new();
     for mp in tree.modules.keys().cloned().collect::<Vec<_>>() {
-        let mh = harvest_module(&mut tree, &arena, &mp, &mut harvest, &dep_vertices);
+        let mh = harvest_module(
+            &mut tree,
+            &arena,
+            &markers,
+            &mp,
+            &mut harvest,
+            &dep_vertices,
+        );
         vertices.push(mh.vertex);
         edges.extend(mh.edges);
         vertices.extend(mh.decls.vertices);
@@ -1101,6 +1116,18 @@ fn emit_crate_level(
     }
 }
 
+/// 파일 머리(앞 10줄)의 생성 코드 마커 판정 — 파싱할 때 읽은 원문으로 파일마다 한 번 낸다.
+/// 인라인 모듈은 담은 파일의 판정을 쓴다: 모듈마다 파일을 다시 통째로 읽으면 인라인 모듈이
+/// 수천 개인 생성 파일(prost 출력)에서 (모듈 수 × 파일 크기)를 읽었다. 모듈 정점과 아이템
+/// 정점의 규칙이 서로 달라 둘 다 둔다 — 합치면 기존 generated 플래그가 바뀐다.
+#[derive(Clone, Copy, Default)]
+struct FileMarkers {
+    /// 모듈 정점의 generated — [`text_has_marker`] 규칙.
+    module: bool,
+    /// 아이템·impl 메서드 정점의 generated — harvest의 규칙.
+    items: bool,
+}
+
 /// 수확 입력 — 워크스페이스 멤버의 모듈 트리와 그 파일들의 AST 아레나다.
 /// 수확과 `--out` 입력 보호가 [`input_tree`] 하나로 만들어, 보호 목록이 수확이 실제로
 /// 읽은 파일과 갈라지지 않는다.
@@ -1109,6 +1136,8 @@ struct InputTree {
     /// 전 워크스페이스가 한 트리 — 크레이트 간 `othercrate::x` 해석이 가능해야 한다.
     tree: ModTree,
     arena: Arena,
+    /// 아레나 파일마다의 생성 코드 마커 — 파싱할 때 읽은 원문으로 판정해 둔다.
+    markers: BTreeMap<PathBuf, FileMarkers>,
     /// `#[cfg]` 뒤의 mod 선언 수 — 수확이 limitation으로 올린다.
     conditional_mods: usize,
     /// 수확 파일 중 include! 계열 매크로를 쓰는 파일이 있는가 — 캐시 판정에 쓴다.
@@ -1198,7 +1227,7 @@ fn grow_tree(found: &mut InputTree, root_path: &str, root_file: &Path) -> Result
             );
         }
     }
-    if let Err(e) = parse_into(&mut found.arena, &root_file, &mut found.uses_include) {
+    if let Err(e) = parse_into(found, &root_file) {
         found.tolerate(&root_file, e)?;
     }
     let mut queue = vec![root_path.to_string()];
@@ -1218,7 +1247,7 @@ fn grow_tree(found: &mut InputTree, root_path: &str, root_file: &Path) -> Result
         ) {
             let file = found.tree.modules[&sub].file.clone();
             if found.tree.modules[&sub].file_module {
-                if let Err(e) = parse_into(&mut found.arena, &file, &mut found.uses_include) {
+                if let Err(e) = parse_into(found, &file) {
                     found.tolerate(&file, e)?;
                 }
             }
@@ -1252,11 +1281,11 @@ fn scan_orphans(dir: &Path, known: &BTreeSet<PathBuf>, tree: &mut ModTree) {
     }
 }
 
-/// 파일을 파싱해 아레나에 넣는다. 파싱 실패는 limitation이 아니라 오류 —
-/// 읽은 파일을 못 읽는 것과 해석 못 하는 것은 다르다…지만 실전에서는
-/// 조건부 생성 파일이 깨진 문법을 가질 수 있어 빈 목록으로 둔다.
-fn parse_into(arena: &mut Arena, file: &Path, uses_include: &mut bool) -> Result<(), String> {
-    if arena.contains_key(file) {
+/// 파일을 파싱해 아레나에 넣고, 같은 원문으로 생성 코드 마커를 판정해 둔다. 파싱 실패는
+/// limitation이 아니라 오류 — 읽은 파일을 못 읽는 것과 해석 못 하는 것은 다르다…지만
+/// 실전에서는 조건부 생성 파일이 깨진 문법을 가질 수 있어 빈 목록으로 둔다.
+fn parse_into(found: &mut InputTree, file: &Path) -> Result<(), String> {
+    if found.arena.contains_key(file) {
         return Ok(());
     }
     #[cfg(test)]
@@ -1265,16 +1294,23 @@ fn parse_into(arena: &mut Arena, file: &Path, uses_include: &mut bool) -> Result
         .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
     // include! 계열은 파일 경로 인자를 받아 별도 입력을 읽는다 —
     // 그 입력 파일은 정점 위치에 안 나타나 지문 밖이다.
-    if !*uses_include
+    if !found.uses_include
         && (src.contains("include!")
             || src.contains("include_str!")
             || src.contains("include_bytes!"))
     {
-        *uses_include = true;
+        found.uses_include = true;
     }
     match syn::parse_file(&src) {
         Ok(ast) => {
-            arena.insert(file.to_path_buf(), Box::leak(ast.items.into_boxed_slice()));
+            let markers = FileMarkers {
+                module: text_has_marker(&src),
+                items: harvest::text_has_generated_marker(&src),
+            };
+            found.markers.insert(file.to_path_buf(), markers);
+            found
+                .arena
+                .insert(file.to_path_buf(), Box::leak(ast.items.into_boxed_slice()));
             Ok(())
         }
         Err(e) => Err(format!("parse error in {}: {e}", file.display())),
@@ -1345,9 +1381,12 @@ struct ModuleHarvest<'a> {
 }
 
 /// 한 모듈의 선언을 수확한다 — 모듈 정점, contains/uses 간선, 본문 보관.
+/// 생성 코드 마커는 파싱할 때 파일마다 판정해 둔 `markers`에서 찾는다. 모듈 파일과 그룹
+/// 파일은 모두 아레나에 있다(엄격 수확은 싣지 못한 파일에서 오류로 끝난다).
 fn harvest_module<'a>(
     tree: &mut ModTree,
     arena: &'a Arena,
+    markers: &BTreeMap<PathBuf, FileMarkers>,
     mp: &str,
     out: &mut Harvest,
     dep_vertices: &BTreeSet<String>,
@@ -1355,15 +1394,16 @@ fn harvest_module<'a>(
     let groups = module_items(tree, arena, mp).expect("module items must exist");
     let file = tree.modules[mp].file.clone();
     let krate = modtree::crate_of(mp);
+    let markers_of = |f: &Path| markers.get(f).copied().unwrap_or_default();
     // 파라미터 이름이 fn harvest와 충돌하면 ident 경로가 함수 정점으로
     // 해석돼 거짓 간선·사이클이 생긴다 — 지역명은 `out`으로 둔다.
-    let decls = harvest::decls(mp, &krate, &groups, out);
+    let decls = harvest::decls_with_markers(mp, &krate, &groups, &|f| markers_of(f).items, out);
 
     // 모듈 정점 — 타깃 루트는 크레이트 정점을 겸한다(rustc 의미론).
     // 위치는 파일 시작, exported는 `pub mod` 여부를 따른다.
     let is_root = !mp.contains("::");
     let public = tree.modules[mp].public;
-    let generated = file_has_marker(&file);
+    let generated = markers_of(&file).module;
     let mod_cfg = tree.modules[mp].cfg.clone();
     let vertex = Vertex {
         id: mp.to_string(),
@@ -1435,18 +1475,16 @@ fn owner_module(tree: &ModTree, id: &str) -> Option<String> {
     }
 }
 
-/// 파일의 생성 코드 마커 — harvest의 판정과 같은 규칙.
-fn file_has_marker(file: &Path) -> bool {
-    std::fs::read_to_string(file)
-        .map(|s| {
-            s.lines().take(10).any(|l| {
-                let l = l.to_lowercase();
-                l.contains("do not edit")
-                    || l.contains("@generated")
-                    || l.contains("auto-generated")
-            })
-        })
-        .unwrap_or(false)
+/// 원문 앞 10줄에 생성 코드 마커가 있는지 본다 — 모듈 정점의 generated 규칙이다.
+/// 아이템 정점의 harvest 규칙과 다르다('do not edit'만 있어도 참, 'autogenerated'는 거짓).
+/// 규칙을 합치면 기존 플래그가 바뀌어, 둘 다 두고 [`parse_into`]가 읽은 원문만 같이 쓴다.
+fn text_has_marker(src: &str) -> bool {
+    #[cfg(test)]
+    MODULE_MARKER_SCANS.with(|c| c.set(c.get() + 1));
+    src.lines().take(10).any(|l| {
+        let l = l.to_lowercase();
+        l.contains("do not edit") || l.contains("@generated") || l.contains("auto-generated")
+    })
 }
 
 /// 정점 없이 건너뛴 `mod` 선언을 사유별 limitation 문장으로 옮긴다 — 셀 것이 없는
@@ -2099,6 +2137,125 @@ mod tests {
             call_targets(&doc, "owner_prefix::T10::run"),
             [("owner_prefix::T10::get", true)]
         );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 정점 ID의 generated 플래그 — 정점이 없으면 None이다.
+    fn generated_flag(doc: &Document, id: &str) -> Option<bool> {
+        doc.vertices
+            .iter()
+            .find(|v| v.id == id)
+            .map(|v| v.generated)
+    }
+
+    /// 생성 코드 마커는 파싱할 때 읽은 원문으로 파일마다 한 번 판정한다 — 모듈(인라인 모듈
+    /// 포함)마다 같은 파일을 다시 통째로 읽으면 인라인 모듈이 수천 개인 생성 파일(prost
+    /// 출력)에서 (모듈 수 × 파일 크기)를 읽었다. 인라인 모듈의 모듈·아이템·impl 메서드
+    /// 정점은 담은 파일의 판정을 그대로 받는다.
+    #[test]
+    fn generated_markers_are_judged_once_per_parsed_file() {
+        let tmp =
+            std::env::temp_dir().join(format!("rustograph-markers-once-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let mut lib = String::from("// This file is @generated by prost-build.\npub mod plain;\n");
+        for i in 0..20 {
+            lib.push_str(&format!(
+                "pub mod m{i} {{\n    pub struct S;\n    impl S {{\n        pub fn f(&self) {{}}\n    }}\n    \
+                 pub mod inner {{\n        pub fn g() {{}}\n    }}\n}}\n"
+            ));
+        }
+        let dir = write_crate(
+            &tmp,
+            "markers_once",
+            None,
+            &[
+                ("src/lib.rs", lib.as_bytes()),
+                ("src/plain.rs", b"pub fn p() {}\n".as_slice()),
+            ],
+        );
+        let scans_now = || {
+            (
+                MODULE_MARKER_SCANS.with(std::cell::Cell::get),
+                harvest::generated_marker_scans(),
+            )
+        };
+        let (parsed_before, scans_before) = (parsed_files(), scans_now());
+        let doc = load(&dir, &span_options()).unwrap();
+        let parsed = parsed_files() - parsed_before;
+        let scans = (
+            scans_now().0 - scans_before.0,
+            scans_now().1 - scans_before.1,
+        );
+        assert_eq!(parsed, 2, "lib.rs and plain.rs");
+        assert_eq!(
+            scans,
+            (parsed, parsed),
+            "(module rule, item rule) marker scans for {parsed} parsed files"
+        );
+        for id in [
+            "markers_once",
+            "markers_once::m7",
+            "markers_once::m7::inner",
+            "markers_once::m7::S",
+            "markers_once::m7::S::f",
+            "markers_once::m7::inner::g",
+        ] {
+            assert_eq!(generated_flag(&doc, id), Some(true), "{id}");
+        }
+        for id in ["markers_once::plain", "markers_once::plain::p"] {
+            assert_eq!(generated_flag(&doc, id), Some(false), "{id}");
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 모듈 정점과 아이템 정점의 생성 마커 규칙은 서로 다르다 — 읽기만 공유하고 규칙은
+    /// 합치지 않는다(합치면 기존 generated 플래그가 바뀐다). 둘 다 원문 앞 10줄만 본다:
+    /// 'do not edit'만 있으면 모듈 정점만, 'autogenerated'만 있으면 아이템 정점만 참이다.
+    #[test]
+    fn generated_marker_rules_stay_distinct_for_modules_and_items() {
+        let tmp =
+            std::env::temp_dir().join(format!("rustograph-marker-rules-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let items = "pub fn f() {}\npub struct S;\nimpl S {\n    pub fn m(&self) {}\n}\n";
+        // 주석 `marker`를 `line`번째 줄에 둔 파일 머리.
+        let marker_at =
+            |line: usize, marker: &str| format!("{}// {marker}\n", "\n".repeat(line - 1));
+        // (모듈 이름, 파일 머리, 모듈 정점 generated, 아이템 정점 generated)
+        let cases = [
+            ("at_ten", marker_at(10, "@generated"), true, true),
+            ("at_eleven", marker_at(11, "@generated"), false, false),
+            ("edit_only", marker_at(1, "DO NOT EDIT"), true, false),
+            ("autogen", marker_at(1, "autogenerated"), false, true),
+        ];
+        let lib: String = cases
+            .iter()
+            .map(|(name, ..)| format!("pub mod {name};\n"))
+            .collect();
+        let sources: Vec<(String, String)> = cases
+            .iter()
+            .map(|(name, head, ..)| (format!("src/{name}.rs"), format!("{head}{items}")))
+            .collect();
+        let mut files: Vec<(&str, &[u8])> = vec![("src/lib.rs", lib.as_bytes())];
+        files.extend(
+            sources
+                .iter()
+                .map(|(path, text)| (path.as_str(), text.as_bytes())),
+        );
+        let dir = write_crate(&tmp, "marker_rules", None, &files);
+        let doc = load(&dir, &span_options()).unwrap();
+        assert_eq!(generated_flag(&doc, "marker_rules"), Some(false));
+        for (name, _, module_flag, item_flag) in &cases {
+            let module = format!("marker_rules::{name}");
+            assert_eq!(
+                generated_flag(&doc, &module),
+                Some(*module_flag),
+                "{module}"
+            );
+            for item in ["f", "S", "S::m"] {
+                let id = format!("{module}::{item}");
+                assert_eq!(generated_flag(&doc, &id), Some(*item_flag), "{id}");
+            }
+        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 }
