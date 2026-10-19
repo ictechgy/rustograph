@@ -451,19 +451,25 @@ pub fn target_facts(triple: &str) -> crate::cfgeval::Facts {
 /// `target/` 아래 생성 파일, 지문 스캔이 건너뛰는 숨김 디렉터리 아래
 /// 파일이면 지문이 바뀌지 않아 캐시가 stale해진다. 그런 문서는 캐시에
 /// 쓰지 않는다 — 쓰기와 읽기 양쪽에서 검사해 구 스키마 엔트리도 걸러낸다.
+/// 정점 대부분이 몇 안 되는 파일을 공유하므로 위치의 파일 부분을 모아 고유 파일만
+/// 검사한다 — 정점마다 canonicalize하면 큰 저장소의 캐시 적중 경로가 이 검사에 초 단위를 쓴다.
 fn has_uncovered_input(doc: &Document, root: &Path) -> bool {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    doc.vertices.iter().any(|v| {
-        v.position
-            .as_deref()
-            .and_then(|p| p.rsplit_once(':').map(|(f, _)| PathBuf::from(f)))
-            .is_some_and(|f| !fingerprint_covers(&f, &root))
-    })
+    let files: BTreeSet<&str> = doc
+        .vertices
+        .iter()
+        .filter_map(|v| v.position.as_deref()?.rsplit_once(':').map(|(f, _)| f))
+        .collect();
+    files
+        .into_iter()
+        .any(|f| !fingerprint_covers(Path::new(f), &root))
 }
 
 /// 지문 스캔이 이 파일을 보는가 — fingerprint()의 순회 규칙과 같다:
 /// 루트 안, target/ 아님, .cargo 외 숨김 디렉터리 아님.
 fn fingerprint_covers(file: &Path, root: &Path) -> bool {
+    #[cfg(test)]
+    COVERAGE_PROBES.with(|c| c.set(c.get() + 1));
     let c = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
     let Ok(rel) = c.strip_prefix(root) else {
         return false;
@@ -644,6 +650,13 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn parsed_files() -> usize {
     PARSED_FILES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 캐시 커버리지 검사가 canonicalize한 파일 수 — 정점마다가 아니라 고유 파일마다
+    /// 한 번만 재는지 단위 테스트가 센다(테스트 스레드마다 따로).
+    static COVERAGE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -1623,6 +1636,93 @@ mod tests {
         // 캐시 파일이 워크스페이스 안에 있어도 지문을 바꾸지 않는다 —
         // .rustograph는 숨김 디렉터리라 지문 걷기에서 빠진다.
         assert_eq!(k2, fingerprint(&tmp, &meta, &opts).unwrap());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 캐시 커버리지 검사는 정점마다가 아니라 고유 파일마다 한 번 canonicalize한다 — 정점
+    /// 대부분이 몇 안 되는 파일을 공유해서, 정점마다 재면 큰 저장소의 캐시 적중 경로가
+    /// 지문 검사에만 초 단위를 쓴다. 판정은 그대로다: 지문이 못 보는 파일(루트 밖·target/·
+    /// 숨김 디렉터리, `..`로 루트를 벗어나는 경로)을 가리키는 정점이 하나라도 있으면 참이다.
+    #[test]
+    fn cache_coverage_canonicalizes_each_file_once() {
+        let tmp = std::env::temp_dir().join(format!("rustograph-coverage-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let root = tmp.join("ws");
+        let covered_files = ["src/lib.rs", "src/a.rs", ".cargo/build.rs"];
+        let hidden_files = ["target/debug/gen.rs", ".hidden/x.rs"];
+        for rel in covered_files.iter().chain(&hidden_files) {
+            let file = root.join(rel);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "fn f() {}").unwrap();
+        }
+        std::fs::write(tmp.join("outside.rs"), "fn f() {}").unwrap();
+        // 정점 ID 접두사로 정렬 순서를 고정한다 — 커버되는 정점이 모두 앞에 온다.
+        let vertex = |id: String, position: Option<String>| Vertex {
+            id,
+            kind: Kind::Fn,
+            krate: "c".to_string(),
+            module: "c".to_string(),
+            position,
+            exported: false,
+            generated: false,
+            cfg: None,
+            unsafe_: false,
+        };
+        let covered: Vec<Vertex> = (0..300)
+            .map(|i| {
+                let file = root.join(covered_files[i % covered_files.len()]);
+                vertex(
+                    format!("c::a{i:04}"),
+                    Some(format!("{}:{i}", file.display())),
+                )
+            })
+            .chain([vertex("c::a_crate".to_string(), None)])
+            .collect();
+        let check = |vertices: Vec<Vertex>| {
+            let doc = document(
+                Level::Symbol,
+                ".".into(),
+                None,
+                vec![],
+                vertices,
+                vec![],
+                vec![],
+            );
+            let before = COVERAGE_PROBES.with(std::cell::Cell::get);
+            let uncovered = has_uncovered_input(&doc, &root);
+            (
+                uncovered,
+                COVERAGE_PROBES.with(std::cell::Cell::get) - before,
+            )
+        };
+        assert_eq!(check(covered.clone()), (false, covered_files.len()));
+        let escaping = root.join("src/../../outside.rs");
+        let uncovered_files = [
+            tmp.join("outside.rs"),
+            escaping,
+            root.join(hidden_files[0]),
+            root.join(hidden_files[1]),
+        ];
+        for file in uncovered_files {
+            let mut vertices = covered.clone();
+            vertices.extend((0..50).map(|i| {
+                vertex(
+                    format!("c::b{i:04}"),
+                    Some(format!("{}:{i}", file.display())),
+                )
+            }));
+            let (uncovered, probes) = check(vertices);
+            assert!(
+                uncovered,
+                "{} is not covered by the fingerprint",
+                file.display()
+            );
+            assert!(
+                probes <= covered_files.len() + 1,
+                "{probes} canonicalize calls for {} distinct files",
+                covered_files.len() + 1
+            );
+        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 
