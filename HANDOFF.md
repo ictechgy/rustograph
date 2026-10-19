@@ -295,7 +295,9 @@ PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
 - `src/export.rs` — 결정적 JSON + mermaid + save/load.
 - `src/sarif.rs` — SARIF 2.1.0(`rustograph/deny` 등 ruleId).
 - `src/config.rs` — `.rustograph.yml` 파싱(serde_norway 격리), baseline 키. 설정·기준선은
-  `read_bounded_text`(정규 파일만, 64MiB 상한)로 읽는다 — 경로를 분석 대상 저장소가 고른다.
+  `read_bounded_text`(64MiB 상한)로 읽고, 여는 파일 종류는 호출자가 `FileKinds`로 정한다 — 분석 대상
+  저장소가 고른 경로(찾은 `.rustograph.yml`·설정의 `baseline:`)와 호출마다 다시 읽는 MCP `--config`는
+  정규 파일만, 실행한 사람이 준 CLI `--config`·`--baseline`은 파이프·프로세스 치환도 받는다.
 - `src/source/routes.rs` + `routes/` — isthmus http `route-decl` 생산자(`rustograph routes --role server`).
   axum(라우터 값 정적 평가·nest 결합·버전별 문법·빈 값 변형)·actix(App·Scope·Resource·매크로·configure·가드·
   NormalizePath)·`pattern`(actix 패턴·정규식 분류)·`template`(정규 템플릿 문법·정규화)·`validate`(order·스코프 검사).
