@@ -296,9 +296,14 @@ MCP `rustograph_deps` 도구는 첫 호출 때 `--dir` 워크스페이스를 대
 
 `--revision` 없는 `reach`·`impact --format language-traversal`은 `revision`을
 읽으려고만 `--dir` 디렉터리에서 `git`도 실행합니다(`git config`, `git ls-files`,
-`git status`, `git rev-parse`). 이 호출은 분석 대상 저장소의 git 설정이 명령을
-실행하지 못하게 합니다.
+`git status`, `git rev-parse`). 이 호출은 분석 대상 체크아웃이 `PATH`로든 git
+설정으로든 실행할 프로그램을 고르지 못하게 합니다.
 
+- `PATH`의 절대 경로 항목(`PATH`가 없으면 `/bin:/usr/bin`)에서 처음 찾은 `git`을
+  그 절대 경로로 실행합니다. 빈 항목과 `.`·`bin` 같은 상대 항목은 건너뜁니다.
+  git은 `--dir` 디렉터리에서 시작하므로 그런 항목이 분석 대상 체크아웃 안으로
+  풀려 체크아웃에 든 `git`을 실행할 수 있습니다. 절대 경로 항목에 `git`이
+  없으면 git이 없을 때처럼 `revision`을 싣지 않습니다.
 - 호출 바로 앞에서 git이 보는 filter 드라이버를 모읍니다
   (`git config -z --includes --name-only --list` — 저장소·사용자·시스템 설정을
   모두 봅니다). 드라이버마다 `clean`·`smudge`·`process`를 빈 명령으로,
@@ -318,7 +323,8 @@ MCP `rustograph_deps` 도구는 첫 호출 때 `--dir` 워크스페이스를 대
 git의 stat 캐시를 새로 고치세요. 서브모듈이 있는 작업 트리나 덮을 수 없는 드라이버
 이름이 있는 설정은 `revision`을 자동으로 싣지 않고 `revision-unverified:`
 limitation으로 알립니다. 분석한 revision은 `--revision`으로 직접 줄 수 있습니다.
-나머지 git 설정은 평소대로 적용됩니다.
+나머지 git 설정과, 설정한 그대로의 `PATH` 절대 경로 항목(체크아웃 안을 가리키는
+항목이라도)은 평소대로 적용됩니다.
 
 ## 라이선스
 

@@ -451,8 +451,15 @@ commands itself.
 `reach` and `impact --format language-traversal` without `--revision` also run
 `git` in the `--dir` directory, only to read `revision` (`git config`,
 `git ls-files`, `git status`, `git rev-parse`). These calls keep the analyzed
-repository's git configuration from running commands:
+checkout from choosing the programs that run, whether through `PATH` or
+through its git configuration:
 
+- rustograph runs the first `git` found in an absolute `PATH` entry
+  (`/bin:/usr/bin` when `PATH` is unset), by that absolute path. Empty and
+  relative entries such as `.` or `bin` are skipped: because git starts in
+  the `--dir` directory, such an entry can resolve inside the analyzed
+  checkout and run a `git` that the checkout contains. Without `git` in an
+  absolute entry, `revision` is omitted, as when git is not installed.
 - Right before each call, rustograph lists the filter drivers git sees
   (`git config -z --includes --name-only --list`, which covers the repository,
   your own and the system configuration) and overrides each with empty
@@ -475,8 +482,9 @@ the tree looks modified and `revision` is omitted rather than claiming a clean
 `git status` first to refresh git's stat cache. A work tree with submodules, or
 a configuration with a driver name that cannot be overridden, gets no
 automatic `revision` and a `revision-unverified:` limitation. Pass `--revision`
-to record the analyzed revision yourself. The rest of your git configuration
-applies as usual.
+to record the analyzed revision yourself. The rest of your git configuration,
+and absolute `PATH` entries as you set them (even one that points into the
+checkout), apply as usual.
 
 ## License
 

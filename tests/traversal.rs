@@ -625,13 +625,26 @@ fn backdate(repo: &Path, files: &[&str], secs: u64) {
 /// 남는다) 분석 대상 밖 `cwd`에서 띄운다. (종료 코드, 문서).
 #[cfg(unix)]
 fn traverse(cwd: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value) {
-    let out = Command::new(env!("CARGO_BIN_EXE_rustograph"))
+    traverse_with_path(cwd, None, args)
+}
+
+/// `traverse`와 같되 `path`가 있으면 그 값을 바이너리의 PATH로 준다.
+#[cfg(unix)]
+fn traverse_with_path(
+    cwd: &Path,
+    path: Option<&std::ffi::OsStr>,
+    args: &[&str],
+) -> (Option<i32>, serde_json::Value) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rustograph"));
+    command
         .args(args)
         .current_dir(cwd)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .unwrap();
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    let out = command.output().unwrap();
     (
         out.status.code(),
         json(&String::from_utf8(out.stdout).unwrap()),
@@ -824,4 +837,46 @@ fn a_file_its_filter_normalizes_makes_the_tree_dirty_once_git_rereads_it() {
     assert!(d.get("revision").is_none(), "{d}");
     assert!(unverified(&d).is_empty(), "{d}");
     assert_eq!(kit.fired(), Vec::<String>::new(), "the filter ran");
+}
+
+#[cfg(unix)]
+#[test]
+fn git_is_never_resolved_from_relative_path_entries() {
+    // revision 판독의 git은 `--dir`을 작업 디렉터리로 띄운다 — PATH의 빈 항목·`.`·`bin` 같은 상대
+    // 항목이 그 디렉터리 기준으로 풀리면 분석 대상이 심은 `git`이 실행된다.
+    let kit = MarkerKit::new("d1-path");
+    let dir = git_workspace("d1-path");
+    std::fs::write(dir.join(".gitignore"), "target/\nCargo.lock\n/git\n/bin/\n").unwrap();
+    let Some(repo) = commit_all(dir) else {
+        return;
+    };
+    let head = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    // 준비 단계의 git이 집지 않게 커밋 뒤에 심는다(무시 목록에 있어 트리는 깨끗하다).
+    let planted = kit.script("planted-git", "exit 1");
+    std::fs::create_dir_all(repo.join("bin")).unwrap();
+    std::fs::copy(&planted, repo.join("git")).unwrap();
+    std::fs::copy(&planted, repo.join("bin/git")).unwrap();
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let dir = repo.display().to_string();
+    let args = ["reach", "--dir", dir.as_str(), "app::a"];
+    // 체크아웃 밖에서 띄운 실행과, 흔한 경우인 체크아웃 안에서 띄운 실행 모두.
+    for cwd in [&kit.dir, &repo] {
+        for entry in ["", ".", "bin"] {
+            let mut path = std::ffi::OsString::from(entry);
+            path.push(":");
+            path.push(&inherited);
+            let (code, d) = traverse_with_path(cwd, Some(&path), &args);
+            assert_eq!(code, Some(0), "{d}");
+            let fired = kit.fired();
+            assert!(
+                fired.is_empty(),
+                "cwd {cwd:?}, PATH entry {entry:?}: {fired:?}"
+            );
+            // 절대 경로 항목에서 찾은 git이 돈다 — 깨끗한 트리의 HEAD다.
+            assert_eq!(
+                d["revision"], head,
+                "cwd {cwd:?}, PATH entry {entry:?}: {d}"
+            );
+        }
+    }
 }

@@ -10,6 +10,7 @@ use crate::traversal::{self, Direction};
 use crate::{export, source};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -710,16 +711,66 @@ fn count_gitlinks(entries: &[u8]) -> usize {
 /// 분석 대상 작업 트리에서 git 명령 하나를 실행한다. 분석 대상 `.git`(과 사용자·시스템 설정)이 정한
 /// 명령을 이 읽기 전용 조회가 실행하지 않게 격리한다(DECISIONS D1): 바로 앞에서 설정된 filter 드라이버
 /// 이름을 다시 모아(`filter_driver_names`) 이름마다 명령을 빈 값으로 덮는다(`analysis_command`).
-/// 조회를 호출마다 다시 하는 것은 앞선 호출 뒤에 바뀐 설정도 따라가기 위해서다. 모든 git 호출이 이
-/// 함수를 지난다 — 호출마다 따로 쓰면 한쪽만 설정의 명령을 실행하는 어긋남이 생긴다.
+/// 조회를 호출마다 다시 하는 것은 앞선 호출 뒤에 바뀐 설정도 따라가기 위해서다. 실행할 git도 분석 대상
+/// 파일이 고르지 못하게 PATH의 절대 경로 항목에서만 찾는다(`git_program`). 모든 git 호출이 이 함수를
+/// 지난다 — 호출마다 따로 쓰면 한쪽만 설정의 명령을 실행하는 어긋남이 생긴다.
 /// `Ok(Some)`은 성공한 명령의 표준 출력, `Ok(None)`은 git 없음·저장소 아님·명령이나 설정 조회 실패
 /// (revision이 없다는 것이 신호다), `Err`는 덮을 수 없는 드라이버 이름이 있어 실행하지 않은 경우다
 /// (fail-closed).
 fn git(project: &Path, args: &[&str]) -> Result<Option<Vec<u8>>, Unverified> {
-    let Some(drivers) = filter_driver_names(project)? else {
+    let Some(program) = git_program() else {
         return Ok(None);
     };
-    Ok(run_git(analysis_command(project, &drivers, args)))
+    let Some(drivers) = filter_driver_names(&program, project)? else {
+        return Ok(None);
+    };
+    Ok(run_git(analysis_command(&program, project, &drivers, args)))
+}
+
+/// PATH가 없을 때 git을 찾는 디렉터리 — 이름만 넘긴 `Command::new("git")`은 libc의 기본 탐색 경로를
+/// 썼다(macOS `_PATH_DEFPATH`는 `/usr/bin:/bin`). 같은 두 디렉터리를 계열 kartograph·pythograph와 같은
+/// 순서로 본다. Windows에는 기본값이 없다.
+#[cfg(unix)]
+const DEFAULT_SEARCH_PATH: Option<&str> = Some("/bin:/usr/bin");
+#[cfg(not(unix))]
+const DEFAULT_SEARCH_PATH: Option<&str> = None;
+
+/// 실행할 git의 절대 경로 — PATH(없으면 `DEFAULT_SEARCH_PATH`)의 절대 경로 항목에서 처음 찾은 실행
+/// 파일이다. 찾지 못하면 None이다(git이 없는 것과 같다).
+fn git_program() -> Option<PathBuf> {
+    find_git(std::env::var_os("PATH").as_deref(), is_executable_file)
+}
+
+/// PATH 값(`None`은 PATH 없음)에서 git 실행 파일을 찾는다 — 셸처럼 앞 항목이 이긴다. 빈 항목과 `.`·`bin`
+/// 같은 상대 항목은 건너뛴다. git을 `current_dir(project)`로 띄우므로, 이름만 넘기면 unix std는 자식이
+/// 작업 디렉터리를 옮긴 뒤 PATH를 찾아 그런 항목이 분석 대상 디렉터리 기준으로 풀린다 — 저장소에 심은
+/// `git`이 실행된다(macOS에서 빈 항목·`.`·`bin`으로 확인했다). Windows std는 부모의 현재 디렉터리
+/// 기준으로 풀어 체크아웃 안에서 띄우면 같은 일이 생긴다. 그래서 찾은 절대 경로로 띄운다.
+/// `is_executable`은 후보 검사다(테스트가 파일 시스템 대신 주입한다).
+fn find_git(path: Option<&OsStr>, is_executable: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    let path = path.or(DEFAULT_SEARCH_PATH.map(OsStr::new))?;
+    let file = format!("git{}", std::env::consts::EXE_SUFFIX);
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(&file))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// 실행할 수 있는 일반 파일인가(링크는 따라간다) — unix는 실행 비트까지 본다. 없거나 읽을 수 없거나
+/// 실행할 수 없는 후보는 execvp처럼 건너뛴다(오류가 아니라 다음 PATH 항목을 볼 이유다).
+fn is_executable_file(candidate: &Path) -> bool {
+    let Ok(found) = std::fs::metadata(candidate) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        found.is_file() && found.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        found.is_file()
+    }
 }
 
 /// git이 이 디렉터리에서 읽는 설정 전체(시스템·사용자·저장소·worktree·include·`-c`)에 정의된 filter
@@ -727,8 +778,8 @@ fn git(project: &Path, args: &[&str]) -> Result<Option<Vec<u8>>, Unverified> {
 /// 저장소에서 돌지 않는다). 덮을 수 없는 이름이 하나라도 있으면 `Err`다 — 그 드라이버는 실행될 수 있다.
 /// D1 문구의 `--get-regexp` 대신 이름 목록 전체를 바이트로 읽는다: UTF-8 로캘의 git 정규식은 깨진
 /// UTF-8 이름을 결과에서 빼지만 속성 대조는 바이트로 해 그 드라이버를 실행한다(계열 isthmus 실험).
-fn filter_driver_names(project: &Path) -> Result<Option<Vec<String>>, Unverified> {
-    let mut listing = git_command(project);
+fn filter_driver_names(program: &Path, project: &Path) -> Result<Option<Vec<String>>, Unverified> {
+    let mut listing = git_command(program, project);
     listing.args(["config", "-z", "--includes", "--name-only", "--list"]);
     match run_git(listing) {
         Some(keys) => parse_filter_driver_names(&keys).map(Some),
@@ -782,9 +833,9 @@ fn can_override(name: &str) -> bool {
 /// 못하게 끈다: fsmonitor 훅, untracked cache 기록, log 계열의 서명 확인(gpg 실행). 선택 잠금을 꺼
 /// index를 다시 쓰지 않고(그래서 `post-index-change` 훅도 돌지 않는다), 프롬프트를 막고 메시지를 C
 /// 로캘로 고정한다. `GIT_CONFIG`는 `git config`만 따르는 옛 변수라(그 파일만 읽는다) 드라이버 조회가
-/// 분석용 명령과 다른 설정을 보지 않게 뺀다.
-fn git_command(project: &Path) -> Command {
-    let mut command = Command::new("git");
+/// 분석용 명령과 다른 설정을 보지 않게 뺀다. `program`은 `git_program`이 찾은 절대 경로다.
+fn git_command(program: &Path, project: &Path) -> Command {
+    let mut command = Command::new(program);
     command
         .args([
             "-c",
@@ -807,8 +858,8 @@ fn git_command(project: &Path) -> Command {
 /// 분석용 git 명령 — 공통 부분 뒤에 드라이버마다 명령 세 키를 빈 값으로, required를 false로 덮는다.
 /// 빈 명령은 git이 실행하지 않고(filter 없이 원문을 쓴다), required=false라야 "filter 실패"로 끝나지
 /// 않는다. `--attr-source`는 `.git/info/attributes`를 막지 못해 쓰지 않는다.
-fn analysis_command(project: &Path, drivers: &[String], args: &[&str]) -> Command {
-    let mut command = git_command(project);
+fn analysis_command(program: &Path, project: &Path, drivers: &[String], args: &[&str]) -> Command {
+    let mut command = git_command(program, project);
     for name in drivers {
         for setting in ["clean=", "smudge=", "process=", "required=false"] {
             command.arg("-c").arg(format!("filter.{name}.{setting}"));
@@ -1001,7 +1052,10 @@ filter.clean\0filter.x.cleanup\0myfilter.y.clean\0FILTER.Up.CLEAN\0";
     #[test]
     fn analysis_commands_override_every_listed_driver() {
         let drivers = ["evil.name".to_string(), String::new()];
-        let command = analysis_command(Path::new("/p"), &drivers, &["status"]);
+        let program = Path::new("/opt/git/bin/git");
+        let command = analysis_command(program, Path::new("/p"), &drivers, &["status"]);
+        // 이름 `git`이 아니라 `git_program`이 고른 절대 경로를 띄운다.
+        assert_eq!(command.get_program(), program.as_os_str());
         let args: Vec<&str> = command.get_args().map(|a| a.to_str().unwrap()).collect();
         let mut expected = vec![
             "-c",
@@ -1035,6 +1089,73 @@ filter.clean\0filter.x.cleanup\0myfilter.y.clean\0FILTER.Up.CLEAN\0";
         assert_eq!(value("LC_ALL"), Some(Some(std::ffi::OsStr::new("C"))));
         // 드라이버 조회가 분석용 명령과 같은 설정을 읽도록 `git config` 전용 변수를 뺀다.
         assert_eq!(value("GIT_CONFIG"), Some(None));
+    }
+
+    #[test]
+    fn git_is_found_only_in_absolute_path_entries() {
+        // 상대 항목이 분석 대상 디렉터리 기준으로 풀리는 실제 실행은 tests/traversal.rs가 본다. 여기서는
+        // 어떤 후보를 어떤 순서로 보는지만 본다 — 파일 검사를 주입해 본 후보를 적는다.
+        let base = std::env::temp_dir();
+        let (first, second) = (base.join("first"), base.join("second"));
+        let exe_in = |dir: &Path| dir.join(format!("git{}", std::env::consts::EXE_SUFFIX));
+        let entries = [
+            Path::new(""),
+            Path::new("."),
+            Path::new("bin"),
+            &first,
+            &second,
+        ];
+        let path = std::env::join_paths(entries).unwrap();
+        let checked = std::cell::RefCell::new(Vec::new());
+        let found = find_git(Some(&path), |candidate| {
+            checked.borrow_mut().push(candidate.to_path_buf());
+            candidate == exe_in(&second)
+        });
+        // 빈 항목·`.`·`bin`은 후보로 보지도 않고, 앞 항목이 이긴다.
+        assert_eq!(found, Some(exe_in(&second)));
+        assert_eq!(checked.into_inner(), [exe_in(&first), exe_in(&second)]);
+        let relative_only = std::env::join_paths([Path::new("."), Path::new("bin")]).unwrap();
+        assert_eq!(find_git(Some(&relative_only), |_| true), None);
+        // PATH가 있지만 비어 있으면 빈 항목 하나다 — 기본 디렉터리로 돌아가지 않는다.
+        assert_eq!(find_git(Some(OsStr::new("")), |_| true), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_search_without_path_uses_the_libc_default_directories() {
+        let checked = std::cell::RefCell::new(Vec::new());
+        let found = find_git(None, |candidate| {
+            checked.borrow_mut().push(candidate.to_path_buf());
+            false
+        });
+        assert_eq!(found, None);
+        let defaults = [PathBuf::from("/bin/git"), PathBuf::from("/usr/bin/git")];
+        assert_eq!(checked.into_inner(), defaults);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_candidates_are_executable_regular_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let base =
+            std::env::temp_dir().join(format!("rustograph-git-candidate-{}", std::process::id()));
+        if base.exists() {
+            // 같은 pid로 중단된 이전 실행의 잔재 — 링크를 다시 만들 수 있게 비운다.
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+        std::fs::create_dir_all(base.join("dir/git")).unwrap();
+        let program = base.join("git");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!is_executable_file(&program), "no execute bit");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_executable_file(&program));
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&program, &alias).unwrap();
+        assert!(is_executable_file(&alias), "links are followed");
+        assert!(!is_executable_file(&base.join("dir/git")), "a directory");
+        assert!(!is_executable_file(&base.join("missing")));
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
