@@ -145,7 +145,7 @@ fn cmd_schema(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     let text = export::to_json(&doc);
     match a.get("out") {
         Some(p) => {
-            write_output(a, Path::new(p), &text, &[])?;
+            write_output(a, Path::new(p), &text, &[], None)?;
             writeln!(out, "wrote {p}").ok();
         }
         None => {
@@ -171,7 +171,7 @@ fn cmd_routes(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     };
     match a.get("out") {
         Some(p) => {
-            write_output(a, Path::new(p), &text, &[])?;
+            write_output(a, Path::new(p), &text, &[], None)?;
             writeln!(out, "wrote {p}").ok();
         }
         None => {
@@ -228,8 +228,16 @@ fn routes_client(a: &Args) -> Result<String, String> {
     Ok(export::to_json(&doc))
 }
 
-/// 출력 형식과 무관하게 그래프 입력과 수확 원본을 보호한다.
-fn write_output(a: &Args, path: &Path, text: &str, extra: &[PathBuf]) -> Result<(), String> {
+/// 출력 형식과 무관하게 그래프 입력과 수확 원본을 보호한다. `harvested`는 결과 문서를 만든
+/// 수확이 읽은 입력이다 — 없으면(schema·routes, semantic 캐시 적중) 보호 목록을 위해
+/// 모듈 트리를 다시 찾는다.
+fn write_output(
+    a: &Args,
+    path: &Path,
+    text: &str,
+    extra: &[PathBuf],
+    harvested: Option<&source::HarvestInputs>,
+) -> Result<(), String> {
     let mut protected = extra.to_vec();
     let directory = Path::new(a.get("dir").unwrap_or("."));
     protected.extend(
@@ -243,19 +251,40 @@ fn write_output(a: &Args, path: &Path, text: &str, extra: &[PathBuf]) -> Result<
         }
     }
     if a.get("graph").is_none() {
-        let (files, unresolved_includes) = source::input_files(directory)?;
-        protected.extend(files);
-        if unresolved_includes && path.exists() {
-            return Err("cannot safely replace an existing output with unresolved include paths; choose a new output path or write to stdout".into());
+        let listed = match harvested {
+            Some(inputs) => inputs.protected_files(),
+            None => source::input_files(directory)?,
+        };
+        if path.exists() {
+            if let Some(refusal) = replacement_refusal(&listed) {
+                return Err(refusal);
+            }
         }
+        protected.extend(listed.files);
     }
     export::write_file(path, text.as_bytes(), &protected)
+}
+
+/// 보호 목록에 빠진 입력이 있을 수 있으면 기존 출력을 교체하지 않는 이유 — 기존 파일이
+/// 그 빠진 입력일 수 있다. 새 경로와 표준 출력은 덮어쓸 원본이 없어 막지 않는다.
+fn replacement_refusal(listed: &source::ProtectedInputs) -> Option<String> {
+    if let Some(first) = listed.unloaded_modules.first() {
+        return Some(format!(
+            "cannot safely replace an existing output: {} module file(s) could not be read or parsed (first: {}), so the modules and include inputs they declare are unknown; fix them, choose a new output path or write to stdout",
+            listed.unloaded_modules.len(),
+            first.display()
+        ));
+    }
+    listed.unresolved_includes.then(|| {
+        "cannot safely replace an existing output with unresolved include paths; choose a new output path or write to stdout".to_string()
+    })
 }
 
 fn cmd_graph(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     let level = cli_args::level_of(a)?;
     // 수확은 항상 최대 깊이로 — 얕은 레벨은 투영이다.
-    let doc = cli_args::document_for(a, true)?.view(level)?;
+    let (doc, inputs) = cli_args::document_with_inputs(a, true, a.get("out").is_some())?;
+    let doc = doc.view(level)?;
     let text = match a.get("format").unwrap_or("json") {
         "json" => export::to_json(&doc),
         "mermaid" => export::to_mermaid(&doc),
@@ -264,7 +293,13 @@ fn cmd_graph(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     match a.get("out") {
         Some(p) => {
             let path = Path::new(p);
-            write_output(a, path, &text, &export::document_inputs(&doc))?;
+            write_output(
+                a,
+                path,
+                &text,
+                &export::document_inputs(&doc),
+                inputs.as_ref(),
+            )?;
             writeln!(out, "wrote {p}").ok();
         }
         None => {
@@ -360,16 +395,14 @@ fn cmd_rules(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
         .map(|f| Path::new(f).parent().unwrap_or(dir.as_path()).to_path_buf())
         .unwrap_or_else(|| dir.clone());
     let cfg: config::Config = match a.get("config") {
-        Some(f) => {
-            let src = std::fs::read_to_string(f).map_err(|e| format!("cannot read {f}: {e}"))?;
-            serde_yml::from_str(&src).map_err(|e| format!("bad {f}: {e}"))?
-        }
+        // 명시 --config는 실행한 사람이 고른 입력이라 파이프·프로세스 치환도 읽는다(상한은 같다).
+        Some(f) => config::load_file(Path::new(f), config::FileKinds::AnyReadable)?,
         None => match config::load(&dir)? {
             Some(c) => c,
             None => return Err(format!("no .rustograph.yml in {}", dir.display())),
         },
     };
-    let doc = cli_args::document_for(a, true)?;
+    let (doc, inputs) = cli_args::document_with_inputs(a, true, a.has("write-baseline"))?;
     let mut report = rules::check(&doc, &cfg);
     // 기준선 경로 — --baseline이 cfg.baseline을 이긴다.
     let baseline_path = a
@@ -391,6 +424,7 @@ fn cmd_rules(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
             path,
             &rules::Baseline::render(&report.violations),
             &export::document_inputs(&doc),
+            inputs.as_ref(),
         )?;
         writeln!(
             out,
@@ -402,7 +436,14 @@ fn cmd_rules(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
         return Ok(0);
     }
     if let Some(path) = &baseline_path {
-        match std::fs::read_to_string(path) {
+        // 설정의 baseline:은 분석 대상 저장소가 고른다 — 장치·FIFO는 열지 않는다. 명시
+        // --baseline은 실행한 사람이 고른 입력이라 파이프도 읽는다. 둘 다 상한까지만 읽는다.
+        let kinds = if a.get("baseline").is_some() {
+            config::FileKinds::AnyReadable
+        } else {
+            config::FileKinds::RegularOnly
+        };
+        match config::read_bounded_text(path, config::MAX_FILE_BYTES, kinds) {
             Ok(src) => rules::apply_baseline(&mut report, &rules::Baseline::parse(&src)),
             // 명시 --baseline은 없는 파일을 가리키면 오타일 가능성이 높다 — 오류.
             // cfg.baseline은 NotFound만 도입 전으로 본다 — 권한 오류나
@@ -669,5 +710,46 @@ mod tests {
         let (code, _, err) = run_cli(&["query", "--dir", "no-such-dir-xyz"]);
         assert_eq!(code, 2);
         assert!(err.contains("vertex ID"));
+    }
+
+    /// `graph --out`·`rules --write-baseline`은 문서를 만든 수확이 읽은 입력으로 보호 목록을
+    /// 만든다 — 보호 목록 때문에 워크스페이스를 다시 수확하면 대형 저장소에서 시간과 누수 AST
+    /// 메모리가 두 배였다. 표준 출력 실행과 같은 수의 파일만 파싱해야 한다.
+    #[test]
+    fn file_outputs_reuse_the_documents_harvest() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture");
+        let dir = fixture.to_str().unwrap();
+        let tmp = std::env::temp_dir().join(format!("rustograph-cli-out-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let rules_config = tmp.join("rules.yml");
+        std::fs::write(&rules_config, "components: {}\ndeps: {}\n").unwrap();
+        let parsed_by = |args: &[&str]| {
+            let before = source::parsed_files();
+            let (code, _, err) = run_cli(args);
+            assert_eq!(code, 0, "{args:?}: {err}");
+            source::parsed_files() - before
+        };
+        let stdout = parsed_by(&["graph", "--level", "symbol", "--dir", dir]);
+        assert!(stdout > 0, "the harvest must parse the fixture");
+        // fixture에는 풀 수 없는 include!가 있어 기존 출력 교체가 거부된다 — 새 경로에 쓴다.
+        let (graph_out, baseline) = (tmp.join("graph.json"), tmp.join("baseline.txt"));
+        let (graph_out, baseline) = (graph_out.to_str().unwrap(), baseline.to_str().unwrap());
+        let rules_config = rules_config.to_str().unwrap();
+        let to_file = parsed_by(&[
+            "graph", "--level", "symbol", "--dir", dir, "--out", graph_out,
+        ]);
+        let to_baseline = parsed_by(&[
+            "rules",
+            "--write-baseline",
+            "--dir",
+            dir,
+            "--config",
+            rules_config,
+            "--baseline",
+            baseline,
+        ]);
+        assert_eq!((to_file, to_baseline), (stdout, stdout));
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 }

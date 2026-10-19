@@ -8,11 +8,33 @@ use std::process::{Command, Stdio};
 struct Snapshot(PathBuf);
 
 impl Snapshot {
-    fn new(name: &str) -> Self {
+    /// 문서 하나를 테스트별 임시 파일로 쓴다.
+    fn write(name: &str, doc: &Value) -> Self {
         let path = std::env::temp_dir().join(format!(
             "rustograph-analysis-{}-{name}.json",
             std::process::id()
         ));
+        std::fs::write(&path, serde_json::to_vec(doc).unwrap()).unwrap();
+        Self(path)
+    }
+
+    /// 정점 n개의 확정 call 고리 — DFS 깊이가 n인 SCC 하나다.
+    fn ring(name: &str, n: usize) -> Self {
+        let id = |i: usize| format!("app::f{i}");
+        let vertices: Vec<_> = (0..n)
+            .map(|i| json!({"id": id(i), "kind": "fn", "crate": "app", "module": "app"}))
+            .collect();
+        let edges: Vec<_> = (0..n)
+            .map(|i| json!({"from": id(i), "to": id((i + 1) % n), "kind": "call"}))
+            .collect();
+        let doc = json!({
+            "version": 1, "tool": "rustograph", "level": "symbol", "root": ".",
+            "roots": [id(0)], "vertices": vertices, "edges": edges
+        });
+        Self::write(name, &doc)
+    }
+
+    fn new(name: &str) -> Self {
         let vertices: Vec<_> = ["root", "shared", "sibling", "caller", "entry"]
             .into_iter()
             .map(|id| json!({"id": id, "kind": "fn", "crate": "app", "module": "app"}))
@@ -28,8 +50,7 @@ impl Snapshot {
                 {"from": "entry", "to": "caller", "kind": "call"}
             ]
         });
-        std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
-        Self(path)
+        Self::write(name, &doc)
     }
 
     fn cli(&self, args: &[&str]) -> Value {
@@ -110,4 +131,147 @@ fn mcp_and_cli_share_directional_results_and_caps() {
         report,
         snapshot.cli(&["impact", "root", "--depth", "10", "--max", "2"])
     );
+}
+
+/// MCP 서버는 질의 색인·cycles 보고서를 세션 안에서 재사용한다 — 같은 세션에서 섞어
+/// 두 바퀴 부른 query·impact·paths·dead·cycles가 매번 같은 인자의 CLI JSON과 같아야 한다.
+#[test]
+fn mcp_repeated_calls_match_cli() {
+    let vertices: Vec<_> = ["a", "b", "c", "d", "e"]
+        .into_iter()
+        .map(|id| json!({"id": id, "kind": "fn", "crate": "app", "module": "app"}))
+        .collect();
+    let snapshot = Snapshot::write(
+        "mcp-repeat",
+        &json!({
+            "version": 1, "tool": "rustograph", "level": "symbol", "root": ".",
+            "roots": ["a"], "vertices": vertices,
+            "edges": [
+                {"from": "a", "to": "b", "kind": "call"},
+                {"from": "b", "to": "c", "kind": "call"},
+                {"from": "c", "to": "a", "kind": "references"},
+                {"from": "c", "to": "d", "kind": "call"},
+                {"from": "e", "to": "d", "kind": "call"}
+            ]
+        }),
+    );
+    let calls = [
+        (
+            json!({"name": "rustograph_query", "arguments": {"id": "c"}}),
+            vec!["query", "c"],
+        ),
+        (
+            json!({"name": "rustograph_impact", "arguments": {"id": "d", "depth": 10, "max": 3}}),
+            vec!["impact", "d", "--depth", "10", "--max", "3"],
+        ),
+        (
+            json!({"name": "rustograph_paths", "arguments": {"from": "a", "to": "d"}}),
+            vec!["paths", "a", "d"],
+        ),
+        (
+            json!({"name": "rustograph_dead", "arguments": {}}),
+            vec!["dead", "--format", "json"],
+        ),
+        (
+            json!({"name": "rustograph_cycles", "arguments": {"level": "symbol"}}),
+            vec!["cycles", "--level", "symbol", "--format", "json"],
+        ),
+        (
+            json!({"name": "rustograph_query", "arguments": {"id": "a", "depth": 2}}),
+            vec!["query", "a", "--depth", "2"],
+        ),
+    ];
+    // 두 번째 바퀴는 첫 바퀴가 만든 색인·보고서를 다시 쓴다.
+    let rounds: Vec<_> = calls.iter().chain(calls.iter()).collect();
+    let requests: Vec<String> = rounds
+        .iter()
+        .enumerate()
+        .map(|(i, (params, _))| {
+            json!({"jsonrpc": "2.0", "id": i + 1, "method": "tools/call", "params": params})
+                .to_string()
+        })
+        .collect();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rustograph"))
+        .args(["mcp", "--graph"])
+        .arg(&snapshot.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{}", requests.join("\n")).unwrap();
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses: Vec<Value> = output
+        .stdout
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), rounds.len());
+    for (i, (response, (_, cli))) in responses.iter().zip(&rounds).enumerate() {
+        assert_eq!(
+            response["result"]["isError"],
+            Value::Null,
+            "call {i}: {response}"
+        );
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let report: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(report, snapshot.cli(cli), "call {i}: {cli:?}");
+    }
+}
+
+/// 재귀 Tarjan은 고리 수만 정점에서 메인 스레드 스택을 넘겨 MCP 서버째 abort시켰다
+/// (종료 코드 134 — 같은 세션의 다른 도구도 함께 사라진다). cycles에 답하고 다음
+/// 요청(ping)에도 답해야 한다.
+#[test]
+fn mcp_cycles_answers_on_a_deep_ring() {
+    let n = 50_000;
+    let snapshot = Snapshot::ring("mcp-deep-ring", n);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rustograph"))
+        .args(["mcp", "--graph"])
+        .arg(&snapshot.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let cycles = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "rustograph_cycles", "arguments": {}}
+    });
+    let ping = json!({"jsonrpc": "2.0", "id": 2, "method": "ping"});
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{cycles}\n{ping}").unwrap();
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses: Vec<Value> = output
+        .stdout
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 2);
+    let report: Value = serde_json::from_str(
+        responses[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report["cycles"].as_array().unwrap().len(), 1);
+    assert_eq!(report["cycles"][0]["members"].as_array().unwrap().len(), n);
+    assert_eq!(responses[1]["id"], 2);
+    assert_eq!(responses[1]["result"], json!({}));
 }

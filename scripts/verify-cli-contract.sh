@@ -81,6 +81,36 @@ check 0 "graph exclude"     graph --exclude-tests
 check 2 "tests xor"         dead --tests --exclude-tests
 check 0 "graph target"      graph --target x86_64-pc-windows-msvc
 
+# 깊은 입력 — 재귀 Tarjan은 DFS 경로 길이만큼 스택을 써서 수만 정점 고리에서
+# 프로세스가 abort(134)했다. 계약 밖 종료 코드라 실제 바이너리로 본다 — 고리는
+# 순환 하나라 --strict는 1이다. --graph가 있으면 check()가 붙이는 --dir는 무시된다.
+awk -v n=100000 'BEGIN {
+	printf "{\"version\":1,\"tool\":\"rustograph\",\"level\":\"symbol\",\"root\":\".\",\"roots\":[\"r0\"],\"vertices\":["
+	for (i = 0; i < n; i++) printf "%s{\"id\":\"r%d\",\"kind\":\"fn\",\"crate\":\"r\",\"module\":\"r\"}", (i ? "," : ""), i
+	printf "],\"edges\":["
+	for (i = 0; i < n; i++) printf "%s{\"from\":\"r%d\",\"to\":\"r%d\",\"kind\":\"call\"}", (i ? "," : ""), i, (i + 1) % n
+	print "]}"
+}' > "$FIX/ring.json"
+check 1 "cycles deep ring"  cycles --level symbol --strict --graph "$FIX/ring.json"
+# cfg 평가기도 괄호 중첩마다 재귀했다 — not( 10만 겹 cfg 하나로 --exclude-tests가
+# abort(134)했다. 상한을 넘는 조건은 문법 오류처럼 미지라 정점이 남는다 — 루트에서
+# 안 닿는 정점이 남으니 dead --strict는 1이다(지워졌다면 0).
+awk -v n=100000 'BEGIN {
+	printf "{\"version\":1,\"tool\":\"rustograph\",\"level\":\"symbol\",\"root\":\".\",\"roots\":[\"c::root\"],\"vertices\":["
+	printf "{\"id\":\"c::root\",\"kind\":\"fn\",\"crate\":\"c\",\"module\":\"c\"},"
+	printf "{\"id\":\"c::kept\",\"kind\":\"fn\",\"crate\":\"c\",\"module\":\"c\",\"cfg\":\""
+	for (i = 0; i < n; i++) printf "not("
+	printf "test"
+	for (i = 0; i < n; i++) printf ")"
+	print "\"}],\"edges\":[]}"
+}' > "$FIX/deep-cfg.json"
+check 1 "dead deep cfg"     dead --strict --exclude-tests --graph "$FIX/deep-cfg.json"
+# 다른 도구가 만든 문서의 ID에 제어 문자(JSON \u001b = ESC)가 있으면 텍스트·순회 출력에
+# 옮기지 않고 입력 오류(2)다 — reach도 root 인자 오류(64)가 아니라 문서 오류라 2다.
+printf '%s' '{"version":1,"tool":"rustograph","level":"symbol","root":".","roots":["c::r"],"vertices":[{"id":"c::r","kind":"fn","crate":"c","module":"c"},{"id":"c::\u001b[2Jx","kind":"fn","crate":"c","module":"c"}],"edges":[{"from":"c::r","to":"c::\u001b[2Jx","kind":"call"},{"from":"c::\u001b[2Jx","to":"c::r","kind":"call"}]}' > "$FIX/tainted.json"
+check 2 "cycles tainted id" cycles --level symbol --graph "$FIX/tainted.json"
+check 2 "reach tainted id"  reach c::r --graph "$FIX/tainted.json"
+
 # rules baseline — 얼리기와 억눌림 계약. app이 core를 참조하지 못하게
 # 거꾸로 선 룰셋으로 위반을 만든다.
 cat > "$FIX/deny.yml" <<'EOF'
@@ -95,6 +125,18 @@ check 1 "rules deny"        rules --strict --config "$FIX/deny.yml"
 check 0 "baseline write"    rules --config "$FIX/deny.yml" --baseline "$FIX/base.txt" --write-baseline
 check 0 "baseline strict"   rules --strict --config "$FIX/deny.yml" --baseline "$FIX/base.txt"
 check 2 "baseline missing"  rules --config "$FIX/deny.yml" --baseline /nonexistent-xyz.txt
+# 명시 --baseline·--config는 실행한 사람이 고른 입력이라 파이프·프로세스 치환도 읽는다 —
+# 장치를 가리켜도 크기 상한에서 끝나 2다. 설정의 baseline:처럼 저장소가 고른 경로는 정규
+# 파일만 연다(tests/integration.rs가 FIFO로 본다).
+check 2 "baseline device"   rules --config "$FIX/deny.yml" --baseline /dev/zero
+check 1 "config pipe"       rules --strict --config <(cat "$FIX/deny.yml")
+check 0 "baseline pipe"     rules --strict --config "$FIX/deny.yml" --baseline <(cat "$FIX/base.txt")
+got=0
+cat "$FIX/deny.yml" | "$BIN" rules --strict --config /dev/stdin --dir "$FIX/fixture" >/dev/null 2>&1 || got=$?
+if [ "$got" -ne 1 ]; then
+	echo "FAIL config stdin: expected 1, got $got" >&2
+	fails=$((fails+1))
+fi
 grep -q "allow|fixture_app" "$FIX/base.txt" || {
 	echo "FAIL baseline file: no violation key written" >&2
 	fails=$((fails+1))

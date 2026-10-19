@@ -78,7 +78,7 @@ dispatch 하나만 선언한다). 둘 다 없으면 사실 0건과 `route-covera
   `NormalizePath::trim_trailing_slash(svc)`)이 있으면 trim은 끝 슬래시 없는 템플릿을, append는 끝 슬래시 있는 템플릿을
   `optional`로 낸다. `Router::layer`·`MethodRouter::layer` 인자나 변수로 넘긴 레이어처럼 라우팅 전에 동작한다는 증거가
   없으면 효과가 없다고 본다(틀리면 선언이 strict로 남아 소비자는 끝 슬래시 불일치 경고를 낸다 — 거짓 error가 아니다).
-- **location**: `.route()`의 경로 인자(줄, UTF-16 열 — 알려진 결함: GRAPH-EXCHANGE는 UTF-8 바이트 열을 요구하므로 비ASCII 줄에서 어긋난다). 경로 인자가 `&str` 상수면 그 값을 쓴다.
+- **location**: `.route()`의 경로 인자(줄, 그 줄의 UTF-8 바이트 오프셋 + 1인 열 — GRAPH-EXCHANGE 계약이며 schema·client 사실과 같은 환산이다). 경로 인자가 `&str` 상수면 그 값을 쓴다.
 
 ## actix-web
 
@@ -128,7 +128,7 @@ dispatch 하나만 선언한다). 둘 다 없으면 사실 0건과 `route-covera
 |---|---|
 | 워크스페이스에 axum·actix-web 의존이 없음 | 사실 0건 + `route-coverage:` |
 | 확인한 메이저 밖의 버전 | `route-framework-version-unknown:` |
-| 리터럴·`&str` 상수가 아닌 경로 | dynamic 사실(원문) + `route-coverage:` |
+| 리터럴·`&str` 상수가 아닌 경로 | dynamic 사실(원문 요약 — 공백류를 한 칸으로 접고 제어 문자·NEL·U+2028/2029를 지운 한 줄, UTF-16 2,048 단위 이하. 템플릿으로 못 바꾼 리터럴 경로도 같다) + `route-coverage:` |
 | 평가하지 못한 nest·merge·서비스·설정 함수 | 그 자리 접두사가 리터럴이면 `templatePrefixes` 스코프의 `route-coverage:`, 아니면 스코프 없음 |
 | 조건·반복 안의 actix `ServiceConfig` 등록 | `route-coverage:` |
 | impl·trait 메서드 안의 `Router::new()`·`App::new()` | `route-coverage:`(추출기는 모듈 수준 함수만 평가한다) |

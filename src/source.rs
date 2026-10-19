@@ -40,32 +40,110 @@ pub struct Options {
 /// 'static으로 누수시킨다. CLI는 짧게 살다 종료하므로 해제 비용이 없다.
 type Arena = BTreeMap<PathBuf, &'static [syn::Item]>;
 
+/// 분석 대상이 경로를 고르는 소스를 읽을 때의 크기 상한이다. 생성 코드(수 MB)는 넉넉히
+/// 덮되, 상한 없는 읽기가 거대한 sparse 파일을 통째로 메모리에 올리지 않게 한다.
+/// 판단값이다(rustc의 문서화된 한도가 아니다).
+pub(crate) const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 분석 대상 소스를 `max_bytes`까지만 읽는다 — 정규 파일만 연다([`require_regular_file`]).
+/// 정규 파일이 아니면 `InvalidInput`, 상한을 넘으면 `InvalidData` 오류다.
+pub(crate) fn read_source_bounded(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::Read;
+    require_regular_file(path)?;
+    let mut text = String::new();
+    std::fs::File::open(path)?
+        .take(max_bytes.saturating_add(1))
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is larger than {max_bytes} bytes", path.display()),
+        ));
+    }
+    Ok(text)
+}
+
+/// 분석 대상이 경로를 고른 소스가 정규 파일인지 연기 전에 본다 — `metadata`는 stat이라
+/// FIFO에서도 막히지 않는다. FIFO는 여는 순간 쓰는 쪽을 영원히 기다리고 장치(`/dev/zero`,
+/// 그것을 가리키는 링크)는 끝없이 읽혀, 보지 않고 읽으면 수확이 끝나지 않거나 메모리를 다
+/// 쓴다. 정규 파일이 아니면 `InvalidInput`이고 문구에 해결 방향을 싣는다 — 호출자가 앞에
+/// 경로를 붙인다.
+fn require_regular_file(path: &Path) -> std::io::Result<()> {
+    if std::fs::metadata(path)?.is_file() {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "not a regular file (devices, FIFOs and directories are not read); \
+         point it at a regular .rs file",
+    ))
+}
+
 /// `dir`의 cargo 워크스페이스를 수확해 문서를 만든다.
 /// 실패는 문자열 오류 — 빈 그래프로 성공한 척하지 않는다.
 /// semantic 모드에서 cache가 켜져 있으면 소스 지문이 같은 이전 수확
 /// 문서를 재사용한다 — ra_ap 로드가 수십 초라 반복 질의의 실제 병목이다.
 pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
-    // feature가 꺼진 빌드는 여기서 오류 — 조용히 syn으로 떨어지면
-    // --semantic이 받은 결과가 의미 해석이 아니게 되어 거짓이 된다.
+    require_semantic_build(opts)?;
+    let meta = cargo_meta::load(dir)?;
+    load_with(dir, &meta, opts)
+}
+
+/// feature가 꺼진 빌드는 여기서 오류 — 조용히 syn으로 떨어지면
+/// --semantic이 받은 결과가 의미 해석이 아니게 되어 거짓이 된다.
+fn require_semantic_build(opts: &Options) -> Result<(), String> {
     if opts.semantic && !cfg!(feature = "semantic") {
         return Err(
             "--semantic requires a build with the `semantic` feature (cargo build --features semantic)"
                 .to_string(),
         );
     }
+    Ok(())
+}
+
+/// 이미 읽은 메타데이터로 [`load`]와 같은 문서를 만든다 — deps 보고서처럼 메타데이터를
+/// 따로 쓰는 호출자가 한 실행에서 `cargo metadata`를 두 번 돌리지 않게 한다.
+pub fn load_with(dir: &Path, meta: &Metadata, opts: &Options) -> Result<Document, String> {
+    load_inner(dir, meta, opts, false).map(|(doc, _)| doc)
+}
+
+/// [`load`]와 같은 문서와, 그 문서를 만든 수확이 읽은 입력을 돌려준다 — 문서를 파일로
+/// 쓰는 명령이 입력 보호 목록을 위해 워크스페이스를 다시 수확하지 않게 한다.
+/// semantic 캐시가 적중하면 수확이 없어 입력은 None이다(호출자가 [`input_files`]로 찾는다).
+pub(crate) fn load_with_inputs(
+    dir: &Path,
+    opts: &Options,
+) -> Result<(Document, Option<HarvestInputs>), String> {
+    require_semantic_build(opts)?;
     let meta = cargo_meta::load(dir)?;
+    load_inner(dir, &meta, opts, true)
+}
+
+/// 캐시를 거친 수확 — `want_inputs`면 수확이 읽은 입력도 함께 돌려준다.
+fn load_inner(
+    dir: &Path,
+    meta: &Metadata,
+    opts: &Options,
+    want_inputs: bool,
+) -> Result<(Document, Option<HarvestInputs>), String> {
+    require_semantic_build(opts)?;
     // 캐시 키는 모든 입력의 지문 — 지문을 못 재면 캐시를 끈다(실패는 부가적).
     let cache = if opts.semantic && opts.cache {
-        fingerprint(dir, &meta, opts).map(|key| (key, cache_path(&meta)))
+        fingerprint(dir, meta, opts).map(|key| (key, cache_path(meta)))
     } else {
         None
     };
     if let Some((key, path)) = &cache {
         if let Some(doc) = read_cache(path, *key, &meta.workspace_root) {
-            return Ok(doc);
+            return Ok((doc, None));
         }
     }
-    let (doc, uses_include) = harvest(dir, &meta, opts, None)?;
+    let mut sink = Sink {
+        want_edges: true,
+        want_inputs,
+        ..Default::default()
+    };
+    let (doc, uses_include) = harvest(dir, meta, opts, Some(&mut sink))?;
     if let Some((key, path)) = &cache {
         // 지문이 못 보는 입력을 소비한 문서는 캐시에 쓰지 않는다 —
         // include!/OUT_DIR 생성 파일과 루트 밖 #[path] 파일, 지문이
@@ -74,27 +152,57 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Document, String> {
             write_cache(path, *key, &doc);
         }
     }
-    Ok(doc)
+    Ok((doc, sink.inputs))
 }
 
-/// syn 심볼 그래프와 정점별 소스 범위를 함께 돌려준다 — `schema`가
-/// relation-use 사실을 impact와 같은 정점 ID로 귀속하는 데 쓴다.
+/// syn 심볼 그래프와 정점별 소스 범위를 함께 돌려준다 — 소스 위치를 impact와
+/// 같은 정점 ID로 귀속하려는 라이브러리 호출자용이다.
 /// 기본 옵션(심볼 레벨, 외부 크레이트 정점 없음, semantic 없음)으로
-/// 수확한다 — 정점 집합은 `impact`/`reach` 기본 실행과 같다.
+/// 수확한다 — 정점 집합은 `impact`/`reach` 기본 실행과 같다. 간선까지 만든
+/// 완전한 문서다. 정점 ID만 쓰는 `schema`는 간선 해석을 건너뛰는 같은 수확을 쓴다.
 pub fn owner_spans(
     dir: &Path,
     meta: &Metadata,
 ) -> Result<(Document, Vec<harvest::OwnerSpan>), String> {
-    let opts = Options {
-        symbol_level: true,
-        ..Default::default()
-    };
     let mut sink = Sink {
         spans: Some(Vec::new()),
+        want_edges: true,
         ..Default::default()
     };
-    let (doc, _) = harvest(dir, meta, &opts, Some(&mut sink))?;
+    let (doc, _) = harvest(dir, meta, &span_options(), Some(&mut sink))?;
     Ok((doc, sink.spans.unwrap_or_default()))
+}
+
+/// 정점 ID 집합과 정점별 소스 범위만 돌려준다 — `schema`가 relation-use 사실을
+/// impact와 같은 정점 ID로 귀속하는 데 쓴다. 간선은 해석하지 않는다: 본문 이름
+/// 팬아웃 간선이 대형 저장소에서 이 수확 시간·메모리의 대부분인데 귀속에는 정점과
+/// 범위만 필요하다. 정점·범위는 1패스가 다 만들므로 [`owner_spans`]와 같다.
+pub(crate) fn vertex_spans(
+    dir: &Path,
+    meta: &Metadata,
+) -> Result<(BTreeSet<String>, Vec<harvest::OwnerSpan>), String> {
+    let mut sink = Sink {
+        spans: Some(Vec::new()),
+        want_edges: false,
+        ..Default::default()
+    };
+    let (doc, _) = harvest(dir, meta, &span_options(), Some(&mut sink))?;
+    Ok((vertex_id_set(doc), sink.spans.unwrap_or_default()))
+}
+
+/// 정점 범위를 쓰는 수확의 옵션 — 심볼 레벨, 외부 크레이트 정점 없음, semantic 없음.
+/// 정점 집합이 `impact`/`reach` 기본 실행과 같아야 사실의 usr가 그래프 정점이 된다.
+fn span_options() -> Options {
+    Options {
+        symbol_level: true,
+        ..Default::default()
+    }
+}
+
+/// 간선 없이 만든 문서에서 정점 ID만 남긴다 — 간선이 빈 문서가 완전한 그래프처럼
+/// 다른 질의로 흘러가지 않게 호출자에게는 ID 집합만 넘긴다.
+fn vertex_id_set(doc: Document) -> BTreeSet<String> {
+    doc.vertices.into_iter().map(|v| v.id).collect()
 }
 
 /// 수확 부산물을 받는 그릇 — 필요한 칸만 Some으로 채워 넘긴다.
@@ -108,11 +216,19 @@ struct Sink {
     tree: Option<ModTree>,
     arena: Option<Arena>,
     want_tree: bool,
+    /// 2패스(본문·속성 간선)를 돌릴지 — 정점 ID·범위·트리만 쓰는 호출자는 false다.
+    /// sink 유무로 추정하지 않고 명시한다: 간선이 필요한 sink 호출자가 생겼을 때
+    /// 조용히 간선 없는 문서를 받지 않게 하려는 것이다.
+    want_edges: bool,
+    /// 이 수확이 읽은 입력을 `inputs`로 넘길지 — 문서를 파일로 쓰는 호출자만 true다.
+    want_inputs: bool,
+    inputs: Option<HarvestInputs>,
 }
 
-/// `routes`가 쓰는 수확 산출물 — 문서·정점 범위·모듈 트리·AST 아레나.
+/// `routes`가 쓰는 수확 산출물 — 정점 ID·정점 범위·모듈 트리·AST 아레나.
+/// 간선은 만들지 않으므로 문서 대신 정점 ID 집합만 싣는다.
 pub(crate) struct Parts {
-    pub(crate) doc: Document,
+    pub(crate) vertex_ids: BTreeSet<String>,
     pub(crate) spans: Vec<harvest::OwnerSpan>,
     pub(crate) tree: ModTree,
     arena: Arena,
@@ -126,43 +242,86 @@ impl Parts {
     }
 }
 
-/// 기본 옵션(심볼 레벨)으로 수확하고 트리·아레나까지 돌려준다.
+/// 기본 옵션(심볼 레벨)으로 수확하고 트리·아레나까지 돌려준다. 라우트 추출은
+/// 간선을 읽지 않으므로 간선 해석을 건너뛴다.
 pub(crate) fn harvest_parts(dir: &Path, meta: &Metadata) -> Result<Parts, String> {
-    let opts = Options {
-        symbol_level: true,
-        ..Default::default()
-    };
     let mut sink = Sink {
         spans: Some(Vec::new()),
         want_tree: true,
+        want_edges: false,
         ..Default::default()
     };
-    let (doc, _) = harvest(dir, meta, &opts, Some(&mut sink))?;
+    let (doc, _) = harvest(dir, meta, &span_options(), Some(&mut sink))?;
     let (Some(tree), Some(arena)) = (sink.tree, sink.arena) else {
         return Err("internal error: harvest did not return its module tree".to_string());
     };
     Ok(Parts {
-        doc,
+        vertex_ids: vertex_id_set(doc),
         spans: sink.spans.unwrap_or_default(),
         tree,
         arena,
     })
 }
 
-/// 산출물 경로가 실제 수확 입력을 덮어쓰지 않도록 파일 목록을 돌려준다.
-/// 모듈·사용자 지정 타깃은 수확 아레나를, include 계열은 별도 경로 검사를 쓴다.
-pub(crate) fn input_files(dir: &Path) -> Result<(Vec<PathBuf>, bool), String> {
-    let metadata = cargo_meta::load(dir)?;
-    let parts = harvest_parts(dir, &metadata)?;
-    let mut files: BTreeSet<PathBuf> = parts.arena.keys().cloned().collect();
-    let unresolved_includes = include_inputs(&parts.arena, &mut files);
-    files.extend(parts.tree.orphan_files);
-    for path in files
-        .clone()
-        .into_iter()
-        .chain(std::iter::once(metadata.workspace_root.join("Cargo.toml")))
-    {
+/// 수확이 읽은 입력 — 산출물이 덮어쓰면 안 되는 파일 목록의 재료다. 문서를 만든 수확이
+/// 이것을 넘기면 `--out`이 보호 목록을 위해 워크스페이스를 다시 수확하지 않는다
+/// (cargo metadata·전체 파싱을 한 번 더 해 대형 저장소에서 `--out` 시간이 두 배였다).
+pub(crate) struct HarvestInputs {
+    arena: Arena,
+    orphan_files: Vec<PathBuf>,
+    /// 읽거나 파싱하지 못한 모듈 파일 — 끝까지 간 수확에는 없다(수확은 그런 파일에서
+    /// 실패한다). 관대 모드로 트리만 다시 찾은 [`input_files`]만 채운다.
+    unloaded: Vec<PathBuf>,
+    workspace_root: PathBuf,
+}
+
+/// `--out` 입력 보호 목록 — 덮어쓰면 안 되는 파일과, 목록에 빠진 입력이 있을 수 있는
+/// 이유다. 이유가 있으면 호출자가 기존 출력 교체를 보수적으로 거부한다.
+pub(crate) struct ProtectedInputs {
+    /// 산출물이 덮어쓰면 안 되는 파일.
+    pub(crate) files: Vec<PathBuf>,
+    /// 리터럴로 풀지 못한 include 경로가 있다 — 그 대상은 목록에 없다.
+    pub(crate) unresolved_includes: bool,
+    /// 읽거나 파싱하지 못한 모듈 파일(경로순) — 파일은 목록에 있지만 그 파일이 선언한
+    /// 하위 모듈·include 입력은 없다.
+    pub(crate) unloaded_modules: Vec<PathBuf>,
+}
+
+impl HarvestInputs {
+    /// 산출물 경로가 실제 수확 입력을 덮어쓰지 않도록 보호 목록을 만든다. 모듈·사용자 지정
+    /// 타깃은 수확 아레나를, include 계열은 별도 경로 검사를 쓴다.
+    pub(crate) fn protected_files(&self) -> ProtectedInputs {
+        let mut files: BTreeSet<PathBuf> = self.arena.keys().cloned().collect();
+        let unresolved_includes = include_inputs(&self.arena, &mut files);
+        files.extend(self.orphan_files.iter().cloned());
+        files.extend(self.unloaded.iter().cloned());
+        let manifests = manifests_above(
+            files
+                .iter()
+                .chain(std::iter::once(&self.workspace_root.join("Cargo.toml"))),
+        );
+        files.extend(manifests);
+        ProtectedInputs {
+            files: files.into_iter().collect(),
+            unresolved_includes,
+            unloaded_modules: self.unloaded.clone(),
+        }
+    }
+}
+
+/// 파일들의 조상 디렉터리에 있는 매니페스트·설정 파일 — 수확 입력이다. 디렉터리마다 한
+/// 번만 본다: 파일마다 조상 전부를 stat하면 깊은 트리에서 파일 수 × 깊이 × 4번이다.
+/// 이미 본 디렉터리에서 멈춰도 된다 — 처음 볼 때 그 위 조상까지 이미 다 봤다.
+fn manifests_above<'a>(paths: impl Iterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
+    let mut seen: BTreeSet<&Path> = BTreeSet::new();
+    let mut found = Vec::new();
+    for path in paths {
         for parent in path.ancestors().skip(1) {
+            if !seen.insert(parent) {
+                break;
+            }
+            #[cfg(test)]
+            PROBED_DIRS.with(|c| c.set(c.get() + 1));
             for name in [
                 "Cargo.toml",
                 "Cargo.lock",
@@ -171,12 +330,29 @@ pub(crate) fn input_files(dir: &Path) -> Result<(Vec<PathBuf>, bool), String> {
             ] {
                 let input = parent.join(name);
                 if input.is_file() {
-                    files.insert(input);
+                    found.push(input);
                 }
             }
         }
     }
-    Ok((files.into_iter().collect(), unresolved_includes))
+    found
+}
+
+/// 문서를 만든 수확의 입력을 넘겨받지 못한 `--out`(schema·routes, semantic 캐시 적중)이
+/// 보호 목록을 다시 만든다. 모듈 트리만 키운다 — 이름 해석·정점 수확은 보호 목록에 쓰이지
+/// 않는다. 파일 목록은 [`HarvestInputs::protected_files`]와 같다. 읽거나 파싱하지 못한
+/// 모듈 파일은 오류가 아니라 `unloaded_modules`다 — 그런 파일을 limitation으로 세고 문서를
+/// 내는 명령(`schema`)이 출력 대상에 따라 성공·실패가 갈리지 않게 한다.
+pub(crate) fn input_files(dir: &Path) -> Result<ProtectedInputs, String> {
+    let metadata = cargo_meta::load(dir)?;
+    let found = input_tree(&metadata, true)?;
+    let inputs = HarvestInputs {
+        arena: found.arena,
+        orphan_files: found.tree.orphan_files,
+        unloaded: found.unloaded.into_iter().flatten().collect(),
+        workspace_root: metadata.workspace_root,
+    };
+    Ok(inputs.protected_files())
 }
 
 /// 매크로 확장을 추정하지 않고 리터럴 include 입력만 보호한다.
@@ -231,7 +407,9 @@ fn include_inputs(arena: &Arena, files: &mut BTreeSet<PathBuf>) -> bool {
         if !code || !visited.insert(file.clone()) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&file) else {
+        // 리터럴 경로는 분석 대상이 고른다 — 장치·FIFO·거대 파일도 될 수 있다. 못 읽으면
+        // 읽은 입력인 척하지 않고 기존 산출물 교체를 보수적으로 막는다(보호 등록은 위에서 끝났다).
+        let Ok(text) = read_source_bounded(&file, MAX_SOURCE_BYTES) else {
             unresolved = true;
             continue;
         };
@@ -282,19 +460,25 @@ pub fn target_facts(triple: &str) -> crate::cfgeval::Facts {
 /// `target/` 아래 생성 파일, 지문 스캔이 건너뛰는 숨김 디렉터리 아래
 /// 파일이면 지문이 바뀌지 않아 캐시가 stale해진다. 그런 문서는 캐시에
 /// 쓰지 않는다 — 쓰기와 읽기 양쪽에서 검사해 구 스키마 엔트리도 걸러낸다.
+/// 정점 대부분이 몇 안 되는 파일을 공유하므로 위치의 파일 부분을 모아 고유 파일만
+/// 검사한다 — 정점마다 canonicalize하면 큰 저장소의 캐시 적중 경로가 이 검사에 초 단위를 쓴다.
 fn has_uncovered_input(doc: &Document, root: &Path) -> bool {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    doc.vertices.iter().any(|v| {
-        v.position
-            .as_deref()
-            .and_then(|p| p.rsplit_once(':').map(|(f, _)| PathBuf::from(f)))
-            .is_some_and(|f| !fingerprint_covers(&f, &root))
-    })
+    let files: BTreeSet<&str> = doc
+        .vertices
+        .iter()
+        .filter_map(|v| v.position.as_deref()?.rsplit_once(':').map(|(f, _)| f))
+        .collect();
+    files
+        .into_iter()
+        .any(|f| !fingerprint_covers(Path::new(f), &root))
 }
 
 /// 지문 스캔이 이 파일을 보는가 — fingerprint()의 순회 규칙과 같다:
 /// 루트 안, target/ 아님, .cargo 외 숨김 디렉터리 아님.
 fn fingerprint_covers(file: &Path, root: &Path) -> bool {
+    #[cfg(test)]
+    COVERAGE_PROBES.with(|c| c.set(c.get() + 1));
     let c = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
     let Ok(rel) = c.strip_prefix(root) else {
         return false;
@@ -451,10 +635,59 @@ fn write_cache(path: &Path, key: u64, doc: &Document) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 2패스가 간선을 해석한 본문·속성 참조 수 — 정점 범위·모듈 트리만 쓰는 수확이 버릴
+    /// 간선을 만들지 않는지 단위 테스트가 센다(테스트 스레드마다 따로).
+    static LINKED_ITEMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 테스트용 — 이 스레드에서 지금까지 2패스가 간선을 해석한 본문·속성 참조 수.
+#[cfg(test)]
+fn linked_items() -> usize {
+    LINKED_ITEMS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// parse_into가 실제로 파싱한 파일 수 — `--out`이 입력 보호 목록을 만들려고 같은
+    /// 워크스페이스를 다시 파싱하지 않는지 단위 테스트가 센다(테스트 스레드마다 따로).
+    static PARSED_FILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 테스트용 — 이 스레드에서 지금까지 parse_into가 파싱한 파일 수.
+#[cfg(test)]
+pub(crate) fn parsed_files() -> usize {
+    PARSED_FILES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 모듈 정점 규칙으로 생성 코드 마커를 판정한 횟수 — 모듈마다가 아니라 파싱한 파일마다
+    /// 한 번인지 단위 테스트가 센다(테스트 스레드마다 따로).
+    static MODULE_MARKER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 캐시 커버리지 검사가 canonicalize한 파일 수 — 정점마다가 아니라 고유 파일마다
+    /// 한 번만 재는지 단위 테스트가 센다(테스트 스레드마다 따로).
+    static COVERAGE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 매니페스트 이름을 확인한 조상 디렉터리 수 — 보호 목록이 디렉터리마다 한 번만
+    /// stat하는지 단위 테스트가 센다(테스트 스레드마다 따로).
+    static PROBED_DIRS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// 실제 수확 — 메타데이터 위에서 모듈 트리·간선을 조립한다.
 /// (문서, include! 계열 매크로 사용 여부)를 돌린다 — include!는
 /// 정점 위치에 안 나타나는 입력이라 캐시 판정이 별도로 필요하다.
-/// `sink`가 주어지면 정점별 소스 범위(OwnerSpan)와 모듈 트리·아레나도 넘긴다.
+/// `sink`가 주어지면 정점별 소스 범위(OwnerSpan)와 모듈 트리·아레나, 읽은 입력도 넘긴다.
+/// sink가 간선을 원하지 않으면(`want_edges = false`) 2패스(본문·속성 간선)를 건너뛴다 —
+/// 그 문서에는 간선과 2패스가 센 limitation이 없어 정점 ID만 믿을 수 있다.
 fn harvest(
     dir: &Path,
     meta: &Metadata,
@@ -533,44 +766,16 @@ fn harvest(
         &mut limitations,
     );
 
-    // 전 워크스페이스가 한 트리 — 크레이트 간 `othercrate::x` 해석이 가능해야 한다.
-    let mut tree = ModTree::default();
-    let mut arena: Arena = BTreeMap::new();
-    let mut conditional_mods = 0usize;
-    let mut uses_include = false;
-    let mut scan_roots: BTreeSet<PathBuf> = BTreeSet::new();
-    for p in meta.packages.iter().filter(|p| p.workspace_member) {
-        for t in &p.targets {
-            if !matches!(t.kind.as_str(), "lib" | "bin") {
-                continue; // example/test/bench 타깃은 수확 범위 밖(루트가 아님).
-            }
-            if let Ok(f) = t.src.canonicalize() {
-                if let Some(d) = f.parent() {
-                    scan_roots.insert(d.to_path_buf());
-                }
-            }
-            grow_tree(
-                &mut tree,
-                &mut arena,
-                &t.name,
-                &t.src,
-                &mut conditional_mods,
-                &mut uses_include,
-            )?;
-            if t.kind == "bin" {
-                entry_roots.push(format!("{}::main", t.name));
-            }
-        }
-    }
-    // orphan .rs — 전 타깃 처리 후에 스캔한다. lib의 스캔이 bin 병합 전에
-    // 돌면 main.rs가 orphan으로 오인된다. known은 공유 루트의 extra_files까지.
-    let known: BTreeSet<PathBuf> = tree
-        .modules
-        .values()
-        .flat_map(|m| std::iter::once(m.file.clone()).chain(m.extra_files.iter().cloned()))
-        .collect();
-    for root in scan_roots {
-        scan_orphans(&root, &known, &mut tree);
+    let InputTree {
+        mut tree,
+        arena,
+        markers,
+        conditional_mods,
+        uses_include,
+        ..
+    } = input_tree(meta, false)?;
+    for t in source_targets(meta).filter(|t| t.kind == "bin") {
+        entry_roots.push(format!("{}::main", t.name));
     }
     if conditional_mods > 0 {
         limitations.push(format!(
@@ -583,6 +788,7 @@ fn harvest(
             tree.orphan_files.len()
         ));
     }
+    push_skipped_mods(&tree.skipped_mods, &mut limitations);
 
     // 스코프 2단계: 전 모듈의 아이템 표를 먼저 채우고(1단계), 그 다음
     // `use`를 해석한다(2단계). 임포트 해석이 다른 모듈의 아이템 표를 필요로
@@ -607,7 +813,14 @@ fn harvest(
     // 지역명이 fn owner_spans와 같으면 이름 해석이 함수 정점으로 읽어 거짓 순환이 된다.
     let mut item_spans: Vec<harvest::OwnerSpan> = Vec::new();
     for mp in tree.modules.keys().cloned().collect::<Vec<_>>() {
-        let mh = harvest_module(&mut tree, &arena, &mp, &mut harvest, &dep_vertices);
+        let mh = harvest_module(
+            &mut tree,
+            &arena,
+            &markers,
+            &mp,
+            &mut harvest,
+            &dep_vertices,
+        );
         vertices.push(mh.vertex);
         edges.extend(mh.edges);
         vertices.extend(mh.decls.vertices);
@@ -631,75 +844,90 @@ fn harvest(
         collect_owner_spans(&tree, &impls, &bodies, item_spans, out);
     }
 
-    // 메서드 이름 → ID 인덱스 — 이름 팬아웃 폴백에 쓴다(semantic에서는
-    // ra가 해석하지 못한 호출에만 쓰인다).
-    let mut method_index: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for v in &vertices {
-        if v.kind == Kind::Method {
-            if let Some(name) = v.id.rsplit("::").next() {
-                method_index
-                    .entry(name.to_string())
-                    .or_default()
-                    .push(v.id.clone());
+    // 2패스 전체(메서드 색인·본문·속성 간선)는 간선을 쓰는 수확만 돈다 — 정점 ID·범위·
+    // 트리만 쓰는 sink(schema·routes)에는 버려질 일이라 건너뛴다.
+    let want_edges = sink.as_ref().is_none_or(|k| k.want_edges);
+    if want_edges {
+        #[cfg(test)]
+        LINKED_ITEMS.with(|c| c.set(c.get() + bodies.len() + attr_refs.len()));
+        // 메서드 이름 → ID 인덱스 — 이름 팬아웃 폴백에 쓴다(semantic에서는
+        // ra가 해석하지 못한 호출에만 쓰인다).
+        let mut method_index: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for v in &vertices {
+            if v.kind == Kind::Method {
+                if let Some(name) = v.id.rsplit("::").next() {
+                    method_index
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(v.id.clone());
+                }
             }
         }
-    }
 
-    // 2패스: 본문 — 모든 정점이 준비된 뒤에 해석한다.
-    // semantic 엔진이 붙어 있으면 hir이 아는 본문은 타입 해석으로 정확히
-    // 잡고, 모르는 본문(cfg 비활성·매크로 생성)만 syn 팬아웃으로 돌아간다.
-    #[cfg(feature = "semantic")]
-    let engine = if opts.semantic {
-        // syn이 수확한 선언 위치 — 의미 해석 쪽에서 정규 ID 문자열이
-        // 가리키는 정점의 provenance 검증에 쓴다(생성 정의 충돌 방지).
-        let mut sites: BTreeMap<String, Vec<sem::Site>> = BTreeMap::new();
-        for b in &bodies {
-            sites.entry(b.id.clone()).or_default().push(sem::Site {
-                file: b.file.clone(),
-                range: b.range.clone(),
-                module: b.module.clone(),
-            });
-        }
-        Some(sem::Engine::load(&meta.workspace_root, &sites)?)
-    } else {
-        None
-    };
-    #[cfg(feature = "semantic")]
-    if let Some(eng) = &engine {
-        let ids: BTreeSet<&str> = vertices.iter().map(|v| v.id.as_str()).collect();
-        let mut st = sem::Stats::default();
-        for b in &bodies {
-            let site = sem::OwnerSite {
-                id: &b.id,
-                cfg: &b.cfg,
-                file: &b.file,
-                range: &b.range,
-                // 소유 크레이트·모듈 — 같은 파일을 둘이 넘는 문맥이
-                // 공유해도(공유 include!·`#[path]`) 선언 문맥으로 정확한
-                // 항목을 고른다.
-                krate: b.module.split("::").next().unwrap_or_default(),
-                module: &b.module,
-            };
-            match eng.body_edges(&site, &ids, &method_index, &mut st) {
-                Some(es) => {
-                    // 시그니처 간선은 엔진과 무관하게 syn이 권위다.
-                    edges.extend(harvest::signature_edges(b, &tree, &dep_crates));
-                    edges.extend(es);
-                }
-                None => {
-                    st.unmapped += 1;
-                    edges.extend(harvest::bodies(
-                        std::slice::from_ref(b),
-                        &tree,
-                        &dep_crates,
-                        &method_index,
-                        &mut harvest,
-                    ));
+        // 2패스: 본문 — 모든 정점이 준비된 뒤에 해석한다.
+        // semantic 엔진이 붙어 있으면 hir이 아는 본문은 타입 해석으로 정확히
+        // 잡고, 모르는 본문(cfg 비활성·매크로 생성)만 syn 팬아웃으로 돌아간다.
+        #[cfg(feature = "semantic")]
+        let engine = if opts.semantic {
+            // syn이 수확한 선언 위치 — 의미 해석 쪽에서 정규 ID 문자열이
+            // 가리키는 정점의 provenance 검증에 쓴다(생성 정의 충돌 방지).
+            let mut sites: BTreeMap<String, Vec<sem::Site>> = BTreeMap::new();
+            for b in &bodies {
+                sites.entry(b.id.clone()).or_default().push(sem::Site {
+                    file: b.file.clone(),
+                    range: b.range.clone(),
+                    module: b.module.clone(),
+                });
+            }
+            Some(sem::Engine::load(&meta.workspace_root, &sites)?)
+        } else {
+            None
+        };
+        #[cfg(feature = "semantic")]
+        if let Some(eng) = &engine {
+            let ids: BTreeSet<&str> = vertices.iter().map(|v| v.id.as_str()).collect();
+            let mut st = sem::Stats::default();
+            for b in &bodies {
+                let site = sem::OwnerSite {
+                    id: &b.id,
+                    cfg: &b.cfg,
+                    file: &b.file,
+                    range: &b.range,
+                    // 소유 크레이트·모듈 — 같은 파일을 둘이 넘는 문맥이
+                    // 공유해도(공유 include!·`#[path]`) 선언 문맥으로 정확한
+                    // 항목을 고른다.
+                    krate: b.module.split("::").next().unwrap_or_default(),
+                    module: &b.module,
+                };
+                match eng.body_edges(&site, &ids, &method_index, &mut st) {
+                    Some(es) => {
+                        // 시그니처 간선은 엔진과 무관하게 syn이 권위다.
+                        edges.extend(harvest::signature_edges(b, &tree, &dep_crates));
+                        edges.extend(es);
+                    }
+                    None => {
+                        st.unmapped += 1;
+                        edges.extend(harvest::bodies(
+                            std::slice::from_ref(b),
+                            &tree,
+                            &dep_crates,
+                            &method_index,
+                            &mut harvest,
+                        ));
+                    }
                 }
             }
+            push_sem_stats(&st, eng.has_proc_macros(), &mut limitations, &mut harvest);
+        } else {
+            edges.extend(harvest::bodies(
+                &bodies,
+                &tree,
+                &dep_crates,
+                &method_index,
+                &mut harvest,
+            ));
         }
-        push_sem_stats(&st, eng.has_proc_macros(), &mut limitations, &mut harvest);
-    } else {
+        #[cfg(not(feature = "semantic"))]
         edges.extend(harvest::bodies(
             &bodies,
             &tree,
@@ -707,24 +935,16 @@ fn harvest(
             &method_index,
             &mut harvest,
         ));
-    }
-    #[cfg(not(feature = "semantic"))]
-    edges.extend(harvest::bodies(
-        &bodies,
-        &tree,
-        &dep_crates,
-        &method_index,
-        &mut harvest,
-    ));
 
-    // 속성 경로 참조 — 모드와 무관하게 syn이 권위다. `#[dep::attr]`나
-    // `#[derive(dep::X)]`는 의미 해석이 더 잘 아는 것이 없다.
-    edges.extend(harvest::attr_edges(
-        &attr_refs,
-        &tree,
-        &dep_crates,
-        &mut harvest,
-    ));
+        // 속성 경로 참조 — 모드와 무관하게 syn이 권위다. `#[dep::attr]`나
+        // `#[derive(dep::X)]`는 의미 해석이 더 잘 아는 것이 없다.
+        edges.extend(harvest::attr_edges(
+            &attr_refs,
+            &tree,
+            &dep_crates,
+            &mut harvest,
+        ));
+    }
 
     push_limitations(&harvest, &mut limitations);
 
@@ -762,9 +982,19 @@ fn harvest(
     } else {
         Level::Module
     };
-    if let Some(k) = sink.filter(|k| k.want_tree) {
-        k.tree = Some(tree);
-        k.arena = Some(arena);
+    if let Some(k) = sink {
+        if k.want_inputs {
+            k.inputs = Some(HarvestInputs {
+                arena: arena.clone(),
+                orphan_files: tree.orphan_files.clone(),
+                unloaded: Vec::new(),
+                workspace_root: meta.workspace_root.clone(),
+            });
+        }
+        if k.want_tree {
+            k.tree = Some(tree);
+            k.arena = Some(arena);
+        }
     }
     Ok((
         graph::document(
@@ -895,46 +1125,152 @@ fn emit_crate_level(
     }
 }
 
+/// 파일 머리(앞 10줄)의 생성 코드 마커 판정 — 파싱할 때 읽은 원문으로 파일마다 한 번 낸다.
+/// 인라인 모듈은 담은 파일의 판정을 쓴다: 모듈마다 파일을 다시 통째로 읽으면 인라인 모듈이
+/// 수천 개인 생성 파일(prost 출력)에서 (모듈 수 × 파일 크기)를 읽었다. 모듈 정점과 아이템
+/// 정점의 규칙이 서로 달라 둘 다 둔다 — 합치면 기존 generated 플래그가 바뀐다.
+#[derive(Clone, Copy, Default)]
+struct FileMarkers {
+    /// 모듈 정점의 generated — [`text_has_marker`] 규칙.
+    module: bool,
+    /// 아이템·impl 메서드 정점의 generated — harvest의 규칙.
+    items: bool,
+}
+
+/// 수확 입력 — 워크스페이스 멤버의 모듈 트리와 그 파일들의 AST 아레나다.
+/// 수확과 `--out` 입력 보호가 [`input_tree`] 하나로 만들어, 보호 목록이 수확이 실제로
+/// 읽은 파일과 갈라지지 않는다.
+#[derive(Default)]
+struct InputTree {
+    /// 전 워크스페이스가 한 트리 — 크레이트 간 `othercrate::x` 해석이 가능해야 한다.
+    tree: ModTree,
+    arena: Arena,
+    /// 아레나 파일마다의 생성 코드 마커 — 파싱할 때 읽은 원문으로 판정해 둔다.
+    markers: BTreeMap<PathBuf, FileMarkers>,
+    /// `#[cfg]` 뒤의 mod 선언 수 — 수확이 limitation으로 올린다.
+    conditional_mods: usize,
+    /// 수확 파일 중 include! 계열 매크로를 쓰는 파일이 있는가 — 캐시 판정에 쓴다.
+    uses_include: bool,
+    /// 읽거나 파싱하지 못한 모듈 파일 — Some이면 관대 모드다. 수확(None)은 그런 파일에서
+    /// 오류로 끝나지만, `--out` 입력 보호는 파일을 적고 나머지 트리를 계속 찾는다. `schema`는
+    /// 그런 파일을 unparsed-sources로 세고 문서를 내는데, 보호 목록 수집이 실패하면 `--out`일
+    /// 때만 종료 2가 됐다.
+    unloaded: Option<BTreeSet<PathBuf>>,
+}
+
+impl InputTree {
+    /// 모듈 파일을 싣지 못한 오류를 처리한다 — 엄격 모드는 오류를 그대로 돌려주고, 관대
+    /// 모드는 파일을 적고 넘어간다(그 파일이 선언한 하위 모듈은 트리에 실리지 않는다).
+    fn tolerate(&mut self, file: &Path, error: String) -> Result<(), String> {
+        match self.unloaded.as_mut() {
+            Some(unloaded) => {
+                unloaded.insert(file.to_path_buf());
+                Ok(())
+            }
+            None => Err(error),
+        }
+    }
+}
+
+/// 수확 대상 타깃 — 워크스페이스 멤버의 lib·bin이다. example/test/bench 타깃은
+/// 수확 범위 밖이다(루트가 아님).
+fn source_targets(meta: &Metadata) -> impl Iterator<Item = &cargo_meta::Target> {
+    meta.packages
+        .iter()
+        .filter(|p| p.workspace_member)
+        .flat_map(|p| &p.targets)
+        .filter(|t| matches!(t.kind.as_str(), "lib" | "bin"))
+}
+
+/// 수확 대상 타깃마다 mod 선언을 따라 모듈 트리를 키우고, 어느 선언에도 닿지 않는
+/// .rs를 orphan으로 센다. 이름 해석·정점 수확은 하지 않는다 — `--out` 입력 보호는
+/// 읽은 파일만 알면 된다. `tolerant`가 false면 오류는 grow_tree가 낸 그대로고, true면
+/// 싣지 못한 모듈 파일을 `unloaded`에 적는다.
+fn input_tree(meta: &Metadata, tolerant: bool) -> Result<InputTree, String> {
+    let mut found = InputTree {
+        unloaded: tolerant.then(BTreeSet::new),
+        ..Default::default()
+    };
+    let mut scan_roots: BTreeSet<PathBuf> = BTreeSet::new();
+    for t in source_targets(meta) {
+        if let Ok(f) = t.src.canonicalize() {
+            if let Some(d) = f.parent() {
+                scan_roots.insert(d.to_path_buf());
+            }
+        }
+        grow_tree(&mut found, &t.name, &t.src)?;
+    }
+    // orphan .rs — 전 타깃 처리 후에 스캔한다. lib의 스캔이 bin 병합 전에
+    // 돌면 main.rs가 orphan으로 오인된다. known은 공유 루트의 extra_files까지.
+    let known: BTreeSet<PathBuf> = found
+        .tree
+        .modules
+        .values()
+        .flat_map(|m| std::iter::once(m.file.clone()).chain(m.extra_files.iter().cloned()))
+        .collect();
+    for root in scan_roots {
+        scan_orphans(&root, &known, &mut found.tree);
+    }
+    Ok(found)
+}
+
 /// 타깃의 모듈 트리를 키운다 — mod 선언을 따라 파일을 발견한다.
-/// `uses_include`는 수확 파일 중 하나라도 include! 계열 매크로를
+/// `found.uses_include`는 수확 파일 중 하나라도 include! 계열 매크로를
 /// 쓰면 true가 된다 — 그 입력은 정점 위치에 안 나타나 지문이 못 본다.
-fn grow_tree(
-    tree: &mut ModTree,
-    arena: &mut Arena,
-    root_path: &str,
-    root_file: &Path,
-    conditional_count: &mut usize,
-    uses_include: &mut bool,
-) -> Result<(), String> {
-    let root_file = root_file
-        .canonicalize()
-        .map_err(|e| format!("cannot read {}: {e}", root_file.display()))?;
-    match tree.modules.get_mut(root_path) {
+/// 싣지 못한 파일은 [`InputTree::tolerate`]가 모드에 따라 오류로 내거나 적는다.
+fn grow_tree(found: &mut InputTree, root_path: &str, root_file: &Path) -> Result<(), String> {
+    // 타깃 루트는 cargo metadata가 준 경로라 mod 대상처럼 미리 걸러지지 않는다 — 정규 파일이
+    // 아니면(FIFO, `/dev/zero`를 가리키는 링크) 열지 않는다. 링크를 따라간 정규 경로로는 어느
+    // 타깃인지 알 수 없어, 판정은 정규화 전 경로로 하고 오류에도 그 경로를 싣는다.
+    let checked = require_regular_file(root_file).and_then(|()| root_file.canonicalize());
+    let root_file = match checked {
+        Ok(file) => file,
+        Err(e) => {
+            let error = format!("cannot read {}: {e}", root_file.display());
+            return found.tolerate(root_file, error);
+        }
+    };
+    match found.tree.modules.get_mut(root_path) {
         // lib와 같은 이름의 bin — 두 크레이트 인스턴스가 루트 경로를 공유한다.
         Some(m) => m.extra_files.push(root_file.clone()),
         None => {
-            tree.modules.insert(
+            found.tree.modules.insert(
                 root_path.to_string(),
                 modtree::Module::new(root_file.clone(), true, true),
             );
         }
     }
-    parse_into(arena, &root_file, uses_include)?;
+    if let Err(e) = parse_into(found, &root_file) {
+        found.tolerate(&root_file, e)?;
+    }
     let mut queue = vec![root_path.to_string()];
     let mut visited: BTreeSet<String> = BTreeSet::new();
     while let Some(mp) = queue.pop() {
         if !visited.insert(mp.clone()) {
             continue;
         }
-        let Some(groups) = module_items(tree, arena, &mp) else {
+        let Some(mut groups) = module_items(&found.tree, &found.arena, &mp) else {
             continue;
         };
-        for sub in
-            modtree::collect_submodules(&flatten_items(&groups), &mp, tree, conditional_count)
-        {
-            let file = tree.modules[&sub].file.clone();
-            if tree.modules[&sub].file_module {
-                parse_into(arena, &file, uses_include)?;
+        // 루트에서는 이 타깃의 루트 파일에 든 선언만 훑는다. lib과 같은 이름의 bin이 함께 쓰는
+        // 루트의 다른 파일 선언은 그 타깃의 grow_tree가 훑는다(타깃 순서와 무관) — 여기서도
+        // 훑으면 그 선언과 하위 트리를 이 타깃의 루트 파일을 조상으로 둔 사슬로 잘못 판정한다
+        // (거짓 순환).
+        if mp == root_path {
+            groups.retain(|(file, _)| *file == root_file);
+        }
+        for sub in modtree::collect_target_submodules(
+            Some(&root_file),
+            &flatten_items(&groups),
+            &mp,
+            &mut found.tree,
+            &mut found.conditional_mods,
+        ) {
+            let file = found.tree.modules[&sub].file.clone();
+            if found.tree.modules[&sub].file_module {
+                if let Err(e) = parse_into(found, &file) {
+                    found.tolerate(&file, e)?;
+                }
             }
             queue.push(sub);
         }
@@ -966,27 +1302,41 @@ fn scan_orphans(dir: &Path, known: &BTreeSet<PathBuf>, tree: &mut ModTree) {
     }
 }
 
-/// 파일을 파싱해 아레나에 넣는다. 파싱 실패는 limitation이 아니라 오류 —
-/// 읽은 파일을 못 읽는 것과 해석 못 하는 것은 다르다…지만 실전에서는
-/// 조건부 생성 파일이 깨진 문법을 가질 수 있어 빈 목록으로 둔다.
-fn parse_into(arena: &mut Arena, file: &Path, uses_include: &mut bool) -> Result<(), String> {
-    if arena.contains_key(file) {
+/// 파일을 파싱해 아레나에 넣고, 같은 원문으로 생성 코드 마커를 판정해 둔다. 파싱 실패는
+/// limitation이 아니라 오류 — 읽은 파일을 못 읽는 것과 해석 못 하는 것은 다르다…지만
+/// 실전에서는 조건부 생성 파일이 깨진 문법을 가질 수 있어 빈 목록으로 둔다.
+/// 정규 파일이 아니면 열지 않고 "cannot read" 오류다 — `mod` 대상은 collect_submodules가,
+/// 타깃 루트는 grow_tree가 미리 거르지만, stat이 실패해 걸러지지 않은 대상과 검사 뒤에 바뀐
+/// 파일도 여기서 막는다. 크기 상한은 두지 않는다(정상인 거대 생성 파일을 오류로 할지
+/// limitation으로 할지 정하지 않았다 — 정규 파일은 끝이 있다).
+fn parse_into(found: &mut InputTree, file: &Path) -> Result<(), String> {
+    if found.arena.contains_key(file) {
         return Ok(());
     }
-    let src = std::fs::read_to_string(file)
+    #[cfg(test)]
+    PARSED_FILES.with(|c| c.set(c.get() + 1));
+    let src = require_regular_file(file)
+        .and_then(|()| std::fs::read_to_string(file))
         .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
     // include! 계열은 파일 경로 인자를 받아 별도 입력을 읽는다 —
     // 그 입력 파일은 정점 위치에 안 나타나 지문 밖이다.
-    if !*uses_include
+    if !found.uses_include
         && (src.contains("include!")
             || src.contains("include_str!")
             || src.contains("include_bytes!"))
     {
-        *uses_include = true;
+        found.uses_include = true;
     }
     match syn::parse_file(&src) {
         Ok(ast) => {
-            arena.insert(file.to_path_buf(), Box::leak(ast.items.into_boxed_slice()));
+            let markers = FileMarkers {
+                module: text_has_marker(&src),
+                items: harvest::text_has_generated_marker(&src),
+            };
+            found.markers.insert(file.to_path_buf(), markers);
+            found
+                .arena
+                .insert(file.to_path_buf(), Box::leak(ast.items.into_boxed_slice()));
             Ok(())
         }
         Err(e) => Err(format!("parse error in {}: {e}", file.display())),
@@ -1057,9 +1407,12 @@ struct ModuleHarvest<'a> {
 }
 
 /// 한 모듈의 선언을 수확한다 — 모듈 정점, contains/uses 간선, 본문 보관.
+/// 생성 코드 마커는 파싱할 때 파일마다 판정해 둔 `markers`에서 찾는다. 모듈 파일과 그룹
+/// 파일은 모두 아레나에 있다(엄격 수확은 싣지 못한 파일에서 오류로 끝난다).
 fn harvest_module<'a>(
     tree: &mut ModTree,
     arena: &'a Arena,
+    markers: &BTreeMap<PathBuf, FileMarkers>,
     mp: &str,
     out: &mut Harvest,
     dep_vertices: &BTreeSet<String>,
@@ -1067,15 +1420,16 @@ fn harvest_module<'a>(
     let groups = module_items(tree, arena, mp).expect("module items must exist");
     let file = tree.modules[mp].file.clone();
     let krate = modtree::crate_of(mp);
+    let markers_of = |f: &Path| markers.get(f).copied().unwrap_or_default();
     // 파라미터 이름이 fn harvest와 충돌하면 ident 경로가 함수 정점으로
     // 해석돼 거짓 간선·사이클이 생긴다 — 지역명은 `out`으로 둔다.
-    let decls = harvest::decls(mp, &krate, &groups, out);
+    let decls = harvest::decls_with_markers(mp, &krate, &groups, &|f| markers_of(f).items, out);
 
     // 모듈 정점 — 타깃 루트는 크레이트 정점을 겸한다(rustc 의미론).
     // 위치는 파일 시작, exported는 `pub mod` 여부를 따른다.
     let is_root = !mp.contains("::");
     let public = tree.modules[mp].public;
-    let generated = file_has_marker(&file);
+    let generated = markers_of(&file).module;
     let mod_cfg = tree.modules[mp].cfg.clone();
     let vertex = Vertex {
         id: mp.to_string(),
@@ -1147,18 +1501,47 @@ fn owner_module(tree: &ModTree, id: &str) -> Option<String> {
     }
 }
 
-/// 파일의 생성 코드 마커 — harvest의 판정과 같은 규칙.
-fn file_has_marker(file: &Path) -> bool {
-    std::fs::read_to_string(file)
-        .map(|s| {
-            s.lines().take(10).any(|l| {
-                let l = l.to_lowercase();
-                l.contains("do not edit")
-                    || l.contains("@generated")
-                    || l.contains("auto-generated")
-            })
-        })
-        .unwrap_or(false)
+/// 원문 앞 10줄에 생성 코드 마커가 있는지 본다 — 모듈 정점의 generated 규칙이다.
+/// 아이템 정점의 harvest 규칙과 다르다('do not edit'만 있어도 참, 'autogenerated'는 거짓).
+/// 규칙을 합치면 기존 플래그가 바뀌어, 둘 다 두고 [`parse_into`]가 읽은 원문만 같이 쓴다.
+fn text_has_marker(src: &str) -> bool {
+    #[cfg(test)]
+    MODULE_MARKER_SCANS.with(|c| c.set(c.get() + 1));
+    src.lines().take(10).any(|l| {
+        let l = l.to_lowercase();
+        l.contains("do not edit") || l.contains("@generated") || l.contains("auto-generated")
+    })
+}
+
+/// 정점 없이 건너뛴 `mod` 선언을 사유별 limitation 문장으로 옮긴다 — 셀 것이 없는
+/// 사유는 조용하다. 순환 선언을 오류(2)로 만들지 않는 것은 cfg로 막혀 rustc가 받는
+/// 크레이트가 있어서다.
+fn push_skipped_mods(
+    skipped: &BTreeMap<String, modtree::SkippedMod>,
+    limitations: &mut Vec<String>,
+) {
+    for (reason, why) in [
+        (
+            modtree::SkippedMod::Circular,
+            "they re-enter an ancestor module's file (circular modules)".to_string(),
+        ),
+        (
+            modtree::SkippedMod::NotRegularFile,
+            "their file is not a regular file (device, FIFO, or directory)".to_string(),
+        ),
+        (
+            modtree::SkippedMod::TooDeep,
+            format!(
+                "module nesting exceeds {} levels",
+                modtree::MAX_MODULE_DEPTH
+            ),
+        ),
+    ] {
+        let n = skipped.values().filter(|r| **r == reason).count();
+        if n > 0 {
+            limitations.push(format!("{n} mod declarations were skipped because {why}"));
+        }
+    }
 }
 
 /// 수확 실측을 limitation 문장으로 옮긴다.
@@ -1317,6 +1700,588 @@ mod tests {
         // 캐시 파일이 워크스페이스 안에 있어도 지문을 바꾸지 않는다 —
         // .rustograph는 숨김 디렉터리라 지문 걷기에서 빠진다.
         assert_eq!(k2, fingerprint(&tmp, &meta, &opts).unwrap());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 캐시 커버리지 검사는 정점마다가 아니라 고유 파일마다 한 번 canonicalize한다 — 정점
+    /// 대부분이 몇 안 되는 파일을 공유해서, 정점마다 재면 큰 저장소의 캐시 적중 경로가
+    /// 지문 검사에만 초 단위를 쓴다. 판정은 그대로다: 지문이 못 보는 파일(루트 밖·target/·
+    /// 숨김 디렉터리, `..`로 루트를 벗어나는 경로)을 가리키는 정점이 하나라도 있으면 참이다.
+    #[test]
+    fn cache_coverage_canonicalizes_each_file_once() {
+        let tmp = std::env::temp_dir().join(format!("rustograph-coverage-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let root = tmp.join("ws");
+        let covered_files = ["src/lib.rs", "src/a.rs", ".cargo/build.rs"];
+        let hidden_files = ["target/debug/gen.rs", ".hidden/x.rs"];
+        for rel in covered_files.iter().chain(&hidden_files) {
+            let file = root.join(rel);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "fn f() {}").unwrap();
+        }
+        std::fs::write(tmp.join("outside.rs"), "fn f() {}").unwrap();
+        // 정점 ID 접두사로 정렬 순서를 고정한다 — 커버되는 정점이 모두 앞에 온다.
+        let vertex = |id: String, position: Option<String>| Vertex {
+            id,
+            kind: Kind::Fn,
+            krate: "c".to_string(),
+            module: "c".to_string(),
+            position,
+            exported: false,
+            generated: false,
+            cfg: None,
+            unsafe_: false,
+        };
+        let covered: Vec<Vertex> = (0..300)
+            .map(|i| {
+                let file = root.join(covered_files[i % covered_files.len()]);
+                vertex(
+                    format!("c::a{i:04}"),
+                    Some(format!("{}:{i}", file.display())),
+                )
+            })
+            .chain([vertex("c::a_crate".to_string(), None)])
+            .collect();
+        let check = |vertices: Vec<Vertex>| {
+            let doc = document(
+                Level::Symbol,
+                ".".into(),
+                None,
+                vec![],
+                vertices,
+                vec![],
+                vec![],
+            );
+            let before = COVERAGE_PROBES.with(std::cell::Cell::get);
+            let uncovered = has_uncovered_input(&doc, &root);
+            (
+                uncovered,
+                COVERAGE_PROBES.with(std::cell::Cell::get) - before,
+            )
+        };
+        assert_eq!(check(covered.clone()), (false, covered_files.len()));
+        let escaping = root.join("src/../../outside.rs");
+        let uncovered_files = [
+            tmp.join("outside.rs"),
+            escaping,
+            root.join(hidden_files[0]),
+            root.join(hidden_files[1]),
+        ];
+        for file in uncovered_files {
+            let mut vertices = covered.clone();
+            vertices.extend((0..50).map(|i| {
+                vertex(
+                    format!("c::b{i:04}"),
+                    Some(format!("{}:{i}", file.display())),
+                )
+            }));
+            let (uncovered, probes) = check(vertices);
+            assert!(
+                uncovered,
+                "{} is not covered by the fingerprint",
+                file.display()
+            );
+            assert!(
+                probes <= covered_files.len() + 1,
+                "{probes} canonicalize calls for {} distinct files",
+                covered_files.len() + 1
+            );
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// semantic 본문 간선은 load가 사이트마다 해석해 둔 선언 정의를 다시 쓴다 — 본문마다 같은
+    /// (파일, 범위, 모듈)로 파일 루트부터 다시 찾으면 사이트 탐색이 사이트 수의 두 배가 된다.
+    /// 대조: 확정 메서드 호출이 그대로 나온다(재사용한 정의로 본문 소유자를 고르지 못하면
+    /// syn 이름 팬아웃의 추정 간선으로 떨어진다).
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn semantic_bodies_reuse_site_definitions_resolved_at_load() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture");
+        let (searches_before, sites_before) = sem::site_search_counts();
+        let doc = load(
+            &fixture,
+            &Options {
+                symbol_level: true,
+                semantic: true,
+                ..Default::default()
+            },
+        )
+        .expect("semantic fixture load");
+        let (searches, sites) = sem::site_search_counts();
+        let (searches, sites) = (searches - searches_before, sites - sites_before);
+        assert!(sites > 0, "the fixture registers body sites");
+        assert_eq!(
+            searches, sites,
+            "{searches} site searches for {sites} sites"
+        );
+        assert!(
+            doc.edges.iter().any(|e| e.from == "fixture_app::main"
+                && e.to == "fixture_core::Used::<Greet>::greet"
+                && e.kind == EdgeKind::Call
+                && !e.tentative),
+            "the concrete method call must stay a firm semantic edge"
+        );
+    }
+
+    /// 정점 범위·모듈 트리만 쓰는 명령(schema·routes 서버·클라이언트)과 `--out` 입력 보호는
+    /// 본문·속성 간선을 해석하지 않는다 — 대형 저장소에서 버려질 이름 팬아웃 본문 간선이
+    /// 그 명령들의 시간·메모리 대부분이었다. 전체 수확은 그대로 해석한다(대조군).
+    #[test]
+    fn span_only_commands_resolve_no_edges() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let resolved_during = |run: &dyn Fn()| {
+            let before = linked_items();
+            run();
+            linked_items() - before
+        };
+        let full = resolved_during(&|| {
+            load(&repo.join("tests/fixture"), &span_options()).unwrap();
+        });
+        assert!(full > 0, "the full harvest must resolve body edges");
+        let commands = [
+            (
+                "schema",
+                resolved_during(&|| {
+                    schema::facts(&repo.join("tests/fixture-schema"), "test").unwrap();
+                }),
+            ),
+            (
+                "routes server",
+                resolved_during(&|| {
+                    let dir = repo.join("tests/fixture-routes/axum08");
+                    routes::routes(&dir, "test", &Default::default()).unwrap();
+                }),
+            ),
+            (
+                "routes client",
+                resolved_during(&|| {
+                    let dir = repo.join("tests/fixture-client/app");
+                    routes::client::client_routes(&dir, "test", &Default::default()).unwrap();
+                }),
+            ),
+            (
+                "output inputs",
+                resolved_during(&|| {
+                    input_files(&repo.join("tests/fixture")).unwrap();
+                }),
+            ),
+        ];
+        assert!(commands.iter().all(|(_, n)| *n == 0), "{commands:?}");
+    }
+
+    /// 정점 범위 비교 키 — OwnerSpan은 비교 연산이 없어 필드를 그대로 늘어놓는다.
+    fn span_keys(spans: &[harvest::OwnerSpan]) -> Vec<(String, PathBuf, std::ops::Range<usize>)> {
+        spans
+            .iter()
+            .map(|s| (s.id.clone(), s.file.clone(), s.range.clone()))
+            .collect()
+    }
+
+    /// 간선을 건너뛴 수확도 정점 ID·정점 범위·모듈 트리·아레나는 간선까지 만든 수확과
+    /// 같다 — schema의 usr와 routes의 핸들러 ID가 impact와 같은 정점을 가리켜야 한다.
+    #[test]
+    fn edgeless_harvests_keep_vertices_spans_and_tree() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for name in [
+            "tests/fixture",
+            "tests/fixture-schema",
+            "tests/fixture-client/app",
+        ] {
+            let dir = repo.join(name);
+            let meta = cargo_meta::load(&dir).unwrap();
+            let mut sink = Sink {
+                spans: Some(Vec::new()),
+                want_tree: true,
+                want_edges: true,
+                ..Default::default()
+            };
+            let (full, _) = harvest(&dir, &meta, &span_options(), Some(&mut sink)).unwrap();
+            assert!(!full.edges.is_empty(), "{name}");
+            let full_ids: BTreeSet<String> = full.vertices.iter().map(|v| v.id.clone()).collect();
+            let full_spans = span_keys(sink.spans.as_deref().unwrap());
+            let (tree, arena) = (sink.tree.unwrap(), sink.arena.unwrap());
+            let (ids, spans) = vertex_spans(&dir, &meta).unwrap();
+            assert_eq!(ids, full_ids, "{name}");
+            assert_eq!(span_keys(&spans), full_spans, "{name}");
+            // 공개 owner_spans는 그대로 간선까지 만든 완전한 문서다.
+            let (doc, owners) = owner_spans(&dir, &meta).unwrap();
+            let json = |d: &Document| serde_json::to_string(d).unwrap();
+            assert_eq!(json(&doc), json(&full), "{name}");
+            assert_eq!(span_keys(&owners), full_spans, "{name}");
+            let parts = harvest_parts(&dir, &meta).unwrap();
+            assert_eq!(parts.vertex_ids, full_ids, "{name}");
+            assert_eq!(span_keys(&parts.spans), full_spans, "{name}");
+            assert!(parts.tree.modules.keys().eq(tree.modules.keys()), "{name}");
+            assert_eq!(parts.tree.orphan_files, tree.orphan_files, "{name}");
+            assert!(parts.arena.keys().eq(arena.keys()), "{name}");
+        }
+    }
+
+    /// 옛 `--out` 보호 목록 — 간선 없는 전체 수확의 아레나·orphan과, 파일마다 조상 디렉터리
+    /// 전부의 매니페스트 확인이다. 새 경로가 같은 파일 집합을 내는지 비교하는 오라클이다.
+    fn protected_files_by_full_harvest(dir: &Path) -> (Vec<PathBuf>, bool) {
+        let metadata = cargo_meta::load(dir).unwrap();
+        let parts = harvest_parts(dir, &metadata).unwrap();
+        let mut files: BTreeSet<PathBuf> = parts.arena.keys().cloned().collect();
+        let unresolved_includes = include_inputs(&parts.arena, &mut files);
+        files.extend(parts.tree.orphan_files);
+        let root_manifest = metadata.workspace_root.join("Cargo.toml");
+        for path in files
+            .clone()
+            .into_iter()
+            .chain(std::iter::once(root_manifest))
+        {
+            for parent in path.ancestors().skip(1) {
+                for name in [
+                    "Cargo.toml",
+                    "Cargo.lock",
+                    ".rustograph.yml",
+                    ".rustograph.yaml",
+                ] {
+                    let input = parent.join(name);
+                    if input.is_file() {
+                        files.insert(input);
+                    }
+                }
+            }
+        }
+        (files.into_iter().collect(), unresolved_includes)
+    }
+
+    /// `--out` 보호 목록은 문서를 만든 수확의 입력으로 만들든(graph·rules) 모듈 트리만 다시
+    /// 키워 만들든(schema·routes) 옛 구현과 같은 파일 집합·include 미해석 표시다. 조상
+    /// 디렉터리는 한 번씩만 본다 — 파일마다 조상 전부를 stat하면 깊은 트리에서 수만 번이었다.
+    #[test]
+    fn output_protection_matches_the_full_harvest_and_probes_each_directory_once() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for name in [
+            "tests/fixture",
+            "tests/fixture-schema",
+            "tests/fixture-client/app",
+            "tests/fixture-routes/axum08",
+        ] {
+            let dir = repo.join(name);
+            let expected = protected_files_by_full_harvest(&dir);
+            let probed_before = PROBED_DIRS.with(std::cell::Cell::get);
+            let rebuilt = input_files(&dir).unwrap();
+            let probed = PROBED_DIRS.with(std::cell::Cell::get) - probed_before;
+            assert!(rebuilt.unloaded_modules.is_empty(), "{name}");
+            assert_eq!(
+                (rebuilt.files, rebuilt.unresolved_includes),
+                expected,
+                "{name}"
+            );
+            let (_, inputs) = load_with_inputs(&dir, &span_options()).unwrap();
+            let reused = inputs
+                .expect("a harvest hands over what it read")
+                .protected_files();
+            assert!(reused.unloaded_modules.is_empty(), "{name}");
+            assert_eq!(
+                (reused.files, reused.unresolved_includes),
+                expected,
+                "{name}"
+            );
+            let directories: BTreeSet<&Path> = expected
+                .0
+                .iter()
+                .flat_map(|path| path.ancestors().skip(1))
+                .collect();
+            assert_eq!(probed, directories.len(), "{name}");
+        }
+    }
+
+    /// 테스트용 단일 패키지 크레이트를 만들고 정규화한 루트를 돌려준다. `lib_path`가 있으면
+    /// `[lib] path`로 쓴다(없는 파일이어도 cargo metadata는 받는다).
+    fn write_crate(
+        root: &Path,
+        name: &str,
+        lib_path: Option<&str>,
+        files: &[(&str, &[u8])],
+    ) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let lib = lib_path
+            .map(|path| format!("[lib]\npath = \"{path}\"\n"))
+            .unwrap_or_default();
+        let manifest =
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{lib}");
+        std::fs::write(dir.join("Cargo.toml"), manifest).unwrap();
+        for (path, text) in files {
+            let file = dir.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        }
+        dir.canonicalize().unwrap()
+    }
+
+    /// 보호 목록 수집은 싣지 못한 모듈 파일(파싱 실패·UTF-8이 아닌 파일·없는 타깃 루트)에서
+    /// 멈추지 않는다 — 그 파일을 보호 목록과 unloaded_modules에 두고, 하위 모듈을 못 봐도
+    /// orphan으로 잡히는 파일은 보호한다. 같은 입력의 수확(graph 등)은 그대로 오류다.
+    #[test]
+    fn output_protection_lists_module_files_it_cannot_load() {
+        let tmp = std::env::temp_dir().join(format!("rustograph-unloaded-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let broken: [(&str, &[u8]); 3] = [
+            ("src/lib.rs", b"pub mod broken;\n"),
+            ("src/broken.rs", b"pub mod child;\npub fn oops( {\n"),
+            ("src/broken/child.rs", b"pub fn child() {}\n"),
+        ];
+        let not_utf8: [(&str, &[u8]); 2] = [
+            ("src/lib.rs", b"pub mod data;\n"),
+            ("src/data.rs", b"pub fn d() {}\n// \xff\n"),
+        ];
+        let cases = [
+            (
+                write_crate(&tmp, "parse_failure", None, &broken),
+                "src/broken.rs",
+                vec!["src/lib.rs", "src/broken/child.rs"],
+            ),
+            (
+                write_crate(&tmp, "not_utf8", None, &not_utf8),
+                "src/data.rs",
+                vec!["src/lib.rs"],
+            ),
+            (
+                write_crate(&tmp, "missing_root", Some("src/nope.rs"), &[]),
+                "src/nope.rs",
+                vec![],
+            ),
+        ];
+        for (dir, unloaded, loaded) in cases {
+            let listed = input_files(&dir).unwrap();
+            assert_eq!(listed.unloaded_modules, [dir.join(unloaded)], "{unloaded}");
+            assert!(!listed.unresolved_includes, "{unloaded}");
+            for file in std::iter::once(unloaded).chain(loaded) {
+                assert!(listed.files.contains(&dir.join(file)), "{unloaded}: {file}");
+            }
+            assert!(load(&dir, &span_options()).is_err(), "{unloaded}");
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 상한 읽기는 정규 파일만 열고 상한을 넘으면 거부한다 — FIFO·장치·디렉터리는 열지
+    /// 않으니 막히거나 끝없이 읽지 않는다. 상한까지는 그대로 읽는다.
+    #[cfg(unix)]
+    #[test]
+    fn bounded_source_reads_only_regular_files_within_the_limit() {
+        let tmp = std::env::temp_dir().join(format!("rustograph-bounded-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let fits = tmp.join("fits.rs");
+        std::fs::write(&fits, "fn a() {}").unwrap();
+        assert_eq!(read_source_bounded(&fits, 9).unwrap(), "fn a() {}");
+        let over = read_source_bounded(&fits, 8).unwrap_err();
+        assert_eq!(over.kind(), std::io::ErrorKind::InvalidData);
+        let fifo = tmp.join("pipe.rs");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must run");
+        assert!(made.success());
+        for special in [fifo.as_path(), Path::new("/dev/zero"), tmp.as_path()] {
+            let err = read_source_bounded(special, MAX_SOURCE_BYTES).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{}",
+                special.display()
+            );
+        }
+        let missing = read_source_bounded(&tmp.join("missing.rs"), MAX_SOURCE_BYTES).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 문서에서 `from`이 보내는 call 간선의 (받는 정점, 추정 여부)를 정렬해 돌려준다.
+    fn call_targets<'d>(doc: &'d Document, from: &str) -> Vec<(&'d str, bool)> {
+        let mut found: Vec<(&str, bool)> = doc
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Call && e.from == from)
+            .map(|e| (e.to.as_str(), e.tentative))
+            .collect();
+        found.sort_unstable();
+        found
+    }
+
+    /// `Type::assoc()`와 `self.m()`의 타입 범위 후보 접두사 `{타입}::`는 호출마다 한 번
+    /// 만든다 — 같은 이름 메서드 후보마다 만들면 `new`·`get`을 정의한 타입이 수천 개인
+    /// 워크스페이스에서 할당이 (호출 수 × 같은 이름 정의 수)였다. 해석은 그대로다: 고유
+    /// 메서드와 트레이트 impl 메서드(`T::<Tr>::m`)를 함께 잡고, 이름이 접두사인 다른
+    /// 타입(`T1`과 `T10`)의 메서드는 잡지 않는다.
+    #[test]
+    fn type_scoped_calls_build_each_owner_prefix_once() {
+        let tmp =
+            std::env::temp_dir().join(format!("rustograph-owner-prefix-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let types = 30;
+        let mut lib =
+            String::from("pub trait Tr {\n    fn new() -> Self;\n    fn get(&self) -> u32;\n}\n");
+        for i in 0..types {
+            lib.push_str(&format!(
+                "pub struct T{i};\nimpl T{i} {{\n    pub fn new() -> Self {{\n        T{i}\n    }}\n    \
+                 pub fn get(&self) -> u32 {{\n        {i}\n    }}\n    \
+                 pub fn run(&self) -> u32 {{\n        self.get()\n    }}\n}}\n"
+            ));
+        }
+        lib.push_str("impl Tr for T1 {\n    fn new() -> Self {\n        T1\n    }\n");
+        lib.push_str("    fn get(&self) -> u32 {\n        1\n    }\n}\n");
+        lib.push_str("pub fn make() {\n    T0::new();\n    T1::new();\n    T2::new();\n}\n");
+        let dir = write_crate(
+            &tmp,
+            "owner_prefix",
+            None,
+            &[("src/lib.rs", lib.as_bytes())],
+        );
+        let before = harvest::owner_prefixes();
+        let doc = load(&dir, &span_options()).unwrap();
+        let built = harvest::owner_prefixes() - before;
+        // 타입 범위 호출 자리 — `make`의 `Tk::new()` 3곳과 타입마다 `run`의 `self.get()` 1곳.
+        let call_sites = 3 + types;
+        assert_eq!(
+            built, call_sites,
+            "{built} owner prefixes for {call_sites} type-scoped calls"
+        );
+        assert_eq!(
+            call_targets(&doc, "owner_prefix::make"),
+            [
+                ("owner_prefix::T0::new", false),
+                ("owner_prefix::T1::<Tr>::new", false),
+                ("owner_prefix::T1::new", false),
+                ("owner_prefix::T2::new", false),
+            ]
+        );
+        assert_eq!(
+            call_targets(&doc, "owner_prefix::T1::run"),
+            [
+                ("owner_prefix::T1::<Tr>::get", true),
+                ("owner_prefix::T1::get", true),
+            ]
+        );
+        assert_eq!(
+            call_targets(&doc, "owner_prefix::T10::run"),
+            [("owner_prefix::T10::get", true)]
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 정점 ID의 generated 플래그 — 정점이 없으면 None이다.
+    fn generated_flag(doc: &Document, id: &str) -> Option<bool> {
+        doc.vertices
+            .iter()
+            .find(|v| v.id == id)
+            .map(|v| v.generated)
+    }
+
+    /// 생성 코드 마커는 파싱할 때 읽은 원문으로 파일마다 한 번 판정한다 — 모듈(인라인 모듈
+    /// 포함)마다 같은 파일을 다시 통째로 읽으면 인라인 모듈이 수천 개인 생성 파일(prost
+    /// 출력)에서 (모듈 수 × 파일 크기)를 읽었다. 인라인 모듈의 모듈·아이템·impl 메서드
+    /// 정점은 담은 파일의 판정을 그대로 받는다.
+    #[test]
+    fn generated_markers_are_judged_once_per_parsed_file() {
+        let tmp =
+            std::env::temp_dir().join(format!("rustograph-markers-once-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let mut lib = String::from("// This file is @generated by prost-build.\npub mod plain;\n");
+        for i in 0..20 {
+            lib.push_str(&format!(
+                "pub mod m{i} {{\n    pub struct S;\n    impl S {{\n        pub fn f(&self) {{}}\n    }}\n    \
+                 pub mod inner {{\n        pub fn g() {{}}\n    }}\n}}\n"
+            ));
+        }
+        let dir = write_crate(
+            &tmp,
+            "markers_once",
+            None,
+            &[
+                ("src/lib.rs", lib.as_bytes()),
+                ("src/plain.rs", b"pub fn p() {}\n".as_slice()),
+            ],
+        );
+        let scans_now = || {
+            (
+                MODULE_MARKER_SCANS.with(std::cell::Cell::get),
+                harvest::generated_marker_scans(),
+            )
+        };
+        let (parsed_before, scans_before) = (parsed_files(), scans_now());
+        let doc = load(&dir, &span_options()).unwrap();
+        let parsed = parsed_files() - parsed_before;
+        let scans = (
+            scans_now().0 - scans_before.0,
+            scans_now().1 - scans_before.1,
+        );
+        assert_eq!(parsed, 2, "lib.rs and plain.rs");
+        assert_eq!(
+            scans,
+            (parsed, parsed),
+            "(module rule, item rule) marker scans for {parsed} parsed files"
+        );
+        for id in [
+            "markers_once",
+            "markers_once::m7",
+            "markers_once::m7::inner",
+            "markers_once::m7::S",
+            "markers_once::m7::S::f",
+            "markers_once::m7::inner::g",
+        ] {
+            assert_eq!(generated_flag(&doc, id), Some(true), "{id}");
+        }
+        for id in ["markers_once::plain", "markers_once::plain::p"] {
+            assert_eq!(generated_flag(&doc, id), Some(false), "{id}");
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 모듈 정점과 아이템 정점의 생성 마커 규칙은 서로 다르다 — 읽기만 공유하고 규칙은
+    /// 합치지 않는다(합치면 기존 generated 플래그가 바뀐다). 둘 다 원문 앞 10줄만 본다:
+    /// 'do not edit'만 있으면 모듈 정점만, 'autogenerated'만 있으면 아이템 정점만 참이다.
+    #[test]
+    fn generated_marker_rules_stay_distinct_for_modules_and_items() {
+        let tmp =
+            std::env::temp_dir().join(format!("rustograph-marker-rules-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let items = "pub fn f() {}\npub struct S;\nimpl S {\n    pub fn m(&self) {}\n}\n";
+        // 주석 `marker`를 `line`번째 줄에 둔 파일 머리.
+        let marker_at =
+            |line: usize, marker: &str| format!("{}// {marker}\n", "\n".repeat(line - 1));
+        // (모듈 이름, 파일 머리, 모듈 정점 generated, 아이템 정점 generated)
+        let cases = [
+            ("at_ten", marker_at(10, "@generated"), true, true),
+            ("at_eleven", marker_at(11, "@generated"), false, false),
+            ("edit_only", marker_at(1, "DO NOT EDIT"), true, false),
+            ("autogen", marker_at(1, "autogenerated"), false, true),
+        ];
+        let lib: String = cases
+            .iter()
+            .map(|(name, ..)| format!("pub mod {name};\n"))
+            .collect();
+        let sources: Vec<(String, String)> = cases
+            .iter()
+            .map(|(name, head, ..)| (format!("src/{name}.rs"), format!("{head}{items}")))
+            .collect();
+        let mut files: Vec<(&str, &[u8])> = vec![("src/lib.rs", lib.as_bytes())];
+        files.extend(
+            sources
+                .iter()
+                .map(|(path, text)| (path.as_str(), text.as_bytes())),
+        );
+        let dir = write_crate(&tmp, "marker_rules", None, &files);
+        let doc = load(&dir, &span_options()).unwrap();
+        assert_eq!(generated_flag(&doc, "marker_rules"), Some(false));
+        for (name, _, module_flag, item_flag) in &cases {
+            let module = format!("marker_rules::{name}");
+            assert_eq!(
+                generated_flag(&doc, &module),
+                Some(*module_flag),
+                "{module}"
+            );
+            for item in ["f", "S", "S::m"] {
+                let id = format!("{module}::{item}");
+                assert_eq!(generated_flag(&doc, &id), Some(*item_flag), "{id}");
+            }
+        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

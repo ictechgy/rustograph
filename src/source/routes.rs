@@ -24,7 +24,9 @@ pub mod validate;
 pub mod wrappers;
 
 use crate::cargo_meta;
-use crate::source::schema::{rfc3339_utc_now, BridgeFactsTool, BridgeLocation, FactSymbol};
+use crate::source::schema::{
+    dynamic_channel, rfc3339_utc_now, BridgeFactsTool, BridgeLocation, FactSymbol,
+};
 use common::{Anchor, Ctx, Decl, DeclPath, Gap, Handler, Output, ScopeSpec, Trailing};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -426,7 +428,11 @@ fn decl_facts(
             false
         }
         DeclPath::Dynamic(text) => {
-            variants.push((Some(text.clone()), Vec::new(), None));
+            // 비리터럴 식의 원문(여러 줄일 수 있다)과 템플릿으로 못 바꾼 리터럴 경로가
+            // 모두 여기로 모인다 — 공백을 접고 제어 문자를 지운 뒤 소비자의 UTF-16 상한으로
+            // 자른다. 줄바꿈 하나로 isthmus가 문서 전체를 거부하지 않게 한다.
+            let channel = common::take_utf16(&dynamic_channel(text), template::MAX_TEMPLATE_LENGTH);
+            variants.push((Some(channel), Vec::new(), None));
             true
         }
     };

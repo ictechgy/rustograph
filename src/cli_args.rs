@@ -142,7 +142,24 @@ pub(crate) fn parse(args: &[String]) -> Result<Args, String> {
 /// --focus/--target/--exclude-tests 필터는 저장 문서에도 같은 순서로
 /// 적용된다 — 필터는 문서 변환이라 수확 방식과 무관하다.
 pub(crate) fn document_for(a: &Args, symbol_level: bool) -> Result<Document, String> {
-    document_impl(a, symbol_level, a.has("deps"), a.has("semantic"))
+    document_impl(a, symbol_level, a.has("deps"), a.has("semantic"), false).map(|(doc, _)| doc)
+}
+
+/// [`document_for`]와 같은 문서와, 문서를 수확했다면 그 수확이 읽은 입력을 돌려준다 —
+/// 결과를 파일로 쓰는 명령(`graph --out`, `rules --write-baseline`)이 입력 보호 목록을
+/// 위해 워크스페이스를 다시 수확하지 않게 한다. `want_inputs`가 false면 입력을 모으지 않는다.
+pub(crate) fn document_with_inputs(
+    a: &Args,
+    symbol_level: bool,
+    want_inputs: bool,
+) -> Result<(Document, Option<source::HarvestInputs>), String> {
+    document_impl(
+        a,
+        symbol_level,
+        a.has("deps"),
+        a.has("semantic"),
+        want_inputs,
+    )
 }
 
 fn document_impl(
@@ -150,7 +167,8 @@ fn document_impl(
     symbol_level: bool,
     include_deps: bool,
     semantic: bool,
-) -> Result<Document, String> {
+    want_inputs: bool,
+) -> Result<(Document, Option<source::HarvestInputs>), String> {
     if a.has("tests") && a.has("exclude-tests") {
         return Err("--tests and --exclude-tests are mutually exclusive".to_string());
     }
@@ -165,22 +183,24 @@ fn document_impl(
             }
         }
     }
-    let mut doc = if let Some(f) = a.get("graph") {
-        export::load_file(Path::new(f))?
+    let (mut doc, inputs) = if let Some(f) = a.get("graph") {
+        (export::load_file(Path::new(f))?, None)
     } else {
         let dir = PathBuf::from(a.get("dir").unwrap_or("."));
-        source::load(
-            &dir,
-            &source::Options {
-                symbol_level,
-                include_deps,
-                tests: a.has("tests"),
-                retain_public: a.has("retain-public"),
-                extra_roots: a.get_all("root").iter().map(|s| s.to_string()).collect(),
-                semantic,
-                cache: !a.has("no-cache"),
-            },
-        )?
+        let opts = source::Options {
+            symbol_level,
+            include_deps,
+            tests: a.has("tests"),
+            retain_public: a.has("retain-public"),
+            extra_roots: a.get_all("root").iter().map(|s| s.to_string()).collect(),
+            semantic,
+            cache: !a.has("no-cache"),
+        };
+        if want_inputs {
+            source::load_with_inputs(&dir, &opts)?
+        } else {
+            (source::load(&dir, &opts)?, None)
+        }
     };
     if symbol_level && !matches!(a.cmd.as_str(), "graph" | "cycles" | "mcp" | "search") {
         doc.require_level(Level::Symbol)?;
@@ -197,7 +217,7 @@ fn document_impl(
     if !focus.is_empty() {
         doc = doc.focus(&focus);
     }
-    Ok(doc)
+    Ok((doc, inputs))
 }
 
 /// 정수 인자 하나를 꺼낸다 — 없으면 기본값, 있으면 반드시 파싱돼야 한다.

@@ -4,7 +4,7 @@
 //! "규칙이 모르는 영역"으로 따로 보고한다 — 규칙 무관이 아니다.
 
 use crate::config::{self, Config};
-use crate::graph::{Document, EdgeKind, Kind};
+use crate::graph::{Document, EdgeKind, Kind, Vertex};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -128,14 +128,40 @@ fn component_of(cfg: &Config, path: &str) -> Option<String> {
     best.map(|(c, _)| c.clone())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 규칙 검사·SARIF 위치 조회가 살핀 정점 수 — 간선·위반마다 정점 배열을 다시 훑지
+    /// 않는지 단위 테스트가 센다(테스트 스레드마다 따로).
+    static EXAMINED_VERTICES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 테스트용 — 이 스레드에서 지금까지 살핀 정점 수.
+#[cfg(test)]
+pub(crate) fn examined_vertices() -> usize {
+    EXAMINED_VERTICES.with(std::cell::Cell::get)
+}
+
+/// 정점 ID → 그 ID의 첫 정점. 같은 ID의 cfg 변형(`#[cfg(unix)] fn f` / `#[cfg(windows)] fn f`)
+/// 가운데 문서 순서상 첫 변형이 규칙 매칭 단위(module)·exported·SARIF 위치를 대표한다 —
+/// 정점 배열을 선형 탐색하던 `find`가 고르던 변형 그대로다. 간선·위반마다 정점 배열을
+/// 처음부터 훑으면 O(E·V)라, 정점 4만·확정 간선 18만 합성 문서에서 `rules`가 17초,
+/// 위반 17만 건을 내는 `--format sarif`가 22초였다.
+pub(crate) fn vertices_by_id(doc: &Document) -> BTreeMap<&str, &Vertex> {
+    let mut first: BTreeMap<&str, &Vertex> = BTreeMap::new();
+    for v in &doc.vertices {
+        #[cfg(test)]
+        EXAMINED_VERTICES.with(|c| c.set(c.get() + 1));
+        first.entry(v.id.as_str()).or_insert(v);
+    }
+    first
+}
+
 /// 규칙 대상 경로 — 정점의 소속 단위(모듈 경로 또는 크레이트 이름).
-fn scope_of(doc: &Document, vertex_id: &str) -> String {
+fn scope_of<'a>(by_id: &BTreeMap<&str, &'a Vertex>, vertex_id: &'a str) -> &'a str {
     // 정점의 module 필드가 규칙 매칭 단위다.
-    doc.vertices
-        .iter()
-        .find(|v| v.id == vertex_id)
-        .map(|v| v.module.clone())
-        .unwrap_or_else(|| vertex_id.to_string())
+    by_id
+        .get(vertex_id)
+        .map_or(vertex_id, |v| v.module.as_str())
 }
 
 /// 규칙 검사 — 의존 간선을 컴포넌트 규칙에 대조한다.
@@ -162,6 +188,7 @@ pub fn check(doc: &Document, cfg: &Config) -> RulesReport {
     unmapped.sort();
     unmapped.dedup();
 
+    let by_id = vertices_by_id(doc);
     let mut skipped_tentative = 0usize;
     for e in &doc.edges {
         if !e.kind.is_dependency() {
@@ -171,11 +198,11 @@ pub fn check(doc: &Document, cfg: &Config) -> RulesReport {
             skipped_tentative += 1;
             continue;
         }
-        let (fs, ts) = (scope_of(doc, &e.from), scope_of(doc, &e.to));
+        let (fs, ts) = (scope_of(&by_id, &e.from), scope_of(&by_id, &e.to));
         if fs == ts {
             continue; // 같은 컴포넌트 내부 의존은 규칙 대상이 아니다.
         }
-        let (Some(fc), Some(tc)) = (comp(&fs), comp(&ts)) else {
+        let (Some(fc), Some(tc)) = (comp(fs), comp(ts)) else {
             continue; // 매핑 밖은 unmapped로 이미 보고된다.
         };
         if fc == tc {
@@ -185,7 +212,7 @@ pub fn check(doc: &Document, cfg: &Config) -> RulesReport {
         if cfg
             .deny
             .get(&fc)
-            .is_some_and(|list| list.iter().any(|p| p == &tc || config::matches(p, &ts)))
+            .is_some_and(|list| list.iter().any(|p| p == &tc || config::matches(p, ts)))
         {
             violations.push(Violation {
                 rule: "deny".to_string(),
@@ -200,14 +227,10 @@ pub fn check(doc: &Document, cfg: &Config) -> RulesReport {
         // signature 규칙: exported 심볼의 signature 간선만 대상. 비exported
         // 심볼이나 signature 규칙이 없는 컴포넌트의 간선은 아래 deps 검사로 간다.
         if e.kind == EdgeKind::Signature {
-            let from_exported = doc
-                .vertices
-                .iter()
-                .find(|v| v.id == e.from)
-                .is_some_and(|v| v.exported);
+            let from_exported = by_id.get(e.from.as_str()).is_some_and(|v| v.exported);
             if from_exported {
                 if let Some(allowed) = cfg.signature.get(&fc) {
-                    let ok = allowed.iter().any(|p| p == &tc || config::matches(p, &ts));
+                    let ok = allowed.iter().any(|p| p == &tc || config::matches(p, ts));
                     if !ok {
                         violations.push(Violation {
                             rule: "signature".to_string(),
@@ -223,8 +246,8 @@ pub fn check(doc: &Document, cfg: &Config) -> RulesReport {
             }
         }
         // allowlist: deps 항목이 없는 컴포넌트는 자기 외 의존 불가.
-        let allowed = cfg.deps.get(&fc).cloned().unwrap_or_default();
-        let ok = allowed.iter().any(|p| p == &tc || config::matches(p, &ts));
+        let allowed = cfg.deps.get(&fc).map(Vec::as_slice).unwrap_or(&[]);
+        let ok = allowed.iter().any(|p| p == &tc || config::matches(p, ts));
         if !ok {
             violations.push(Violation {
                 rule: "allow".to_string(),
@@ -365,6 +388,71 @@ mod tests {
         let rep = check(&d, &cfg());
         assert!(rep.unmapped.contains(&"z::nowhere::m".to_string()));
         assert!(!rep.unmapped.contains(&"c::other::x".to_string()));
+    }
+
+    /// 같은 ID의 cfg 변형(`#[cfg(unix)] fn dup` / `#[cfg(windows)] fn dup`)은 문서 순서상 첫
+    /// 변형이 규칙 매칭 단위(module)와 exported를 정한다 — 다른 변형으로 바뀌면 같은 문서의
+    /// 위반이 달라진다.
+    #[test]
+    fn first_cfg_variant_decides_scope_and_export() {
+        let dup = "c::ui::dup";
+        let mut d = doc(vec![
+            // 첫 변형(ui, exported)이면 signature 위반, 둘째 변형(core, 비exported)이면 core의 allow 위반.
+            Edge::new(dup.into(), "c::other::x".into(), EdgeKind::Signature),
+            // 첫 변형이면 core→ui deny, 둘째 변형이면 같은 단위(c::core)라 면제.
+            Edge::new("c::core::a".into(), dup.into(), EdgeKind::Call),
+        ]);
+        d.vertices.push(Vertex {
+            position: Some("src/ui.rs:3".into()),
+            cfg: Some("unix".into()),
+            ..v(dup, Kind::Fn, true)
+        });
+        d.vertices.push(Vertex {
+            module: "c::core".into(),
+            position: Some("src/core.rs:9".into()),
+            cfg: Some("windows".into()),
+            ..v(dup, Kind::Fn, false)
+        });
+        let rep = check(&d, &cfg());
+        let found: Vec<(&str, &str, &str)> = rep
+            .violations
+            .iter()
+            .map(|x| (x.rule.as_str(), x.from.as_str(), x.component.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [("deny", "c::core::a", "core"), ("signature", dup, "ui")]
+        );
+    }
+
+    /// 간선마다 정점 배열을 처음부터 훑어 소속 단위·exported를 찾으면 O(E·V)다 — 정점 4만
+    /// 합성 문서의 `rules`가 17초였다. 규칙 검사가 정점 색인을 정확히 한 번 만드는지(정점마다
+    /// 한 번) 센다. 상한이 아니라 정확한 횟수로 단언한다 — 색인을 간선마다 다시 만들면 넘치고,
+    /// 색인을 빼고 옛 선형 탐색으로 돌아가면 0이라 둘 다 실패한다. 계수기는 색인 구축에만 있어
+    /// 색인을 만들어 두고 쓰지 않는 우회는 못 잡는다(시간 비교 없이 결정적으로 잴 수 있는 한계다).
+    #[test]
+    fn check_examines_each_vertex_once() {
+        let n = 60;
+        let mut d = doc(vec![]);
+        for i in 0..n {
+            let (ui, core) = (format!("c::ui::f{i}"), format!("c::core::g{i}"));
+            d.vertices.push(v(&ui, Kind::Fn, true));
+            d.vertices.push(v(&core, Kind::Fn, true));
+            // core→ui는 deny 위반, ui→core signature는 허용.
+            d.edges
+                .push(Edge::new(core.clone(), ui.clone(), EdgeKind::Call));
+            d.edges.push(Edge::new(ui, core, EdgeKind::Signature));
+        }
+        let before = examined_vertices();
+        let rep = check(&d, &cfg());
+        let examined = examined_vertices() - before;
+        assert_eq!(rep.violations.len(), n);
+        assert_eq!(
+            examined,
+            d.vertices.len(),
+            "{examined} vertex visits for {} vertices",
+            d.vertices.len()
+        );
     }
 
     /// 위반 두 건을 내는 문서 — core→ui는 deny, other→ui는 allow 위반.

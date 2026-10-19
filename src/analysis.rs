@@ -3,9 +3,10 @@
 //! 여기서도 판정은 보수적이다: unreachable은 "보존 루트에서 도달 불가"라는
 //! 그래프 사실이지 삭제 권고가 아니다.
 
-use crate::graph::{Document, EdgeKind, Kind};
+use crate::graph::{Document, Edge, EdgeKind, Kind};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::OnceLock;
 
 /// 이웃 질의 한 건 — 정점과 그쪽으로의 간선 종류 전부.
 #[derive(Debug, Serialize)]
@@ -29,16 +30,154 @@ pub struct QueryResult {
 /// 정점의 양방향 이웃을 depth까지 BFS로 찾는다.
 /// 같은 이웃·방향은 최단 거리에서 한 번만 보고하고 시작 정점은 제외한다.
 pub fn query(doc: &Document, id: &str, depth: usize, max: usize) -> QueryResult {
-    walk_neighbors(doc, id, depth, max, false)
+    QueryIndex::new(doc).query(id, depth, max)
 }
 
 /// 방향별 간선 종류를 색인한다 — 역방향 종류나 contains를 증거에 섞지 않는다.
 type NeighborIndex<'a> = BTreeMap<&'a str, BTreeMap<(&'a str, &'static str), BTreeSet<EdgeKind>>>;
 
-fn neighbor_index(doc: &Document, incoming_only: bool) -> NeighborIndex<'_> {
-    let ids = doc.vertex_ids();
-    let mut index: NeighborIndex<'_> = BTreeMap::new();
+/// 경로 탐색 인접 목록 — (from,to) 쌍마다 간선 하나(확정·최소 종류).
+type PathAdjacency<'a> = BTreeMap<&'a str, Vec<(&'a str, EdgeKind, bool)>>;
+
+/// 도달성 인접 목록 — 의존 간선의 outgoing([`Document::outgoing`]).
+type ReachMap<'a> = BTreeMap<&'a str, Vec<(&'a EdgeKind, &'a str)>>;
+
+#[cfg(test)]
+thread_local! {
+    /// 색인을 만들며 살핀 정점·간선 수 — 같은 문서에 질의를 되풀이할 때 색인을 다시 만들지
+    /// 않는지 단위 테스트가 센다(테스트 스레드마다 따로).
+    static INDEXED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 테스트용 — 이 스레드에서 지금까지 색인 구축이 살핀 정점·간선 수.
+#[cfg(test)]
+pub(crate) fn indexed() -> usize {
+    INDEXED.with(std::cell::Cell::get)
+}
+
+/// 테스트용 — 색인 구축이 정점·간선 `n`개를 살폈다고 센다.
+#[cfg(test)]
+fn note_indexed(n: usize) {
+    INDEXED.with(|c| c.set(c.get() + n));
+}
+
+/// 한 문서 위의 질의 색인 — 정점 ID 집합, 양방향·역방향 이웃, 경로 인접, 도달 인접을 처음
+/// 쓰는 질의가 한 번 만들고 같은 문서의 다음 질의가 재사용한다. MCP 서버는 불변 스냅샷
+/// 하나에 query·impact를 세션 내내 묻는다 — 호출마다 전 간선을 다시 색인하면 답이 이웃 몇
+/// 개여도 호출당 O(E log V)였다. [`query`]·[`impact`]·[`paths`]·[`resolve_id`]·[`dead`]는
+/// 이 색인을 한 번 쓰고 버리는 래퍼라 CLI와 MCP가 같은 경로로 답한다.
+pub struct QueryIndex<'a> {
+    doc: &'a Document,
+    ids: OnceLock<BTreeSet<&'a str>>,
+    neighbors: OnceLock<NeighborIndex<'a>>,
+    dependers: OnceLock<NeighborIndex<'a>>,
+    adjacency: OnceLock<PathAdjacency<'a>>,
+    reach: OnceLock<ReachMap<'a>>,
+}
+
+impl<'a> QueryIndex<'a> {
+    /// 아직 아무것도 색인하지 않은 색인 — 각 색인은 그것을 쓰는 첫 질의가 만든다.
+    pub fn new(doc: &'a Document) -> Self {
+        QueryIndex {
+            doc,
+            ids: OnceLock::new(),
+            neighbors: OnceLock::new(),
+            dependers: OnceLock::new(),
+            adjacency: OnceLock::new(),
+            reach: OnceLock::new(),
+        }
+    }
+
+    /// 이 ID의 정점이 문서에 있는가.
+    pub fn has_vertex(&self, id: &str) -> bool {
+        self.vertex_set().contains(id)
+    }
+
+    /// [`query`]와 같은 양방향 이웃.
+    pub fn query(&self, id: &str, depth: usize, max: usize) -> QueryResult {
+        walk_neighbors(self, id, depth, max, false)
+    }
+
+    /// [`impact`]와 같은 역방향 전이 — 처음부터 incoming만 따라간다.
+    pub fn impact(&self, id: &str, depth: usize, max: usize) -> ImpactResult {
+        let q = walk_neighbors(self, id, depth, max, true);
+        ImpactResult {
+            id: q.id,
+            found: q.found,
+            depth: q.depth,
+            truncated: q.truncated,
+            impacted: q.neighbors,
+        }
+    }
+
+    /// [`paths`]와 같은 경로 탐색.
+    pub fn paths(&self, from: &str, to: &str, max_paths: usize, budget: usize) -> PathsReport {
+        paths_bounded(self, from, to, max_paths, budget, &mut 0)
+    }
+
+    /// [`resolve_id`]와 같은 ID 확정 — 정확 일치가 없으면 검색 후보를 돌린다.
+    pub fn resolve_id(&self, id: &str) -> Result<String, Vec<String>> {
+        if self.has_vertex(id) {
+            return Ok(id.to_string());
+        }
+        Err(search(self.doc, id, 10)
+            .matches
+            .into_iter()
+            .map(|h| h.id)
+            .collect())
+    }
+
+    /// `roots`를 보존 루트로 삼은 [`dead`] — 루트만 바꾼 문서 사본을 만들지 않는다.
+    pub fn dead(&self, roots: &[String]) -> Result<DeadReport, String> {
+        // 레벨이 모자라면 도달 인접을 만들기 전에 거절한다.
+        self.doc.require_level(crate::graph::Level::Symbol)?;
+        Ok(dead_with(self.doc, self.reach_map(), roots))
+    }
+
+    /// 정점 ID 집합 — 같은 ID의 cfg 변형은 하나다.
+    fn vertex_set(&self) -> &BTreeSet<&'a str> {
+        self.ids.get_or_init(|| {
+            #[cfg(test)]
+            note_indexed(self.doc.vertices.len());
+            self.doc.vertex_ids()
+        })
+    }
+
+    /// 방향별 이웃 색인 — impact는 역방향만, query는 양방향을 쓴다.
+    fn neighbor_map(&self, incoming_only: bool) -> &NeighborIndex<'a> {
+        let slot = if incoming_only {
+            &self.dependers
+        } else {
+            &self.neighbors
+        };
+        slot.get_or_init(|| neighbor_index(self.doc, self.vertex_set(), incoming_only))
+    }
+
+    /// 경로 탐색 인접 목록.
+    fn path_adjacency(&self) -> &PathAdjacency<'a> {
+        self.adjacency
+            .get_or_init(|| adjacency_of(self.doc, self.vertex_set()))
+    }
+
+    /// 보존 루트 BFS가 따라가는 도달성 인접 목록.
+    fn reach_map(&self) -> &ReachMap<'a> {
+        self.reach.get_or_init(|| {
+            #[cfg(test)]
+            note_indexed(self.doc.edges.len());
+            self.doc.outgoing()
+        })
+    }
+}
+
+fn neighbor_index<'a>(
+    doc: &'a Document,
+    ids: &BTreeSet<&str>,
+    incoming_only: bool,
+) -> NeighborIndex<'a> {
+    let mut index: NeighborIndex<'a> = BTreeMap::new();
     for edge in &doc.edges {
+        #[cfg(test)]
+        note_indexed(1);
         if !edge.kind.is_dependency()
             || !ids.contains(edge.from.as_str())
             || !ids.contains(edge.to.as_str())
@@ -66,7 +205,7 @@ fn neighbor_index(doc: &Document, incoming_only: bool) -> NeighborIndex<'_> {
 /// BFS의 한 깊이를 먼저 합쳐 다이아몬드 경로의 모든 최단 증거를 보존한다.
 /// 상한은 실제 보고 항목 수에 적용하고, 생략할 항목이 있어야 truncated다.
 fn walk_neighbors(
-    doc: &Document,
+    index: &QueryIndex<'_>,
     id: &str,
     depth: usize,
     max: usize,
@@ -74,7 +213,7 @@ fn walk_neighbors(
 ) -> QueryResult {
     let mut result = QueryResult {
         id: id.to_string(),
-        found: doc.vertex_ids().contains(id),
+        found: index.has_vertex(id),
         depth,
         truncated: false,
         neighbors: Vec::new(),
@@ -82,7 +221,7 @@ fn walk_neighbors(
     if !result.found || depth == 0 {
         return result;
     }
-    let index = neighbor_index(doc, incoming_only);
+    let edges_of = index.neighbor_map(incoming_only);
     let mut seen = BTreeSet::from([id]);
     let mut reported = BTreeSet::new();
     let mut frontier = BTreeSet::from([id]);
@@ -92,7 +231,7 @@ fn walk_neighbors(
         }
         let mut step: BTreeMap<(&str, &str), BTreeSet<EdgeKind>> = BTreeMap::new();
         for current in frontier {
-            for (&key, kinds) in index.get(current).into_iter().flatten() {
+            for (&key, kinds) in edges_of.get(current).into_iter().flatten() {
                 if key.0 != id && !reported.contains(&key) {
                     step.entry(key).or_default().extend(kinds);
                 }
@@ -132,14 +271,7 @@ pub struct ImpactResult {
 
 /// impact 질의 — 처음부터 incoming만 따라가야 공유 의존의 다른 사용자가 섞이지 않는다.
 pub fn impact(doc: &Document, id: &str, depth: usize, max: usize) -> ImpactResult {
-    let q = walk_neighbors(doc, id, depth, max, true);
-    ImpactResult {
-        id: q.id,
-        found: q.found,
-        depth: q.depth,
-        truncated: q.truncated,
-        impacted: q.neighbors,
-    }
+    QueryIndex::new(doc).impact(id, depth, max)
 }
 
 /// 두 정점 사이의 경로 하나 — 각 홉이 어떤 간선을 건넜는지까지 싣는다.
@@ -175,25 +307,19 @@ pub struct PathsReport {
 /// 나온다. 추정 간선도 따라가되 경로에 tentative로 표시한다 —
 /// "도달 가능할 수 있다"는 사실이 보고 가치다.
 pub fn paths(doc: &Document, from: &str, to: &str, max_paths: usize, budget: usize) -> PathsReport {
-    paths_bounded(doc, from, to, max_paths, budget, &mut 0)
+    QueryIndex::new(doc).paths(from, to, max_paths, budget)
 }
 
-fn paths_bounded(
-    doc: &Document,
-    from: &str,
-    to: &str,
-    max_paths: usize,
-    budget: usize,
-    peak_pending: &mut usize,
-) -> PathsReport {
-    let ids = doc.vertex_ids();
-    // 인접 목록: (from,to) 쌍에 간선이 여러 개면 확정·최소 종류
-    // (EdgeKind의 선언 순서 Ord) 하나만 남긴다 — 같은 경로를 간선
-    // 종류만큼 중복 보고하지 않기 위함이다. 끝점이 없는 간선은 건너뛴다
-    // — 비형식 문서의 dangling 간선이 경로에 없는 정점을 끼워 넣는
-    // 것을 막는다.
-    let mut adj: BTreeMap<&str, Vec<(&str, EdgeKind, bool)>> = BTreeMap::new();
+/// 경로 탐색 인접 목록: (from,to) 쌍에 간선이 여러 개면 확정·최소 종류
+/// (EdgeKind의 선언 순서 Ord) 하나만 남긴다 — 같은 경로를 간선
+/// 종류만큼 중복 보고하지 않기 위함이다. 끝점이 없는 간선은 건너뛴다
+/// — 비형식 문서의 dangling 간선이 경로에 없는 정점을 끼워 넣는
+/// 것을 막는다.
+fn adjacency_of<'a>(doc: &'a Document, ids: &BTreeSet<&str>) -> PathAdjacency<'a> {
+    let mut adj: PathAdjacency<'a> = BTreeMap::new();
     for e in &doc.edges {
+        #[cfg(test)]
+        note_indexed(1);
         if e.kind.is_dependency() && ids.contains(e.from.as_str()) && ids.contains(e.to.as_str()) {
             adj.entry(e.from.as_str())
                 .or_default()
@@ -204,6 +330,17 @@ fn paths_bounded(
         outs.sort_by(|a, b| (a.0, a.2, a.1).cmp(&(b.0, b.2, b.1)));
         outs.dedup_by(|a, b| a.0 == b.0); // 정렬 후 첫 항목이 확정·최소 종류.
     }
+    adj
+}
+
+fn paths_bounded(
+    index: &QueryIndex<'_>,
+    from: &str,
+    to: &str,
+    max_paths: usize,
+    budget: usize,
+    peak_pending: &mut usize,
+) -> PathsReport {
     let mut report = PathsReport {
         from: from.to_string(),
         to: to.to_string(),
@@ -212,7 +349,7 @@ fn paths_bounded(
         expanded: 0,
         paths: Vec::new(),
     };
-    if !ids.contains(from) || !ids.contains(to) {
+    if !index.has_vertex(from) || !index.has_vertex(to) {
         return report; // 끝점이 없으면 경로도 없다 — 호출자가 404를 처리한다.
     }
     if from == to {
@@ -229,6 +366,7 @@ fn paths_bounded(
         }
         return report;
     }
+    let adj = index.path_adjacency();
     // 부분 경로 상태 — 경로 내부 재방문 금지로 단순 경로만 나온다.
     struct State {
         vertices: Vec<String>,
@@ -372,14 +510,7 @@ pub fn search(doc: &Document, query: &str, max: usize) -> SearchReport {
 /// Err로 돌린다 — 조용히 아무 후보나 고르면 호출자가 엉뚱한 정점을
 /// 본다. 실패 메시지에 후보를 싣는 것이 애매 거부의 전부다.
 pub fn resolve_id(doc: &Document, id: &str) -> Result<String, Vec<String>> {
-    if doc.vertex_ids().contains(id) {
-        return Ok(id.to_string());
-    }
-    Err(search(doc, id, 10)
-        .matches
-        .into_iter()
-        .map(|h| h.id)
-        .collect())
+    QueryIndex::new(doc).resolve_id(id)
 }
 
 /// Tarjan SCC — 2개 이상 정점의 강연결 컴포넌트, 또는 자기루프 단독 정점.
@@ -406,18 +537,171 @@ pub struct CycleEdge {
     pub kind: EdgeKind,
 }
 
-/// 의존 간선 중 확정분만의 outgoing 인접 목록 — 순환·규칙 검사용.
+/// 확정 의존 간선만 남긴 번호 그래프 — 순환 탐지가 ID 문자열 대신 번호로 돈다.
 /// tentative는 "이 중 하나일 수 있다"라는 추정이라 증거가 못 된다.
-fn firm_outgoing(doc: &Document) -> BTreeMap<&str, Vec<(&EdgeKind, &str)>> {
-    let mut map: BTreeMap<&str, Vec<(&EdgeKind, &str)>> = BTreeMap::new();
-    for e in &doc.edges {
-        if e.kind.is_dependency() && !e.tentative {
-            map.entry(e.from.as_str())
-                .or_default()
-                .push((&e.kind, e.to.as_str()));
+/// 번호 `0..roots`는 정렬된 정점 ID(Tarjan 시작점)이고, 그 뒤는 간선에만 나오는
+/// dangling 끝점이다. 저장 문서(`--graph`)에서 정점이 가리키는 dangling 끝점도
+/// 방문해 SCC 멤버로 내 왔다 — 그 출력을 지키려면 끝점에도 번호가 있어야 한다.
+struct FirmGraph<'a> {
+    /// 번호 → ID.
+    names: Vec<&'a str>,
+    /// Tarjan 시작점 수 — 앞쪽 번호가 정점이다.
+    roots: usize,
+    /// 번호 → 후속 번호. doc.edges 순서라 방문 순서가 입력만으로 정해진다.
+    successors: Vec<Vec<usize>>,
+    /// 확정 의존 간선을 doc.edges 순서로 — (from 번호, to 번호, 간선). 증거 분배용.
+    edges: Vec<(usize, usize, &'a Edge)>,
+    /// 번호 → 확정 의존 자기 루프가 있는가. 정점 하나짜리 SCC의 순환 여부다.
+    self_loop: Vec<bool>,
+}
+
+impl<'a> FirmGraph<'a> {
+    fn new(doc: &'a Document) -> FirmGraph<'a> {
+        let mut names: Vec<&str> = doc.vertex_ids().into_iter().collect();
+        let roots = names.len();
+        let mut numbers: HashMap<&str, usize> =
+            names.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        let mut edges = Vec::new();
+        for e in doc
+            .edges
+            .iter()
+            .filter(|e| e.kind.is_dependency() && !e.tentative)
+        {
+            let from = number_of(&mut numbers, &mut names, &e.from);
+            let to = number_of(&mut numbers, &mut names, &e.to);
+            edges.push((from, to, e));
+        }
+        let mut successors = vec![Vec::new(); names.len()];
+        let mut self_loop = vec![false; names.len()];
+        for &(from, to, _) in &edges {
+            successors[from].push(to);
+            self_loop[from] |= from == to;
+        }
+        FirmGraph {
+            names,
+            roots,
+            successors,
+            edges,
+            self_loop,
         }
     }
-    map
+}
+
+/// ID의 번호 — 처음 보는 ID(dangling 끝점)면 다음 번호를 준다.
+fn number_of<'a>(
+    numbers: &mut HashMap<&'a str, usize>,
+    names: &mut Vec<&'a str>,
+    id: &'a str,
+) -> usize {
+    *numbers.entry(id).or_insert_with(|| {
+        names.push(id);
+        names.len() - 1
+    })
+}
+
+/// 반복형 Tarjan의 상태 — 정점 번호로 색인한다.
+/// 재귀판은 DFS 경로 길이만큼 호출 스택을 써서, 수만 정점 고리나 긴 호출 사슬에서
+/// 스레드 스택을 넘겨 프로세스가 abort했다(종료 코드 134, MCP 서버 소멸). 그래서
+/// 호출 스택 대신 (정점, 다음 후속 위치) 프레임을 힙에 쌓는다. 시작점 순서(정렬된
+/// 정점 ID)와 후속 순서(doc.edges)가 재귀판과 같아 SCC와 그 안의 순서도 같다.
+struct Tarjan<'g> {
+    successors: &'g [Vec<usize>],
+    /// 방문 순번. `UNSEEN`이면 아직 안 봤다.
+    order: Vec<usize>,
+    /// DFS 부분 트리에서 Tarjan 스택 위 정점으로 닿는 가장 작은 순번.
+    low: Vec<usize>,
+    on_stack: Vec<bool>,
+    stack: Vec<usize>,
+    /// 다음에 매길 순번.
+    next: usize,
+    /// 완성된 SCC — 발견 순서, 멤버는 스택에서 꺼낸 순서.
+    found: Vec<Vec<usize>>,
+}
+
+impl Tarjan<'_> {
+    const UNSEEN: usize = usize::MAX;
+
+    /// 시작점마다 아직 안 본 것에서 DFS를 연다.
+    fn strongly_connected(firm: &FirmGraph) -> Vec<Vec<usize>> {
+        let n = firm.successors.len();
+        let mut state = Tarjan {
+            successors: &firm.successors,
+            order: vec![Self::UNSEEN; n],
+            low: vec![0; n],
+            on_stack: vec![false; n],
+            stack: Vec::new(),
+            next: 0,
+            found: Vec::new(),
+        };
+        for start in 0..firm.roots {
+            if state.order[start] == Self::UNSEEN {
+                state.visit(start);
+            }
+        }
+        state.found
+    }
+
+    /// start에서 닿는 끝점을 전부 방문한다 — 재귀 호출 하나가 프레임 하나다.
+    fn visit(&mut self, start: usize) {
+        self.enter(start);
+        let mut frames = vec![(start, 0usize)];
+        while let Some(frame) = frames.last_mut() {
+            let v = frame.0;
+            let Some(&w) = self.successors[v].get(frame.1) else {
+                frames.pop();
+                self.finish(v, frames.last().map(|parent| parent.0));
+                continue;
+            };
+            frame.1 += 1;
+            if self.order[w] == Self::UNSEEN {
+                self.enter(w);
+                frames.push((w, 0));
+            } else if self.on_stack[w] {
+                self.low[v] = self.low[v].min(self.order[w]);
+            }
+        }
+    }
+
+    /// 순번을 매기고 Tarjan 스택에 올린다.
+    fn enter(&mut self, v: usize) {
+        self.order[v] = self.next;
+        self.low[v] = self.next;
+        self.next += 1;
+        self.stack.push(v);
+        self.on_stack[v] = true;
+    }
+
+    /// v의 후속을 다 봤다 — 뿌리면 SCC를 꺼내고, 재귀판이 호출에서 돌아와 하던
+    /// 대로 부모의 low에 v의 low를 반영한다.
+    fn finish(&mut self, v: usize, parent: Option<usize>) {
+        if self.low[v] == self.order[v] {
+            let mut members = Vec::new();
+            while let Some(w) = self.stack.pop() {
+                self.on_stack[w] = false;
+                members.push(w);
+                if w == v {
+                    break;
+                }
+            }
+            self.found.push(members);
+        }
+        if let Some(p) = parent {
+            self.low[p] = self.low[p].min(self.low[v]);
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 순환 판정·증거 수집이 살핀 간선 수 — SCC마다 전체 간선을 다시 훑지 않는지
+    /// 단위 테스트가 센다(테스트 스레드마다 따로).
+    static CLASSIFIED_EDGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 테스트용 — 이 스레드에서 지금까지 순환 판정·증거 수집이 살핀 간선 수.
+#[cfg(test)]
+pub(crate) fn classified_edges() -> usize {
+    CLASSIFIED_EDGES.with(std::cell::Cell::get)
 }
 
 /// 순환을 찾는다 — 확정 의존 간선만 따라간다(추정 간선은 제외하고 센다).
@@ -427,104 +711,55 @@ pub fn cycles(doc: &Document) -> CycleReport {
         .iter()
         .filter(|e| e.kind.is_dependency() && e.tentative)
         .count();
-    let out = firm_outgoing(doc);
-    let ids: Vec<&str> = doc.vertex_ids().into_iter().collect();
-    // Tarjan.
-    let mut index = 0usize;
-    let mut indices: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut low: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut on_stack: BTreeSet<&str> = BTreeSet::new();
-    let mut stack: Vec<&str> = Vec::new();
-    let mut sccs: Vec<Vec<String>> = Vec::new();
-
-    // Tarjan 상태 기계는 인자가 많다 — 구조체로 나누면 재귀가 더 읽기 어렵다.
-    #[allow(clippy::too_many_arguments)]
-    fn strongconnect<'a>(
-        v: &'a str,
-        out: &BTreeMap<&'a str, Vec<(&'a EdgeKind, &'a str)>>,
-        index: &mut usize,
-        indices: &mut BTreeMap<&'a str, usize>,
-        low: &mut BTreeMap<&'a str, usize>,
-        stack: &mut Vec<&'a str>,
-        on_stack: &mut BTreeSet<&'a str>,
-        sccs: &mut Vec<Vec<String>>,
-    ) {
-        indices.insert(v, *index);
-        low.insert(v, *index);
-        *index += 1;
-        stack.push(v);
-        on_stack.insert(v);
-        if let Some(succs) = out.get(v) {
-            for (_, w) in succs {
-                if !indices.contains_key(w) {
-                    strongconnect(w, out, index, indices, low, stack, on_stack, sccs);
-                    low.insert(v, low[v].min(low[w]));
-                } else if on_stack.contains(w) {
-                    low.insert(v, low[v].min(indices[w]));
-                }
-            }
-        }
-        if low[v] == indices[v] {
-            let mut scc = Vec::new();
-            while let Some(w) = stack.pop() {
-                on_stack.remove(w);
-                scc.push(w.to_string());
-                if w == v {
-                    break;
-                }
-            }
-            sccs.push(scc);
-        }
-    }
-    for id in &ids {
-        if !indices.contains_key(id) {
-            strongconnect(
-                id,
-                &out,
-                &mut index,
-                &mut indices,
-                &mut low,
-                &mut stack,
-                &mut on_stack,
-                &mut sccs,
-            );
-        }
-    }
-    let mut result = Vec::new();
-    for scc in sccs {
-        let is_cycle = scc.len() > 1
-            || doc.edges.iter().any(|e| {
-                e.kind.is_dependency() && !e.tentative && e.from == scc[0] && e.to == scc[0]
-            });
-        if !is_cycle {
-            continue;
-        }
-        let member_set: BTreeSet<&str> = scc.iter().map(|s| s.as_str()).collect();
-        let mut evidence: Vec<CycleEdge> = doc
-            .edges
-            .iter()
-            .filter(|e| {
-                e.kind.is_dependency()
-                    && !e.tentative
-                    && member_set.contains(e.from.as_str())
-                    && member_set.contains(e.to.as_str())
-            })
-            .map(|e| CycleEdge {
-                from: e.from.clone(),
-                to: e.to.clone(),
-                kind: e.kind,
-            })
-            .collect();
-        evidence.sort_by(|a, b| (&a.from, &a.to).cmp(&(&b.from, &b.to)));
-        let mut members = scc;
-        members.sort();
-        result.push(Cycle { members, evidence });
-    }
+    let firm = FirmGraph::new(doc);
+    let cyclic: Vec<Vec<usize>> = Tarjan::strongly_connected(&firm)
+        .into_iter()
+        // SCC는 비지 않는다 — 뿌리 자신이 들어 있다.
+        .filter(|scc| scc.len() > 1 || firm.self_loop[scc[0]])
+        .collect();
+    let evidence = cycle_evidence(&firm, &cyclic);
+    let mut result: Vec<Cycle> = cyclic
+        .into_iter()
+        .zip(evidence)
+        .map(|(scc, mut evidence)| {
+            // 안정 정렬 — 같은 (from,to)의 여러 종류는 doc.edges 순서를 지킨다.
+            evidence.sort_by(|a, b| (&a.from, &a.to).cmp(&(&b.from, &b.to)));
+            let mut members: Vec<String> =
+                scc.into_iter().map(|m| firm.names[m].to_string()).collect();
+            members.sort();
+            Cycle { members, evidence }
+        })
+        .collect();
     result.sort_by(|a, b| a.members.cmp(&b.members));
     CycleReport {
         cycles: result,
         excluded_tentative: excluded,
     }
+}
+
+/// 순환 SCC마다 증거 간선(양 끝이 같은 SCC인 확정 의존 간선)을 doc.edges 순서로
+/// 모은다. 확정 간선을 한 번만 돈다 — SCC마다 전체 간선을 다시 훑으면 비순환
+/// 그래프(SCC 수 = 정점 수)에서 O(V·E)라 합성 심볼 그래프 8만 정점에서 1분을 넘겼다.
+fn cycle_evidence(firm: &FirmGraph, cyclic: &[Vec<usize>]) -> Vec<Vec<CycleEdge>> {
+    let mut owner: Vec<Option<usize>> = vec![None; firm.names.len()];
+    for (k, scc) in cyclic.iter().enumerate() {
+        for &m in scc {
+            owner[m] = Some(k);
+        }
+    }
+    let mut evidence: Vec<Vec<CycleEdge>> = cyclic.iter().map(|_| Vec::new()).collect();
+    for &(from, to, e) in &firm.edges {
+        #[cfg(test)]
+        CLASSIFIED_EDGES.with(|c| c.set(c.get() + 1));
+        if let Some(k) = owner[from].filter(|&k| owner[to] == Some(k)) {
+            evidence[k].push(CycleEdge {
+                from: e.from.clone(),
+                to: e.to.clone(),
+                kind: e.kind,
+            });
+        }
+    }
+    evidence
 }
 
 /// dead 질의의 finding 하나.
@@ -551,10 +786,14 @@ pub struct DeadReport {
 
 /// 루트에서 도달 가능한 정점 집합 — 의존 간선만.
 pub fn reachable(doc: &Document) -> BTreeSet<&str> {
-    let out = doc.outgoing();
+    reach_from(&doc.outgoing(), &doc.roots)
+}
+
+/// `roots`에서 도달 인접 목록을 따라 닿는 정점 집합 — [`reachable`]과 색인을 쓰는 dead가 공유한다.
+fn reach_from<'a>(out: &ReachMap<'a>, roots: &'a [String]) -> BTreeSet<&'a str> {
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     let mut queue: VecDeque<&str> = VecDeque::new();
-    for r in &doc.roots {
+    for r in roots {
         if seen.insert(r.as_str()) {
             queue.push_back(r.as_str());
         }
@@ -604,8 +843,13 @@ pub fn explain_path(doc: &Document, id: &str) -> Option<Vec<String>> {
 /// 도달 불가 심볼 보고 — state+reason만, 삭제 판정 없음.
 /// 루트도 크레이트/모듈 정점도 리포트 대상이 아니다(그것들은 골격이다).
 pub fn dead(doc: &Document) -> Result<DeadReport, String> {
-    doc.require_level(crate::graph::Level::Symbol)?;
-    let reach = reachable(doc);
+    QueryIndex::new(doc).dead(&doc.roots)
+}
+
+/// `roots`를 보존 루트로 삼아 도달 인접 목록 `out` 위에서 [`dead`]를 판정한다 — 레벨
+/// 확인은 호출자([`QueryIndex::dead`])가 먼저 한다.
+fn dead_with(doc: &Document, out: &ReachMap<'_>, roots: &[String]) -> DeadReport {
+    let reach = reach_from(out, roots);
     let mut findings = Vec::new();
     for v in &doc.vertices {
         if matches!(v.kind, Kind::Crate | Kind::Module) {
@@ -630,11 +874,11 @@ pub fn dead(doc: &Document) -> Result<DeadReport, String> {
             "{method_findings} unreachable methods may be invoked via trait objects, generics, or external crates — dispatch not visible to syntactic analysis"
         ));
     }
-    Ok(DeadReport {
-        roots: doc.roots.clone(),
+    DeadReport {
+        roots: roots.to_vec(),
         findings,
         limitations,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -704,7 +948,8 @@ mod tests {
             EdgeKind::Call,
         ));
         let mut peak = 0;
-        let report = paths_bounded(&graph, "start", "zz_target", 1, 2, &mut peak);
+        let index = QueryIndex::new(&graph);
+        let report = paths_bounded(&index, "start", "zz_target", 1, 2, &mut peak);
         assert!(report.found && report.truncated);
         assert_eq!(report.paths[0].vertices, ["start", "zz_target"]);
         assert_eq!(report.expanded, 2);
@@ -751,6 +996,217 @@ mod tests {
         assert_eq!(rep.cycles.len(), 1);
         assert!(rep.cycles[0].members.contains(&"c::a".to_string()));
         assert!(!rep.cycles[0].evidence.is_empty());
+    }
+
+    /// 재귀 Tarjan은 DFS 경로 길이만큼 호출 스택을 써서 수만 정점 고리·사슬에서
+    /// 스레드 스택을 넘기고 프로세스를 abort시켰다(종료 코드 134, MCP 서버 소멸).
+    /// 재귀판이 수천 단계도 못 버티는 작은 스택에서 고리 하나·사슬 순환 없음을 낸다.
+    #[test]
+    fn cycles_survive_deep_paths_on_a_small_stack() {
+        let n = 5_000;
+        let ids: Vec<String> = (0..n).map(|i| format!("c::f{i:05}")).collect();
+        let mut ring = doc();
+        ring.vertices = ids.iter().map(|id| v(id, Kind::Fn)).collect();
+        ring.edges = (0..n)
+            .map(|i| Edge::new(ids[i].clone(), ids[(i + 1) % n].clone(), EdgeKind::Call))
+            .collect();
+        let mut chain = ring.clone();
+        // 마지막 간선(끝 → 처음)을 빼면 같은 깊이의 비순환 사슬이다.
+        chain.edges.pop();
+        let (ring_rep, chain_rep) = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || (cycles(&ring), cycles(&chain)))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(ring_rep.cycles.len(), 1);
+        assert_eq!(ring_rep.cycles[0].members.len(), n);
+        assert_eq!(ring_rep.cycles[0].evidence.len(), n);
+        assert!(chain_rep.cycles.is_empty());
+    }
+
+    /// 순환 판정이 SCC마다 전체 간선을 다시 훑으면 비순환 그래프(SCC 수 = 정점 수)에서
+    /// O(V·E)다 — 합성 심볼 그래프 8만 정점에서 1분을 넘겼다. 증거 분배가 확정 간선을 정확히
+    /// 한 번씩 살피는지 센다 — 상한이 아니라 정확한 횟수라서, SCC마다 다시 훑어도(넘침) 분배를
+    /// 빼고 옛 SCC별 전체 탐색으로 돌아가도(0) 실패한다.
+    #[test]
+    fn cycle_classification_examines_each_edge_once() {
+        let n = 1_000;
+        let ids: Vec<String> = (0..n).map(|i| format!("c::f{i:04}")).collect();
+        let mut d = doc();
+        d.vertices = ids.iter().map(|id| v(id, Kind::Fn)).collect();
+        d.edges = (0..n)
+            .flat_map(|i| (i + 1..n.min(i + 4)).map(move |j| (i, j)))
+            .map(|(i, j)| Edge::new(ids[i].clone(), ids[j].clone(), EdgeKind::Call))
+            .collect();
+        // 여러 정점 순환 하나와 자기 루프 하나 — 판정이 실제로 일을 하게 한다.
+        d.edges
+            .push(Edge::new(ids[10].clone(), ids[0].clone(), EdgeKind::Call));
+        d.edges.push(Edge::new(
+            ids[500].clone(),
+            ids[500].clone(),
+            EdgeKind::Uses,
+        ));
+        let before = CLASSIFIED_EDGES.with(std::cell::Cell::get);
+        let rep = cycles(&d);
+        let visits = CLASSIFIED_EDGES.with(std::cell::Cell::get) - before;
+        assert_eq!(rep.cycles.len(), 2);
+        assert_eq!(rep.cycles[0].members.len(), 11);
+        assert_eq!(rep.cycles[1].members, ["c::f0500"]);
+        // 이 문서의 간선은 모두 확정 의존 간선이다.
+        assert_eq!(
+            visits,
+            d.edges.len(),
+            "{visits} edge visits for {} edges",
+            d.edges.len()
+        );
+    }
+
+    /// 결정적 의사 난수(LCG) — 무작위 비교 테스트가 실행마다 같은 그래프를 본다.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) as usize % n
+        }
+    }
+
+    /// (멤버, 증거 (from, to, kind)) 목록과 제외한 추정 간선 수 — 비교용 평탄 형태.
+    type FlatCycles = (Vec<(Vec<String>, Vec<(String, String, EdgeKind)>)>, usize);
+
+    fn flatten(rep: &CycleReport) -> FlatCycles {
+        let found = rep
+            .cycles
+            .iter()
+            .map(|c| {
+                let evidence = c
+                    .evidence
+                    .iter()
+                    .map(|e| (e.from.clone(), e.to.clone(), e.kind))
+                    .collect();
+                (c.members.clone(), evidence)
+            })
+            .collect();
+        (found, rep.excluded_tentative)
+    }
+
+    /// 정의 그대로의 순환 판정 — Tarjan과 독립인 오라클. 확정 의존 간선의 도달 집합이
+    /// 서로를 품는 끝점끼리 SCC다. 후보는 정점에서 닿는 끝점뿐이고(dangling 끝점 포함 —
+    /// 정점에서 안 닿는 dangling 순환은 보고하지 않는다), 증거는 doc.edges 순서를
+    /// (from,to)로 안정 정렬한다. 재작성 전 구현의 출력 계약이 이것이다.
+    fn cycles_by_reachability(d: &Document) -> FlatCycles {
+        let firm: Vec<&Edge> = d
+            .edges
+            .iter()
+            .filter(|e| e.kind.is_dependency() && !e.tentative)
+            .collect();
+        let reach = |start: &str| -> BTreeSet<String> {
+            let mut seen = BTreeSet::from([start.to_string()]);
+            let mut queue = vec![start.to_string()];
+            while let Some(cur) = queue.pop() {
+                for e in firm.iter().filter(|e| e.from == cur) {
+                    if seen.insert(e.to.clone()) {
+                        queue.push(e.to.clone());
+                    }
+                }
+            }
+            seen
+        };
+        let mut candidates = BTreeSet::new();
+        for id in d.vertex_ids() {
+            candidates.extend(reach(id));
+        }
+        let mut placed: BTreeSet<String> = BTreeSet::new();
+        let mut found = Vec::new();
+        for u in &candidates {
+            if placed.contains(u) {
+                continue;
+            }
+            let members: Vec<String> = reach(u)
+                .into_iter()
+                .filter(|w| reach(w).contains(u))
+                .collect();
+            placed.extend(members.iter().cloned());
+            let looped = firm.iter().any(|e| e.from == *u && e.to == *u);
+            if members.len() < 2 && !looped {
+                continue;
+            }
+            let mut evidence: Vec<(String, String, EdgeKind)> = firm
+                .iter()
+                .filter(|e| members.contains(&e.from) && members.contains(&e.to))
+                .map(|e| (e.from.clone(), e.to.clone(), e.kind))
+                .collect();
+            evidence.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+            found.push((members, evidence));
+        }
+        found.sort();
+        let excluded = d
+            .edges
+            .iter()
+            .filter(|e| e.kind.is_dependency() && e.tentative)
+            .count();
+        (found, excluded)
+    }
+
+    /// 정렬되지 않은 저장 문서(`--graph`)처럼 간선 순서·중복·자기 루프·추정 간선만의
+    /// 순환·contains·정점이 아닌 dangling 끝점·같은 ID의 cfg 변형을 섞은 무작위
+    /// 그래프에서 cycles가 오라클과 같은 보고서를 낸다.
+    #[test]
+    fn cycles_match_reachability_oracle_on_random_graphs() {
+        let kinds = [
+            EdgeKind::Call,
+            EdgeKind::References,
+            EdgeKind::Uses,
+            EdgeKind::Contains,
+            EdgeKind::Implements,
+            EdgeKind::Depends,
+            EdgeKind::Signature,
+        ];
+        let mut rng = Lcg(0x5eed);
+        // 비교가 공허하지 않은지 — 여러 정점 순환, 자기 루프 단독, dangling 멤버를 실제로 봤다.
+        let (mut multi, mut looped, mut dangling) = (0, 0, 0);
+        for _ in 0..3_000 {
+            let vertex_count = 1 + rng.below(6);
+            let names: Vec<String> = (0..vertex_count)
+                .map(|i| format!("c::v{i}"))
+                .chain(["x::g0".to_string(), "x::g1".to_string()])
+                .collect();
+            let mut d = doc();
+            d.vertices = names[..vertex_count]
+                .iter()
+                .rev()
+                .map(|id| v(id, Kind::Fn))
+                .collect();
+            if rng.below(4) == 0 {
+                d.vertices.push(v(&names[0], Kind::Fn));
+            }
+            d.edges = (0..rng.below(14))
+                .map(|_| {
+                    let from = names[rng.below(names.len())].clone();
+                    let to = names[rng.below(names.len())].clone();
+                    let mut e = Edge::new(from, to, kinds[rng.below(kinds.len())]);
+                    e.tentative = rng.below(4) == 0;
+                    e
+                })
+                .collect();
+            let rep = cycles(&d);
+            assert_eq!(
+                flatten(&rep),
+                cycles_by_reachability(&d),
+                "edges: {:?}",
+                d.edges
+            );
+            for c in &rep.cycles {
+                multi += usize::from(c.members.len() > 1);
+                looped += usize::from(c.members.len() == 1);
+                dangling += usize::from(c.members.iter().any(|m| m.starts_with("x::")));
+            }
+        }
+        assert!(multi > 100 && looped > 100 && dangling > 100);
     }
 
     #[test]
@@ -886,6 +1342,8 @@ mod tests {
     fn impact_matches_reverse_reachability_for_every_three_vertex_graph() {
         // 3개 정점의 가능한 유향 그래프 512개를 독립 거리 행렬과 대조한다.
         // 자기 루프·순환·재수렴·고립 정점이 방향/상한 수정에서 빠지지 않게 한다.
+        // 그래프마다 색인 하나를 모든 (root, depth, max) 질의가 함께 쓴다 — MCP 세션처럼
+        // 재사용해도 앞 질의의 상태가 다음 질의에 새지 않아야 한다.
         let names = ["c::a", "c::b", "c::c"];
         for mask in 0..(1_u16 << 9) {
             let mut d = doc();
@@ -915,6 +1373,7 @@ mod tests {
                     }
                 }
             }
+            let shared = QueryIndex::new(&d);
             for (root, name) in names.iter().enumerate() {
                 for depth in 0..=3 {
                     let mut expected: Vec<_> = (0..3)
@@ -923,18 +1382,28 @@ mod tests {
                         .collect();
                     expected.sort();
                     for max in 0..=3 {
-                        let r = impact(&d, name, depth, max);
+                        for r in [
+                            impact(&d, name, depth, max),
+                            shared.impact(name, depth, max),
+                        ] {
+                            assert_eq!(
+                                r.truncated,
+                                expected.len() > max,
+                                "mask {mask}, root {name}, depth {depth}, max {max}"
+                            );
+                            assert_eq!(
+                                r.impacted
+                                    .iter()
+                                    .map(|n| (n.depth, n.id.as_str()))
+                                    .collect::<Vec<_>>(),
+                                expected.iter().copied().take(max).collect::<Vec<_>>()
+                            );
+                        }
+                        // 양방향 이웃도 공유 색인과 새 색인의 답이 같다.
                         assert_eq!(
-                            r.truncated,
-                            expected.len() > max,
+                            serde_json::to_string(&shared.query(name, depth, max)).unwrap(),
+                            serde_json::to_string(&query(&d, name, depth, max)).unwrap(),
                             "mask {mask}, root {name}, depth {depth}, max {max}"
-                        );
-                        assert_eq!(
-                            r.impacted
-                                .iter()
-                                .map(|n| (n.depth, n.id.as_str()))
-                                .collect::<Vec<_>>(),
-                            expected.iter().copied().take(max).collect::<Vec<_>>()
                         );
                     }
                 }

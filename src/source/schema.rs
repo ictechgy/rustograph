@@ -58,7 +58,8 @@ pub struct FactSymbol {
     pub usr: String,
 }
 
-/// 계약의 1 기반 소스 위치다 — 열은 UTF-16 코드 단위다.
+/// 계약의 1 기반 소스 위치다 — 열은 그 줄의 UTF-8 바이트 오프셋 + 1이다
+/// (GRAPH-EXCHANGE). 환산은 생산자 모두 `utf8_column` 하나를 쓴다.
 #[derive(Serialize, Clone)]
 pub struct BridgeLocation {
     pub path: String,
@@ -67,6 +68,18 @@ pub struct BridgeLocation {
     /// 파일 안 바이트 오프셋 — 직렬화하지 않고 감싸는 정점을 찾는 데만 쓴다.
     #[serde(skip)]
     pub byte: usize,
+}
+
+/// proc-macro2 열(줄 시작부터의 문자 수)을 계약 열(그 줄의 UTF-8 바이트 오프셋 + 1)로
+/// 바꾼다. GRAPH-EXCHANGE는 문자 수·UTF-16 열을 그대로 내보내지 말라고 한다 — schema·
+/// routes·client가 이 함수 하나를 써야 같은 줄의 사실 열이 갈라지지 않는다.
+pub(crate) fn utf8_column(line_text: &str, chars: usize) -> u32 {
+    line_text
+        .chars()
+        .take(chars)
+        .map(|c| c.len_utf8() as u32)
+        .sum::<u32>()
+        + 1
 }
 
 /// 문서를 생산한 도구 식별자다.
@@ -110,7 +123,10 @@ pub fn facts(dir: &Path, tool_version: &str) -> Result<BridgeFactsDocument, Stri
     scan.limitations.extend(meta.limitations.iter().cloned());
     let mut files: Vec<(PathBuf, String, syn::File)> = Vec::new();
     for file in workspace_rs_files(&meta) {
-        let Ok(src) = std::fs::read_to_string(&file) else {
+        // 순회가 정규 파일만 모으지만 읽기도 상한을 둔다 — 못 읽거나 너무 큰 파일은
+        // 지금처럼 unparsed로 센다.
+        let Ok(src) = crate::source::read_source_bounded(&file, crate::source::MAX_SOURCE_BYTES)
+        else {
             scan.unparsed += 1;
             continue;
         };
@@ -133,13 +149,17 @@ pub fn facts(dir: &Path, tool_version: &str) -> Result<BridgeFactsDocument, Stri
     for (file, src, ast) in &files {
         scan_file(&mut scan, file, src, ast);
     }
+    // 스캔한 원문·AST는 여기서 끝이다. 아래 정점 귀속 수확이 같은 파일을 다시 읽어
+    // 파싱하므로, 쥔 채로 부르면 두 집합이 함께 살아 최대 메모리가 둘의 합이 된다.
+    drop(files);
     let mut facts = std::mem::take(&mut scan.list);
     // 감싸는 정점 귀속 — impact와 같은 syn 수확을 돌려 정점 ID와 범위를
-    // 얻는다. 그래프를 못 만들면 사실은 그대로 내되 usr는 싣지 않는다 —
-    // 사실 수확을 그래프 성공에 묶으면 파싱 실패 하나로 문서 전체를 잃는다.
-    let graph = crate::source::owner_spans(dir, &meta);
+    // 얻는다(간선은 귀속에 필요 없어 만들지 않는다). 그래프를 못 만들면 사실은
+    // 그대로 내되 usr는 싣지 않는다 — 사실 수확을 그래프 성공에 묶으면 파싱
+    // 실패 하나로 문서 전체를 잃는다.
+    let graph = crate::source::vertex_spans(dir, &meta);
     let index = match &graph {
-        Ok((doc, spans)) => Some(OwnerIndex::new(doc, spans)),
+        Ok((ids, spans)) => Some(OwnerIndex::new(ids, spans)),
         Err(_) => {
             scan.graph_failed = true;
             None
@@ -177,8 +197,7 @@ struct OwnerIndex {
 impl OwnerIndex {
     /// 범위의 파일 경로를 정규화해 사실 경로(정규화된 루트 기준)와 맞춘다.
     /// 정점 집합에 없는 ID는 버린다 — usr는 그래프 정점이어야 한다.
-    fn new(doc: &crate::graph::Document, spans: &[crate::harvest::OwnerSpan]) -> OwnerIndex {
-        let ids = doc.vertex_ids();
+    fn new(ids: &BTreeSet<String>, spans: &[crate::harvest::OwnerSpan]) -> OwnerIndex {
         let mut canon: BTreeMap<&Path, PathBuf> = BTreeMap::new();
         let mut by_file: BTreeMap<PathBuf, Vec<(std::ops::Range<usize>, String)>> = BTreeMap::new();
         for sp in spans {
@@ -240,11 +259,11 @@ fn workspace_rs_files(meta: &cargo_meta::Metadata) -> Vec<PathBuf> {
             }
         }
     }
-    let mut out: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut state = RsWalk::within(&meta.workspace_root);
     for root in roots {
-        walk_rs(&root, &mut out);
+        walk_rs(&root, &mut state);
     }
-    out.into_iter().collect()
+    state.sources.into_iter().collect()
 }
 
 /// 타깃 소스의 조상 중 Cargo.toml을 가진 디렉터리가 패키지 루트다.
@@ -257,24 +276,107 @@ fn package_root(target_src: &Path) -> Option<PathBuf> {
     None
 }
 
-/// 디렉터리를 재귀로 훑어 .rs를 모은다 — `target`·숨김 디렉터리 제외.
-fn walk_rs(dir: &Path, out: &mut BTreeSet<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        let name = e.file_name();
-        let name = name.to_string_lossy();
-        if p.is_dir() {
-            if name != "target" && !name.starts_with('.') {
-                walk_rs(&p, out);
-            }
-        } else if p.extension().is_some_and(|x| x == "rs") {
-            if let Ok(c) = p.canonicalize() {
-                out.insert(c);
+/// .rs 순회 상태 — 링크 순환과 루트 밖 탈출을 끊는 데 필요한 것만 든다.
+///
+/// 링크를 따라가는 순회는 `src/a -> .`·`src/b -> .` 두 개만으로 단계마다 경로가 두 배가
+/// 되어 OS 링크 한도(macOS 32단계)까지 사실상 끝나지 않는다. 루트 밖 링크는 locate가
+/// 어차피 버릴 파일을 읽어 unlocated·unparsed·`sourceModifiedAt`만 흐린다. 그래서 링크는
+/// 대상이 워크스페이스 루트 안이고 처음 보는 디렉터리일 때만 따른다 — 루트 안 링크로만
+/// 닿는 공유 소스는 전처럼 사실의 출처다.
+struct RsWalk {
+    /// 정규화한 워크스페이스 루트 — 링크 대상이 이 아래여야 따른다.
+    boundary: PathBuf,
+    /// 이미 걸은 디렉터리(정규 경로) — 같은 디렉터리를 두 번 걷지 않는다.
+    seen_dirs: BTreeSet<PathBuf>,
+    /// 모은 .rs 파일(정규 경로).
+    sources: BTreeSet<PathBuf>,
+}
+
+impl RsWalk {
+    /// 워크스페이스 루트를 경계로 쓰는 빈 순회 상태다. 루트를 정규화하지 못하면 그대로
+    /// 쓴다 — 정규 경로인 링크 대상과 맞지 않아 링크를 덜 따를 뿐 더 따르지는 않는다.
+    fn within(workspace_root: &Path) -> RsWalk {
+        RsWalk {
+            boundary: workspace_root
+                .canonicalize()
+                .unwrap_or_else(|_| workspace_root.to_path_buf()),
+            seen_dirs: BTreeSet::new(),
+            sources: BTreeSet::new(),
+        }
+    }
+}
+
+/// 순회 항목 하나의 판정이다.
+enum RsEntry {
+    /// 걸을 디렉터리(정규 경로).
+    Dir(PathBuf),
+    /// 모을 .rs 정규 파일(정규 경로).
+    Source(PathBuf),
+    /// 건너뛸 항목 — .rs가 아닌 파일, 정규 파일이 아닌 항목, 끊기거나 루트 밖인 링크.
+    Skip,
+}
+
+/// 디렉터리를 명시 스택으로 훑어 .rs를 모은다 — `target`·숨김 디렉터리 제외.
+/// 디렉터리마다 한 번만 걷는다. 이름 규칙은 링크든 아니든 항목 이름에 건다(전과 같다).
+fn walk_rs(start: &Path, state: &mut RsWalk) {
+    let mut stack = vec![start.canonicalize().unwrap_or_else(|_| start.to_path_buf())];
+    while let Some(dir) = stack.pop() {
+        if !state.seen_dirs.insert(dir.clone()) {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            match rs_entry(&e, &state.boundary) {
+                RsEntry::Dir(next) => {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    if name != "target" && !name.starts_with('.') {
+                        stack.push(next);
+                    }
+                }
+                RsEntry::Source(file) => {
+                    state.sources.insert(file);
+                }
+                RsEntry::Skip => continue,
             }
         }
+    }
+}
+
+/// 항목의 종류를 `file_type`(링크를 따라가지 않는다)으로 판정한다 — fingerprint·
+/// scan_orphans와 같은 규칙이다. 링크만 대상을 정규화해, 그 대상이 `boundary` 안일 때
+/// 대상의 종류로 본다. 정규 파일이 아닌 .rs(FIFO·장치)는 모으지 않는다 — 읽으면 영원히
+/// 막히거나 끝없이 읽힌다. 종류를 못 읽은 항목은 읽는 사이 사라진 것이라 건너뛴다.
+fn rs_entry(e: &std::fs::DirEntry, boundary: &Path) -> RsEntry {
+    let path = e.path();
+    let is_rs = path.extension().is_some_and(|x| x == "rs");
+    let Ok(kind) = e.file_type() else {
+        return RsEntry::Skip;
+    };
+    if kind.is_dir() {
+        // 정규 경로 디렉터리 아래의 실제 디렉터리라 이 경로도 정규 경로다.
+        return RsEntry::Dir(path);
+    }
+    if kind.is_file() && is_rs {
+        return path.canonicalize().map_or(RsEntry::Skip, RsEntry::Source);
+    }
+    if !kind.is_symlink() {
+        return RsEntry::Skip;
+    }
+    // 끊긴 링크와 루트 밖 링크는 따르지 않는다.
+    let Some(real) = path
+        .canonicalize()
+        .ok()
+        .filter(|real| real.starts_with(boundary))
+    else {
+        return RsEntry::Skip;
+    };
+    match std::fs::metadata(&real) {
+        Ok(md) if md.is_dir() => RsEntry::Dir(real),
+        Ok(md) if md.is_file() && is_rs => RsEntry::Source(real),
+        _ => RsEntry::Skip,
     }
 }
 
@@ -333,6 +435,9 @@ struct SchemaScan {
     diesel_tables: BTreeSet<String>,       // 워크스페이스의 diesel 선언 이름
     latest: Option<std::time::SystemTime>, // 읽은 소스의 최신 mtime
     seen: BTreeSet<String>,
+    /// 위치를 계산한 횟수 — 버릴 리터럴에 위치를 구하지 않는지 단위 테스트가 센다.
+    #[cfg(test)]
+    located: std::cell::Cell<usize>,
 }
 
 /// `use` 트리에서 모은 sqlx·diesel 바인딩 집합이다.
@@ -355,7 +460,7 @@ struct UseBindings {
 fn scan_file(scan: &mut SchemaScan, file: &Path, src: &str, ast: &syn::File) {
     let mut ctx = FileCtx {
         scan,
-        src,
+        lines: LineIndex::new(src),
         file,
         binds: UseBindings::default(),
         pass_two: false,
@@ -365,10 +470,58 @@ fn scan_file(scan: &mut SchemaScan, file: &Path, src: &str, ast: &syn::File) {
     ctx.visit_file(ast); // 2패스: 사실 수확
 }
 
+/// 파일 원문과 줄 시작 바이트 오프셋 색인이다. 사실마다 `str::lines().nth()`로 파일
+/// 앞에서부터 줄을 세면 파일 하나가 O(리터럴 × 줄)이 된다 — 문서 주석·문자열이 수만
+/// 개인 생성 파일에서 제곱으로 커진다. 파일마다 한 번 만들어 줄을 바로 찾는다.
+struct LineIndex<'a> {
+    src: &'a str,
+    /// 줄마다 시작 바이트 — 0과 모든 `\n` 바로 다음 자리다.
+    starts: Vec<usize>,
+}
+
+impl<'a> LineIndex<'a> {
+    /// 원문을 한 번 훑어 줄 시작을 모은다 — proc-macro2처럼 `\n`만 줄 경계로 본다.
+    fn new(src: &'a str) -> LineIndex<'a> {
+        let mut starts = vec![0];
+        starts.extend(src.match_indices('\n').map(|(i, _)| i + 1));
+        LineIndex { src, starts }
+    }
+
+    /// 1 기반 줄의 본문 — `str::lines().nth(line - 1)`과 같은 규칙이다. 줄 끝 `\n`과
+    /// 그 바로 앞 `\r`을 떼고, 개행 없는 마지막 줄의 `\r`은 남기며, 마지막 개행 뒤의
+    /// 빈 꼬리는 줄이 아니다.
+    fn line(&self, line: usize) -> Option<&'a str> {
+        let start = *self.starts.get(line.checked_sub(1)?)?;
+        match self.starts.get(line) {
+            Some(&next) => {
+                let text = &self.src[start..next - 1];
+                Some(text.strip_suffix('\r').unwrap_or(text))
+            }
+            None => (start < self.src.len()).then(|| &self.src[start..]),
+        }
+    }
+
+    /// proc-macro2 위치(1 기반 줄, 줄 시작부터의 문자 수)의 원문 바이트 오프셋이다 —
+    /// 열은 문자 수라 그만큼의 문자를 바이트로 센다. 없는 줄은 원문 끝이다.
+    fn offset(&self, line: usize, column: usize) -> usize {
+        let start = line
+            .checked_sub(1)
+            .and_then(|i| self.starts.get(i))
+            .copied()
+            .unwrap_or(self.src.len());
+        start
+            + self.src[start..]
+                .chars()
+                .take(column)
+                .map(char::len_utf8)
+                .sum::<usize>()
+    }
+}
+
 /// 파일 단위 스캔 문맥 — sqlx·diesel에서 import한 이름과 누적 상태.
 struct FileCtx<'a> {
     scan: &'a mut SchemaScan,
-    src: &'a str,
+    lines: LineIndex<'a>,
     file: &'a Path,
     binds: UseBindings,
     pass_two: bool,
@@ -389,7 +542,7 @@ impl<'ast> Visit<'ast> for FileCtx<'ast> {
         }
         // 알려진 매크로가 아니면 토큰 안의 SQL 리터럴만 훑는다 —
         // format!("DELETE FROM {}", t) 같은 템플릿도 관계 참조다.
-        scan_macro_literals(self.scan, node, self.src, self.file);
+        scan_macro_literals(self.scan, node, &self.lines, self.file);
     }
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
@@ -424,9 +577,11 @@ impl<'ast> Visit<'ast> for FileCtx<'ast> {
 
     fn visit_lit_str(&mut self, node: &'ast LitStr) {
         if self.pass_two {
-            // 맥락 없는 리터럴은 산문 오탐을 막는 동사 게이트를 적용한다.
+            // 맥락 없는 리터럴은 산문 오탐을 막는 동사 게이트를 적용한다 — 문서 주석
+            // (`#[doc = ".."]`)도 여기로 오므로 위치는 게이트를 통과한 뒤에만 구한다.
+            let (lines, file, span) = (&self.lines, self.file, node.span());
             self.scan
-                .push_sql_literal(self.scan_locate(node.span()), &node.value(), false);
+                .push_sql_literal(&node.value(), false, |scan| scan.locate(lines, span, file));
         }
         syn::visit::visit_lit_str(self, node);
     }
@@ -640,7 +795,7 @@ impl<'ast> FileCtx<'ast> {
         match (is_file, expr) {
             // 파일 매크로는 SQL이 파일에 있으므로 항상 dynamic이다 — 채널에는
             // 경로 리터럴의 원문을 실어 어느 호출인지 남긴다.
-            (true, Some(e)) => self.scan.push_dynamic(self.src, &e, loc, self.file),
+            (true, Some(e)) => self.scan.push_dynamic(&self.lines, &e, loc, self.file),
             (true, None) => match loc {
                 Some(l) => self.scan.push_dynamic_text(l),
                 None => self.scan.unlocated += 1,
@@ -649,17 +804,14 @@ impl<'ast> FileCtx<'ast> {
                 if let syn::Lit::Str(lit) = &el.lit {
                     // 확인된 sqlx 인자 자리의 리터럴은 SQL 컨텍스트가
                     // 확정됐다 — 동사 게이트를 건너뛴다.
-                    self.scan.push_sql_literal(
-                        self.scan_locate(lit.span()).or(loc),
-                        &lit.value(),
-                        true,
-                    );
+                    let at = self.scan_locate(lit.span()).or(loc);
+                    self.scan.push_sql_literal(&lit.value(), true, |_| at);
                 } else {
                     self.scan
-                        .push_dynamic(self.src, &Expr::Lit(el.clone()), loc, self.file);
+                        .push_dynamic(&self.lines, &Expr::Lit(el.clone()), loc, self.file);
                 }
             }
-            (false, Some(e)) => self.scan.push_dynamic(self.src, &e, loc, self.file),
+            (false, Some(e)) => self.scan.push_dynamic(&self.lines, &e, loc, self.file),
             (false, None) => match loc {
                 Some(l) => self.scan.push_dynamic_text(l),
                 None => self.scan.unlocated += 1,
@@ -712,14 +864,14 @@ impl<'ast> FileCtx<'ast> {
                         let loc = self
                             .scan_locate(lit.span())
                             .or_else(|| self.scan_locate(fp.path.span()));
-                        self.scan.push_sql_literal(loc, &lit.value(), true);
+                        self.scan.push_sql_literal(&lit.value(), true, |_| loc);
                     }
                     // 비문자열 리터럴(`query(1)`)은 SQL 근거가 아니다 —
                     // 계약상 유일하게 계수하지 않고 버리는 예외다.
                 }
                 e => {
                     let loc = self.scan_locate(fp.path.span());
-                    self.scan.push_dynamic(self.src, e, loc, self.file);
+                    self.scan.push_dynamic(&self.lines, e, loc, self.file);
                 }
             }
         }
@@ -736,7 +888,7 @@ impl<'ast> FileCtx<'ast> {
             .collect();
         let loc_of = |i: usize| {
             self.scan
-                .locate(self.src, path.segments[i].ident.span(), self.file)
+                .locate(&self.lines, path.segments[i].ident.span(), self.file)
         };
         // `x::dsl::table`처럼 dsl·columns 아래의 `table`은 컬럼 이름이다 —
         // 끝 세그먼트가 table인 팔보다 이 팔을 먼저 맞춰야 한다.
@@ -872,7 +1024,7 @@ impl<'ast> FileCtx<'ast> {
     /// 토큰 span을 프로젝트 상대의 계약 위치로 바꾼다.
     /// 프로젝트 밖 파일은 상대 경로가 없어 사실로 만들지 않는다.
     fn scan_locate(&self, span: Span) -> Option<BridgeLocation> {
-        self.scan.locate(self.src, span, self.file)
+        self.scan.locate(&self.lines, span, self.file)
     }
 }
 
@@ -1111,7 +1263,7 @@ fn split_top_level_commas(tokens: &TokenStream) -> Vec<TokenStream> {
 
 /// 알려지지 않은 매크로의 토큰 안에서 SQL 리터럴을 찾는다 —
 /// format!·const concat 같은 템플릿 속 SQL도 관계 참조다.
-fn scan_macro_literals(scan: &mut SchemaScan, m: &syn::Macro, src: &str, file: &Path) {
+fn scan_macro_literals(scan: &mut SchemaScan, m: &syn::Macro, lines: &LineIndex, file: &Path) {
     let mut stack: Vec<TokenTree> = m.tokens.clone().into_iter().collect();
     while let Some(tt) = stack.pop() {
         match tt {
@@ -1121,7 +1273,8 @@ fn scan_macro_literals(scan: &mut SchemaScan, m: &syn::Macro, src: &str, file: &
                     syn::parse2::<LitStr>(TokenStream::from(TokenTree::Literal(l.clone())))
                 {
                     // 위치를 못 구한 SQL 리터럴도 push_sql_literal이 센다.
-                    scan.push_sql_literal(scan.locate(src, lit.span(), file), &lit.value(), false);
+                    let span = lit.span();
+                    scan.push_sql_literal(&lit.value(), false, |s| s.locate(lines, span, file));
                 }
             }
             _ => {}
@@ -1134,12 +1287,19 @@ impl SchemaScan {
     /// 관계 자리에 플레이스홀더 같은 비리터럴 피연산자가 오면 관계 참조가
     /// 있었다는 근거를 동적 사실로 남긴다 — 조용히 버리지 않는다.
     /// `trusted`는 확인된 DB 인자 자리라는 뜻이다 — 그때는 동사 게이트를
-    /// 건너뛴다. 위치를 못 구한 SQL 리터럴은 unlocated로 센다.
-    fn push_sql_literal(&mut self, loc: Option<BridgeLocation>, text: &str, trusted: bool) {
+    /// 건너뛴다. 위치(`loc`)는 SQL로 판정된 리터럴에만 구한다 — 리터럴 대부분
+    /// (문서 주석·산문)이 게이트에서 버려지는데 위치부터 구하면 버릴 리터럴마다
+    /// 줄을 찾는다. 위치를 못 구한 SQL 리터럴은 unlocated로 센다.
+    fn push_sql_literal(
+        &mut self,
+        text: &str,
+        trusted: bool,
+        loc: impl FnOnce(&SchemaScan) -> Option<BridgeLocation>,
+    ) {
         if !trusted && !looks_like_sql(text) {
             return;
         }
-        let Some(loc) = loc else {
+        let Some(loc) = loc(self) else {
             self.unlocated += 1;
             return;
         };
@@ -1162,7 +1322,13 @@ impl SchemaScan {
     /// 리터럴로 읽히지 않는 SQL 인자를 동적 사실로 보존한다.
     /// channel에는 잘린 원문 표현식을 실어 어느 위치의 호출인지 남긴다.
     /// 위치를 못 구한 동적 근거는 unlocated로 센다.
-    fn push_dynamic(&mut self, src: &str, expr: &Expr, loc: Option<BridgeLocation>, file: &Path) {
+    fn push_dynamic(
+        &mut self,
+        lines: &LineIndex,
+        expr: &Expr,
+        loc: Option<BridgeLocation>,
+        file: &Path,
+    ) {
         // 비문자열 리터럴 인자(`query!(1)`)는 SQL 근거가 될 수 없다 — 모든
         // 경로를 계수하는 계약에서 유일하게 "근거 없음"으로 버리는 예외다.
         if let Expr::Lit(el) = expr {
@@ -1170,11 +1336,11 @@ impl SchemaScan {
                 return;
             }
         }
-        let Some(loc) = loc.or_else(|| self.locate(src, expr.span(), file)) else {
+        let Some(loc) = loc.or_else(|| self.locate(lines, expr.span(), file)) else {
             self.unlocated += 1;
             return;
         };
-        let text = expr_text(src, expr);
+        let text = expr_text(lines, expr);
         self.push_dynamic_str(&text, loc);
     }
 
@@ -1183,10 +1349,11 @@ impl SchemaScan {
         self.push_dynamic_str("<unparsed macro argument>", loc);
     }
 
-    /// dynamic 사실 공통 경로 — 원문은 120자로 자른다.
+    /// dynamic 사실 공통 경로 — 원문을 채널 규칙으로 정화한 뒤 120자로 자른다.
     fn push_dynamic_str(&mut self, text: &str, loc: BridgeLocation) {
+        let summary = dynamic_channel(text);
         // 문자·바이트 단위를 섞지 않는다 — 실제로 잘렸을 때만 ...를 붙인다.
-        let mut chars = text.chars();
+        let mut chars = summary.chars();
         let head: String = chars.by_ref().take(120).collect();
         let channel = if chars.next().is_some() {
             format!("{}...", head.trim_end())
@@ -1225,31 +1392,20 @@ impl SchemaScan {
     }
 
     /// 토큰 span을 프로젝트 상대의 계약 위치로 바꾼다.
-    /// proc-macro2의 열은 바이트라 UTF-16 열로 환산한다.
-    fn locate(&self, src: &str, span: Span, file: &Path) -> Option<BridgeLocation> {
+    /// proc-macro2의 열은 문자 수라 그 줄의 UTF-8 바이트 열로 환산한다.
+    fn locate(&self, lines: &LineIndex, span: Span, file: &Path) -> Option<BridgeLocation> {
+        #[cfg(test)]
+        self.located.set(self.located.get() + 1);
         let start = span.start();
         if start.line == 0 {
             return None;
         }
         let rel = file.strip_prefix(&self.root).ok()?;
-        let line_text = src.lines().nth(start.line - 1)?;
-        // 열이 바이트 오프셋이 아니거나 문자 경계와 어긋나면 문자 수로
-        // 재해석한다 — 실패 시 0 대신 그만큼의 문자열을 센 값을 쓴다.
-        let column = line_text
-            .get(..start.column)
-            .map(|s| s.chars().map(|c| c.len_utf16() as u32).sum::<u32>())
-            .unwrap_or_else(|| {
-                line_text
-                    .chars()
-                    .take(start.column)
-                    .map(|c| c.len_utf16() as u32)
-                    .sum()
-            })
-            + 1;
+        let line_text = lines.line(start.line)?;
         Some(BridgeLocation {
             path: rel.to_string_lossy().replace('\\', "/"),
             line: start.line as u32,
-            column,
+            column: utf8_column(line_text, start.column),
             byte: span.byte_range().start,
         })
     }
@@ -1336,31 +1492,66 @@ fn fact_cmp(a: &RelationFact, b: &RelationFact) -> std::cmp::Ordering {
         ))
 }
 
+/// dynamic 사실의 channel에 실을 원문 요약이다 — 공백류(`char::is_whitespace`) 연속을 한
+/// 칸으로 접어 앞뒤를 다듬고, 남은 제어 문자(C0·DEL·C1·U+2028·U+2029)를 지운다. 지운 제어
+/// 문자는 공백 연속을 끊지 않는다. 남는 글자가 없으면 `<dynamic>`이다.
+///
+/// 원문 식은 rustfmt가 여러 줄로 나눈 인자나 여러 줄 raw SQL이 흔한데, isthmus는
+/// dynamic 사실이어도 채널에 제어 문자가 하나라도 있으면 문서 전체를 거부한다
+/// (GRAPH-EXCHANGE 채널 규칙). 계열 생산자(dartograph `_dynamicChannel`, tsograph
+/// `dynamicChannel`)와 목적은 같지만 규칙이 같지는 않다. 그쪽은 정규식 `\s+`(NEL 제외, U+FEFF
+/// 포함)를 한 칸으로 접고 다듬은 뒤 제어 문자를 지워서, `"x\u{85}y"`는 그쪽 `xy`·여기 `x y`,
+/// `"a \u{1} b"`는 `a  b`·`a b`, `"\u{1} a"`는 ` a`·`a`, `"a\u{feff}b"`는 `a b`·그대로다. 어느 쪽
+/// 결과도 isthmus 제어 문자 검사를 통과하고, dynamic 채널은 조인 키가 아니라 진단 문자열만
+/// 다르다. 길이 상한도 계열(UTF-16 160)과 다르며 호출자가 이 결과에 건다(schema 120자, routes
+/// 템플릿 상한) — 정화 전에 자르면 접힐 공백이 상한을 먼저 써 버린다.
+pub(crate) fn dynamic_channel(text: &str) -> String {
+    let mut summary = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            pending_space = true;
+        } else if !is_channel_control(c) {
+            // 지운 제어 문자는 공백 연속을 끊지 않는다 — `a \u{1} b`도 `a b`다.
+            if pending_space && !summary.is_empty() {
+                summary.push(' ');
+            }
+            pending_space = false;
+            summary.push(c);
+        }
+    }
+    if summary.is_empty() {
+        "<dynamic>".to_string()
+    } else {
+        summary
+    }
+}
+
+/// isthmus `controlCharacterPattern`과 같은 판정이다 — C0·DEL·C1(NEL 포함)·U+2028·U+2029.
+fn is_channel_control(c: char) -> bool {
+    matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}' | '\u{2028}' | '\u{2029}')
+}
+
 /// 표현식의 원문을 span 범위로 잘라낸다 — 토큰 재조합보다 소스 그대로가
 /// 진단 단서로 정확하다. 줄 오프셋은 실제 바이트로 계산해 CRLF에서도
 /// 어긋나지 않는다.
-fn expr_text(src: &str, expr: &Expr) -> String {
+fn expr_text(lines: &LineIndex, expr: &Expr) -> String {
     let span = expr.span();
     let (s, e) = (span.start(), span.end());
     if s.line == 0 || e.line == 0 {
         return "<dynamic expression>".to_string();
     }
-    let mut starts = vec![0usize];
-    for (i, b) in src.bytes().enumerate() {
-        if b == b'\n' {
-            starts.push(i + 1);
-        }
-    }
-    // 열이 문자 경계와 어긋나면 경계까지 보정한다.
-    let get = |line: usize, col: usize| -> usize {
-        let mut p = starts.get(line - 1).copied().unwrap_or(src.len()) + col;
-        while p < src.len() && !src.is_char_boundary(p) {
-            p += 1;
-        }
-        p.min(src.len())
-    };
-    let (a, b) = (get(s.line, s.column), get(e.line, e.column));
-    src.get(a..b).unwrap_or("<dynamic expression>").to_string()
+    // 파일의 줄 색인을 재사용한다 — 사실마다 줄 시작을 다시 세지 않는다. proc-macro2
+    // 열은 문자 수라 색인이 바이트로 바꾼다.
+    let (a, b) = (
+        lines.offset(s.line, s.column),
+        lines.offset(e.line, e.column),
+    );
+    lines
+        .src
+        .get(a..b)
+        .unwrap_or("<dynamic expression>")
+        .to_string()
 }
 
 /// 문자열이 SQL로 보이는지 본다 — 강한 동사가 없고 문장 머리가
@@ -2027,20 +2218,21 @@ pub fn rfc3339_utc_now() -> String {
     rfc3339_utc(std::time::SystemTime::now())
 }
 
-/// SystemTime을 RFC 3339 UTC 문자열로 변환한다.
+/// SystemTime을 RFC 3339 UTC 문자열로 변환한다 — GRAPH-EXCHANGE가 정한 밀리초 세
+/// 자리(`YYYY-MM-DDTHH:mm:ss.SSSZ`)다. 초 단위로 내면 같은 초 안에 만든 문서의 순서를
+/// 시각 문자열로 가를 수 없다. 밀리초 아래는 버린다(반올림하면 초가 올라갈 수 있다).
 fn rfc3339_utc(t: std::time::SystemTime) -> String {
-    let secs = t
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let since_epoch = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let secs = since_epoch.as_secs() as i64;
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
     format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
         rem / 3600,
         rem % 3600 / 60,
-        rem % 60
+        rem % 60,
+        since_epoch.subsec_millis()
     )
 }
 
@@ -2201,6 +2393,28 @@ mod tests {
         assert!(!looks_like_sql(""));
     }
 
+    /// dynamic 채널 요약 — 공백류는 한 칸으로 접히고(NEL·U+2028/2029·NBSP 포함),
+    /// 나머지 제어 문자는 공백 연속을 끊지 않고 사라지며, 비면 `<dynamic>`이다.
+    #[test]
+    fn dynamic_channel_folds_whitespace_and_drops_controls() {
+        let cases = [
+            ("a\n  b\tc", "a b c"),
+            ("  lead and trail \r\n", "lead and trail"),
+            ("x\u{85}y\u{2028}z\u{2029}w\u{a0}v", "x y z w v"),
+            ("a\u{1}b\u{7f}c\u{9f}d", "abcd"),
+            ("a \u{1} b", "a b"),
+            ("\u{1}a", "a"),
+            ("한글\n😀", "한글 😀"),
+            ("<unparsed macro argument>", "<unparsed macro argument>"),
+            ("", "<dynamic>"),
+            (" \n\t\u{85} ", "<dynamic>"),
+            ("\u{1}\u{9b}", "<dynamic>"),
+        ];
+        for (text, want) in cases {
+            assert_eq!(dynamic_channel(text), want, "{text:?}");
+        }
+    }
+
     #[test]
     fn snake_case_matches_sea_orm_convention() {
         assert_eq!(to_snake_case("userId"), "user_id");
@@ -2251,6 +2465,102 @@ mod tests {
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
     }
 
+    /// 원문 하나를 가짜 루트 아래 파일로 스캔한다 — 디스크를 읽지 않는다.
+    fn scan_source(src: &str) -> SchemaScan {
+        let root = PathBuf::from("/nonexistent-root");
+        let file = root.join("src/lib.rs");
+        let ast = syn::parse_file(src).expect("test source parses");
+        let mut scan = SchemaScan {
+            root,
+            ..Default::default()
+        };
+        scan_file(&mut scan, &file, src, &ast);
+        scan
+    }
+
+    /// 위치는 SQL로 판정된 리터럴에만 구한다 — 문서 주석·산문 리터럴마다 줄을 찾으면
+    /// 문서 주석이 수만 줄인 생성 파일에서 비용이 리터럴 × 줄로 커진다.
+    #[test]
+    fn only_sql_literals_are_located() {
+        let mut src: String = (0..50)
+            .map(|i| format!("/// 문서 {i}\npub const C{i}: &str = \"value {i}\";\n"))
+            .collect();
+        src.push_str("pub fn f() -> String { format!(\"not sql {}\", 1) }\n");
+        src.push_str("pub const Q: &str = \"SELECT * FROM t\";\n");
+        let scan = scan_source(&src);
+        let channels: Vec<&str> = scan.list.iter().map(|f| f.channel.as_str()).collect();
+        assert_eq!(channels, ["t"]);
+        assert_eq!(scan.located.get(), 1, "prose literals must not be located");
+    }
+
+    /// CRLF·멀티바이트 줄·개행 없는 마지막 줄에서도 위치(줄·열)가 LF 원문과 같다 —
+    /// 줄 색인이 `str::lines`의 `\r` 규칙을 지킨다.
+    #[test]
+    fn crlf_sources_locate_like_lf() {
+        let lf = "/// 설명\npub const A: &str = \"SELECT * FROM a_t\";\n\
+                  pub fn f() { let 이름 = 1; let _s = \"SELECT * FROM b_t\"; let _ = 이름; }\n\
+                  pub const Z: &str = \"DELETE FROM {} WHERE 😀 = 1\";";
+        let crlf = lf.replace('\n', "\r\n");
+        let at = |src: &str| -> Vec<(String, u32, u32)> {
+            scan_source(src)
+                .list
+                .iter()
+                .map(|f| (f.channel.clone(), f.location.line, f.location.column))
+                .collect()
+        };
+        let want = at(lf);
+        assert_eq!(
+            want.iter().map(|w| w.1).collect::<Vec<_>>(),
+            [2, 3, 4],
+            "{want:?}"
+        );
+        assert_eq!(at(&crlf), want);
+    }
+
+    /// 줄 색인은 바꾸기 전의 `str::lines().nth()`와 같은 줄을 돌려준다 — CRLF, 개행
+    /// 없는 마지막 줄, 끝의 빈 줄, 맨 끝 `\r`, 멀티바이트 줄. 오프셋은 문자 열을 바이트로
+    /// 센 자리이고, 없는 줄은 원문 끝이다.
+    #[test]
+    fn line_index_matches_str_lines() {
+        let sources = [
+            "",
+            "\n",
+            "a",
+            "a\n",
+            "a\r\nb\r\n",
+            "a\r\nb",
+            "a\n\n",
+            "a\r",
+            "x\r\r\n",
+            "\r\n\r\n",
+            "한글 줄\n😀\r\nend",
+        ];
+        for src in sources {
+            let ix = LineIndex::new(src);
+            for line in 0..src.lines().count() + 3 {
+                let want = line.checked_sub(1).and_then(|i| src.lines().nth(i));
+                assert_eq!(ix.line(line), want, "{src:?} line {line}");
+            }
+        }
+        let ix = LineIndex::new("한글 줄\n😀x");
+        assert_eq!(ix.offset(1, 3), "한글 ".len());
+        assert_eq!(ix.offset(2, 1), "한글 줄\n😀".len());
+        assert_eq!(ix.offset(9, 0), "한글 줄\n😀x".len());
+    }
+
+    /// 계약 시각은 밀리초 세 자리 `YYYY-MM-DDTHH:mm:ss.SSSZ`다 — 밀리초는 버림이라
+    /// 초가 올라가지 않는다.
+    #[test]
+    fn timestamps_carry_three_millisecond_digits() {
+        let at = |secs: u64, nanos: u32| {
+            rfc3339_utc(std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos))
+        };
+        assert_eq!(at(0, 0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(at(1_727_654_400, 123_456_789), "2024-09-30T00:00:00.123Z");
+        assert_eq!(at(86_399, 999_999_999), "1970-01-01T23:59:59.999Z");
+        assert_eq!(at(1_790_000_000, 7_000_000), "2026-09-21T14:13:20.007Z");
+    }
+
     #[test]
     fn meta_name_value_reads_diesel_and_sea_orm() {
         let attr: syn::Attribute = syn::parse_quote!(#[diesel(table_name = users)]);
@@ -2291,28 +2601,10 @@ mod tests {
 
     #[test]
     fn owner_index_picks_innermost_vertex_and_skips_non_vertices() {
-        let doc = crate::graph::document(
-            crate::graph::Level::Symbol,
-            ".".into(),
-            None,
-            vec![],
-            ["c::T", "c::T::m"]
-                .iter()
-                .map(|id| crate::graph::Vertex {
-                    id: id.to_string(),
-                    kind: crate::graph::Kind::Fn,
-                    krate: "c".into(),
-                    module: "c".into(),
-                    position: None,
-                    exported: false,
-                    generated: false,
-                    cfg: None,
-                    unsafe_: false,
-                })
-                .collect(),
-            vec![],
-            vec![],
-        );
+        let ids: BTreeSet<String> = ["c::T", "c::T::m"]
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
         let file = PathBuf::from("/nonexistent-root/src/lib.rs");
         let span = |id: &str, r: std::ops::Range<usize>| crate::harvest::OwnerSpan {
             id: id.into(),
@@ -2325,7 +2617,7 @@ mod tests {
             // 정점이 아닌 ID는 usr가 될 수 없다.
             span("c::Ghost", 30..40),
         ];
-        let ix = OwnerIndex::new(&doc, &spans);
+        let ix = OwnerIndex::new(&ids, &spans);
         let root = Path::new("/nonexistent-root");
         let mut facts = vec![
             fact_at("src/lib.rs", 15),
@@ -2361,5 +2653,70 @@ mod tests {
             .limitations()
             .iter()
             .any(|l| l.contains("could not be harvested")));
+    }
+
+    /// 링크가 얽힌 트리에서도 실제 디렉터리를 한 번씩만 걷고 루트 안 링크 대상만
+    /// 모은다 — `a -> .`·`b -> .` 두 링크를 따라가던 순회는 경로가 단계마다 두 배였다.
+    /// 루트 밖·끊긴·장치 링크와 FIFO는 모으지 않고, 이름 규칙(target·숨김)은 전과 같다.
+    #[cfg(unix)]
+    #[test]
+    fn walk_visits_each_real_directory_once() {
+        use std::os::unix::fs::symlink;
+        let tmp = std::env::temp_dir().join(format!("rg-walk-rs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let ws = tmp.join("ws");
+        for d in ["pkg/src/inner", "pkg/target", "pkg/.hidden", "shared"] {
+            std::fs::create_dir_all(ws.join(d)).unwrap();
+        }
+        std::fs::create_dir_all(tmp.join("outside")).unwrap();
+        for f in [
+            "ws/pkg/src/lib.rs",
+            "ws/pkg/src/inner/m.rs",
+            "ws/pkg/target/gen.rs",
+            "ws/pkg/.hidden/h.rs",
+            "ws/shared/s.rs",
+            "outside/o.rs",
+        ] {
+            std::fs::write(tmp.join(f), "").unwrap();
+        }
+        let src = ws.join("pkg/src");
+        for (link, target) in [
+            ("a", "."),
+            ("b", "."),
+            ("up", ".."),
+            ("inner/back", "../.."),
+            ("shared", "../../shared"),
+            ("out", "../../../outside"),
+            ("o.rs", "../../../outside/o.rs"),
+            ("zero.rs", "/dev/zero"),
+            ("gone.rs", "missing.rs"),
+        ] {
+            symlink(target, src.join(link)).unwrap();
+        }
+        let fifo = std::process::Command::new("mkfifo")
+            .arg(src.join("pipe.rs"))
+            .status()
+            .expect("mkfifo must run");
+        assert!(fifo.success());
+        let mut state = RsWalk::within(&ws);
+        walk_rs(&ws.join("pkg"), &mut state);
+        let real = ws.canonicalize().unwrap();
+        let rel = |set: &BTreeSet<PathBuf>| -> Vec<String> {
+            set.iter()
+                .map(|p| {
+                    p.strip_prefix(&real)
+                        .map_or_else(|_| p.display().to_string(), |r| r.display().to_string())
+                })
+                .collect()
+        };
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(
+            rel(&state.sources),
+            ["pkg/src/inner/m.rs", "pkg/src/lib.rs", "shared/s.rs"]
+        );
+        assert_eq!(
+            rel(&state.seen_dirs),
+            ["pkg", "pkg/src", "pkg/src/inner", "shared"]
+        );
     }
 }

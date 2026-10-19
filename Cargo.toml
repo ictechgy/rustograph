@@ -10,7 +10,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 syn = { version = "2", features = ["full", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
-serde_yml = "0.0.12"
+# YAML 파서는 config 안에서만 쓴다. serde_yml·libyml은 RUSTSEC-2025-0068·0067
+# (unsound·unmaintained, 패치 없음)이라 권고 대안인 serde_norway(유지되는
+# serde_yaml 포크, 백엔드 unsafe-libyaml-norway)를 쓴다. serde_yaml_ng는 권고상
+# 미유지 백엔드(unsafe-libyaml)를 써서 고르지 않았다.
+serde_norway = "0.9.42"
 # ra_ap_*는 주 단위로 API가 바뀌어 exact pin이다. 0.0.350부터 rust-version이
 # 1.98로 올라가 현재 최소 toolchain(rustc 1.96)과 어긋나 0.0.349를 쓴다.
 # Cargo.lock의 salsa 0.28.2·salsa-macro-rules 0.28.2·unicode-ident 1.0.24

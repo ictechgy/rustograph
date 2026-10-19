@@ -5,7 +5,7 @@
 //! 비운 채 64, 그래프 정점이 아닌 root가 섞이면 나머지 root로 순회한 문서를 쓰고 64, 수확 실패는 2.
 
 use crate::cli_args::{self, Args};
-use crate::graph::{Document, Vertex};
+use crate::graph::{Document, Edge, Level, Vertex};
 use crate::traversal::{self, Direction};
 use crate::{export, source};
 use serde::Serialize;
@@ -162,11 +162,9 @@ fn revision_of(a: &Args) -> Result<Option<String>, String> {
 }
 
 /// id·revision에 올 수 없는 문자다(제어 문자, U+2028/2029) — isthmus의 안전 문자열 규칙과 같다.
+/// 판정은 저장 문서의 ID 검사(`export::load_file`)와 같은 graph 규칙 하나다.
 fn has_forbidden(s: &str) -> bool {
-    s.chars().any(|c| {
-        let u = c as u32;
-        u <= 0x1f || (0x7f..=0x9f).contains(&u) || u == 0x2028 || u == 0x2029
-    })
+    s.chars().any(crate::graph::is_forbidden_id_char)
 }
 
 /// 위치 인자 다음에 `--roots-from`의 id를 잇고, 중복은 처음 나온 순서로 하나만 남긴다
@@ -551,10 +549,65 @@ impl Locator {
 /// 그래프 산출물의 신원 — root를 project로 맞춘 그래프 JSON의 SHA-256.
 /// `--dir .`과 절대 경로처럼 같은 그래프를 다른 문자열로 연 실행이 같은 값을 내야
 /// isthmus가 같은 플랫폼 분석끼리 stale로 오판하지 않는다.
+/// JSON은 `export::to_json`과 같은 바이트(pretty + 끝 개행)를 해셔로 흘려 보낸다 — 문서를
+/// 복제하고 JSON 문자열을 만든 뒤 그 사본에 패딩까지 붙이면 간선 수백만 그래프에서 이 함수
+/// 하나가 문서 크기의 몇 배를 더 썼다.
 fn graph_revision(doc: &Document, project: &Path) -> String {
-    let mut canonical = doc.clone();
-    canonical.root = project.display().to_string();
-    traversal::sha256::hex_digest(export::to_json(&canonical).as_bytes())
+    let root = project.display().to_string();
+    let mut hasher = traversal::sha256::Sha256::new();
+    // 해셔 쓰기는 실패하지 않고, 문서는 문자열 키 구조체뿐이라 직렬화도 실패할 수 없다
+    // (`export::to_json`의 expect와 같은 근거).
+    serde_json::to_writer_pretty(&mut hasher, &RootedGraph::new(doc, &root))
+        .expect("graph document must serialize");
+    hasher.update(b"\n");
+    hasher.finalize_hex()
+}
+
+/// root만 바꾼 그래프 문서의 차용 뷰 — graphRevision이 해시하는 JSON이다. 필드 이름·순서·
+/// 생략 규칙이 `graph::Document`의 serde 정의와 같아야 `graph --level symbol` 출력과 같은
+/// 바이트가 된다(tests/traversal.rs가 해시로 대조한다).
+#[derive(Serialize)]
+struct RootedGraph<'a> {
+    version: u32,
+    tool: &'a str,
+    level: Level,
+    root: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<&'a str>,
+    roots: &'a [String],
+    vertices: &'a [Vertex],
+    edges: &'a [Edge],
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    limitations: &'a [String],
+}
+
+impl<'a> RootedGraph<'a> {
+    /// 문서를 `..` 없이 구조 분해한다 — `Document`에 필드가 늘면 여기서 컴파일이 멈춰, 새 필드가
+    /// 해시 입력에서 조용히 빠지지 않는다.
+    fn new(doc: &'a Document, root: &'a str) -> RootedGraph<'a> {
+        let Document {
+            version,
+            tool,
+            level,
+            root: _,
+            workspace,
+            roots,
+            vertices,
+            edges,
+            limitations,
+        } = doc;
+        RootedGraph {
+            version: *version,
+            tool,
+            level: *level,
+            root,
+            workspace: workspace.as_deref(),
+            roots,
+            vertices,
+            edges,
+            limitations,
+        }
+    }
 }
 
 /// 작업 트리가 깨끗할 때만 git HEAD를 돌려준다. 커밋하지 않은 변경·추적하지 않는 파일이
@@ -654,6 +707,81 @@ mod tests {
         assert!(has_forbidden("a\u{85}"));
         assert!(has_forbidden("a\u{2028}"));
         assert!(!has_forbidden("c::<T as Tr>::m"));
+    }
+
+    /// 옛 graphRevision — 문서를 복제해 root를 바꾸고 pretty JSON 전체를 만든 뒤 해시했다.
+    /// 해시를 흘려 계산하는 지금 구현이 같은 바이트를 해시하는지 재는 기준이다.
+    fn graph_revision_by_copy(doc: &Document, project: &Path) -> String {
+        let mut canonical = doc.clone();
+        canonical.root = project.display().to_string();
+        traversal::sha256::hex_digest(export::to_json(&canonical).as_bytes())
+    }
+
+    /// 선택 필드를 모두 비운 문서와 모두 채운 문서 — JSON 이스케이프가 필요한 문자를 섞는다.
+    fn sample_documents() -> Vec<Document> {
+        use crate::graph::{document, Edge, EdgeKind, Kind, Level};
+        let bare = document(
+            Level::Module,
+            ".".into(),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let full_vertex = Vertex {
+            id: "c::m::\"q\"\\é😀".into(),
+            kind: Kind::Method,
+            krate: "c".into(),
+            module: "c::m".into(),
+            position: Some("src/lib.rs:7".into()),
+            exported: true,
+            generated: true,
+            cfg: Some("feature = \"x\"".into()),
+            unsafe_: true,
+        };
+        let plain_vertex = Vertex {
+            id: "c::main".into(),
+            kind: Kind::Fn,
+            krate: "c".into(),
+            module: "c".into(),
+            position: None,
+            exported: false,
+            generated: false,
+            cfg: None,
+            unsafe_: false,
+        };
+        let mut odd_edge = Edge::maybe(
+            "c::main".into(),
+            full_vertex.id.clone(),
+            EdgeKind::Signature,
+        );
+        odd_edge.cfg = Some("unix".into());
+        odd_edge.unsafe_ = true;
+        let full = document(
+            Level::Symbol,
+            "/elsewhere".into(),
+            Some("/ws \"root\"".into()),
+            vec!["c::main".into()],
+            vec![full_vertex.clone(), plain_vertex],
+            vec![
+                Edge::new("c::main".into(), full_vertex.id.clone(), EdgeKind::Call),
+                odd_edge,
+            ],
+            vec!["limit: \"x\"\n\ttab\u{1}".into()],
+        );
+        vec![bare, full]
+    }
+
+    #[test]
+    fn graph_revision_hashes_the_same_bytes_as_the_cloned_document_json() {
+        let project = Path::new("/tmp/project \"p\"/é");
+        for doc in sample_documents() {
+            assert_eq!(
+                graph_revision(&doc, project),
+                graph_revision_by_copy(&doc, project)
+            );
+        }
     }
 
     #[test]

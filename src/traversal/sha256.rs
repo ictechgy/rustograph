@@ -22,20 +22,91 @@ const H0: [u32; 8] = [
 
 /// 바이트열의 SHA-256을 소문자 16진 문자열로 돌려준다.
 pub fn hex_digest(data: &[u8]) -> String {
-    let mut h = H0;
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize_hex()
+}
+
+/// 조각으로 받는 SHA-256 — 해시할 바이트를 한 버퍼에 모으지 않는다. 그래프 문서 전체(수백 MB)를
+/// JSON 문자열로 만들고 그 사본에 패딩을 붙이던 graphRevision이 직렬화 결과를 흘려 넣는다
+/// (`io::Write`). 덜 찬 블록 하나만 들고 있고, 패딩은 마지막 블록에만 붙인다.
+pub struct Sha256 {
+    /// 지금까지 압축한 블록들의 중간 해시 값.
+    state: [u32; 8],
+    /// 아직 압축하지 않은 마지막 블록 조각(앞 `buffered` 바이트).
+    block: [u8; 64],
+    buffered: usize,
+    /// 지금까지 받은 바이트 수.
+    length: u64,
+}
+
+impl Default for Sha256 {
+    fn default() -> Self {
+        Sha256::new()
     }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-    // 패딩 뒤 길이는 늘 64의 배수라 나머지는 비어 있다.
-    let (blocks, _) = msg.as_chunks::<64>();
-    for block in blocks {
-        compress(&mut h, block);
+}
+
+impl Sha256 {
+    /// 빈 메시지 상태다.
+    pub fn new() -> Sha256 {
+        Sha256 {
+            state: H0,
+            block: [0; 64],
+            buffered: 0,
+            length: 0,
+        }
     }
-    h.iter().map(|w| format!("{w:08x}")).collect()
+
+    /// 메시지 조각을 잇는다. 조각을 어떻게 나눠도 한 번에 넣은 것과 같다.
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.length = self.length.wrapping_add(data.len() as u64);
+        if self.buffered > 0 {
+            let take = (64 - self.buffered).min(data.len());
+            self.block[self.buffered..self.buffered + take].copy_from_slice(&data[..take]);
+            self.buffered += take;
+            data = &data[take..];
+            if self.buffered < 64 {
+                return;
+            }
+            compress(&mut self.state, &self.block);
+            self.buffered = 0;
+        }
+        let (blocks, rest) = data.as_chunks::<64>();
+        for block in blocks {
+            compress(&mut self.state, block);
+        }
+        self.block[..rest.len()].copy_from_slice(rest);
+        self.buffered = rest.len();
+    }
+
+    /// 마지막 블록에 패딩(0x80, 0들, 비트 길이)을 붙여 끝내고 소문자 16진 문자열을 돌려준다.
+    /// 남은 조각이 55바이트를 넘으면 길이가 들어갈 자리가 없어 블록 하나가 더 붙는다.
+    pub fn finalize_hex(mut self) -> String {
+        let bit_len = self.length.wrapping_mul(8);
+        let mut tail = [0u8; 128];
+        tail[..self.buffered].copy_from_slice(&self.block[..self.buffered]);
+        tail[self.buffered] = 0x80;
+        let end = if self.buffered < 56 { 64 } else { 128 };
+        tail[end - 8..end].copy_from_slice(&bit_len.to_be_bytes());
+        // end는 64의 배수라 나머지는 비어 있다.
+        let (blocks, _) = tail[..end].as_chunks::<64>();
+        for block in blocks {
+            compress(&mut self.state, block);
+        }
+        self.state.iter().map(|w| format!("{w:08x}")).collect()
+    }
+}
+
+/// 직렬화기가 바이트를 흘려 넣는 자리 — 쓰기는 실패하지 않는다.
+impl std::io::Write for Sha256 {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// 64바이트 블록 하나로 상태를 갱신한다.
@@ -80,7 +151,92 @@ fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
 
 #[cfg(test)]
 mod tests {
-    use super::hex_digest;
+    use super::{hex_digest, Sha256};
+
+    /// 'a' n개의 SHA-256 — 시스템 `shasum -a 256`으로 구한 기준값. 패딩이 같은 블록에 들어가는
+    /// 마지막 길이(55), 다음 블록으로 넘어가는 길이(56·63), 블록 경계(64·128)와 그 이웃이다.
+    const BOUNDARY_DIGESTS: [(usize, &str); 8] = [
+        (
+            55,
+            "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318",
+        ),
+        (
+            56,
+            "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a",
+        ),
+        (
+            63,
+            "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34",
+        ),
+        (
+            64,
+            "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+        ),
+        (
+            65,
+            "635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0",
+        ),
+        (
+            119,
+            "31eba51c313a5c08226adf18d4a359cfdfd8d2e816b13f4af952f7ea6584dcfb",
+        ),
+        (
+            120,
+            "2f3d335432c70b580af0e8e1b3674a7c020d683aa5f73aaaedfdc55af904c21c",
+        ),
+        (
+            128,
+            "6836cf13bac400e9105071cd6af47084dfacad4e5e302c94bfed24e013afb73e",
+        ),
+    ];
+
+    #[test]
+    fn boundary_lengths_match_reference_digests() {
+        for (n, want) in BOUNDARY_DIGESTS {
+            assert_eq!(hex_digest(&vec![b'a'; n]), want, "{n} bytes");
+        }
+    }
+
+    #[test]
+    fn incremental_updates_match_reference_digests_at_every_split() {
+        // 기준 메시지를 모든 위치에서 둘로 나눠 넣어도 같다 — 내부 버퍼가 비었을 때·찼을 때·블록
+        // 경계를 넘을 때를 다 지난다.
+        for (n, want) in BOUNDARY_DIGESTS {
+            let msg = vec![b'a'; n];
+            for split in 0..=n {
+                let mut h = Sha256::new();
+                h.update(&msg[..split]);
+                h.update(&msg[split..]);
+                assert_eq!(h.finalize_hex(), want, "{n} bytes split at {split}");
+            }
+        }
+        // 바이트 하나씩, 블록 크기와 서로소인 조각으로 넣어도 NIST 벡터와 같다.
+        let mut h = Sha256::new();
+        for b in b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq" {
+            h.update(std::slice::from_ref(b));
+        }
+        assert_eq!(
+            h.finalize_hex(),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        let mut h = Sha256::new();
+        for chunk in vec![b'a'; 1_000_000].chunks(997) {
+            h.update(chunk);
+        }
+        assert_eq!(
+            h.finalize_hex(),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    #[test]
+    fn hasher_is_an_io_writer() {
+        // serde_json이 문서를 조각으로 흘려 넣는 경로다.
+        let mut h = Sha256::new();
+        serde_json::to_writer(&mut h, &"abc").unwrap();
+        std::io::Write::write_all(&mut h, b"\n").unwrap();
+        assert_eq!(h.finalize_hex(), hex_digest(b"\"abc\"\n"));
+    }
 
     #[test]
     fn nist_vectors() {

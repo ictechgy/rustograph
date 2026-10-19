@@ -123,6 +123,28 @@ pub struct ModTree {
     pub modules: BTreeMap<String, Module>,
     /// 선언에 도달하지 못한 .rs 파일(orphan) — limitation으로 올린다.
     pub orphan_files: Vec<PathBuf>,
+    /// 정점 없이 건너뛴 `mod` 선언 — 모듈 경로 → 사유. limitation으로 올린다.
+    /// 경로가 키라 병합 루트(lib+같은 이름 bin)를 두 타깃이 다시 훑어도 한 번만 센다.
+    pub skipped_mods: BTreeMap<String, SkippedMod>,
+}
+
+/// 모듈 경로 깊이(세그먼트 수) 상한이다. 순환은 조상 파일 검사가 끊지만, 그 검사를
+/// 비껴가는 입력(정규화되지 않는 경로 등)에도 트리 확장이 끝나도록 둔 보조 상한이다.
+/// 실제 크레이트의 모듈 중첩(수십 단계 미만)보다 넉넉하게 잡은 판단값이다.
+pub const MAX_MODULE_DEPTH: usize = 512;
+
+/// `mod` 선언을 정점 없이 건너뛴 사유 — 유령 정점 대신 실측으로 센다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkippedMod {
+    /// 조상 모듈의 파일을 다시 싣는다(rustc의 circular modules). cfg로 막혀 rustc가
+    /// 받는 크레이트도 있어 오류가 아니라 실측이다. 그대로 실으면 같은 파일이
+    /// `m`, `m::m`, …으로 끝없이 늘어난다.
+    Circular,
+    /// 대상이 정규 파일이 아니다(장치·FIFO·디렉터리) — 읽으면 영원히 막히거나
+    /// 끝없이 읽힌다.
+    NotRegularFile,
+    /// 모듈 경로가 [`MAX_MODULE_DEPTH`]를 넘는다.
+    TooDeep,
 }
 
 /// 모듈 경로에서 크레이트(첫 세그먼트)를 뗀다.
@@ -280,7 +302,26 @@ impl ModTree {
 /// ast 아이템들에서 `mod` 선언을 찾아 트리에 심는다.
 /// 반환값: 큐에 넣을 서브모듈 경로들 — 파일·인라인 모두 큐에 넣고,
 /// 아이템 목록은 module_items가 파일/인라인을 구분해 찾는다.
+/// 선언이 어느 타깃(크레이트 인스턴스)에 속하는지 모르는 호출이라, 순환 판정에서 크레이트
+/// 루트의 파일을 모두 조상으로 본다(lib과 같은 이름의 bin이 서로의 루트 파일을 싣는 선언도
+/// 순환으로 센다 — 보수적이다). 수확은 타깃을 아는 변형으로 루트 파일 하나만 조상으로 본다.
 pub fn collect_submodules(
+    items: &[&syn::Item],
+    parent_path: &str,
+    tree: &mut ModTree,
+    conditional_count: &mut usize,
+) -> Vec<String> {
+    collect_target_submodules(None, items, parent_path, tree, conditional_count)
+}
+
+/// [`collect_submodules`]와 같되, 선언이 루트 파일 `target_root`인 타깃 하나의 모듈 트리에
+/// 속한다. lib과 같은 이름의 bin은 트리에서 루트 모듈 하나를 함께 쓰지만(file + extra_files)
+/// rustc에게는 루트가 다른 두 크레이트다 — bin의 `mod lib;`(lib.rs)와 lib의
+/// `#[path = "main.rs"] mod m;`은 순환이 아니라 rustc가 받는 선언이다(special_module_name
+/// 경고뿐). 그래서 순환 판정에서 크레이트 루트는 이 타깃의 루트 파일만 조상이다. None이면
+/// 루트의 파일을 모두 조상으로 본다.
+pub(crate) fn collect_target_submodules(
+    target_root: Option<&Path>,
     items: &[&syn::Item],
     parent_path: &str,
     tree: &mut ModTree,
@@ -301,17 +342,18 @@ pub fn collect_submodules(
         };
         (path_base, parent.dir.clone(), parent.file.clone())
     };
+    // 자식 경로의 세그먼트 수 — 상한을 넘는 선언은 싣지 않고 센다.
+    let child_depth = parent_path.split("::").count() + 1;
     let mut queued = Vec::new();
     for item in items {
         let syn::Item::Mod(m) = item else { continue };
         let name = m.ident.to_string();
         let path = format!("{parent_path}::{name}");
-        // 병합 루트(lib+같은 이름 bin)를 두 번째 타깃이 다시 훑을 때 같은
-        // mod 선언을 재계수하지 않는다 — 처음 보는 경로일 때만 센다.
-        let cfg = cfg_of(&m.attrs);
-        if cfg.is_some() && !tree.modules.contains_key(&path) {
-            *conditional_count += 1;
+        if child_depth > MAX_MODULE_DEPTH {
+            tree.skipped_mods.insert(path, SkippedMod::TooDeep);
+            continue;
         }
+        let cfg = cfg_of(&m.attrs);
         // `#[path = "..."]`는 NameValue 메타다 — `parse_args`는
         // `#[path("...")]` 문법만 받으므로 값은 nv.value에서 읽는다.
         // 인라인 모듈에도 달 수 있고, 그 값은 자식의 기준 디렉터리를
@@ -330,14 +372,14 @@ pub fn collect_submodules(
                 },
                 _ => None,
             });
-        let (file, is_file_module, dir) = if m.content.is_some() {
+        let resolved = if m.content.is_some() {
             // 인라인 모듈 — 같은 파일. `#[path]`는 자식의 기준
             // 디렉터리 세그먼트를 덮어쓴다.
             let dir = match &path_attr {
                 Some(p) => path_base.join(p),
                 None => child_base.join(&name),
             };
-            (parent_file.clone(), false, dir)
+            Some((parent_file.clone(), false, dir))
         } else {
             let base = if path_attr.is_some() {
                 &path_base
@@ -346,6 +388,10 @@ pub fn collect_submodules(
             };
             match mod_file(base, &name, path_attr.as_deref()) {
                 Some(f) => {
+                    if let Some(reason) = file_module_skip(tree, parent_path, &f, target_root) {
+                        tree.skipped_mods.insert(path, reason);
+                        continue;
+                    }
                     // `#[path]`로 로드된 파일은 자기 디렉터리를 소유한다
                     // — `loaded.rs`라도 `loaded/` 스템 디렉터리를
                     // 만들지 않는다(rustc 실증).
@@ -354,10 +400,20 @@ pub fn collect_submodules(
                     } else {
                         module_dir(&f)
                     };
-                    (f, true, dir)
+                    Some((f, true, dir))
                 }
-                None => continue, // 파일 없는 mod(조건부·생성) — 정점 없이 limitation만.
+                None => None,
             }
+        };
+        // 병합 루트(lib+같은 이름 bin)를 두 번째 타깃이 다시 훑을 때 같은
+        // mod 선언을 재계수하지 않는다 — 처음 보는 경로일 때만 센다.
+        // 건너뛴 선언(skipped_mods)은 실리지 않았으니 세지 않는다.
+        if cfg.is_some() && !tree.modules.contains_key(&path) {
+            *conditional_count += 1;
+        }
+        // 파일 없는 mod(조건부·생성) — 정점 없이 limitation만.
+        let Some((file, is_file_module, dir)) = resolved else {
+            continue;
         };
         let public = matches!(m.vis, syn::Visibility::Public(_));
         let mut module = Module::new(file, is_file_module, public);
@@ -372,6 +428,54 @@ pub fn collect_submodules(
         queued.push(path);
     }
     queued
+}
+
+/// 파일 모듈 대상 `file`을 정점으로 싣지 못하는 사유다 — 실을 수 있으면 None.
+/// 순환은 조상 사슬만 본다 — 조상이 아닌 두 모듈이 같은 파일을 싣는 `#[path]`는
+/// rustc도 받는다. 종류는 stat으로 본다(FIFO에서도 막히지 않는다). stat이 실패하면
+/// None이다 — 읽기는 parse_into가 원인을 담은 오류로 낸다(지금과 같다).
+fn file_module_skip(
+    tree: &ModTree,
+    parent_path: &str,
+    file: &Path,
+    target_root: Option<&Path>,
+) -> Option<SkippedMod> {
+    if reenters_ancestor(tree, parent_path, file, target_root) {
+        return Some(SkippedMod::Circular);
+    }
+    match std::fs::metadata(file) {
+        Ok(md) if !md.is_file() => Some(SkippedMod::NotRegularFile),
+        _ => None,
+    }
+}
+
+/// `file`이 `parent_path`부터 크레이트 루트까지 어느 조상 모듈의 파일인가 — 인라인 조상은
+/// 감싼 파일을 file로 가진다. 크레이트 루트는 `target_root`가 있으면 그 파일만, 없으면 병합
+/// 루트의 extra_files까지 조상 파일이다. 다른 타깃의 루트 파일을 거쳐 돌아오는 진짜 순환도
+/// 그 파일이 루트 아래 모듈의 file로 다시 나타나는 자리에서 끊긴다.
+/// 경로는 둘 다 mod_file·grow_tree가 정규화한 것이라 그대로 비교한다.
+fn reenters_ancestor(
+    tree: &ModTree,
+    parent_path: &str,
+    file: &Path,
+    target_root: Option<&Path>,
+) -> bool {
+    let mut current = Some(parent_path);
+    while let Some(path) = current {
+        let up = path.rsplit_once("::").map(|(up, _)| up);
+        let ancestor_file = match (up, target_root) {
+            (None, Some(root)) => root == file,
+            _ => tree
+                .modules
+                .get(path)
+                .is_some_and(|m| m.file == file || m.extra_files.iter().any(|f| f == file)),
+        };
+        if ancestor_file {
+            return true;
+        }
+        current = up;
+    }
+    false
 }
 
 /// `#[cfg]`가 붙어 있으면 조건부로 본다 — 포함은 하되 실측으로 센다.

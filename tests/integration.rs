@@ -192,6 +192,20 @@ fn kinds_cover_traits_and_methods() {
     assert_eq!(m.kind, Kind::Method);
 }
 
+/// 라이브러리 호출자가 쓰는 0.5.0 공개 시그니처 그대로다 — 인자를 늘리면 이 외부 크레이트
+/// 테스트가 컴파일되지 않는다. 드라이버 버전은 호출자가 넘기지 않아도 이 크레이트의 버전이다.
+#[test]
+fn sarif_keeps_its_published_library_signature() {
+    let render: fn(&rustograph::graph::Document, &[rustograph::rules::Violation]) -> String =
+        rustograph::sarif::rules_sarif;
+    let log: serde_json::Value =
+        serde_json::from_str(&render(&doc(&Default::default()), &[])).expect("SARIF must be JSON");
+    assert_eq!(
+        log["runs"][0]["tool"]["driver"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
 #[test]
 fn deterministic_across_runs() {
     let a = rustograph::export::to_json(&doc(&Default::default()));
@@ -497,6 +511,205 @@ mod cli_tests {
         let _ = std::fs::remove_file(&cfg);
         let _ = std::fs::remove_file(&base);
     }
+
+    /// README의 기준선 흐름 — 설정 옆 `.rustograph/rules-baseline.txt`가 아직 없으면 도입
+    /// 전으로 보고, `--write-baseline`이 디렉터리째 만들어 얼린 뒤 strict가 억누른다.
+    #[test]
+    fn rules_baseline_under_dot_rustograph_round_trips() {
+        let tmp = std::env::temp_dir().join(format!("rg-dot-base-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cfg = tmp.join(".rustograph.yml");
+        std::fs::write(
+            &cfg,
+            "components:\n  app: [\"fixture_app/**\"]\n  core: [\"fixture_core/**\"]\n\
+             deps:\n  app: []\n  core: []\nbaseline: .rustograph/rules-baseline.txt\n",
+        )
+        .unwrap();
+        let cfgp = cfg.to_str().unwrap();
+        let (code, _, err) = run(&["rules", "--strict", "--config", cfgp]);
+        assert_eq!(code, 1, "{err}");
+        let (code, out, err) = run(&["rules", "--config", cfgp, "--write-baseline"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("wrote baseline"));
+        let frozen = std::fs::read_to_string(tmp.join(".rustograph/rules-baseline.txt")).unwrap();
+        assert!(frozen.contains("allow|fixture_app"), "{frozen}");
+        let (code, out, err) = run(&["rules", "--strict", "--config", cfgp]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("suppressed by baseline"));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 설정의 `baseline:`과 디렉터리에서 찾은 `.rustograph.yml`은 분석 대상 저장소가 고른다 —
+    /// FIFO는 여는 순간 쓰는 쪽을 영원히 기다리고 장치는 끝없이 읽힌다. rules는 막히거나
+    /// 메모리를 다 쓰지 않고 원인을 담은 오류(2)로 끝나야 한다. 명시 `--baseline`은 실행한
+    /// 사람이 고른 입력이라 파이프도 읽지만, 장치를 주어도 크기 상한에서 2로 끝난다.
+    #[cfg(unix)]
+    #[test]
+    fn rules_refuses_special_config_and_baseline_files() {
+        let tmp = std::env::temp_dir().join(format!("rg-special-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let fifo = tmp.join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must run");
+        assert!(made.success());
+        let cfg = tmp.join("rules.yml");
+        std::fs::write(
+            &cfg,
+            "components:\n  app: [\"fixture_app/**\"]\ndeps:\n  app: []\nbaseline: pipe\n",
+        )
+        .unwrap();
+        let cfgp = cfg.to_str().unwrap();
+        for (args, cause, why) in [
+            // 설정의 baseline이 FIFO — 열지 않는다.
+            (
+                vec!["rules", "--config", cfgp],
+                "cannot read baseline ",
+                "not a regular file",
+            ),
+            // 명시 --baseline이 장치 — 읽되 상한에서 끝난다.
+            (
+                vec!["rules", "--config", cfgp, "--baseline", "/dev/zero"],
+                "cannot read baseline /dev/zero: ",
+                "larger than",
+            ),
+        ] {
+            let (code, _, err) = run(&args);
+            assert_eq!(code, 2, "{args:?}: {err}");
+            assert!(err.contains(cause) && err.contains(why), "{args:?}: {err}");
+        }
+        // --dir에서 찾은 .rustograph.yml이 FIFO여도 같다 — 설정을 읽은 뒤에야 수확한다.
+        std::fs::remove_file(&cfg).unwrap();
+        std::fs::rename(&fifo, tmp.join(".rustograph.yml")).unwrap();
+        let argv: Vec<String> = ["rules", "--dir", tmp.to_str().unwrap()]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = cli::run(&argv, &mut out, &mut err);
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(code, 2, "{err}");
+        assert!(err.contains("not a regular file"), "{err}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 명시 `--config`·`--baseline`은 실행한 사람이 고른 입력이라 파이프도 읽는다 —
+    /// `cat rules.yml | rustograph rules --config /dev/stdin`과 `--baseline <(…)`는 셸에서 흔한
+    /// 쓰임이다. 정규 파일만 받으면 이런 실행의 종료 코드가 1·0에서 2로 바뀐다.
+    #[cfg(unix)]
+    #[test]
+    fn rules_reads_piped_config_and_baseline_arguments() {
+        let tmp = std::env::temp_dir().join(format!("rg-piped-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        // app이 core를 참조하지 못하게 거꾸로 선 룰셋 — fixture에 위반이 생긴다.
+        let deny = "components:\n  app: [\"fixture_app/**\"]\n  core: [\"fixture_core/**\"]\n\
+                    deps:\n  app: []\n  core: []\n";
+        let cfg = tmp.join("deny.yml");
+        std::fs::write(&cfg, deny).unwrap();
+        let base = tmp.join("base.txt");
+        let (cfgp, basep) = (cfg.to_str().unwrap(), base.to_str().unwrap());
+        let (code, _, err) = run(&[
+            "rules",
+            "--config",
+            cfgp,
+            "--baseline",
+            basep,
+            "--write-baseline",
+        ]);
+        assert_eq!(code, 0, "{err}");
+        let frozen = std::fs::read_to_string(&base).unwrap();
+        // 설정을 표준 입력 파이프로 — 위반이 남으니 strict는 1이다.
+        let (code, err) = piped(&["rules", "--strict", "--config", "/dev/stdin"], deny);
+        assert_eq!(code, Some(1), "{err}");
+        // 기준선을 파이프로 — 얼린 위반이 억눌려 0이다(읽지 않았다면 1).
+        let (code, err) = piped(
+            &[
+                "rules",
+                "--strict",
+                "--config",
+                cfgp,
+                "--baseline",
+                "/dev/stdin",
+            ],
+            &frozen,
+        );
+        assert_eq!(code, Some(0), "{err}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 실제 바이너리를 fixture에 돌리며 `input`을 표준 입력 파이프로 준다 — (종료 코드, stderr).
+    #[cfg(unix)]
+    fn piped(args: &[&str], input: &str) -> (Option<i32>, String) {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(env!("CARGO_BIN_EXE_rustograph"))
+            .args(args)
+            .arg("--dir")
+            .arg(fixture())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("rustograph binary must start");
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        match stdin.write_all(input.as_bytes()) {
+            Ok(()) => {}
+            // 파이프를 읽지 않고 먼저 끝난 실행 — 그 이유는 종료 코드와 stderr가 말한다.
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("writing the piped input failed: {e}"),
+        }
+        drop(stdin);
+        let output = child.wait_with_output().expect("rustograph must finish");
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// 다른 도구가 만든 `--graph` 문서의 ID에 ESC·개행이 섞여 있으면 어떤 명령도 그 ID를
+    /// 텍스트·Mermaid·순회 출력에 옮기지 않고 입력 오류(2)로 끝난다. 오류는 한 줄이고
+    /// 그 문자를 싣지 않는다 — 터미널 화면 지우기나 Mermaid `click` 줄이 끼어들 수 없다.
+    #[test]
+    fn tainted_graph_documents_are_input_errors() {
+        let tmp = std::env::temp_dir().join(format!("rg-tainted-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("g.json");
+        // JSON 이스케이프(\u001b·\n·\")로 싣는다 — 읽으면 실제 ESC·개행·따옴표다.
+        let tainted = r#"c::\u001b[2Jx\"]\n    click x"#;
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"tool":"rustograph","level":"symbol","root":".","roots":["c::r"],
+"vertices":[{{"id":"c::r","kind":"fn","crate":"c","module":"c"}},
+{{"id":"{tainted}","kind":"fn","crate":"c","module":"c"}}],
+"edges":[{{"from":"c::r","to":"{tainted}","kind":"call"}},{{"from":"{tainted}","to":"c::r","kind":"call"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let g = path.to_str().unwrap();
+        for args in [
+            vec![
+                "graph", "--level", "symbol", "--format", "mermaid", "--graph", g,
+            ],
+            vec!["cycles", "--level", "symbol", "--graph", g],
+            vec!["dead", "--explain", "c::r", "--graph", g],
+            vec!["reach", "c::r", "--graph", g],
+        ] {
+            let (code, out, err) = run(&args);
+            assert_eq!(code, 2, "{args:?}: {err:?}");
+            assert!(out.is_empty(), "{args:?}: {out:?}");
+            assert!(
+                err.contains("vertices[1].id contains U+001B"),
+                "{args:?}: {err:?}"
+            );
+            assert_eq!(err.lines().count(), 1, "{args:?}: {err:?}");
+            assert!(!err.contains('\u{1b}'), "{args:?}: {err:?}");
+        }
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
 }
 
 #[test]
@@ -734,4 +947,386 @@ pub fn nested_fn() { let _ = { fn go(helper: u32) -> u32 { helper } go(1) }; }
         .edges
         .iter()
         .any(|e| e.from == "locals::S::me" && e.to == "locals"));
+}
+
+/// src 아래 파일들로 임시 크레이트(`pathcycle` 패키지)를 만든다 — 공유 fixture의 계수를
+/// 건드리지 않고 모듈 트리 모양 하나만 검증할 때 쓴다. 파일 이름의 디렉터리도 만든다.
+fn temp_crate(tag: &str, files: &[(String, String)]) -> PathBuf {
+    let tmp = std::env::temp_dir().join(format!("rg-modtree-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("src")).unwrap();
+    std::fs::write(
+        tmp.join("Cargo.toml"),
+        "[package]\nname = \"pathcycle\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    for (name, text) in files {
+        let path = tmp.join("src").join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    tmp
+}
+
+/// (이름, 내용) 쌍 목록을 소유 문자열로 바꾼다 — 표 테스트를 짧게 쓰기 위한 도우미.
+fn owned(files: &[(&str, &str)]) -> Vec<(String, String)> {
+    files
+        .iter()
+        .map(|(name, text)| (name.to_string(), text.to_string()))
+        .collect()
+}
+
+/// 실제 CLI 경로(`graph --level symbol`)로 임시 크레이트를 수확한 JSON 문서다. 종료 코드가
+/// 0이 아니면 그 코드와 stderr로 실패한다. 크레이트 디렉터리는 지운다.
+fn graph_json(dir: &std::path::Path) -> serde_json::Value {
+    let argv: Vec<String> = ["graph", "--level", "symbol", "--dir"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(std::iter::once(dir.display().to_string()))
+        .collect();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = rustograph::cli::run(&argv, &mut out, &mut err);
+    let _ = std::fs::remove_dir_all(dir);
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+    serde_json::from_slice(&out).unwrap()
+}
+
+/// [`graph_json`]으로 수확해 (모듈 정점 ID 정렬 목록, limitation 목록)을 돌려준다.
+fn graph_modules(dir: &std::path::Path) -> (Vec<String>, Vec<String>) {
+    let doc = graph_json(dir);
+    let mut modules: Vec<String> = doc["vertices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|v| matches!(v["kind"].as_str(), Some("crate" | "module")))
+        .map(|v| v["id"].as_str().unwrap().to_string())
+        .collect();
+    modules.sort();
+    // 셀 것이 없으면 키가 빠진다 — 빈 목록과 같다.
+    let limitations = doc["limitations"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .map(|l| l.as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    (modules, limitations)
+}
+
+/// 건너뛴 `mod` 선언을 세는 limitation 줄만 고른다.
+fn skipped_mod_lines(limitations: &[String]) -> Vec<&str> {
+    limitations
+        .iter()
+        .filter(|l| l.contains("mod declarations were skipped"))
+        .map(String::as_str)
+        .collect()
+}
+
+/// `#[path]`가 자기 파일이나 조상 모듈의 파일을 다시 싣는 선언(rustc의 circular modules)은
+/// 정점 없이 한 번 센다. 방문 집합이 모듈 경로 기준이라 같은 파일이 `m`, `m::m`, …으로
+/// 끝없이 늘었다(2줄 크레이트로 수 초에 RSS 수 GB). cfg로 막힌 변형은 rustc가 받으므로
+/// 오류(2)가 아니라 limitation이다. 인라인 조상의 파일도 조상 파일이다.
+#[test]
+fn circular_path_modules_are_skipped_and_counted() {
+    assert_one_circular(
+        "self",
+        &[(
+            "lib.rs",
+            "#[path = \"lib.rs\"]\npub mod m;\npub fn f() {}\n",
+        )],
+        &["pathcycle"],
+    );
+    assert_one_circular(
+        "cfg",
+        &[(
+            "lib.rs",
+            "#[cfg(feature = \"never-enabled\")]\n#[path = \"lib.rs\"]\npub mod again;\npub fn f() {}\n",
+        )],
+        &["pathcycle"],
+    );
+    assert_one_circular(
+        "mutual",
+        &[
+            ("lib.rs", "pub mod a;\npub fn f() {}\n"),
+            ("a.rs", "#[path = \"b.rs\"]\npub mod b;\npub fn in_a() {}\n"),
+            ("b.rs", "#[path = \"a.rs\"]\npub mod a;\npub fn in_b() {}\n"),
+        ],
+        &["pathcycle", "pathcycle::a", "pathcycle::a::b"],
+    );
+    assert_one_circular(
+        "inline",
+        &[
+            (
+                "lib.rs",
+                "pub mod outer {\n    #[path = \"../lib.rs\"]\n    pub mod back;\n}\npub fn f() {}\n",
+            ),
+            // `src/outer/../lib.rs`가 풀리려면 디렉터리가 있어야 한다(rustc도 같다).
+            ("outer/.keep", ""),
+        ],
+        &["pathcycle", "pathcycle::outer"],
+    );
+}
+
+/// lib과 같은 이름의 bin은 트리에서 루트 모듈 하나를 함께 쓰지만 rustc에게는 루트가 다른 두
+/// 크레이트다. bin의 `mod lib;`(lib.rs를 `lib` 모듈로 싣는다 — rustc는 special_module_name
+/// 경고만 낸다)와 lib의 `#[path = "main.rs"] mod m;`은 순환이 아니다 — 정점·간선이 그대로
+/// 실리고 순환 limitation이 없어야 한다. 루트 파일을 모두 조상으로 보던 판정은 두 선언을
+/// 순환으로 세어 `lib` 모듈과 `main → lib::run` 호출을 버렸다.
+#[test]
+fn bin_and_lib_of_one_name_may_load_each_others_root_file() {
+    let doc = graph_json(&temp_crate(
+        "binlib",
+        &owned(&[
+            (
+                "lib.rs",
+                "pub fn run() -> u32 {\n    helper()\n}\nfn helper() -> u32 {\n    1\n}\n",
+            ),
+            (
+                "main.rs",
+                "mod lib;\nfn main() {\n    println!(\"{}\", lib::run());\n}\n",
+            ),
+        ]),
+    ));
+    let ids: Vec<&str> = doc["vertices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_str().unwrap())
+        .collect();
+    for id in [
+        "pathcycle::lib",
+        "pathcycle::lib::run",
+        "pathcycle::lib::helper",
+    ] {
+        assert!(ids.contains(&id), "missing {id} in {ids:?}");
+    }
+    let calls_lib_run = doc["edges"].as_array().unwrap().iter().any(|e| {
+        e["from"] == "pathcycle::main" && e["to"] == "pathcycle::lib::run" && e["kind"] == "call"
+    });
+    assert!(calls_lib_run, "main must call lib::run");
+    let limitations: Vec<String> = doc["limitations"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .map(|l| l.as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(skipped_mod_lines(&limitations), Vec::<&str>::new());
+    assert!(
+        !limitations
+            .iter()
+            .any(|l| l.contains("could not be resolved")),
+        "{limitations:?}"
+    );
+
+    let (modules, limitations) = graph_modules(&temp_crate(
+        "libpath",
+        &owned(&[
+            (
+                "lib.rs",
+                "#[path = \"main.rs\"]\nmod m;\npub fn run() -> u32 {\n    m::helper()\n}\n",
+            ),
+            (
+                "main.rs",
+                "pub fn helper() -> u32 {\n    1\n}\nfn main() {}\n",
+            ),
+        ]),
+    ));
+    assert_eq!(modules, ["pathcycle", "pathcycle::m"]);
+    assert_eq!(skipped_mod_lines(&limitations), Vec::<&str>::new());
+}
+
+/// 같은 이름의 lib·bin에서도 진짜 순환은 끊긴다 — rustc가 circular modules로 거부하는
+/// 입력이다. 서로의 루트 파일을 싣는 두 선언은 각 타깃의 사슬에서 자기 루트로 돌아오고,
+/// bin 루트가 자기 파일을 싣는 선언은 bin 루트에서 끊긴다.
+#[test]
+fn circular_modules_across_one_name_lib_and_bin_are_still_cut() {
+    let (modules, limitations) = graph_modules(&temp_crate(
+        "crossroots",
+        &owned(&[
+            (
+                "lib.rs",
+                "#[path = \"main.rs\"]\nmod m;\npub fn run() -> u32 {\n    1\n}\n",
+            ),
+            (
+                "main.rs",
+                "mod lib;\nfn main() {\n    println!(\"{}\", lib::run());\n}\n",
+            ),
+        ]),
+    ));
+    assert_eq!(modules, ["pathcycle", "pathcycle::lib", "pathcycle::m"]);
+    assert_eq!(
+        skipped_mod_lines(&limitations),
+        ["2 mod declarations were skipped because they re-enter an ancestor module's file (circular modules)"]
+    );
+    assert_one_circular(
+        "binself",
+        &[
+            ("lib.rs", "pub fn run() -> u32 {\n    1\n}\n"),
+            (
+                "main.rs",
+                "#[path = \"main.rs\"]\nmod again;\nfn main() {}\n",
+            ),
+        ],
+        &["pathcycle"],
+    );
+}
+
+/// 임시 크레이트가 종료 코드 0으로 모듈 정점 `want`와 순환 limitation 한 줄을 내는지 본다.
+fn assert_one_circular(tag: &str, files: &[(&str, &str)], want: &[&str]) {
+    let (modules, limitations) = graph_modules(&temp_crate(tag, &owned(files)));
+    assert_eq!(modules, want, "{tag}");
+    assert_eq!(
+        skipped_mod_lines(&limitations),
+        ["1 mod declarations were skipped because they re-enter an ancestor module's file (circular modules)"],
+        "{tag}"
+    );
+}
+
+/// 정규 파일이 아닌 모듈 대상(FIFO, `/dev/zero`, 디렉터리)은 읽지 않고 센다 — FIFO는 여는
+/// 순간 쓰는 쪽을 영원히 기다리고 `/dev/zero`는 1초에 수 GB를 읽는다. cfg로 막혀 rustc가
+/// 읽지 않는 선언도 수확은 조건을 평가하지 않으니 같은 자리에서 걸러야 한다.
+#[cfg(unix)]
+#[test]
+fn non_regular_module_files_are_skipped_and_counted() {
+    let lib = "#[cfg(feature = \"never-enabled\")]\n#[path = \"pipe.rs\"]\nmod pipe;\n\
+               #[cfg(feature = \"never-enabled\")]\n#[path = \"/dev/zero\"]\nmod zero;\n\
+               #[cfg(feature = \"never-enabled\")]\n#[path = \"folder\"]\nmod folder;\n\
+               pub fn f() {}\n";
+    let dir = temp_crate("special", &owned(&[("lib.rs", lib), ("folder/.keep", "")]));
+    let status = std::process::Command::new("mkfifo")
+        .arg(dir.join("src/pipe.rs"))
+        .status()
+        .expect("mkfifo must run");
+    assert!(status.success());
+    let (modules, limitations) = graph_modules(&dir);
+    assert_eq!(modules, ["pathcycle"]);
+    assert_eq!(
+        skipped_mod_lines(&limitations),
+        ["3 mod declarations were skipped because their file is not a regular file (device, FIFO, or directory)"]
+    );
+}
+
+/// 타깃 루트 파일(cargo metadata가 준 src/lib.rs)이 정규 파일이 아니면 읽지 않고, 그 경로와
+/// 원인을 담은 오류(2)로 끝난다. FIFO는 여는 순간 쓰는 쪽을 영원히 기다리고 `/dev/zero`를
+/// 가리키는 링크(git이 담을 수 있다)는 끝없이 읽혀, 수확을 거치는 graph·rules·MCP 기동이
+/// 멈추거나 메모리를 다 썼다. 회귀해도 테스트가 멈추지 않게 실제 바이너리를 시간 제한 안에서
+/// 돌린다.
+#[cfg(unix)]
+#[test]
+fn non_regular_target_roots_are_input_errors() {
+    for (tag, link_to_device) in [("rootfifo", false), ("rootzero", true)] {
+        let dir = temp_crate(tag, &owned(&[("lib.rs", "pub fn f() {}\n")]));
+        let lib = dir.join("src/lib.rs");
+        std::fs::remove_file(&lib).unwrap();
+        if link_to_device {
+            std::os::unix::fs::symlink("/dev/zero", &lib).unwrap();
+        } else {
+            let made = std::process::Command::new("mkfifo")
+                .arg(&lib)
+                .status()
+                .expect("mkfifo must run");
+            assert!(made.success());
+        }
+        let (code, err) = run_with_deadline(&["graph", "--dir", dir.to_str().unwrap()], 10);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(code, Some(2), "{tag}: {err}");
+        // 링크를 따라간 `/dev/zero`가 아니라 타깃 경로를 말해야 어느 타깃인지 안다.
+        assert!(
+            err.contains("src/lib.rs: not a regular file"),
+            "{tag}: {err}"
+        );
+    }
+}
+
+/// 실제 바이너리를 돌려 (종료 코드, stderr)를 돌려준다 — `seconds` 안에 끝나지 않으면 죽이고
+/// 실패한다(멈추는 회귀가 테스트 전체를 멈추지 않게).
+#[cfg(unix)]
+fn run_with_deadline(args: &[&str], seconds: u64) -> (Option<i32>, String) {
+    use std::io::Read;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rustograph"))
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("rustograph binary must start");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    loop {
+        match child.try_wait().expect("polling the child must work") {
+            Some(status) => {
+                let mut err = String::new();
+                child
+                    .stderr
+                    .take()
+                    .expect("stderr is piped")
+                    .read_to_string(&mut err)
+                    .expect("stderr must be UTF-8");
+                return (status.code(), err);
+            }
+            None if std::time::Instant::now() >= deadline => {
+                child.kill().expect("killing the stuck child must work");
+                child.wait().expect("reaping the killed child must work");
+                panic!("rustograph {args:?} did not finish within {seconds}s");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+}
+
+/// 순환이 아니어도 모듈 중첩은 `MAX_MODULE_DEPTH`에서 멈추고 넘는 선언을 센다 — 조상
+/// 파일 검사를 비껴가는 입력에도 트리 확장이 끝나게 하는 보조 상한이다. 서로 다른 정규
+/// 파일 600개가 차례로 다음 파일을 싣는다.
+#[test]
+fn module_nesting_beyond_the_depth_cap_is_counted() {
+    let cap = rustograph::modtree::MAX_MODULE_DEPTH;
+    let files: Vec<(String, String)> = (0..cap + 88)
+        .map(|i| {
+            let name = if i == 0 {
+                "lib.rs".to_string()
+            } else {
+                format!("f{i}.rs")
+            };
+            let next = i + 1;
+            (
+                name,
+                format!("#[path = \"f{next}.rs\"]\npub mod m;\npub fn g{i}() {{}}\n"),
+            )
+        })
+        .collect();
+    let (modules, limitations) = graph_modules(&temp_crate("deep", &files));
+    assert_eq!(modules.len(), cap);
+    let deepest = format!("pathcycle{}", "::m".repeat(cap - 1));
+    assert!(modules.contains(&deepest));
+    assert_eq!(
+        skipped_mod_lines(&limitations),
+        [
+            format!("1 mod declarations were skipped because module nesting exceeds {cap} levels")
+                .as_str()
+        ]
+    );
+}
+
+/// 같은 파일을 서로 다른(조상이 아닌) 모듈이 싣는 `#[path]`와 인라인·디렉터리 `#[path]`는
+/// 그대로 정점이다 — 조상 파일만 순환이다. 셀 것이 없으니 limitation도 조용하다.
+#[test]
+fn path_attribute_fixture_modules_are_kept() {
+    let d = doc(&Default::default());
+    let ids = d.vertex_ids();
+    for id in [
+        "fixture_core::gen",
+        "fixture_core::shared",
+        "fixture_core::nest::inner::leaf",
+        "fixture_core::outer_a::duplex",
+        "fixture_core::outer_b::inner",
+        "fixture_core::single::inner",
+        "fixture_core::single::pin::pin_leaf",
+        "fixture_core::single::pin::pin_plain",
+        "fixture_core::single::pmod::inline::leaf",
+    ] {
+        assert!(ids.contains(id), "missing module {id}");
+    }
+    assert_eq!(skipped_mod_lines(&d.limitations), Vec::<&str>::new());
 }

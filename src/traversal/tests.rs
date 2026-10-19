@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::graph::{self, Edge, EdgeKind, Kind, Level, Vertex};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 /// 의존성 없는 결정적 난수(xorshift64*).
 struct Rng(u64);
@@ -67,6 +67,15 @@ fn random_doc(rng: &mut Rng, n: usize, m: usize) -> Document {
         edges,
         vec![],
     )
+}
+
+/// 오라클 쪽 간선 종류 이름 — 구현과 따로 serde 이름을 읽는다.
+fn kind_name(kind: EdgeKind) -> String {
+    serde_json::to_value(kind)
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 /// 방향에 맞춘 (출발 → 도착) 인접 목록 — firm_only면 확정 간선만.
@@ -161,21 +170,45 @@ fn check_case(doc: &Document, roots: &[String], dir: Direction, max_depth: usize
         };
         let evidence = rs.iter().map(|&i| strongest(i)).max().unwrap();
         assert_eq!(row.evidence, evidence, "evidence of {}", row.id);
-        // 관계는 원래 방향 via→정점 간선 종류다.
-        assert!(!row.relationships.is_empty());
+        // 관계는 원래 방향 via→정점 의존 간선 종류 이름이다(이름 사전순, 중복 없음).
+        let (from, to) = match dir {
+            Direction::Dependencies => (&row.via, &row.id),
+            Direction::Dependents => (&row.id, &row.via),
+        };
+        let kinds: BTreeSet<String> = doc
+            .edges
+            .iter()
+            .filter(|e| e.kind.is_dependency() && &e.from == from && &e.to == to)
+            .map(|e| kind_name(e.kind))
+            .collect();
+        assert!(!kinds.is_empty(), "via edge of {}", row.id);
+        assert_eq!(
+            row.relationships,
+            kinds.into_iter().collect::<Vec<_>>(),
+            "relationships of {}",
+            row.id
+        );
     }
     assert_eq!(
         out.roots_truncated,
         expected.values().any(|rs| rs.len() > 64),
         "rootsTruncated"
     );
-    if roots.len() <= 64 {
-        // 깊이 상한 밖(정확히 max_depth+1)에 정점이 있으면 depth로 잘린다.
-        let cut = roots
-            .iter()
-            .enumerate()
-            .any(|(i, r)| bfs(&full, r, max_depth + 1).len() > dists[i].len());
-        assert_eq!(out.truncation_reasons.contains(&"depth"), cut, "depth cut");
+    // 깊이 상한 밖(정확히 max_depth+1)에 정점이 있으면 depth로 잘린다. 가지치기(root 66개 넘게
+    // 모이는 정점)가 있으면 단일 패스는 잘림을 놓칠 수는 있어도(rootsTruncated가 알린다) 오라클에
+    // 없는 잘림을 알리지 않는다 — tsograph traversal-oracle 계약(사유는 오라클 사유의 부분집합).
+    let cut = roots
+        .iter()
+        .enumerate()
+        .any(|(i, r)| bfs(&full, r, max_depth + 1).len() > dists[i].len());
+    let reported = out.truncation_reasons.contains(&"depth");
+    if out.roots_truncated {
+        assert!(
+            !reported || cut,
+            "depth cut the per-root oracle does not have"
+        );
+    } else {
+        assert_eq!(reported, cut, "depth cut");
     }
 }
 
@@ -197,20 +230,42 @@ fn single_pass_matches_per_root_oracle() {
         } else {
             Direction::Dependents
         };
-        check_case(&doc, &roots, dir, 1 + rng.below(6));
+        let depth = 1 + rng.below(6);
+        check_case(&doc, &roots, dir, depth);
+        let reversed: Vec<String> = roots.iter().rev().cloned().collect();
+        check_case(&doc, &reversed, dir, depth);
     }
+}
+
+/// 같은 root의 요청 순서 세 가지 — 주어진 순서, 역순, 섞은 순서. 섞기는 별도 난수라 호출자의
+/// 무작위 사례 열을 바꾸지 않는다.
+fn root_orders(roots: &[String], seed: u64) -> [Vec<String>; 3] {
+    let mut shuffled = roots.to_vec();
+    let mut rng = Rng(seed);
+    for i in (1..shuffled.len()).rev() {
+        shuffled.swap(i, rng.below(i + 1));
+    }
+    [
+        roots.to_vec(),
+        roots.iter().rev().cloned().collect(),
+        shuffled,
+    ]
 }
 
 #[test]
 fn many_roots_prune_without_changing_output() {
-    // 65개 넘는 root가 한 정점에 모이면 큰 인덱스 root는 전파를 멈춘다 — 출력은 오라클과 같아야 한다.
+    // 66개 넘는 root가 한 정점에 모이면 큰 인덱스 root는 전파를 멈춘다 — 출력은 오라클과 같아야 한다.
+    // 가지치기는 처리 순서에 기대면 안 되므로 요청 순서(역순·섞음)를 바꿔도 같아야 한다.
     let mut rng = Rng(42);
-    for _ in 0..20 {
+    for case in 0..20u64 {
         let n = 90 + rng.below(20);
         let doc = random_doc(&mut rng, n, n * 4);
         let k = 70 + rng.below(15);
         let roots: Vec<String> = (0..k).map(name).collect();
-        check_case(&doc, &roots, Direction::Dependencies, 1 + rng.below(4));
+        let depth = 1 + rng.below(4);
+        for order in root_orders(&roots, case) {
+            check_case(&doc, &order, Direction::Dependencies, depth);
+        }
     }
     // 허브 하나에 root 80개가 모이는 결정적 경우 — rootsTruncated가 선다.
     let mut vertices: Vec<Vertex> = (0..80).map(|i| vertex(&name(i))).collect();
@@ -230,7 +285,293 @@ fn many_roots_prune_without_changing_output() {
         vec![],
     );
     let roots: Vec<String> = (0..80).map(name).collect();
-    check_case(&doc, &roots, Direction::Dependencies, 8);
+    for order in root_orders(&roots, 80) {
+        check_case(&doc, &order, Direction::Dependencies, 8);
+    }
+}
+
+/// root `r`개 → root마다 중간 정점 하나 → `c::hub` → 자식 `c`개 팬 문서와 root id(오름차순).
+/// 허브에는 둘째 단계에 닿는다 — 처음 경계(root마다 자기 정점)가 아니라 전파가 쌓은 경계에서 root가
+/// 허브로 몰릴 때도 가지치기가 요청 순서에 기대지 않는지 본다.
+fn fan_doc(r: usize, c: usize) -> (Document, Vec<String>) {
+    let roots: Vec<String> = (0..r).map(|i| format!("c::r{i:03}")).collect();
+    let middles: Vec<String> = (0..r).map(|i| format!("c::m{i:03}")).collect();
+    let kids: Vec<String> = (0..c).map(|j| format!("c::k{j:02}")).collect();
+    let mut vertices: Vec<Vertex> = roots
+        .iter()
+        .chain(&middles)
+        .chain(&kids)
+        .map(|id| vertex(id))
+        .collect();
+    vertices.push(vertex("c::hub"));
+    let mut edges: Vec<Edge> = roots
+        .iter()
+        .zip(&middles)
+        .map(|(x, m)| Edge::new(x.clone(), m.clone(), EdgeKind::Call))
+        .collect();
+    edges.extend(
+        middles
+            .iter()
+            .map(|m| Edge::new(m.clone(), "c::hub".into(), EdgeKind::Call)),
+    );
+    edges.extend(
+        kids.iter()
+            .map(|k| Edge::new("c::hub".into(), k.clone(), EdgeKind::Call)),
+    );
+    let doc = graph::document(
+        Level::Symbol,
+        ".".into(),
+        None,
+        vec![],
+        vertices,
+        edges,
+        vec![],
+    );
+    (doc, roots)
+}
+
+/// 정점 번호별 기록한 root 수와 전파 중단 여부 — 기록 수가 곧 순회 메모리와 이웃 방문 수다.
+fn held_counts(doc: &Document, roots: &[String]) -> (Vec<usize>, bool) {
+    let g = Graph::new(doc, Direction::Dependencies);
+    let starts: Vec<usize> = roots.iter().map(|r| g.index[r]).collect();
+    let (levels, _, pruned) = propagate(&g, &starts, MAX_DEPTH);
+    (levels.iter().map(HashMap::len).collect(), pruned)
+}
+
+#[test]
+fn pruning_does_not_depend_on_root_request_order() {
+    // root 200개가 허브 하나로 모인다. 어떤 순서로 요청해도 허브와 그 아래 정점은 root를 66개만
+    // 싣는다. 도착 순서대로 지배를 따지면 root 인덱스가 정점 id 순서와 반대일 때 가지치기가 전혀
+    // 일어나지 않아, 정점마다 root 200개를 싣고 그 수만큼 이웃에 전파했다.
+    let (doc, roots) = fan_doc(200, 10);
+    let [ascending, reversed, shuffled] = root_orders(&roots, 5);
+    let want = held_counts(&doc, &ascending);
+    // root·중간 정점은 하나씩, 허브와 자식 10개는 66개씩.
+    assert_eq!(want.0.iter().sum::<usize>(), 400 + 11 * DOMINATING_ROOTS);
+    assert!(want.1, "the hub prunes");
+    assert_eq!(held_counts(&doc, &reversed), want, "reversed request");
+    assert_eq!(held_counts(&doc, &shuffled), want, "shuffled request");
+}
+
+#[test]
+fn each_level_keeps_what_ascending_root_order_would_keep() {
+    // 한 단계에 정점으로 오는 root(중복 포함)를 어떤 순서로 보내도, 단계가 끝난 기록은 root를 인덱스
+    // 오름차순으로 처리한 결과 — 이전 기록에, 이번에 온 root 가운데 자기 아닌 기록과 합쳐 가장 작은
+    // 66개에 드는 것을 더한 것 — 와 같다. 다음 경계에는 새로 남은 root만 있고, 멈춤 신호는 이번에 온
+    // root 가운데 떨어진 것이 있을 때만 선다. 정점이 root 자신인 경우와 아닌 경우 모두 본다.
+    let mut rng = Rng(23);
+    for case in 0..60 {
+        let total = 70 + rng.below(150);
+        let owner = (case % 2 == 0).then(|| rng.below(total));
+        let mut levels: Levels = vec![owner.map(|o| (o, 0)).into_iter().collect()];
+        let mut smallest = Smallest::new();
+        for level in 1..=5 {
+            let arrivals: Vec<usize> = (0..rng.below(120)).map(|_| rng.below(total)).collect();
+            let before: BTreeSet<usize> = levels[0].keys().copied().collect();
+            let fresh: BTreeSet<usize> = arrivals
+                .iter()
+                .copied()
+                .filter(|r| !before.contains(r))
+                .collect();
+            let mut pool: Vec<usize> = before
+                .iter()
+                .copied()
+                .filter(|&i| Some(i) != owner)
+                .chain(fresh.iter().copied())
+                .collect();
+            pool.sort_unstable();
+            let smallest_kept: BTreeSet<usize> = pool.into_iter().take(DOMINATING_ROOTS).collect();
+            let kept: BTreeSet<usize> = fresh.intersection(&smallest_kept).copied().collect();
+            let mut next = BTreeMap::new();
+            let mut stopped = false;
+            for r in arrivals {
+                stopped |= spread(&mut levels, &mut smallest, 0, r, level, &mut next).is_some();
+            }
+            let got: BTreeSet<usize> = levels[0].keys().copied().collect();
+            assert_eq!(got, &before | &kept, "case {case} level {level}");
+            let reached: BTreeSet<usize> = next.get(&0).into_iter().flatten().copied().collect();
+            assert_eq!(reached, kept, "case {case} level {level} next");
+            assert!(kept.iter().all(|r| levels[0][r] == level));
+            assert_eq!(
+                stopped,
+                kept.len() < fresh.len(),
+                "case {case} level {level}"
+            );
+        }
+    }
+}
+
+#[test]
+fn depth_cut_survives_pruning_in_every_root_order() {
+    // 깊이 2에서 허브(root 200개, 66개만 전파)까지 닿고 자식은 상한 밖이다 — 전파를 멈춘 root가
+    // 있어도 도달 정점 집합이 깊이에 잘렸으면 depth를 알린다.
+    let (doc, roots) = fan_doc(200, 10);
+    for order in root_orders(&roots, 13) {
+        let out = traverse(
+            &doc,
+            &Request {
+                roots: &order,
+                direction: Direction::Dependencies,
+                max_depth: 2,
+                max_reached: MAX_REACHED,
+                evidence_memory_bytes: EVIDENCE_MEMORY_BYTES,
+            },
+        );
+        assert_eq!(out.truncation_reasons, vec!["depth"]);
+        assert!(out.roots_truncated);
+        assert!(out.reached.iter().all(|r| !r.id.starts_with("c::k")));
+    }
+}
+
+/// 늦은 도착 문서와 root(요청 순서 = 인덱스)다. 작은 root `small`개(c::r00…)가 허브로 모이고 허브는
+/// 싱크로 이어진다. `sink_is_root`면 싱크도 root(인덱스 `small`)로 허브에 닿는다. 가장 큰 인덱스
+/// root c::late는 허브에 닿는 동시에 더 긴 경로 late→p1→p2→u→sink를 가진다. 깊이 상한 3에서 u가
+/// 마지막 경계다 — root별 BFS로는 c::late가 허브를 거쳐 깊이 2에 싱크에 닿으므로 잘림이 없다.
+fn late_arrival_doc(small: usize, sink_is_root: bool) -> (Document, Vec<String>) {
+    let mut roots: Vec<String> = (0..small).map(|i| format!("c::r{i:02}")).collect();
+    if sink_is_root {
+        roots.push("c::sink".into());
+    }
+    roots.push("c::late".into());
+    let mut ids = roots.clone();
+    for id in ["c::hub", "c::sink", "c::p1", "c::p2", "c::u"] {
+        if !ids.iter().any(|x| x == id) {
+            ids.push(id.into());
+        }
+    }
+    let vertices: Vec<Vertex> = ids.iter().map(|id| vertex(id)).collect();
+    let mut edges: Vec<Edge> = roots
+        .iter()
+        .map(|r| Edge::new(r.clone(), "c::hub".into(), EdgeKind::Call))
+        .collect();
+    for (from, to) in [
+        ("c::hub", "c::sink"),
+        ("c::late", "c::p1"),
+        ("c::p1", "c::p2"),
+        ("c::p2", "c::u"),
+        ("c::u", "c::sink"),
+    ] {
+        edges.push(Edge::new(from.into(), to.into(), EdgeKind::Call));
+    }
+    let doc = graph::document(
+        Level::Symbol,
+        ".".into(),
+        None,
+        vec![],
+        vertices,
+        edges,
+        vec![],
+    );
+    (doc, roots)
+}
+
+#[test]
+fn late_arrivals_at_the_depth_limit_are_not_depth_cuts() {
+    // c::late가 허브에서 멈추면(더 작은 root가 전파 상한만큼 모였다) 싱크에는 허브가 넘긴 더 작은
+    // root가 실리고, c::late는 긴 경로로 경계 u에만 닿는다. 한 단계 더 가도 싱크의 행은 그대로라
+    // 잘림이 아니다. 싱크가 root면 넘겨받은 root 가운데 자기 인덱스가 빠진다 — 전파 상한이 행을
+    // 정하는 개수(65)와 같으면 싱크가 64개만 가져 c::late를 잘림으로 셌다. 크기마다 상한 바로 아래·
+    // 위를 본다(가지치기 없음·있음). 수정 전에는 네 경우 모두 오라클에 없는 depth를 알렸다.
+    for (small, sink_is_root) in [(65, false), (66, false), (64, true), (65, true)] {
+        let (doc, roots) = late_arrival_doc(small, sink_is_root);
+        let out = traverse(
+            &doc,
+            &Request {
+                roots: &roots,
+                direction: Direction::Dependencies,
+                max_depth: 3,
+                max_reached: MAX_REACHED,
+                evidence_memory_bytes: EVIDENCE_MEMORY_BYTES,
+            },
+        );
+        let label = format!("{small} smaller roots, sink is a root: {sink_is_root}");
+        assert!(out.roots_truncated, "{label}");
+        assert_eq!(out.truncation_reasons, Vec::<&str>::new(), "{label}");
+        for order in root_orders(&roots, 29) {
+            check_case(&doc, &order, Direction::Dependencies, 3);
+        }
+    }
+}
+
+#[test]
+fn depth_cuts_of_roots_that_never_stopped_are_kept() {
+    // root 65개가 각자 중간 정점을 거쳐 싱크에 닿고(싱크는 자기 아닌 root 65개 — 전파 상한 아래라
+    // 아무 root도 멈추지 않는다), 66번째 root c::late는 긴 경로 late→p1→p2→u로 깊이 상한(3)의 경계
+    // u에만 닿는다(u→sink). c::late는 한 번도 멈추지 않았으니 그 기록 단계가 root별 BFS 거리
+    // 그대로고, 싱크에 아직 없다는 것은 c::late의 순회가 깊이에서 잘렸다는 뜻이다 — 싱크의 행이
+    // 바뀌지 않아도 오라클과 같게 depth를 알린다. 상한 판정을 모든 root에 걸면 이 잘림을 놓친다.
+    let mut roots: Vec<String> = (0..65).map(|i| format!("c::r{i:02}")).collect();
+    roots.push("c::late".into());
+    let mut vertices: Vec<Vertex> = roots.iter().map(|id| vertex(id)).collect();
+    let mut edges = Vec::new();
+    for (i, r) in roots.iter().take(65).enumerate() {
+        let middle = format!("c::m{i:02}");
+        vertices.push(vertex(&middle));
+        edges.push(Edge::new(r.clone(), middle.clone(), EdgeKind::Call));
+        edges.push(Edge::new(middle, "c::sink".into(), EdgeKind::Call));
+    }
+    for id in ["c::sink", "c::p1", "c::p2", "c::u"] {
+        vertices.push(vertex(id));
+    }
+    for (from, to) in [
+        ("c::late", "c::p1"),
+        ("c::p1", "c::p2"),
+        ("c::p2", "c::u"),
+        ("c::u", "c::sink"),
+    ] {
+        edges.push(Edge::new(from.into(), to.into(), EdgeKind::Call));
+    }
+    let doc = graph::document(
+        Level::Symbol,
+        ".".into(),
+        None,
+        vec![],
+        vertices,
+        edges,
+        vec![],
+    );
+    let out = traverse(
+        &doc,
+        &Request {
+            roots: &roots,
+            direction: Direction::Dependencies,
+            max_depth: 3,
+            max_reached: MAX_REACHED,
+            evidence_memory_bytes: EVIDENCE_MEMORY_BYTES,
+        },
+    );
+    assert_eq!(out.truncation_reasons, vec!["depth"]);
+    for order in root_orders(&roots, 31) {
+        check_case(&doc, &order, Direction::Dependencies, 3);
+    }
+}
+
+#[test]
+fn max_reached_cut_keeps_roots_truncated_in_every_root_order() {
+    // 허브에 root 80개가 모이지만 max-reached 1이 허브 행을 자른다(깊이 1에서 id가 가장 앞인 c::a만
+    // 남는다). 허브에서 전파를 멈췄으니 rootsTruncated는 참이다 — 오름차순 요청에서 늘 그랬고, 요청
+    // 순서가 바뀌어도 같아야 한다.
+    let (mut doc, roots) = fan_doc(80, 1);
+    doc.vertices.push(vertex("c::a"));
+    doc.edges
+        .push(Edge::new(roots[0].clone(), "c::a".into(), EdgeKind::Call));
+    doc.sort();
+    for order in root_orders(&roots, 9) {
+        let out = traverse(
+            &doc,
+            &Request {
+                roots: &order,
+                direction: Direction::Dependencies,
+                max_depth: MAX_DEPTH,
+                max_reached: 1,
+                evidence_memory_bytes: EVIDENCE_MEMORY_BYTES,
+            },
+        );
+        assert_eq!(out.reached.len(), 1);
+        assert_eq!(out.reached[0].id, "c::a");
+        assert_eq!(out.truncation_reasons, vec!["max-reached"]);
+        assert!(out.roots_truncated, "request starting with {}", order[0]);
+    }
 }
 
 /// 작은 손 그래프 — A(0)·R(1), A→W→V→R, R→V. 계약 문서의 root 항목 예와 같다.
@@ -370,6 +711,68 @@ fn max_reached_truncates_in_order() {
     assert_eq!(out.reached.len(), 1);
     assert_eq!(out.reached[0].id, "c::b");
     assert_eq!(out.truncation_reasons, vec!["max-reached"]);
+}
+
+#[test]
+fn edge_kind_names_are_made_per_kind_not_per_edge() {
+    // 간선이 수백만인 그래프에서 쌍마다 종류 이름 문자열 집합을 두면 순회 메모리가 문서의 몇 배가
+    // 된다 — 이름은 종류마다 한 번만 만들고 쌍에는 종류 비트만 둔다.
+    let mut rng = Rng(11);
+    let doc = random_doc(&mut rng, 200, 2_000);
+    let before = kind_names_made();
+    let out = traverse(
+        &doc,
+        &Request {
+            roots: &[name(0), name(1), name(2)],
+            direction: Direction::Dependencies,
+            max_depth: MAX_DEPTH,
+            max_reached: MAX_REACHED,
+            evidence_memory_bytes: EVIDENCE_MEMORY_BYTES,
+        },
+    );
+    let made = kind_names_made() - before;
+    // 의존 간선 종류는 call·references·signature 셋뿐이다.
+    assert!(made <= 3, "{made} kind names for {} edges", doc.edges.len());
+    assert!(out.reached.len() > 100, "the walk must cover the graph");
+}
+
+#[test]
+fn relationships_name_every_dependency_kind_on_the_via_pair() {
+    // a→b에 call·references·signature(추정)·uses가 겹치고 contains는 의존이 아니라 빠진다.
+    // 역방향 순회도 원래 방향(a→b) 간선 종류를 싣는다. 순서는 이름 사전순이다.
+    let edges = vec![
+        Edge::maybe("c::a".into(), "c::b".into(), EdgeKind::Signature),
+        Edge::new("c::a".into(), "c::b".into(), EdgeKind::Uses),
+        Edge::new("c::a".into(), "c::b".into(), EdgeKind::Call),
+        Edge::new("c::a".into(), "c::b".into(), EdgeKind::References),
+        Edge::new("c::a".into(), "c::b".into(), EdgeKind::Contains),
+    ];
+    let doc = graph::document(
+        Level::Symbol,
+        ".".into(),
+        None,
+        vec![],
+        vec![vertex("c::a"), vertex("c::b")],
+        edges,
+        vec![],
+    );
+    let walk = |root: &str, direction| {
+        let roots = vec![root.to_string()];
+        traverse(
+            &doc,
+            &Request {
+                roots: &roots,
+                direction,
+                max_depth: MAX_DEPTH,
+                max_reached: MAX_REACHED,
+                evidence_memory_bytes: EVIDENCE_MEMORY_BYTES,
+            },
+        )
+        .reached
+    };
+    let want = vec!["call", "references", "signature", "uses"];
+    assert_eq!(walk("c::a", Direction::Dependencies)[0].relationships, want);
+    assert_eq!(walk("c::b", Direction::Dependents)[0].relationships, want);
 }
 
 #[test]
