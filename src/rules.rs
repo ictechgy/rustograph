@@ -426,7 +426,10 @@ mod tests {
     }
 
     /// 간선마다 정점 배열을 처음부터 훑어 소속 단위·exported를 찾으면 O(E·V)다 — 정점 4만
-    /// 합성 문서의 `rules`가 17초였다. 규칙 검사가 정점을 한 번씩만 살피는지 센다.
+    /// 합성 문서의 `rules`가 17초였다. 규칙 검사가 정점 색인을 정확히 한 번 만드는지(정점마다
+    /// 한 번) 센다. 상한이 아니라 정확한 횟수로 단언한다 — 색인을 간선마다 다시 만들면 넘치고,
+    /// 색인을 빼고 옛 선형 탐색으로 돌아가면 0이라 둘 다 실패한다. 계수기는 색인 구축에만 있어
+    /// 색인을 만들어 두고 쓰지 않는 우회는 못 잡는다(시간 비교 없이 결정적으로 잴 수 있는 한계다).
     #[test]
     fn check_examines_each_vertex_once() {
         let n = 60;
@@ -444,8 +447,9 @@ mod tests {
         let rep = check(&d, &cfg());
         let examined = examined_vertices() - before;
         assert_eq!(rep.violations.len(), n);
-        assert!(
-            examined <= d.vertices.len(),
+        assert_eq!(
+            examined,
+            d.vertices.len(),
             "{examined} vertex visits for {} vertices",
             d.vertices.len()
         );

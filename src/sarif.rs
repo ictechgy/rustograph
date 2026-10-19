@@ -190,8 +190,9 @@ mod tests {
     }
 
     /// 위반마다 정점 배열을 처음부터 훑어 위치를 찾으면 O(위반·V)다 — 기준선을 만들기 전
-    /// 위반이 17만 건인 합성 문서의 `--format sarif`가 22초였다. 위치 조회가 정점을 한 번씩만
-    /// 살피는지 센다.
+    /// 위반이 17만 건인 합성 문서의 `--format sarif`가 22초였다. 위치 조회용 정점 색인을 정확히
+    /// 한 번 만드는지(정점마다 한 번) 센다 — 상한이 아니라 정확한 횟수라서, 위반마다 색인을 다시
+    /// 만들어도(넘침) 색인을 빼고 옛 선형 탐색으로 돌아가도(0) 실패한다.
     #[test]
     fn locations_examine_each_vertex_once() {
         let n = 200;
@@ -224,6 +225,6 @@ mod tests {
         let results = j["runs"][0]["results"].as_array().unwrap();
         assert_eq!(results.len(), n);
         assert_eq!(place(&results[0]), (json!("src/lib.rs"), json!(n)));
-        assert!(examined <= n, "{examined} vertex visits for {n} vertices");
+        assert_eq!(examined, n, "{examined} vertex visits for {n} vertices");
     }
 }

@@ -611,7 +611,9 @@ mod tests {
 
     /// 선언 의존마다 전 간선을 다시 훑고(간선마다 `format!` 할당까지) 외부 패키지마다 정점
     /// ID 집합을 새로 만들면 O(D·E + P·V)다 — 선언 1080개·함수 4만 합성 워크스페이스의
-    /// `deps`가 7.7초였다. 보고서가 정점·간선을 한 번씩만 살피는지 센다.
+    /// `deps`가 7.7초였다. 보고서가 정점 색인(정점마다 한 번)과 사용 증거 색인(간선마다 한 번)을
+    /// 정확히 한 번씩 만드는지 센다 — 상한이 아니라 정확한 횟수라서, 선언 의존마다 색인을 다시
+    /// 만들어도(넘침) 증거 색인을 빼고 옛 간선 전체 탐색으로 돌아가도(모자람) 실패한다.
     #[test]
     fn report_visits_each_vertex_and_edge_once() {
         let n = 40;
@@ -624,10 +626,10 @@ mod tests {
         let mut odd: Vec<&str> = odd.iter().map(String::as_str).collect();
         odd.sort();
         assert_eq!(unused, odd);
-        let bound = doc.vertices.len() + doc.edges.len();
-        assert!(
-            visited <= bound,
-            "{visited} vertex/edge visits for {bound} vertices and edges"
+        let each_once = doc.vertices.len() + doc.edges.len();
+        assert_eq!(
+            visited, each_once,
+            "{visited} vertex/edge visits for {each_once} vertices and edges"
         );
     }
 

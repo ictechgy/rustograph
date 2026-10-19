@@ -1026,8 +1026,9 @@ mod tests {
     }
 
     /// 순환 판정이 SCC마다 전체 간선을 다시 훑으면 비순환 그래프(SCC 수 = 정점 수)에서
-    /// O(V·E)다 — 합성 심볼 그래프 8만 정점에서 1분을 넘겼다. 판정·증거 수집이 간선을
-    /// 한 번씩만 살피는지 센다.
+    /// O(V·E)다 — 합성 심볼 그래프 8만 정점에서 1분을 넘겼다. 증거 분배가 확정 간선을 정확히
+    /// 한 번씩 살피는지 센다 — 상한이 아니라 정확한 횟수라서, SCC마다 다시 훑어도(넘침) 분배를
+    /// 빼고 옛 SCC별 전체 탐색으로 돌아가도(0) 실패한다.
     #[test]
     fn cycle_classification_examines_each_edge_once() {
         let n = 1_000;
@@ -1052,8 +1053,10 @@ mod tests {
         assert_eq!(rep.cycles.len(), 2);
         assert_eq!(rep.cycles[0].members.len(), 11);
         assert_eq!(rep.cycles[1].members, ["c::f0500"]);
-        assert!(
-            visits <= d.edges.len(),
+        // 이 문서의 간선은 모두 확정 의존 간선이다.
+        assert_eq!(
+            visits,
+            d.edges.len(),
             "{visits} edge visits for {} edges",
             d.edges.len()
         );
