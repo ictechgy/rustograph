@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::graph::{self, Edge, EdgeKind, Kind, Level, Vertex};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 /// 의존성 없는 결정적 난수(xorshift64*).
 struct Rng(u64);
@@ -67,6 +67,15 @@ fn random_doc(rng: &mut Rng, n: usize, m: usize) -> Document {
         edges,
         vec![],
     )
+}
+
+/// 오라클 쪽 간선 종류 이름 — 구현과 따로 serde 이름을 읽는다.
+fn kind_name(kind: EdgeKind) -> String {
+    serde_json::to_value(kind)
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 /// 방향에 맞춘 (출발 → 도착) 인접 목록 — firm_only면 확정 간선만.
@@ -161,8 +170,24 @@ fn check_case(doc: &Document, roots: &[String], dir: Direction, max_depth: usize
         };
         let evidence = rs.iter().map(|&i| strongest(i)).max().unwrap();
         assert_eq!(row.evidence, evidence, "evidence of {}", row.id);
-        // 관계는 원래 방향 via→정점 간선 종류다.
-        assert!(!row.relationships.is_empty());
+        // 관계는 원래 방향 via→정점 의존 간선 종류 이름이다(이름 사전순, 중복 없음).
+        let (from, to) = match dir {
+            Direction::Dependencies => (&row.via, &row.id),
+            Direction::Dependents => (&row.id, &row.via),
+        };
+        let kinds: BTreeSet<String> = doc
+            .edges
+            .iter()
+            .filter(|e| e.kind.is_dependency() && &e.from == from && &e.to == to)
+            .map(|e| kind_name(e.kind))
+            .collect();
+        assert!(!kinds.is_empty(), "via edge of {}", row.id);
+        assert_eq!(
+            row.relationships,
+            kinds.into_iter().collect::<Vec<_>>(),
+            "relationships of {}",
+            row.id
+        );
     }
     assert_eq!(
         out.roots_truncated,
@@ -370,6 +395,68 @@ fn max_reached_truncates_in_order() {
     assert_eq!(out.reached.len(), 1);
     assert_eq!(out.reached[0].id, "c::b");
     assert_eq!(out.truncation_reasons, vec!["max-reached"]);
+}
+
+#[test]
+fn edge_kind_names_are_made_per_kind_not_per_edge() {
+    // 간선이 수백만인 그래프에서 쌍마다 종류 이름 문자열 집합을 두면 순회 메모리가 문서의 몇 배가
+    // 된다 — 이름은 종류마다 한 번만 만들고 쌍에는 종류 비트만 둔다.
+    let mut rng = Rng(11);
+    let doc = random_doc(&mut rng, 200, 2_000);
+    let before = kind_names_made();
+    let out = traverse(
+        &doc,
+        &Request {
+            roots: &[name(0), name(1), name(2)],
+            direction: Direction::Dependencies,
+            max_depth: MAX_DEPTH,
+            max_reached: MAX_REACHED,
+            evidence_memory_bytes: EVIDENCE_MEMORY_BYTES,
+        },
+    );
+    let made = kind_names_made() - before;
+    // 의존 간선 종류는 call·references·signature 셋뿐이다.
+    assert!(made <= 3, "{made} kind names for {} edges", doc.edges.len());
+    assert!(out.reached.len() > 100, "the walk must cover the graph");
+}
+
+#[test]
+fn relationships_name_every_dependency_kind_on_the_via_pair() {
+    // a→b에 call·references·signature(추정)·uses가 겹치고 contains는 의존이 아니라 빠진다.
+    // 역방향 순회도 원래 방향(a→b) 간선 종류를 싣는다. 순서는 이름 사전순이다.
+    let edges = vec![
+        Edge::maybe("c::a".into(), "c::b".into(), EdgeKind::Signature),
+        Edge::new("c::a".into(), "c::b".into(), EdgeKind::Uses),
+        Edge::new("c::a".into(), "c::b".into(), EdgeKind::Call),
+        Edge::new("c::a".into(), "c::b".into(), EdgeKind::References),
+        Edge::new("c::a".into(), "c::b".into(), EdgeKind::Contains),
+    ];
+    let doc = graph::document(
+        Level::Symbol,
+        ".".into(),
+        None,
+        vec![],
+        vec![vertex("c::a"), vertex("c::b")],
+        edges,
+        vec![],
+    );
+    let walk = |root: &str, direction| {
+        let roots = vec![root.to_string()];
+        traverse(
+            &doc,
+            &Request {
+                roots: &roots,
+                direction,
+                max_depth: MAX_DEPTH,
+                max_reached: MAX_REACHED,
+                evidence_memory_bytes: EVIDENCE_MEMORY_BYTES,
+            },
+        )
+        .reached
+    };
+    let want = vec!["call", "references", "signature", "uses"];
+    assert_eq!(walk("c::a", Direction::Dependencies)[0].relationships, want);
+    assert_eq!(walk("c::b", Direction::Dependents)[0].relationships, want);
 }
 
 #[test]

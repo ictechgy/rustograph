@@ -19,8 +19,8 @@
 
 pub mod sha256;
 
-use crate::graph::Document;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use crate::graph::{Document, EdgeKind};
+use std::collections::{BTreeMap, HashMap};
 
 /// 정점 하나가 싣는 root 인덱스의 상한이다(계약의 `rootsTruncated`).
 pub const MAX_ROOTS_PER_NODE: usize = 64;
@@ -131,8 +131,11 @@ struct Graph {
     firm: Vec<Vec<usize>>,
     /// 순회 방향의 선행 정점(번호 오름차순 = UTF-16 순).
     predecessors: Vec<Vec<usize>>,
-    /// (출발, 도착) → 원래 방향 간선 종류(정렬).
-    kinds: HashMap<(usize, usize), BTreeSet<String>>,
+    /// (출발, 도착) → 원래 방향 간선 종류 비트(`kind_bit`). 이름은 출력 행에서만 푼다 — 쌍마다
+    /// 이름 문자열 집합을 두면 간선이 수백만인 그래프에서 순회 메모리가 문서의 몇 배가 된다.
+    kinds: HashMap<(usize, usize), u8>,
+    /// 문서에 나온 의존 간선 종류의 (비트, 계약 이름) — 이름 사전순이라 출력 행이 그대로 쓴다.
+    kind_names: Vec<(u8, String)>,
     /// 추정 간선만 있는 쌍의 순회 방향 출발점 — 등급 비교 대상 root를 고르는 재료.
     weak_tails: Vec<usize>,
     /// 추정 간선만 있는 쌍(출발, 도착).
@@ -151,8 +154,9 @@ impl Graph {
             .map(|(i, id)| (id.clone(), i))
             .collect();
         let n = ids.len();
-        // 쌍별 (확정 존재, 종류) — 같은 쌍의 여러 간선은 하나로 합친다.
-        let mut pairs: BTreeMap<(usize, usize), (bool, BTreeSet<String>)> = BTreeMap::new();
+        // 쌍별 (확정 존재, 종류 비트) — 같은 쌍의 여러 간선은 하나로 합친다.
+        let mut pairs: BTreeMap<(usize, usize), (bool, u8)> = BTreeMap::new();
+        let mut kind_names: Vec<(u8, String)> = Vec::new();
         for e in doc.edges.iter().filter(|e| e.kind.is_dependency()) {
             let (Some(&from), Some(&to)) = (index.get(&e.from), index.get(&e.to)) else {
                 continue;
@@ -161,10 +165,17 @@ impl Graph {
                 Direction::Dependencies => (from, to),
                 Direction::Dependents => (to, from),
             };
-            let entry = pairs.entry(key).or_insert((false, BTreeSet::new()));
+            let bit = kind_bit(e.kind);
+            if kind_names.iter().all(|(b, _)| *b != bit) {
+                kind_names.push((bit, edge_kind_name(e.kind)));
+            }
+            let entry = pairs.entry(key).or_insert((false, 0));
             entry.0 |= !e.tentative;
-            entry.1.insert(edge_kind_name(e.kind));
+            entry.1 |= bit;
         }
+        // 관계는 이름 사전순(바이트 순)으로 싣는다 — 이름을 미리 정렬해 두면 비트를 거르는
+        // 순서가 곧 출력 순서다.
+        kind_names.sort_by(|a, b| a.1.cmp(&b.1));
         let mut g = Graph {
             ids,
             index,
@@ -172,6 +183,7 @@ impl Graph {
             firm: vec![Vec::new(); n],
             predecessors: vec![Vec::new(); n],
             kinds: HashMap::new(),
+            kind_names,
             weak_tails: Vec::new(),
             weak_pairs: Vec::new(),
         };
@@ -193,10 +205,52 @@ impl Graph {
         g.weak_tails.dedup();
         g
     }
+
+    /// via → 정점 쌍의 간선 종류 이름 — 이름 사전순, 계약 상한 32개.
+    fn relationships(&self, via: usize, node: usize) -> Vec<String> {
+        let Some(&bits) = self.kinds.get(&(via, node)) else {
+            return Vec::new();
+        };
+        self.kind_names
+            .iter()
+            .filter(|(bit, _)| bits & bit != 0)
+            .take(32)
+            .map(|(_, name)| name.clone())
+            .collect()
+    }
+}
+
+/// 간선 종류 하나의 비트다. 모든 종류를 나열해 종류가 늘면 여기서 컴파일이 멈춘다 —
+/// u8 하나에 여덟 종까지 담긴다.
+fn kind_bit(kind: EdgeKind) -> u8 {
+    match kind {
+        EdgeKind::Depends => 1,
+        EdgeKind::Uses => 1 << 1,
+        EdgeKind::Contains => 1 << 2,
+        EdgeKind::Call => 1 << 3,
+        EdgeKind::References => 1 << 4,
+        EdgeKind::Implements => 1 << 5,
+        EdgeKind::Signature => 1 << 6,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 간선 종류 이름 문자열을 만든 횟수 — 간선·쌍마다 이름을 만들지 않는지 단위 테스트가
+    /// 센다(테스트 스레드마다 따로).
+    static KIND_NAMES_MADE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 테스트용 — 이 스레드에서 지금까지 간선 종류 이름을 만든 횟수.
+#[cfg(test)]
+fn kind_names_made() -> usize {
+    KIND_NAMES_MADE.with(std::cell::Cell::get)
 }
 
 /// 간선 종류의 계약 문자열(serde 이름과 같다).
-fn edge_kind_name(kind: crate::graph::EdgeKind) -> String {
+fn edge_kind_name(kind: EdgeKind) -> String {
+    #[cfg(test)]
+    KIND_NAMES_MADE.with(|c| c.set(c.get() + 1));
     serde_json::to_value(kind)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
@@ -234,11 +288,7 @@ pub fn traverse(doc: &Document, req: &Request) -> Outcome {
             id: g.ids[row.node].clone(),
             via: g.ids[row.via].clone(),
             depth: row.depth,
-            relationships: g
-                .kinds
-                .get(&(row.via, row.node))
-                .map(|k| k.iter().take(32).cloned().collect())
-                .unwrap_or_default(),
+            relationships: g.relationships(row.via, row.node),
             evidence: evidence(row.node),
             roots: row.roots.into_iter().take(MAX_ROOTS_PER_NODE).collect(),
         })

@@ -122,6 +122,67 @@ fn fixed_generated_at_is_byte_identical_and_graph_revision_ignores_dir_spelling(
 }
 
 #[test]
+fn graph_revision_is_the_sha256_of_the_project_rooted_symbol_graph() {
+    use rustograph::traversal::sha256::hex_digest;
+    // graphRevision은 root를 project 정규 경로로 둔 심볼 그래프 JSON — `graph --level symbol`이
+    // 그 경로로 내는 바이트 — 의 SHA-256이다. 해시를 흘려 계산해도 같은 바이트여야 한다.
+    for dir in [fixture(), schema_fixture()] {
+        let canon = dir.canonicalize().unwrap().display().to_string();
+        let (code, graph, err) = run(&["graph", "--level", "symbol", "--dir", &canon]);
+        assert_eq!(code, 0, "{err}");
+        let root = json(&graph)["vertices"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (code, out, err) = run(&["reach", "--dir", &canon, &root]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(json(&out)["graphRevision"], hex_digest(graph.as_bytes()));
+    }
+    // 저장 문서(--graph)도 같다 — workspace·limitations가 없는 문서와 있는 문서 모두.
+    let project = temp_dir("revision").canonicalize().unwrap();
+    let canon = project.display().to_string();
+    for (workspace, limitations) in [(None, vec![]), (Some(canon.clone()), vec!["x: 1".into()])] {
+        let doc = saved_document(&canon, workspace, limitations);
+        let text = rustograph::export::to_json(&doc);
+        let file = project.join("graph.json");
+        std::fs::write(&file, &text).unwrap();
+        let path = file.display().to_string();
+        let (code, out, err) = run(&["reach", "--graph", &path, "--dir", &canon, "c::a"]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(json(&out)["graphRevision"], hex_digest(text.as_bytes()));
+    }
+}
+
+/// root가 `root`인 두 정점 a→b 심볼 문서.
+fn saved_document(
+    root: &str,
+    workspace: Option<String>,
+    limitations: Vec<String>,
+) -> rustograph::graph::Document {
+    use rustograph::graph::{document, Edge, EdgeKind, Kind, Level, Vertex};
+    let vertex = |id: &str| Vertex {
+        id: id.to_string(),
+        kind: Kind::Fn,
+        krate: "c".into(),
+        module: "c".into(),
+        position: None,
+        exported: false,
+        generated: false,
+        cfg: None,
+        unsafe_: false,
+    };
+    document(
+        Level::Symbol,
+        root.to_string(),
+        workspace,
+        vec![],
+        vec![vertex("c::a"), vertex("c::b")],
+        vec![Edge::new("c::a".into(), "c::b".into(), EdgeKind::Call)],
+        limitations,
+    )
+}
+
+#[test]
 fn root_not_found_writes_document_and_exits_64() {
     let dir = fixture().display().to_string();
     let (code, out, err) = run(&[
