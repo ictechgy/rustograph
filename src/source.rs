@@ -2028,4 +2028,77 @@ mod tests {
         assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
         std::fs::remove_dir_all(&tmp).ok();
     }
+
+    /// 문서에서 `from`이 보내는 call 간선의 (받는 정점, 추정 여부)를 정렬해 돌려준다.
+    fn call_targets<'d>(doc: &'d Document, from: &str) -> Vec<(&'d str, bool)> {
+        let mut found: Vec<(&str, bool)> = doc
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Call && e.from == from)
+            .map(|e| (e.to.as_str(), e.tentative))
+            .collect();
+        found.sort_unstable();
+        found
+    }
+
+    /// `Type::assoc()`와 `self.m()`의 타입 범위 후보 접두사 `{타입}::`는 호출마다 한 번
+    /// 만든다 — 같은 이름 메서드 후보마다 만들면 `new`·`get`을 정의한 타입이 수천 개인
+    /// 워크스페이스에서 할당이 (호출 수 × 같은 이름 정의 수)였다. 해석은 그대로다: 고유
+    /// 메서드와 트레이트 impl 메서드(`T::<Tr>::m`)를 함께 잡고, 이름이 접두사인 다른
+    /// 타입(`T1`과 `T10`)의 메서드는 잡지 않는다.
+    #[test]
+    fn type_scoped_calls_build_each_owner_prefix_once() {
+        let tmp =
+            std::env::temp_dir().join(format!("rustograph-owner-prefix-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let types = 30;
+        let mut lib =
+            String::from("pub trait Tr {\n    fn new() -> Self;\n    fn get(&self) -> u32;\n}\n");
+        for i in 0..types {
+            lib.push_str(&format!(
+                "pub struct T{i};\nimpl T{i} {{\n    pub fn new() -> Self {{\n        T{i}\n    }}\n    \
+                 pub fn get(&self) -> u32 {{\n        {i}\n    }}\n    \
+                 pub fn run(&self) -> u32 {{\n        self.get()\n    }}\n}}\n"
+            ));
+        }
+        lib.push_str("impl Tr for T1 {\n    fn new() -> Self {\n        T1\n    }\n");
+        lib.push_str("    fn get(&self) -> u32 {\n        1\n    }\n}\n");
+        lib.push_str("pub fn make() {\n    T0::new();\n    T1::new();\n    T2::new();\n}\n");
+        let dir = write_crate(
+            &tmp,
+            "owner_prefix",
+            None,
+            &[("src/lib.rs", lib.as_bytes())],
+        );
+        let before = harvest::owner_prefixes();
+        let doc = load(&dir, &span_options()).unwrap();
+        let built = harvest::owner_prefixes() - before;
+        // 타입 범위 호출 자리 — `make`의 `Tk::new()` 3곳과 타입마다 `run`의 `self.get()` 1곳.
+        let call_sites = 3 + types;
+        assert_eq!(
+            built, call_sites,
+            "{built} owner prefixes for {call_sites} type-scoped calls"
+        );
+        assert_eq!(
+            call_targets(&doc, "owner_prefix::make"),
+            [
+                ("owner_prefix::T0::new", false),
+                ("owner_prefix::T1::<Tr>::new", false),
+                ("owner_prefix::T1::new", false),
+                ("owner_prefix::T2::new", false),
+            ]
+        );
+        assert_eq!(
+            call_targets(&doc, "owner_prefix::T1::run"),
+            [
+                ("owner_prefix::T1::<Tr>::get", true),
+                ("owner_prefix::T1::get", true),
+            ]
+        );
+        assert_eq!(
+            call_targets(&doc, "owner_prefix::T10::run"),
+            [("owner_prefix::T10::get", true)]
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 }

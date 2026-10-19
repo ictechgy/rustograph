@@ -718,6 +718,28 @@ impl BodyVisitor<'_> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 타입 범위 메서드 후보 접두사를 만든 횟수 — 호출마다 한 번인지(후보마다가 아닌지)
+    /// 단위 테스트가 센다(테스트 스레드마다 따로).
+    static OWNER_PREFIXES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 테스트용 — 이 스레드에서 지금까지 만든 타입 범위 메서드 후보 접두사 수.
+#[cfg(test)]
+pub(crate) fn owner_prefixes() -> usize {
+    OWNER_PREFIXES.with(std::cell::Cell::get)
+}
+
+/// 타입 범위 메서드 후보를 고르는 접두사 `{owner}::`다. 고유 메서드 `T::m`과 트레이트
+/// impl 메서드 `T::<Tr>::m`이 모두 이 아래 있어, `Type::assoc()`·`self.m()`이 두 쪽을
+/// 함께 잡는다. `::`까지 붙여야 이름이 접두사인 다른 타입(`T1`과 `T10`)을 거른다.
+fn owner_prefix(owner: &str) -> String {
+    #[cfg(test)]
+    OWNER_PREFIXES.with(|c| c.set(c.get() + 1));
+    format!("{owner}::")
+}
+
 /// 값 자리 경로의 해석 결과다.
 enum ValueRes {
     /// 크레이트 아이템(또는 외부 크레이트 경계 정점).
@@ -745,8 +767,11 @@ impl Visit<'_> for BodyVisitor<'_> {
                     if n >= 2 {
                         if let Some(ty) = self.resolve(&segs[..n - 1]) {
                             if let Some(ids) = self.method_index.get(&segs[n - 1]) {
+                                // 접두사는 호출마다 한 번 — 후보마다 만들면 같은 이름 정의가
+                                // 수천 개일 때 할당이 (호출 수 × 정의 수)다.
+                                let prefix = owner_prefix(&ty);
                                 for mid in ids {
-                                    if mid.starts_with(&format!("{ty}::")) {
+                                    if mid.starts_with(&prefix) {
                                         self.push(mid.clone(), EdgeKind::Call);
                                         hit = true;
                                     }
@@ -777,8 +802,9 @@ impl Visit<'_> for BodyVisitor<'_> {
             if matches!(&*e.receiver, syn::Expr::Path(p) if p.path.is_ident("self")) {
                 if let Some(sid) = self.resolve(self_ty) {
                     if let Some(ids) = self.method_index.get(&name) {
+                        let prefix = owner_prefix(&sid);
                         for mid in ids {
-                            if mid.starts_with(&format!("{sid}::")) {
+                            if mid.starts_with(&prefix) {
                                 self.push_maybe(mid.clone(), EdgeKind::Call);
                             }
                         }
