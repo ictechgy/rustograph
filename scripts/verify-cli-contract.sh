@@ -125,8 +125,18 @@ check 1 "rules deny"        rules --strict --config "$FIX/deny.yml"
 check 0 "baseline write"    rules --config "$FIX/deny.yml" --baseline "$FIX/base.txt" --write-baseline
 check 0 "baseline strict"   rules --strict --config "$FIX/deny.yml" --baseline "$FIX/base.txt"
 check 2 "baseline missing"  rules --config "$FIX/deny.yml" --baseline /nonexistent-xyz.txt
-# 기준선·설정 경로는 분석 대상 저장소가 고른다 — 장치를 가리켜도 끝없이 읽지 않고 2다.
+# 명시 --baseline·--config는 실행한 사람이 고른 입력이라 파이프·프로세스 치환도 읽는다 —
+# 장치를 가리켜도 크기 상한에서 끝나 2다. 설정의 baseline:처럼 저장소가 고른 경로는 정규
+# 파일만 연다(tests/integration.rs가 FIFO로 본다).
 check 2 "baseline device"   rules --config "$FIX/deny.yml" --baseline /dev/zero
+check 1 "config pipe"       rules --strict --config <(cat "$FIX/deny.yml")
+check 0 "baseline pipe"     rules --strict --config "$FIX/deny.yml" --baseline <(cat "$FIX/base.txt")
+got=0
+cat "$FIX/deny.yml" | "$BIN" rules --strict --config /dev/stdin --dir "$FIX/fixture" >/dev/null 2>&1 || got=$?
+if [ "$got" -ne 1 ]; then
+	echo "FAIL config stdin: expected 1, got $got" >&2
+	fails=$((fails+1))
+fi
 grep -q "allow|fixture_app" "$FIX/base.txt" || {
 	echo "FAIL baseline file: no violation key written" >&2
 	fails=$((fails+1))

@@ -62,6 +62,18 @@ The rename is a single-file publication, not a multi-file transaction or a
 power-loss durability guarantee. On systems that reject replacing an open or
 existing destination, publication fails without truncating the original.
 
+## Rules configuration and baselines
+
+`rules` and the MCP `rustograph_rules` tool read a rules file and its baseline up
+to 64 MiB. Paths that the analyzed repository chooses, the `.rustograph.yml`
+found in `--dir` and the file named by its `baseline:`, must be regular files: a
+device, FIFO, or directory there is never opened, and `rules` exits 2 (the MCP
+tool answers with an error) naming the path. Paths given on the command line,
+`rules --config` and `rules --baseline`, may also be pipes or process
+substitutions such as `--config /dev/stdin` or `--baseline <(…)`. The
+`rustograph mcp --config` file must be a regular file, because the server reads
+it again on every rules call.
+
 ## Mermaid output
 
 Mermaid labels write `"`, `%`, `<`, `>` and `&` as Mermaid entity codes

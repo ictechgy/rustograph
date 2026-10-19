@@ -526,9 +526,10 @@ mod cli_tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// 설정·기준선 경로는 분석 대상 저장소가 고른다 — FIFO는 여는 순간 쓰는 쪽을 영원히
-    /// 기다리고 장치는 끝없이 읽힌다. rules는 막히거나 메모리를 다 쓰지 않고 원인을 담은
-    /// 오류(2)로 끝나야 한다.
+    /// 설정의 `baseline:`과 디렉터리에서 찾은 `.rustograph.yml`은 분석 대상 저장소가 고른다 —
+    /// FIFO는 여는 순간 쓰는 쪽을 영원히 기다리고 장치는 끝없이 읽힌다. rules는 막히거나
+    /// 메모리를 다 쓰지 않고 원인을 담은 오류(2)로 끝나야 한다. 명시 `--baseline`은 실행한
+    /// 사람이 고른 입력이라 파이프도 읽지만, 장치를 주어도 크기 상한에서 2로 끝난다.
     #[cfg(unix)]
     #[test]
     fn rules_refuses_special_config_and_baseline_files() {
@@ -548,22 +549,23 @@ mod cli_tests {
         )
         .unwrap();
         let cfgp = cfg.to_str().unwrap();
-        let fifop = fifo.to_str().unwrap();
-        for (args, cause) in [
-            // 명시 --baseline이 장치, 설정의 baseline이 FIFO, --config 자체가 FIFO.
+        for (args, cause, why) in [
+            // 설정의 baseline이 FIFO — 열지 않는다.
+            (
+                vec!["rules", "--config", cfgp],
+                "cannot read baseline ",
+                "not a regular file",
+            ),
+            // 명시 --baseline이 장치 — 읽되 상한에서 끝난다.
             (
                 vec!["rules", "--config", cfgp, "--baseline", "/dev/zero"],
                 "cannot read baseline /dev/zero: ",
+                "larger than",
             ),
-            (vec!["rules", "--config", cfgp], "cannot read baseline "),
-            (vec!["rules", "--config", fifop], "cannot read "),
         ] {
             let (code, _, err) = run(&args);
             assert_eq!(code, 2, "{args:?}: {err}");
-            assert!(
-                err.contains(cause) && err.contains("not a regular file"),
-                "{args:?}: {err}"
-            );
+            assert!(err.contains(cause) && err.contains(why), "{args:?}: {err}");
         }
         // --dir에서 찾은 .rustograph.yml이 FIFO여도 같다 — 설정을 읽은 뒤에야 수확한다.
         std::fs::remove_file(&cfg).unwrap();
@@ -578,6 +580,79 @@ mod cli_tests {
         assert_eq!(code, 2, "{err}");
         assert!(err.contains("not a regular file"), "{err}");
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 명시 `--config`·`--baseline`은 실행한 사람이 고른 입력이라 파이프도 읽는다 —
+    /// `cat rules.yml | rustograph rules --config /dev/stdin`과 `--baseline <(…)`는 셸에서 흔한
+    /// 쓰임이다. 정규 파일만 받으면 이런 실행의 종료 코드가 1·0에서 2로 바뀐다.
+    #[cfg(unix)]
+    #[test]
+    fn rules_reads_piped_config_and_baseline_arguments() {
+        let tmp = std::env::temp_dir().join(format!("rg-piped-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        // app이 core를 참조하지 못하게 거꾸로 선 룰셋 — fixture에 위반이 생긴다.
+        let deny = "components:\n  app: [\"fixture_app/**\"]\n  core: [\"fixture_core/**\"]\n\
+                    deps:\n  app: []\n  core: []\n";
+        let cfg = tmp.join("deny.yml");
+        std::fs::write(&cfg, deny).unwrap();
+        let base = tmp.join("base.txt");
+        let (cfgp, basep) = (cfg.to_str().unwrap(), base.to_str().unwrap());
+        let (code, _, err) = run(&[
+            "rules",
+            "--config",
+            cfgp,
+            "--baseline",
+            basep,
+            "--write-baseline",
+        ]);
+        assert_eq!(code, 0, "{err}");
+        let frozen = std::fs::read_to_string(&base).unwrap();
+        // 설정을 표준 입력 파이프로 — 위반이 남으니 strict는 1이다.
+        let (code, err) = piped(&["rules", "--strict", "--config", "/dev/stdin"], deny);
+        assert_eq!(code, Some(1), "{err}");
+        // 기준선을 파이프로 — 얼린 위반이 억눌려 0이다(읽지 않았다면 1).
+        let (code, err) = piped(
+            &[
+                "rules",
+                "--strict",
+                "--config",
+                cfgp,
+                "--baseline",
+                "/dev/stdin",
+            ],
+            &frozen,
+        );
+        assert_eq!(code, Some(0), "{err}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 실제 바이너리를 fixture에 돌리며 `input`을 표준 입력 파이프로 준다 — (종료 코드, stderr).
+    #[cfg(unix)]
+    fn piped(args: &[&str], input: &str) -> (Option<i32>, String) {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(env!("CARGO_BIN_EXE_rustograph"))
+            .args(args)
+            .arg("--dir")
+            .arg(fixture())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("rustograph binary must start");
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        match stdin.write_all(input.as_bytes()) {
+            Ok(()) => {}
+            // 파이프를 읽지 않고 먼저 끝난 실행 — 그 이유는 종료 코드와 stderr가 말한다.
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("writing the piped input failed: {e}"),
+        }
+        drop(stdin);
+        let output = child.wait_with_output().expect("rustograph must finish");
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
     }
 
     /// 다른 도구가 만든 `--graph` 문서의 ID에 ESC·개행이 섞여 있으면 어떤 명령도 그 ID를

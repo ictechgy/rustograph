@@ -395,7 +395,8 @@ fn cmd_rules(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
         .map(|f| Path::new(f).parent().unwrap_or(dir.as_path()).to_path_buf())
         .unwrap_or_else(|| dir.clone());
     let cfg: config::Config = match a.get("config") {
-        Some(f) => config::load_file(Path::new(f))?,
+        // 명시 --config는 실행한 사람이 고른 입력이라 파이프·프로세스 치환도 읽는다(상한은 같다).
+        Some(f) => config::load_file(Path::new(f), config::FileKinds::AnyReadable)?,
         None => match config::load(&dir)? {
             Some(c) => c,
             None => return Err(format!("no .rustograph.yml in {}", dir.display())),
@@ -435,8 +436,14 @@ fn cmd_rules(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
         return Ok(0);
     }
     if let Some(path) = &baseline_path {
-        // 기준선 경로는 분석 대상의 설정이 고른다 — 장치·FIFO는 열지 않고 상한까지만 읽는다.
-        match config::read_bounded_text(path, config::MAX_FILE_BYTES) {
+        // 설정의 baseline:은 분석 대상 저장소가 고른다 — 장치·FIFO는 열지 않는다. 명시
+        // --baseline은 실행한 사람이 고른 입력이라 파이프도 읽는다. 둘 다 상한까지만 읽는다.
+        let kinds = if a.get("baseline").is_some() {
+            config::FileKinds::AnyReadable
+        } else {
+            config::FileKinds::RegularOnly
+        };
+        match config::read_bounded_text(path, config::MAX_FILE_BYTES, kinds) {
             Ok(src) => rules::apply_baseline(&mut report, &rules::Baseline::parse(&src)),
             // 명시 --baseline은 없는 파일을 가리키면 오타일 가능성이 높다 — 오류.
             // cfg.baseline은 NotFound만 도입 전으로 본다 — 권한 오류나

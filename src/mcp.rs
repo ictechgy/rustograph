@@ -329,7 +329,9 @@ impl<'d> Server<'d> {
                 let Some(cfg_path) = &self.cfg_path else {
                     return Err("no .rustograph.yml found — pass --config".to_string());
                 };
-                let cfg = config::load_file(cfg_path)?;
+                // 설정은 호출마다 다시 읽는다(세션 중 바뀔 수 있다) — 명시 --config여도 정규
+                // 파일만 연다. 한 번만 읽히는 파이프는 두 번째 호출에서 멈추거나 빈 설정을 읽는다.
+                let cfg = config::load_file(cfg_path, config::FileKinds::RegularOnly)?;
                 let mut rep = rules::check(self.doc, &cfg);
                 // 설정에 선언된 기준선을 적용한다 — CLI rules와 같은 계약.
                 // NotFound만 도입 전으로 본다 — 권한 오류나 깨진 파일을
@@ -337,7 +339,11 @@ impl<'d> Server<'d> {
                 // 열지 않고 상한까지만 읽는다 — 서버가 멈추면 안 된다.
                 if let Some(b) = &cfg.baseline {
                     let path = cfg_path.parent().unwrap_or(self.dir.as_path()).join(b);
-                    match config::read_bounded_text(&path, config::MAX_FILE_BYTES) {
+                    match config::read_bounded_text(
+                        &path,
+                        config::MAX_FILE_BYTES,
+                        config::FileKinds::RegularOnly,
+                    ) {
                         Ok(src) => rules::apply_baseline(&mut rep, &rules::Baseline::parse(&src)),
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         Err(e) => {
