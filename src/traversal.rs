@@ -9,8 +9,11 @@
 //! - `depth`는 그 root들 중 가장 가까운 것까지의 거리, `via`는 가장 가까운 root(같은 거리면 작은
 //!   인덱스)에서 depth-1 거리에 있는 선행 정점 중 id가 가장 작은 것이다(UTF-16 코드 단위 순서).
 //! - 구현은 모든 root를 한 번에 출발시키는 단계 동기 너비 우선 패스다. 정점이 자기 자신이 아닌 더 작은
-//!   인덱스 root를 65개 이상 가졌으면 더 큰 인덱스 root는 그 정점에서 전파를 멈춘다 — 그 정점을 지나는
+//!   인덱스 root를 66개 이상 가졌으면 더 큰 인덱스 root는 그 정점에서 전파를 멈춘다 — 그 정점을 지나는
 //!   경로는 작은 root들도 같거나 짧은 거리로 지나므로 출력(작은 인덱스 64개·depth·via)을 바꿀 수 없다.
+//!   행을 정하는 것은 65개(64개 + rootsTruncated를 정하는 65번째)인데 하나 더 두는 까닭은, 하류 정점이
+//!   root면 넘겨받은 가장 작은 root 가운데 자기 인덱스가 빠지기 때문이다 — 그래야 모든 정점이 자기
+//!   아닌 가장 작은 root 65개를 정확한 단계와 함께 가지고, 깊이 잘림 판정이 그 개수에 기댈 수 있다.
 //!   한 단계가 끝난 정점의 기록은 그 단계에 온 root를 인덱스 오름차순으로 처리한 결과와 같다 — 멈출지가
 //!   정점 처리 순서(id 순서)에 기대지 않고 root 인덱스로만 정해진다.
 //! - `evidence`는 root별 하한이다: 정점에 닿는 모든 root 각각의 가장 강한 등급 중 가장 약한 것.
@@ -33,8 +36,13 @@ pub const MAX_DEPTH: usize = 128;
 pub const MAX_REACHED: usize = 100_000;
 /// 계약이 허용하는 최대 root 수다.
 pub const MAX_ROOTS: usize = 10_000;
-/// 전파를 멈추게 하는 더 작은 root 수 — 정점이 자기 인덱스를 빼도 64개가 남도록 하나 더 둔다.
-const DOMINATING_ROOTS: usize = MAX_ROOTS_PER_NODE + 1;
+/// 정점의 행을 정하는 더 작은 root 수 — 싣는 64개와 rootsTruncated를 정하는 65번째다. 정점이 자기
+/// 아닌 더 작은 root를 이만큼 가졌으면 더 큰 root가 닿아도 그 행은 그대로다(깊이 잘림 판정이 쓴다).
+const DECISIVE_ROOTS: usize = MAX_ROOTS_PER_NODE + 1;
+/// 전파를 멈추게 하는 더 작은 root 수 — 하류 정점이 root면 넘겨받은 root 가운데 자기 인덱스가
+/// 빠지므로 [`DECISIVE_ROOTS`]보다 하나 더 둔다. 같으면 그런 정점이 자기 아닌 root를 64개만 가져,
+/// 가장 짧은 경로에서 멈췄다가 더 긴 경로로 깊이 상한의 경계에 늦게 닿은 root를 잘림으로 오인한다.
+const DOMINATING_ROOTS: usize = DECISIVE_ROOTS + 1;
 /// 정확한 등급 비교(root당 비트 하나)가 쓸 수 있는 메모리 상한(바이트)이다.
 pub const EVIDENCE_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
@@ -304,7 +312,7 @@ pub fn traverse(doc: &Document, req: &Request) -> Outcome {
     }
 }
 
-/// 정점별 자기 자신이 아닌 root 인덱스 중 가장 작은 65개(최대 힙)다. 자기 아닌 기록이 65개인
+/// 정점별 자기 자신이 아닌 root 인덱스 중 가장 작은 66개(최대 힙)다. 자기 아닌 기록이 66개인
 /// 정점에 root가 또 올 때 처음 만든다 — 대부분의 정점은 root가 적거나 그 뒤로 더 오지 않는다.
 type Smallest = HashMap<usize, BinaryHeap<usize>>;
 
@@ -322,7 +330,8 @@ fn propagate(g: &Graph, roots: &[usize], max_depth: usize) -> (Levels, bool, boo
         levels[n].insert(i, 0);
         frontier.insert(n, vec![i]);
     }
-    let mut pruned = false;
+    // root 인덱스별로 어디선가 전파를 멈췄거나 되돌렸는가 — 깊이 잘림 판정이 쓴다.
+    let mut stopped = vec![false; roots.len()];
     for level in 0..max_depth {
         if frontier.is_empty() {
             break;
@@ -331,27 +340,82 @@ fn propagate(g: &Graph, roots: &[usize], max_depth: usize) -> (Levels, bool, boo
         for (&node, held_roots) in &frontier {
             for &nb in &g.full[node] {
                 for &r in held_roots {
-                    pruned |= spread(&mut levels, &mut smallest, nb, r, level + 1, &mut next);
+                    if let Some(halted) =
+                        spread(&mut levels, &mut smallest, nb, r, level + 1, &mut next)
+                    {
+                        stopped[halted] = true;
+                    }
                 }
             }
         }
         frontier = next;
     }
-    let cut = frontier.iter().any(|(&node, held_roots)| {
-        g.full[node]
-            .iter()
-            .any(|&nb| held_roots.iter().any(|r| !levels[nb].contains_key(r)))
-    });
-    (levels, cut, pruned)
+    let cut = depth_cut(g, &levels, &frontier, &stopped);
+    (levels, cut, stopped.contains(&true))
 }
 
-/// 한 간선으로 root 하나를 이웃에 전파한다. 전파를 멈추거나 되돌린 root가 있었으면 true다.
+/// 깊이 상한에 멈춘 경계에서 root별 순회가 잘렸는가 — 경계 정점의 이웃이 그 root를 아직 갖지
+/// 않으면 잘림이다. 한 번도 멈추지 않은 root는 기록 단계가 root별 BFS 거리 그대로라 이 판정이
+/// 정확하다. 어디선가 멈춘 root는 가장 짧은 경로에서 멈췄다가 더 긴 경로로 마지막 경계에 늦게
+/// 닿았을 수 있어, 이웃이 그 root보다 작은 자기 아닌 root를 [`DECISIVE_ROOTS`]개 이상 가졌으면
+/// 뺀다 — 그 root가 닿아도 이웃의 행(작은 인덱스 64개와 rootsTruncated)은 그대로고, 짧은 경로로
+/// 이미 닿았다면 세는 것이 root별 BFS(계열 오라클)에 없는 depth다. 멈춘 root가 있으면
+/// rootsTruncated가 서므로, 진짜 잘림을 뺐더라도 계열 오라클 계약(그때 사유는 부분집합)을 지킨다.
+/// 전파 상한이 그 개수보다 하나 크므로(DOMINATING_ROOTS) 이웃이 root라 자기 인덱스가 빠져도
+/// 개수가 모자라지 않는다.
+fn depth_cut(
+    g: &Graph,
+    levels: &Levels,
+    frontier: &BTreeMap<usize, Vec<usize>>,
+    stopped: &[bool],
+) -> bool {
+    // 이웃마다 자기 아닌 root 인덱스 중 DECISIVE_ROOTS번째로 작은 것 — 경계가 같은 이웃을 여러
+    // 번 가리켜도 한 번만 센다.
+    let mut bounds: HashMap<usize, Option<usize>> = HashMap::new();
+    for (&node, held_roots) in frontier {
+        for &nb in &g.full[node] {
+            for &root in held_roots {
+                if levels[nb].contains_key(&root) {
+                    continue;
+                }
+                if !stopped[root] {
+                    return true;
+                }
+                let bound = *bounds
+                    .entry(nb)
+                    .or_insert_with(|| decisive_bound(&levels[nb]));
+                if !bound.is_some_and(|b| root > b) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// 기록의 자기 아닌 root 인덱스 중 [`DECISIVE_ROOTS`]번째로 작은 것이다 — 그만큼 없으면 None.
+/// 단계 0 기록은 정점 자신의 root라 뺀다.
+fn decisive_bound(held: &HashMap<usize, usize>) -> Option<usize> {
+    let mut others: Vec<usize> = held
+        .iter()
+        .filter(|&(_, &level)| level > 0)
+        .map(|(&i, _)| i)
+        .collect();
+    if others.len() < DECISIVE_ROOTS {
+        return None;
+    }
+    let (_, bound, _) = others.select_nth_unstable(DECISIVE_ROOTS - 1);
+    Some(*bound)
+}
+
+/// 한 간선으로 root 하나를 이웃에 전파한다. 전파를 멈추거나 되돌린 root가 있었으면 그 인덱스다
+/// (한 번에 하나뿐이다 — 멈추면 새 기록이 없고, 기록하면 밀려난 하나만 되돌린다).
 ///
-/// 이웃이 자기 아닌 root를 65개 넘게 가지면 그 가운데 가장 작은 65개만 남긴다: 가장 작은 65개보다
-/// 큰 root는 멈추고, 새 root가 들어와 65번째 밖으로 밀린 root가 같은 단계에 기록된 것이면 기록과
+/// 이웃이 자기 아닌 root를 66개 넘게 가지면 그 가운데 가장 작은 66개만 남긴다: 가장 작은 66개보다
+/// 큰 root는 멈추고, 새 root가 들어와 66번째 밖으로 밀린 root가 같은 단계에 기록된 것이면 기록과
 /// 다음 경계에서 되돌린다(이전 단계 기록은 그대로 둔다). 그러면 한 단계가 끝난 기록은 이전 기록과
-/// 이번에 온 root 가운데 자기 아닌 가장 작은 65개에 드는 것 — root를 인덱스 오름차순으로 처리해
-/// "더 작은 root 65개"를 센 결과와 같고, 처리 순서와 무관하다. 정점 순서로 처리하므로 한 정점의
+/// 이번에 온 root 가운데 자기 아닌 가장 작은 66개에 드는 것 — root를 인덱스 오름차순으로 처리해
+/// "더 작은 root 66개"를 센 결과와 같고, 처리 순서와 무관하다. 정점 순서로 처리하므로 한 정점의
 /// 기록을 이어서 읽고 쓴다.
 fn spread(
     levels: &mut Levels,
@@ -360,37 +424,35 @@ fn spread(
     root: usize,
     level: usize,
     next: &mut BTreeMap<usize, Vec<usize>>,
-) -> bool {
+) -> Option<usize> {
     let held = &mut levels[nb];
     if held.contains_key(&root) {
-        return false;
+        return None;
     }
     let Some(heap) = contested(smallest, held, nb) else {
         held.insert(root, level);
         next.entry(nb).or_default().push(root);
-        return false;
+        return None;
     };
-    // 더 작은 root 65개가 이미 같거나 이른 단계에 닿았다.
+    // 더 작은 root 66개가 이미 같거나 이른 단계에 닿았다.
     if heap.peek().is_some_and(|&top| root > top) {
-        return true;
+        return Some(root);
     }
     held.insert(root, level);
     next.entry(nb).or_default().push(root);
     heap.push(root);
-    let Some(evicted) = heap.pop() else {
-        return false;
-    };
+    let evicted = heap.pop()?;
     if held.get(&evicted) != Some(&level) {
-        return false;
+        return None;
     }
     held.remove(&evicted);
     if let Some(reached) = next.get_mut(&nb) {
         reached.retain(|&r| r != evicted);
     }
-    true
+    Some(evicted)
 }
 
-/// 정점의 자기 아닌 기록이 65개 이상이면 그 가운데 가장 작은 65개(최대 힙)를 돌려준다. 처음이면
+/// 정점의 자기 아닌 기록이 66개 이상이면 그 가운데 가장 작은 66개(최대 힙)를 돌려준다. 처음이면
 /// 기록에서 모은다 — 단계 0 기록은 정점 자신의 root라 뺀다. 단계 1 이상 기록은 늘 자기 아닌
 /// root이고, 힙이 생긴 뒤의 기록은 `spread`가 힙에도 넣는다.
 fn contested<'a>(
