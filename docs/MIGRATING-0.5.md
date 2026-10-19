@@ -21,6 +21,19 @@ errors with `?` or handle them explicitly.
 This source compatibility change is the reason for the 0.5 minor version rather
 than a 0.4 patch. The serialized graph document remains version 1.
 
+Two library changes after 0.5.0 are source-incompatible for some callers:
+
+- `rustograph::modtree::ModTree` has a new public field, `skipped_mods`.
+  `collect_submodules` no longer loads a `mod` declaration whose file re-enters
+  an ancestor module's file (circular modules), is not a regular file, or nests
+  deeper than `MAX_MODULE_DEPTH`; it records the module path with a
+  `SkippedMod` reason there instead. Code that builds a `ModTree` with a struct
+  literal or destructures every field must add the field or use
+  `..Default::default()`.
+- `rustograph::mcp::Server` now borrows the document it serves and is
+  `Server<'d>`. It has no public constructor or methods, so only code that names
+  the type is affected.
+
 ## Saved snapshots and MCP
 
 Regenerate snapshots with `rustograph graph --level symbol` before requesting
