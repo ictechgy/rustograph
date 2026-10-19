@@ -95,6 +95,28 @@ fn require_semantic_build(opts: &Options) -> Result<(), String> {
 /// 이미 읽은 메타데이터로 [`load`]와 같은 문서를 만든다 — deps 보고서처럼 메타데이터를
 /// 따로 쓰는 호출자가 한 실행에서 `cargo metadata`를 두 번 돌리지 않게 한다.
 pub fn load_with(dir: &Path, meta: &Metadata, opts: &Options) -> Result<Document, String> {
+    load_inner(dir, meta, opts, false).map(|(doc, _)| doc)
+}
+
+/// [`load`]와 같은 문서와, 그 문서를 만든 수확이 읽은 입력을 돌려준다 — 문서를 파일로
+/// 쓰는 명령이 입력 보호 목록을 위해 워크스페이스를 다시 수확하지 않게 한다.
+/// semantic 캐시가 적중하면 수확이 없어 입력은 None이다(호출자가 [`input_files`]로 찾는다).
+pub(crate) fn load_with_inputs(
+    dir: &Path,
+    opts: &Options,
+) -> Result<(Document, Option<HarvestInputs>), String> {
+    require_semantic_build(opts)?;
+    let meta = cargo_meta::load(dir)?;
+    load_inner(dir, &meta, opts, true)
+}
+
+/// 캐시를 거친 수확 — `want_inputs`면 수확이 읽은 입력도 함께 돌려준다.
+fn load_inner(
+    dir: &Path,
+    meta: &Metadata,
+    opts: &Options,
+    want_inputs: bool,
+) -> Result<(Document, Option<HarvestInputs>), String> {
     require_semantic_build(opts)?;
     // 캐시 키는 모든 입력의 지문 — 지문을 못 재면 캐시를 끈다(실패는 부가적).
     let cache = if opts.semantic && opts.cache {
@@ -104,10 +126,15 @@ pub fn load_with(dir: &Path, meta: &Metadata, opts: &Options) -> Result<Document
     };
     if let Some((key, path)) = &cache {
         if let Some(doc) = read_cache(path, *key, &meta.workspace_root) {
-            return Ok(doc);
+            return Ok((doc, None));
         }
     }
-    let (doc, uses_include) = harvest(dir, meta, opts, None)?;
+    let mut sink = Sink {
+        want_edges: true,
+        want_inputs,
+        ..Default::default()
+    };
+    let (doc, uses_include) = harvest(dir, meta, opts, Some(&mut sink))?;
     if let Some((key, path)) = &cache {
         // 지문이 못 보는 입력을 소비한 문서는 캐시에 쓰지 않는다 —
         // include!/OUT_DIR 생성 파일과 루트 밖 #[path] 파일, 지문이
@@ -116,7 +143,7 @@ pub fn load_with(dir: &Path, meta: &Metadata, opts: &Options) -> Result<Document
             write_cache(path, *key, &doc);
         }
     }
-    Ok(doc)
+    Ok((doc, sink.inputs))
 }
 
 /// syn 심볼 그래프와 정점별 소스 범위를 함께 돌려준다 — 소스 위치를 impact와
@@ -184,6 +211,9 @@ struct Sink {
     /// sink 유무로 추정하지 않고 명시한다: 간선이 필요한 sink 호출자가 생겼을 때
     /// 조용히 간선 없는 문서를 받지 않게 하려는 것이다.
     want_edges: bool,
+    /// 이 수확이 읽은 입력을 `inputs`로 넘길지 — 문서를 파일로 쓰는 호출자만 true다.
+    want_inputs: bool,
+    inputs: Option<HarvestInputs>,
 }
 
 /// `routes`가 쓰는 수확 산출물 — 정점 ID·정점 범위·모듈 트리·AST 아레나.
@@ -203,8 +233,8 @@ impl Parts {
     }
 }
 
-/// 기본 옵션(심볼 레벨)으로 수확하고 트리·아레나까지 돌려준다. 라우트 추출과
-/// `--out` 입력 보호는 간선을 읽지 않으므로 간선 해석을 건너뛴다.
+/// 기본 옵션(심볼 레벨)으로 수확하고 트리·아레나까지 돌려준다. 라우트 추출은
+/// 간선을 읽지 않으므로 간선 해석을 건너뛴다.
 pub(crate) fn harvest_parts(dir: &Path, meta: &Metadata) -> Result<Parts, String> {
     let mut sink = Sink {
         spans: Some(Vec::new()),
@@ -224,20 +254,46 @@ pub(crate) fn harvest_parts(dir: &Path, meta: &Metadata) -> Result<Parts, String
     })
 }
 
-/// 산출물 경로가 실제 수확 입력을 덮어쓰지 않도록 파일 목록을 돌려준다.
-/// 모듈·사용자 지정 타깃은 수확 아레나를, include 계열은 별도 경로 검사를 쓴다.
-pub(crate) fn input_files(dir: &Path) -> Result<(Vec<PathBuf>, bool), String> {
-    let metadata = cargo_meta::load(dir)?;
-    let parts = harvest_parts(dir, &metadata)?;
-    let mut files: BTreeSet<PathBuf> = parts.arena.keys().cloned().collect();
-    let unresolved_includes = include_inputs(&parts.arena, &mut files);
-    files.extend(parts.tree.orphan_files);
-    for path in files
-        .clone()
-        .into_iter()
-        .chain(std::iter::once(metadata.workspace_root.join("Cargo.toml")))
-    {
+/// 수확이 읽은 입력 — 산출물이 덮어쓰면 안 되는 파일 목록의 재료다. 문서를 만든 수확이
+/// 이것을 넘기면 `--out`이 보호 목록을 위해 워크스페이스를 다시 수확하지 않는다
+/// (cargo metadata·전체 파싱을 한 번 더 해 대형 저장소에서 `--out` 시간이 두 배였다).
+pub(crate) struct HarvestInputs {
+    arena: Arena,
+    orphan_files: Vec<PathBuf>,
+    workspace_root: PathBuf,
+}
+
+impl HarvestInputs {
+    /// 산출물 경로가 실제 수확 입력을 덮어쓰지 않도록 파일 목록을 돌려준다 — 두 번째 값은
+    /// include 경로를 다 풀지 못했는가다. 모듈·사용자 지정 타깃은 수확 아레나를, include
+    /// 계열은 별도 경로 검사를 쓴다.
+    pub(crate) fn protected_files(&self) -> (Vec<PathBuf>, bool) {
+        let mut files: BTreeSet<PathBuf> = self.arena.keys().cloned().collect();
+        let unresolved_includes = include_inputs(&self.arena, &mut files);
+        files.extend(self.orphan_files.iter().cloned());
+        let manifests = manifests_above(
+            files
+                .iter()
+                .chain(std::iter::once(&self.workspace_root.join("Cargo.toml"))),
+        );
+        files.extend(manifests);
+        (files.into_iter().collect(), unresolved_includes)
+    }
+}
+
+/// 파일들의 조상 디렉터리에 있는 매니페스트·설정 파일 — 수확 입력이다. 디렉터리마다 한
+/// 번만 본다: 파일마다 조상 전부를 stat하면 깊은 트리에서 파일 수 × 깊이 × 4번이다.
+/// 이미 본 디렉터리에서 멈춰도 된다 — 처음 볼 때 그 위 조상까지 이미 다 봤다.
+fn manifests_above<'a>(paths: impl Iterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
+    let mut seen: BTreeSet<&Path> = BTreeSet::new();
+    let mut found = Vec::new();
+    for path in paths {
         for parent in path.ancestors().skip(1) {
+            if !seen.insert(parent) {
+                break;
+            }
+            #[cfg(test)]
+            PROBED_DIRS.with(|c| c.set(c.get() + 1));
             for name in [
                 "Cargo.toml",
                 "Cargo.lock",
@@ -246,12 +302,26 @@ pub(crate) fn input_files(dir: &Path) -> Result<(Vec<PathBuf>, bool), String> {
             ] {
                 let input = parent.join(name);
                 if input.is_file() {
-                    files.insert(input);
+                    found.push(input);
                 }
             }
         }
     }
-    Ok((files.into_iter().collect(), unresolved_includes))
+    found
+}
+
+/// 문서를 만든 수확의 입력을 넘겨받지 못한 `--out`(schema·routes, semantic 캐시 적중)이
+/// 보호 목록을 다시 만든다. 모듈 트리만 키운다 — 이름 해석·정점 수확은 보호 목록에 쓰이지
+/// 않는다. 파일 목록은 [`HarvestInputs::protected_files`]와 같다.
+pub(crate) fn input_files(dir: &Path) -> Result<(Vec<PathBuf>, bool), String> {
+    let metadata = cargo_meta::load(dir)?;
+    let found = input_tree(&metadata)?;
+    let inputs = HarvestInputs {
+        arena: found.arena,
+        orphan_files: found.tree.orphan_files,
+        workspace_root: metadata.workspace_root,
+    };
+    Ok(inputs.protected_files())
 }
 
 /// 매크로 확장을 추정하지 않고 리터럴 include 입력만 보호한다.
@@ -541,10 +611,30 @@ fn linked_items() -> usize {
     LINKED_ITEMS.with(std::cell::Cell::get)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// parse_into가 실제로 파싱한 파일 수 — `--out`이 입력 보호 목록을 만들려고 같은
+    /// 워크스페이스를 다시 파싱하지 않는지 단위 테스트가 센다(테스트 스레드마다 따로).
+    static PARSED_FILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 테스트용 — 이 스레드에서 지금까지 parse_into가 파싱한 파일 수.
+#[cfg(test)]
+pub(crate) fn parsed_files() -> usize {
+    PARSED_FILES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 매니페스트 이름을 확인한 조상 디렉터리 수 — 보호 목록이 디렉터리마다 한 번만
+    /// stat하는지 단위 테스트가 센다(테스트 스레드마다 따로).
+    static PROBED_DIRS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// 실제 수확 — 메타데이터 위에서 모듈 트리·간선을 조립한다.
 /// (문서, include! 계열 매크로 사용 여부)를 돌린다 — include!는
 /// 정점 위치에 안 나타나는 입력이라 캐시 판정이 별도로 필요하다.
-/// `sink`가 주어지면 정점별 소스 범위(OwnerSpan)와 모듈 트리·아레나도 넘긴다.
+/// `sink`가 주어지면 정점별 소스 범위(OwnerSpan)와 모듈 트리·아레나, 읽은 입력도 넘긴다.
 /// sink가 간선을 원하지 않으면(`want_edges = false`) 2패스(본문·속성 간선)를 건너뛴다 —
 /// 그 문서에는 간선과 2패스가 센 limitation이 없어 정점 ID만 믿을 수 있다.
 fn harvest(
@@ -625,44 +715,14 @@ fn harvest(
         &mut limitations,
     );
 
-    // 전 워크스페이스가 한 트리 — 크레이트 간 `othercrate::x` 해석이 가능해야 한다.
-    let mut tree = ModTree::default();
-    let mut arena: Arena = BTreeMap::new();
-    let mut conditional_mods = 0usize;
-    let mut uses_include = false;
-    let mut scan_roots: BTreeSet<PathBuf> = BTreeSet::new();
-    for p in meta.packages.iter().filter(|p| p.workspace_member) {
-        for t in &p.targets {
-            if !matches!(t.kind.as_str(), "lib" | "bin") {
-                continue; // example/test/bench 타깃은 수확 범위 밖(루트가 아님).
-            }
-            if let Ok(f) = t.src.canonicalize() {
-                if let Some(d) = f.parent() {
-                    scan_roots.insert(d.to_path_buf());
-                }
-            }
-            grow_tree(
-                &mut tree,
-                &mut arena,
-                &t.name,
-                &t.src,
-                &mut conditional_mods,
-                &mut uses_include,
-            )?;
-            if t.kind == "bin" {
-                entry_roots.push(format!("{}::main", t.name));
-            }
-        }
-    }
-    // orphan .rs — 전 타깃 처리 후에 스캔한다. lib의 스캔이 bin 병합 전에
-    // 돌면 main.rs가 orphan으로 오인된다. known은 공유 루트의 extra_files까지.
-    let known: BTreeSet<PathBuf> = tree
-        .modules
-        .values()
-        .flat_map(|m| std::iter::once(m.file.clone()).chain(m.extra_files.iter().cloned()))
-        .collect();
-    for root in scan_roots {
-        scan_orphans(&root, &known, &mut tree);
+    let InputTree {
+        mut tree,
+        arena,
+        conditional_mods,
+        uses_include,
+    } = input_tree(meta)?;
+    for t in source_targets(meta).filter(|t| t.kind == "bin") {
+        entry_roots.push(format!("{}::main", t.name));
     }
     if conditional_mods > 0 {
         limitations.push(format!(
@@ -725,7 +785,7 @@ fn harvest(
     }
 
     // 2패스 전체(메서드 색인·본문·속성 간선)는 간선을 쓰는 수확만 돈다 — 정점 ID·범위·
-    // 트리만 쓰는 sink(schema·routes·--out 입력 보호)에는 버려질 일이라 건너뛴다.
+    // 트리만 쓰는 sink(schema·routes)에는 버려질 일이라 건너뛴다.
     let want_edges = sink.as_ref().is_none_or(|k| k.want_edges);
     if want_edges {
         #[cfg(test)]
@@ -862,9 +922,18 @@ fn harvest(
     } else {
         Level::Module
     };
-    if let Some(k) = sink.filter(|k| k.want_tree) {
-        k.tree = Some(tree);
-        k.arena = Some(arena);
+    if let Some(k) = sink {
+        if k.want_inputs {
+            k.inputs = Some(HarvestInputs {
+                arena: arena.clone(),
+                orphan_files: tree.orphan_files.clone(),
+                workspace_root: meta.workspace_root.clone(),
+            });
+        }
+        if k.want_tree {
+            k.tree = Some(tree);
+            k.arena = Some(arena);
+        }
     }
     Ok((
         graph::document(
@@ -995,6 +1064,65 @@ fn emit_crate_level(
     }
 }
 
+/// 수확 입력 — 워크스페이스 멤버의 모듈 트리와 그 파일들의 AST 아레나다.
+/// 수확과 `--out` 입력 보호가 [`input_tree`] 하나로 만들어, 보호 목록이 수확이 실제로
+/// 읽은 파일과 갈라지지 않는다.
+#[derive(Default)]
+struct InputTree {
+    /// 전 워크스페이스가 한 트리 — 크레이트 간 `othercrate::x` 해석이 가능해야 한다.
+    tree: ModTree,
+    arena: Arena,
+    /// `#[cfg]` 뒤의 mod 선언 수 — 수확이 limitation으로 올린다.
+    conditional_mods: usize,
+    /// 수확 파일 중 include! 계열 매크로를 쓰는 파일이 있는가 — 캐시 판정에 쓴다.
+    uses_include: bool,
+}
+
+/// 수확 대상 타깃 — 워크스페이스 멤버의 lib·bin이다. example/test/bench 타깃은
+/// 수확 범위 밖이다(루트가 아님).
+fn source_targets(meta: &Metadata) -> impl Iterator<Item = &cargo_meta::Target> {
+    meta.packages
+        .iter()
+        .filter(|p| p.workspace_member)
+        .flat_map(|p| &p.targets)
+        .filter(|t| matches!(t.kind.as_str(), "lib" | "bin"))
+}
+
+/// 수확 대상 타깃마다 mod 선언을 따라 모듈 트리를 키우고, 어느 선언에도 닿지 않는
+/// .rs를 orphan으로 센다. 이름 해석·정점 수확은 하지 않는다 — `--out` 입력 보호는
+/// 읽은 파일만 알면 된다. 오류는 grow_tree가 낸 그대로다.
+fn input_tree(meta: &Metadata) -> Result<InputTree, String> {
+    let mut found = InputTree::default();
+    let mut scan_roots: BTreeSet<PathBuf> = BTreeSet::new();
+    for t in source_targets(meta) {
+        if let Ok(f) = t.src.canonicalize() {
+            if let Some(d) = f.parent() {
+                scan_roots.insert(d.to_path_buf());
+            }
+        }
+        grow_tree(
+            &mut found.tree,
+            &mut found.arena,
+            &t.name,
+            &t.src,
+            &mut found.conditional_mods,
+            &mut found.uses_include,
+        )?;
+    }
+    // orphan .rs — 전 타깃 처리 후에 스캔한다. lib의 스캔이 bin 병합 전에
+    // 돌면 main.rs가 orphan으로 오인된다. known은 공유 루트의 extra_files까지.
+    let known: BTreeSet<PathBuf> = found
+        .tree
+        .modules
+        .values()
+        .flat_map(|m| std::iter::once(m.file.clone()).chain(m.extra_files.iter().cloned()))
+        .collect();
+    for root in scan_roots {
+        scan_orphans(&root, &known, &mut found.tree);
+    }
+    Ok(found)
+}
+
 /// 타깃의 모듈 트리를 키운다 — mod 선언을 따라 파일을 발견한다.
 /// `uses_include`는 수확 파일 중 하나라도 include! 계열 매크로를
 /// 쓰면 true가 된다 — 그 입력은 정점 위치에 안 나타나 지문이 못 본다.
@@ -1073,6 +1201,8 @@ fn parse_into(arena: &mut Arena, file: &Path, uses_include: &mut bool) -> Result
     if arena.contains_key(file) {
         return Ok(());
     }
+    #[cfg(test)]
+    PARSED_FILES.with(|c| c.set(c.get() + 1));
     let src = std::fs::read_to_string(file)
         .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
     // include! 계열은 파일 경로 인자를 받아 별도 입력을 읽는다 —
@@ -1451,7 +1581,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// 정점 범위·모듈 트리만 쓰는 명령(schema·routes 서버·클라이언트·`--out` 입력 보호)은
+    /// 정점 범위·모듈 트리만 쓰는 명령(schema·routes 서버·클라이언트)과 `--out` 입력 보호는
     /// 본문·속성 간선을 해석하지 않는다 — 대형 저장소에서 버려질 이름 팬아웃 본문 간선이
     /// 그 명령들의 시간·메모리 대부분이었다. 전체 수확은 그대로 해석한다(대조군).
     #[test]
@@ -1542,6 +1672,67 @@ mod tests {
             assert!(parts.tree.modules.keys().eq(tree.modules.keys()), "{name}");
             assert_eq!(parts.tree.orphan_files, tree.orphan_files, "{name}");
             assert!(parts.arena.keys().eq(arena.keys()), "{name}");
+        }
+    }
+
+    /// 옛 `--out` 보호 목록 — 간선 없는 전체 수확의 아레나·orphan과, 파일마다 조상 디렉터리
+    /// 전부의 매니페스트 확인이다. 새 경로가 같은 파일 집합을 내는지 비교하는 오라클이다.
+    fn protected_files_by_full_harvest(dir: &Path) -> (Vec<PathBuf>, bool) {
+        let metadata = cargo_meta::load(dir).unwrap();
+        let parts = harvest_parts(dir, &metadata).unwrap();
+        let mut files: BTreeSet<PathBuf> = parts.arena.keys().cloned().collect();
+        let unresolved_includes = include_inputs(&parts.arena, &mut files);
+        files.extend(parts.tree.orphan_files);
+        let root_manifest = metadata.workspace_root.join("Cargo.toml");
+        for path in files
+            .clone()
+            .into_iter()
+            .chain(std::iter::once(root_manifest))
+        {
+            for parent in path.ancestors().skip(1) {
+                for name in [
+                    "Cargo.toml",
+                    "Cargo.lock",
+                    ".rustograph.yml",
+                    ".rustograph.yaml",
+                ] {
+                    let input = parent.join(name);
+                    if input.is_file() {
+                        files.insert(input);
+                    }
+                }
+            }
+        }
+        (files.into_iter().collect(), unresolved_includes)
+    }
+
+    /// `--out` 보호 목록은 문서를 만든 수확의 입력으로 만들든(graph·rules) 모듈 트리만 다시
+    /// 키워 만들든(schema·routes) 옛 구현과 같은 파일 집합·include 미해석 표시다. 조상
+    /// 디렉터리는 한 번씩만 본다 — 파일마다 조상 전부를 stat하면 깊은 트리에서 수만 번이었다.
+    #[test]
+    fn output_protection_matches_the_full_harvest_and_probes_each_directory_once() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for name in [
+            "tests/fixture",
+            "tests/fixture-schema",
+            "tests/fixture-client/app",
+            "tests/fixture-routes/axum08",
+        ] {
+            let dir = repo.join(name);
+            let expected = protected_files_by_full_harvest(&dir);
+            let probed_before = PROBED_DIRS.with(std::cell::Cell::get);
+            let rebuilt = input_files(&dir).unwrap();
+            let probed = PROBED_DIRS.with(std::cell::Cell::get) - probed_before;
+            assert_eq!(rebuilt, expected, "{name}");
+            let (_, inputs) = load_with_inputs(&dir, &span_options()).unwrap();
+            let inputs = inputs.expect("a harvest hands over what it read");
+            assert_eq!(inputs.protected_files(), expected, "{name}");
+            let directories: BTreeSet<&Path> = expected
+                .0
+                .iter()
+                .flat_map(|path| path.ancestors().skip(1))
+                .collect();
+            assert_eq!(probed, directories.len(), "{name}");
         }
     }
 
