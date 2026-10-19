@@ -41,14 +41,22 @@ struct RpcError {
 }
 
 /// 수확된 문서 하나를 서빙하는 서버 상태.
-pub struct Server {
-    doc: Document,
+pub struct Server<'d> {
+    doc: &'d Document,
+    /// 질의 색인 — 정점 ID 집합·이웃·경로 인접·도달 인접을 처음 쓰는 도구 호출이 한 번
+    /// 만들고 이후 호출이 재사용한다. 스냅샷이 불변이라 세션 내내 유효하다 — 호출마다
+    /// 다시 만들면 답이 이웃 몇 개여도 호출당 전 간선 비용을 치른다.
+    index: analysis::QueryIndex<'d>,
     /// deps 도구가 cargo metadata를 읽을 워크스페이스 디렉터리.
     dir: PathBuf,
     /// deps 보고서 — 첫 호출 시 한 번 만든다. 매 요청마다 syn 수확을
     /// 새로 하면 Box::leak된 AST가 서버 수명 동안 계속 쌓이고, 시작
     /// 시 무조건 수확하면 deps를 안 쓰는 세션도 수확 비용을 치른다.
     deps_report: std::sync::OnceLock<Result<String, String>>,
+    /// 레벨별 cycles 보고서 — 레벨마다 첫 호출 시 한 번 만든다(칸 번호는 Level 선언
+    /// 순서). 같은 스냅샷의 같은 레벨은 답이 같다 — 호출마다 투영·SCC를 다시 하면
+    /// 문서 크기만큼 든다.
+    cycles: [std::sync::OnceLock<Result<String, String>>; 4],
     /// rules 도구가 읽을 설정 파일 — 없으면 rules 호출이 isError로 답한다.
     cfg_path: Option<PathBuf>,
     /// 핸드셰이크로 합의한 프로토콜 버전.
@@ -69,13 +77,7 @@ pub(crate) fn cmd(
         Some(f) => Some(PathBuf::from(f)),
         None => find_config(&dir),
     };
-    let srv = Server {
-        doc,
-        dir,
-        deps_report: std::sync::OnceLock::new(),
-        cfg_path,
-        protocol: "2024-11-05".to_string(),
-    };
+    let srv = Server::new(&doc, dir, cfg_path);
     Ok(srv.serve(stdin, out, err))
 }
 
@@ -90,7 +92,20 @@ fn find_config(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-impl Server {
+impl<'d> Server<'d> {
+    /// 문서 하나를 서빙할 서버 — 색인·보고서 캐시는 비어 있고, 처음 쓰는 도구 호출이 채운다.
+    fn new(doc: &'d Document, dir: PathBuf, cfg_path: Option<PathBuf>) -> Self {
+        Server {
+            doc,
+            index: analysis::QueryIndex::new(doc),
+            dir,
+            deps_report: std::sync::OnceLock::new(),
+            cycles: Default::default(),
+            cfg_path,
+            protocol: "2024-11-05".to_string(),
+        }
+    }
+
     /// EOF까지 한 줄씩 JSON-RPC를 처리한다.
     fn serve(&self, stdin: &mut dyn BufRead, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         let mut protocol = self.protocol.clone();
@@ -232,9 +247,7 @@ impl Server {
                 let id = self.require_id(id)?;
                 let depth = arg_usize(args, "depth")?.unwrap_or(1);
                 let max = arg_usize(args, "max")?.unwrap_or(200);
-                Ok(export::to_json(&analysis::query(
-                    &self.doc, &id, depth, max,
-                )))
+                Ok(export::to_json(&self.index.query(&id, depth, max)))
             }
             "rustograph_impact" => {
                 let id = arg_str(args, "id").ok_or("impact needs an \"id\" argument")?;
@@ -248,7 +261,7 @@ impl Server {
                     requested
                 };
                 let max = arg_usize(args, "max")?.unwrap_or(200);
-                let mut r = analysis::impact(&self.doc, &id, effective, max);
+                let mut r = self.index.impact(&id, effective, max);
                 r.depth = requested;
                 Ok(export::to_json(&r))
             }
@@ -259,14 +272,12 @@ impl Server {
                 let to = self.require_id(to)?;
                 let max = arg_usize(args, "max")?.unwrap_or(10);
                 let budget = arg_usize(args, "budget")?.unwrap_or(50_000);
-                Ok(export::to_json(&analysis::paths(
-                    &self.doc, &from, &to, max, budget,
-                )))
+                Ok(export::to_json(&self.index.paths(&from, &to, max, budget)))
             }
             "rustograph_search" => {
                 let q = arg_str(args, "q").ok_or("search needs a \"q\" argument")?;
                 let max = arg_usize(args, "max")?.unwrap_or(20);
-                Ok(export::to_json(&analysis::search(&self.doc, q, max)))
+                Ok(export::to_json(&analysis::search(self.doc, q, max)))
             }
             // 첫 호출에 한 번 수확해 메모한다 — 자체 syn 수확으로
             // 문서를 만드는 이유는 공유 문서가 외부 정점이 없거나
@@ -281,18 +292,12 @@ impl Server {
                         .ok_or_else(|| format!("unknown level {l} (crate|module|type|symbol)"))?,
                     None => self.doc.level,
                 };
-                let view = self.doc.view(level)?;
-                Ok(export::to_json(&analysis::cycles(&view)))
+                self.cycles_report(level)
             }
             "rustograph_dead" => {
-                // 문서 루트에 retainPublic·추가 루트를 얹은 사본 위에서 판정한다 —
-                // 도구 호출이 서빙하는 스냅샷 자체를 흔들면 안 된다.
-                let ids: std::collections::BTreeSet<String> = self
-                    .doc
-                    .vertex_ids()
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
+                // 문서 루트에 retainPublic·추가 루트를 얹은 루트 목록으로 판정한다 —
+                // 도구 호출이 서빙하는 스냅샷 자체를 흔들면 안 되고, 루트만 바꾼
+                // 문서 사본도 만들지 않는다.
                 let mut roots: std::collections::BTreeSet<String> =
                     self.doc.roots.iter().cloned().collect();
                 let mut unknown_roots = Vec::new();
@@ -305,16 +310,15 @@ impl Server {
                 }
                 if let Some(extra) = args.get("roots").and_then(|v| v.as_array()) {
                     for r in extra.iter().filter_map(|v| v.as_str()) {
-                        if ids.contains(r) {
+                        if self.index.has_vertex(r) {
                             roots.insert(r.to_string());
                         } else {
                             unknown_roots.push(r.to_string());
                         }
                     }
                 }
-                let mut d = self.doc.clone();
-                d.roots = roots.into_iter().collect();
-                let rep = analysis::dead(&d)?;
+                let roots: Vec<String> = roots.into_iter().collect();
+                let rep = self.index.dead(&roots)?;
                 let mut out = serde_json::to_value(&rep).expect("report must serialize");
                 if !unknown_roots.is_empty() {
                     out["unknownRoots"] = serde_json::json!(unknown_roots);
@@ -326,7 +330,7 @@ impl Server {
                     return Err("no .rustograph.yml found — pass --config".to_string());
                 };
                 let cfg = config::load_file(cfg_path)?;
-                let mut rep = rules::check(&self.doc, &cfg);
+                let mut rep = rules::check(self.doc, &cfg);
                 // 설정에 선언된 기준선을 적용한다 — CLI rules와 같은 계약.
                 // NotFound만 도입 전으로 본다 — 권한 오류나 깨진 파일을
                 // 조용히 넘기면 억제가 안 먹힌 채로 지나간다. 장치·FIFO는
@@ -351,13 +355,30 @@ impl Server {
     /// 후보를 담은 isError로 돌려준다. 에이전트는 rustograph_search로
     /// 후보를 찾은 뒤 정확한 ID로 다시 호출해야 한다.
     fn require_id(&self, id: &str) -> Result<String, String> {
-        analysis::resolve_id(&self.doc, id).map_err(|cands| {
+        self.index.resolve_id(id).map_err(|cands| {
             if cands.is_empty() {
                 format!("vertex {id} not found")
             } else {
                 format!("vertex {id} not found — candidates: {}", cands.join(", "))
             }
         })
+    }
+
+    /// 레벨 하나의 cycles 보고서(JSON) — 첫 호출에 만들어 두고 같은 레벨의 다음 호출은
+    /// 그대로 돌려준다. 문서 레벨이면 투영할 것이 없다 — view()는 같은 레벨에서 문서를
+    /// 통째로 복제한다.
+    fn cycles_report(&self, level: Level) -> Result<String, String> {
+        // 칸 번호는 Level 선언 순서다(crate·module·type·symbol).
+        self.cycles[level as usize]
+            .get_or_init(|| {
+                let rep = if level == self.doc.level {
+                    analysis::cycles(self.doc)
+                } else {
+                    analysis::cycles(&self.doc.view(level)?)
+                };
+                Ok(export::to_json(&rep))
+            })
+            .clone()
     }
 }
 
@@ -504,30 +525,29 @@ mod tests {
     }
 
     /// a->b 호출, 사용 안 되는 d — 최소 문서.
-    fn test_server() -> Server {
-        Server {
-            doc: document(
-                Level::Symbol,
-                ".".into(),
-                None,
-                vec!["c::a".into()],
-                vec![
-                    v("c::a", Kind::Fn, true),
-                    v("c::b", Kind::Fn, true),
-                    v("c::d", Kind::Fn, false),
-                ],
-                vec![Edge::new("c::a".into(), "c::b".into(), EdgeKind::Call)],
-                vec![],
-            ),
-            dir: PathBuf::from("."),
-            deps_report: std::sync::OnceLock::new(),
-            cfg_path: None,
-            protocol: "2024-11-05".to_string(),
-        }
+    fn test_doc() -> Document {
+        document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec!["c::a".into()],
+            vec![
+                v("c::a", Kind::Fn, true),
+                v("c::b", Kind::Fn, true),
+                v("c::d", Kind::Fn, false),
+            ],
+            vec![Edge::new("c::a".into(), "c::b".into(), EdgeKind::Call)],
+            vec![],
+        )
+    }
+
+    /// 문서 하나를 서빙하는 시험 서버.
+    fn server_for(doc: &Document) -> Server<'_> {
+        Server::new(doc, PathBuf::from("."), None)
     }
 
     /// NDJSON 요청을 밀어 넣고 응답 줄들을 JSON 값으로 돌려준다.
-    fn session(srv: &Server, lines: &[&str]) -> Vec<serde_json::Value> {
+    fn session(srv: &Server<'_>, lines: &[&str]) -> Vec<serde_json::Value> {
         let input = lines.join("\n") + "\n";
         let mut in_: &[u8] = input.as_bytes();
         let mut out = Vec::new();
@@ -544,7 +564,7 @@ mod tests {
     #[test]
     fn handshake_and_tools_list() {
         let res = session(
-            &test_server(),
+            &server_for(&test_doc()),
             &[
                 r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
                 r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
@@ -560,7 +580,7 @@ mod tests {
     #[test]
     fn tool_call_answers_over_the_graph() {
         let res = session(
-            &test_server(),
+            &server_for(&test_doc()),
             &[
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rustograph_query","arguments":{"id":"c::b","depth":1}}}"#,
                 r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"rustograph_dead","arguments":{}}}"#,
@@ -584,7 +604,7 @@ mod tests {
     #[test]
     fn tool_errors_are_content_not_protocol() {
         let res = session(
-            &test_server(),
+            &server_for(&test_doc()),
             &[
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nope","arguments":{}}}"#,
                 r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"rustograph_query","arguments":{}}}"#,
@@ -598,7 +618,7 @@ mod tests {
     }
 
     /// rules 도구 호출 하나를 보내고 결과 객체를 돌려준다.
-    fn call_rules(srv: &Server) -> serde_json::Value {
+    fn call_rules(srv: &Server<'_>) -> serde_json::Value {
         let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rustograph_rules","arguments":{}}}"#;
         session(srv, &[call]).remove(0)["result"].take()
     }
@@ -614,7 +634,8 @@ mod tests {
         std::fs::write(&good, "components:\n  all: [\"c/**\"]\ndeps:\n  all: []\n").unwrap();
         let bad = dir.join("bad.yml");
         std::fs::write(&bad, "components: [unclosed\n").unwrap();
-        let mut srv = test_server();
+        let doc = test_doc();
+        let mut srv = server_for(&doc);
         srv.cfg_path = Some(good);
         let result = call_rules(&srv);
         assert_eq!(result["isError"], serde_json::Value::Null, "{result}");
@@ -653,7 +674,8 @@ mod tests {
             "components:\n  all: [\"c/**\"]\nbaseline: /dev/zero\n",
         )
         .unwrap();
-        let mut srv = test_server();
+        let doc = test_doc();
+        let mut srv = server_for(&doc);
         for (cfg, cause) in [
             (
                 device_baseline,
@@ -673,10 +695,181 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 정점 30개 사슬에 갈래·순환·추정 간선·공개 정점을 섞은 문서 — 도구마다 비지 않은 답이 있다.
+    fn branching_doc() -> Document {
+        let id = |i: usize| format!("c::f{i:02}");
+        let vertices = (0..30).map(|i| v(&id(i), Kind::Fn, i % 7 == 0)).collect();
+        let mut edges: Vec<Edge> = (0..29)
+            .map(|i| Edge::new(id(i), id(i + 1), EdgeKind::Call))
+            .collect();
+        edges.extend(
+            (0..25)
+                .step_by(5)
+                .map(|i| Edge::new(id(i), id(i + 3), EdgeKind::References)),
+        );
+        edges.push(Edge::new(id(12), id(4), EdgeKind::Call));
+        edges.push(Edge::maybe(id(20), id(27), EdgeKind::Call));
+        edges.push(Edge::new(id(3), id(8), EdgeKind::Contains));
+        // f20 다음 사슬은 루트에서 끊긴다 — dead가 보고할 정점이 생긴다.
+        edges.retain(|e| !(e.from == id(19) && e.to == id(20)));
+        document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec![id(0)],
+            vertices,
+            edges,
+            vec![],
+        )
+    }
+
+    /// tools/call 요청 한 줄.
+    fn call_line(n: usize, name: &str, arguments: serde_json::Value) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": n, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        })
+        .to_string()
+    }
+
+    /// 같은 세션에서 query·impact·paths·dead·cycles를 인자를 바꿔 가며 세 번씩 부르는 요청과,
+    /// 각 요청에 기대하는 답(CLI가 내는 분석 결과 JSON) — 서버 색인을 거치지 않고 만든다.
+    fn repeated_calls(doc: &Document) -> (Vec<String>, Vec<String>) {
+        let mut lines = Vec::new();
+        let mut expected = Vec::new();
+        let mut push = |name: &str, arguments: serde_json::Value, answer: String| {
+            lines.push(call_line(lines.len() + 1, name, arguments));
+            expected.push(answer);
+        };
+        for (id, depth) in [("c::f05", 1), ("c::f12", 3), ("c::f27", 2)] {
+            let args = serde_json::json!({"id": id, "depth": depth});
+            push(
+                "rustograph_query",
+                args,
+                export::to_json(&analysis::query(doc, id, depth, 200)),
+            );
+        }
+        for (id, depth, max) in [("c::f08", 0, 200), ("c::f04", 2, 3), ("c::f29", 0, 1)] {
+            let mut r = analysis::impact(doc, id, if depth == 0 { usize::MAX } else { depth }, max);
+            r.depth = depth;
+            let args = serde_json::json!({"id": id, "depth": depth, "max": max});
+            push("rustograph_impact", args, export::to_json(&r));
+        }
+        for (from, to, max) in [
+            ("c::f00", "c::f13", 10),
+            ("c::f02", "c::f09", 2),
+            ("c::f20", "c::f00", 10),
+        ] {
+            let args = serde_json::json!({"from": from, "to": to, "max": max});
+            push(
+                "rustograph_paths",
+                args,
+                export::to_json(&analysis::paths(doc, from, to, max, 50_000)),
+            );
+        }
+        let dead_answer = |roots: Vec<String>, unknown: &[&str]| {
+            let mut d = doc.clone();
+            d.roots = roots;
+            let mut out = serde_json::to_value(analysis::dead(&d).unwrap()).unwrap();
+            if !unknown.is_empty() {
+                out["unknownRoots"] = serde_json::json!(unknown);
+            }
+            export::to_json(&out)
+        };
+        let public: std::collections::BTreeSet<String> = doc
+            .vertices
+            .iter()
+            .filter(|v| v.exported)
+            .map(|v| v.id.clone())
+            .chain(doc.roots.iter().cloned())
+            .collect();
+        push(
+            "rustograph_dead",
+            serde_json::json!({}),
+            dead_answer(doc.roots.clone(), &[]),
+        );
+        push(
+            "rustograph_dead",
+            serde_json::json!({"retainPublic": true}),
+            dead_answer(public.into_iter().collect(), &[]),
+        );
+        push(
+            "rustograph_dead",
+            serde_json::json!({"roots": ["c::f22", "c::nope"]}),
+            dead_answer(vec!["c::f00".into(), "c::f22".into()], &["c::nope"]),
+        );
+        for level in [None, Some("module"), None] {
+            let args = level.map_or(serde_json::json!({}), |l| serde_json::json!({"level": l}));
+            let view = doc
+                .view(level.and_then(Level::parse).unwrap_or(doc.level))
+                .unwrap();
+            push(
+                "rustograph_cycles",
+                args,
+                export::to_json(&analysis::cycles(&view)),
+            );
+        }
+        (lines, expected)
+    }
+
+    /// 한 세션의 도구 호출은 불변 스냅샷 하나를 묻는다 — 호출마다 정점 ID 집합·이웃 색인·
+    /// 경로 인접·도달 인접을 다시 만들거나 문서를 복제하면 답이 이웃 몇 개여도 호출당
+    /// O(E log V)다(정점 8만·간선 40만 합성 문서에서 query 호출당 0.59초). 같은 레벨의
+    /// cycles도 다시 계산할 이유가 없다. 색인은 종류마다 한 번, cycles는 레벨마다 한 번이다.
+    #[test]
+    fn repeated_calls_build_each_index_once() {
+        let doc = branching_doc();
+        let (lines, _) = repeated_calls(&doc);
+        let srv = server_for(&doc);
+        let firm = |d: &Document| {
+            d.edges
+                .iter()
+                .filter(|e| e.kind.is_dependency() && !e.tentative)
+                .count()
+        };
+        let cycle_bound = firm(&doc) + firm(&doc.view(Level::Module).unwrap());
+        let (indexed, classified) = (analysis::indexed(), analysis::classified_edges());
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let res = session(&srv, &lines);
+        let indexed = analysis::indexed() - indexed;
+        let classified = analysis::classified_edges() - classified;
+        assert_eq!(res.len(), lines.len());
+        // 정점 ID 집합 한 번 + 간선 색인 넷(양방향 이웃·역방향 이웃·경로 인접·도달 인접) 한 번씩.
+        let bound = doc.vertices.len() + 4 * doc.edges.len();
+        assert!(indexed <= bound, "{indexed} indexing visits, bound {bound}");
+        assert!(
+            classified <= cycle_bound,
+            "{classified} cycle edge visits, bound {cycle_bound}"
+        );
+    }
+
+    /// 색인·보고서를 재사용해도 답은 호출마다 CLI가 같은 인자로 내는 분석 결과와 같다 —
+    /// 앞 호출의 상태가 다음 호출에 새지 않는다.
+    #[test]
+    fn repeated_calls_match_one_shot_analysis() {
+        let doc = branching_doc();
+        let (lines, expected) = repeated_calls(&doc);
+        let srv = server_for(&doc);
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let res = session(&srv, &lines);
+        assert_eq!(res.len(), expected.len());
+        for (i, (r, want)) in res.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                r["result"]["isError"],
+                serde_json::Value::Null,
+                "call {i}: {r}"
+            );
+            let text = r["result"]["content"][0]["text"].as_str().unwrap();
+            assert_eq!(text, want, "call {i}: {}", lines[i]);
+        }
+        // 같은 줄을 한 번 더 보내도 같은 답이다.
+        assert_eq!(session(&srv, &lines), res);
+    }
+
     #[test]
     fn unknown_method_and_parse_error() {
         let res = session(
-            &test_server(),
+            &server_for(&test_doc()),
             &[
                 r#"{"jsonrpc":"2.0","id":1,"method":"bogus/method"}"#,
                 "not json at all",
@@ -692,7 +885,7 @@ mod tests {
     #[test]
     fn cycles_tool_respects_level_arg() {
         let res = session(
-            &test_server(),
+            &server_for(&test_doc()),
             &[
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rustograph_cycles","arguments":{"level":"module"}}}"#,
                 r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"rustograph_cycles","arguments":{"level":"bogus"}}}"#,
