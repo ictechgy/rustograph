@@ -133,6 +133,89 @@ fn mcp_and_cli_share_directional_results_and_caps() {
     );
 }
 
+/// `--depth 0`(MCP `depth: 0`)은 query·impact 모두 깊이 제한 없는 전체 폐포다 — MCP 도구 설명
+/// ("0 = full closure")과 순회 형식(`--depth 0`은 상한 128)이 문서화한 뜻이다. 예전 CLI는 같은
+/// `depth: 0, truncated: false`로 빈 결과를 내, 의존자가 있는데도 "깨질 것이 없다"로 읽혔다.
+/// 폐포도 `--max`가 묶고, 보고 `depth`는 요청값 0이다. MCP impact의 기본 깊이는 0 그대로다.
+#[test]
+fn cli_and_mcp_depth_zero_walk_the_whole_closure() {
+    let snapshot = Snapshot::new("depth-zero");
+    let impact = snapshot.cli(&["impact", "shared", "--depth", "0"]);
+    assert_eq!(
+        impact,
+        json!({
+            "id": "shared", "found": true, "depth": 0, "truncated": false,
+            "impacted": [
+                {"id": "root", "edges": ["call"], "direction": "in", "depth": 1},
+                {"id": "sibling", "edges": ["call"], "direction": "in", "depth": 1},
+                {"id": "caller", "edges": ["call", "references"], "direction": "in", "depth": 2},
+                {"id": "entry", "edges": ["call"], "direction": "in", "depth": 3}
+            ]
+        })
+    );
+    // 양방향 폐포는 이 그래프에서 깊이 3이면 끝난다 — 0은 그 답과 같고 보고 깊이만 0이다.
+    let query = snapshot.cli(&["query", "root", "--depth", "0"]);
+    let mut deep = snapshot.cli(&["query", "root", "--depth", "10"]);
+    deep["depth"] = json!(0);
+    assert_eq!(query, deep);
+    assert_eq!(query["neighbors"].as_array().unwrap().len(), 5);
+    assert_eq!(query["truncated"], false);
+    let capped = snapshot.cli(&["impact", "shared", "--depth", "0", "--max", "2"]);
+    assert_eq!(capped["impacted"].as_array().unwrap().len(), 2);
+    assert_eq!(capped["truncated"], true);
+    let mcp = mcp_reports(
+        &snapshot,
+        &[
+            json!({"name": "rustograph_impact", "arguments": {"id": "shared", "depth": 0}}),
+            json!({"name": "rustograph_impact", "arguments": {"id": "shared"}}),
+            json!({"name": "rustograph_query", "arguments": {"id": "root", "depth": 0}}),
+            json!({"name": "rustograph_impact", "arguments": {"id": "shared", "depth": 0, "max": 2}}),
+        ],
+    );
+    assert_eq!(mcp, [impact.clone(), impact, query, capped]);
+}
+
+/// 스냅샷을 서빙하는 MCP 서버 한 세션에 도구 호출을 차례로 보내고, 각 답의 보고서 JSON을 돌려준다.
+/// isError 답이면 그 내용으로 실패한다.
+fn mcp_reports(snapshot: &Snapshot, calls: &[Value]) -> Vec<Value> {
+    let requests: Vec<String> = calls
+        .iter()
+        .enumerate()
+        .map(|(i, params)| {
+            json!({"jsonrpc": "2.0", "id": i + 1, "method": "tools/call", "params": params})
+                .to_string()
+        })
+        .collect();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rustograph"))
+        .args(["mcp", "--graph"])
+        .arg(&snapshot.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{}", requests.join("\n")).unwrap();
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+        .stdout
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let response: Value = serde_json::from_slice(line).unwrap();
+            assert_eq!(response["result"]["isError"], Value::Null, "{response}");
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap()
+        })
+        .collect()
+}
+
 /// MCP 서버는 질의 색인·cycles 보고서를 세션 안에서 재사용한다 — 같은 세션에서 섞어
 /// 두 바퀴 부른 query·impact·paths·dead·cycles가 매번 같은 인자의 CLI JSON과 같아야 한다.
 #[test]

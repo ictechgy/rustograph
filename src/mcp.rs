@@ -245,24 +245,21 @@ impl<'d> Server<'d> {
             "rustograph_query" => {
                 let id = arg_str(args, "id").ok_or("query needs an \"id\" argument")?;
                 let id = self.require_id(id)?;
+                // depth 0은 CLI `--depth 0`과 같은 해석 함수로 "깊이 제한 없음"이다 — 보고에는 요청값을 싣는다.
                 let depth = arg_usize(args, "depth")?.unwrap_or(1);
                 let max = arg_usize(args, "max")?.unwrap_or(200);
-                Ok(export::to_json(&self.index.query(&id, depth, max)))
+                let mut r = self.index.query(&id, cli_args::walk_depth(depth), max);
+                r.depth = depth;
+                Ok(export::to_json(&r))
             }
             "rustograph_impact" => {
                 let id = arg_str(args, "id").ok_or("impact needs an \"id\" argument")?;
                 let id = self.require_id(id)?;
-                // depth 0은 "전체 전이 클로저" — 내부에서는 무제한으로 바꾸되
-                // 보고에는 요청값을 싣는다(usize::MAX는 계약이 아니다).
-                let requested = arg_usize(args, "depth")?.unwrap_or(0);
-                let effective = if requested == 0 {
-                    usize::MAX
-                } else {
-                    requested
-                };
+                // 기본 깊이는 0(깊이 제한 없음)이다 — query와 같은 해석 함수를 지나고 보고에는 요청값을 싣는다.
+                let depth = arg_usize(args, "depth")?.unwrap_or(0);
                 let max = arg_usize(args, "max")?.unwrap_or(200);
-                let mut r = self.index.impact(&id, effective, max);
-                r.depth = requested;
+                let mut r = self.index.impact(&id, cli_args::walk_depth(depth), max);
+                r.depth = depth;
                 Ok(export::to_json(&r))
             }
             "rustograph_paths" => {
@@ -403,7 +400,7 @@ fn tool_list() -> serde_json::Value {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "vertex ID, e.g. mycrate::mod::func"},
-                    "depth": {"type": "integer", "description": "neighbor depth (default 1)"},
+                    "depth": {"type": "integer", "description": "neighbor depth (default 1); 0 = no depth limit, bounded by max"},
                     "max": {"type": "integer", "description": "max neighbors (default 200)"},
                 },
                 "required": ["id"],
@@ -416,7 +413,7 @@ fn tool_list() -> serde_json::Value {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "vertex ID"},
-                    "depth": {"type": "integer", "description": "max depth; 0 = full closure"},
+                    "depth": {"type": "integer", "description": "max depth (default 0); 0 = no depth limit, the full closure bounded by max"},
                     "max": {"type": "integer", "description": "max dependers (default 200)"},
                 },
                 "required": ["id"],

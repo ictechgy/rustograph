@@ -44,6 +44,9 @@ shared flags: --deps --tests --retain-public --semantic --no-cache
   semantics (requires a build with `--features semantic`; results cached
   in .rustograph/semantic-cache.json unless --no-cache)
 
+query / impact --depth 0 walks without a depth limit (the whole closure, still
+bounded by --max); the report keeps \"depth\": 0.
+
 reach / impact --format language-traversal emit an isthmus language-traversal
 v1 document (dependencies / dependents) for many roots in one pass; ids that
 are not graph vertices are listed without symbol and the command exits 64.
@@ -643,11 +646,15 @@ fn cmd_query(a: &Args, out: &mut dyn Write, reverse: bool) -> Result<i32, String
     let max = cli_args::usize_arg(a, "max", 200)?;
     let doc = cli_args::document_for(a, true)?;
     let id = require_id(&doc, id)?;
+    // 0은 깊이 제한 없음이다(MCP와 같은 해석 함수) — 보고에는 요청한 깊이를 싣는다.
+    let walk = cli_args::walk_depth(depth);
     if reverse {
-        let r = analysis::impact(&doc, &id, depth, max);
+        let mut r = analysis::impact(&doc, &id, walk, max);
+        r.depth = depth;
         write!(out, "{}", export::to_json(&r)).ok();
     } else {
-        let r = analysis::query(&doc, &id, depth, max);
+        let mut r = analysis::query(&doc, &id, walk, max);
+        r.depth = depth;
         write!(out, "{}", export::to_json(&r)).ok();
     }
     Ok(0)

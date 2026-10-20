@@ -102,6 +102,7 @@ rustograph rules --baseline base.txt      # only *new* violations fail
 # Ask about one symbol (agent-oriented JSON)
 rustograph query mycrate::module::f --depth 2
 rustograph impact mycrate::Type --depth 3  # reverse transitive closure
+rustograph impact mycrate::Type --depth 0  # no depth limit (still bounded by --max)
 rustograph paths mycrate::a mycrate::b    # bounded paths between two ids
 rustograph search entry                   # exact > suffix > substring
 #   partial ids are refused with candidates — retry with an exact id
@@ -403,6 +404,9 @@ each neighbor/direction is reported once at its shortest discovered depth, with
 all dependency edge kinds for that direction and depth. The starting symbol is
 not repeated as its own neighbor. `--max` bounds the number of result records,
 including zero; `truncated` becomes true only when a record is actually omitted.
+`--depth 0` (MCP `depth: 0`) means no depth limit: the report covers the whole
+closure, still bounded by `--max`, and keeps `depth: 0`. The default depth is 1,
+except for MCP `rustograph_impact`, whose default is 0.
 
 ## Development
 

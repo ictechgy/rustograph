@@ -70,6 +70,7 @@ rustograph rules --format sarif          # GitHub 코드 스캐닝용
 rustograph rules --write-baseline        # 기존 위반을 기준선으로 얼림
 rustograph query mycrate::module::f --depth 2
 rustograph impact mycrate::Type --depth 3
+rustograph impact mycrate::Type --depth 0  # 깊이 제한 없는 전체 폐포(--max로만 묶임, MCP depth 0과 같음)
 rustograph paths mycrate::a mycrate::b   # 두 정점 사이 제한된 경로 탐색
 rustograph search entry                  # 정확 > 꼬리 > 부분 문자열 순위
 rustograph deps                          # 미사용 의존 + 중복 버전 보고

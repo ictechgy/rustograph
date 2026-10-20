@@ -232,6 +232,20 @@ pub(crate) fn usize_arg(a: &Args, key: &str, default: usize) -> Result<usize, St
     }
 }
 
+/// query·impact의 깊이 인자를 분석 함수에 넘길 깊이로 바꾼다 — CLI `--depth`와 MCP `depth`가 이 함수
+/// 하나를 지난다. 0은 "깊이 제한 없음"(전체 폐포, 보고 수는 `max`가 묶는다)이다: MCP 도구 설명
+/// ("0 = full closure")과 순회 형식(`--depth 0`은 상한 128)이 0을 "끝까지"로 문서화했는데 CLI만 빈
+/// 결과를 내, 같은 `depth: 0, truncated: false`가 통로마다 반대 뜻이었다. 보고 JSON의 `depth`에는
+/// 호출자가 요청값을 다시 싣는다(`usize::MAX`는 계약이 아니다). analysis 라이브러리 함수의 깊이 뜻
+/// (0 = 이웃 없음)은 라이브러리 호출자를 위해 그대로 둔다.
+pub(crate) fn walk_depth(requested: usize) -> usize {
+    if requested == 0 {
+        usize::MAX
+    } else {
+        requested
+    }
+}
+
 /// `--level` 값을 Level로 변환한다 — 없으면 module이 기본이다.
 pub(crate) fn level_of(a: &Args) -> Result<Level, String> {
     match a.get("level") {
