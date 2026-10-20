@@ -197,6 +197,11 @@ set to the snapshot's workspace, or without `--graph`. It never runs `cargo`
 for a path taken from the snapshot. Partial ids are refused with a candidate
 list — call `rustograph_search` or retry with an exact id.
 
+Each request is one line of at most 1 MiB (1,048,576 bytes, not counting the
+line ending). A longer line is never buffered: the server answers it with a
+JSON-RPC `-32600` error whose `id` is `null`, discards the rest of that line,
+and keeps reading the next request.
+
 Semantic-mode documents are cached under `.rustograph/semantic-cache.json`,
 keyed by a fingerprint of workspace sources and manifests — a stale or
 corrupt cache silently falls back to a fresh harvest.

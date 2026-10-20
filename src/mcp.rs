@@ -40,6 +40,118 @@ struct RpcError {
     message: String,
 }
 
+/// 요청 한 줄의 최대 바이트 수(줄 끝 `\n`·`\r\n` 제외) — 1 MiB. 계열 MCP 서버(schemagraph·cartograph의
+/// 1 MiB 요청 상한)와 같다. 이 서버의 요청은 정점 ID와 정수 몇 개라 수백 바이트면 된다 — 상한이 없으면
+/// 개행 없는 입력 하나가 서버 메모리를 끝없이 쌓는다.
+const MAX_REQUEST_LINE_BYTES: usize = 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// 요청 줄 버퍼가 담았던 가장 긴 내용(바이트) — 상한을 넘는 줄도 버퍼가 상한에 묶이는지
+    /// 단위 테스트가 본다(테스트 스레드마다 따로).
+    static LINE_BUFFER_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// stdin에서 읽은 요청 줄 하나.
+enum RequestLine {
+    /// 줄 끝을 뗀 줄 내용(UTF-8).
+    Text(String),
+    /// 상한을 넘은 줄 — 내용을 쌓지 않고 다음 개행(또는 EOF)까지 읽어 버렸다.
+    Oversized,
+}
+
+/// 다음 요청 줄을 읽는다 — EOF면 None. 줄 내용은 [`MAX_REQUEST_LINE_BYTES`]까지만 버퍼에 쌓고, 넘으면
+/// 나머지는 읽어 버리기만 해 메모리가 상한에 묶인다. 줄 끝·오류 처리는 예전 `BufRead::lines`와 같다:
+/// `\n`을 떼고 그 앞 `\r`도 떼며, 개행 없이 EOF로 끝난 마지막 줄도 한 줄이고, UTF-8이 아닌 줄은 읽기 오류다.
+fn read_request_line(stdin: &mut dyn BufRead) -> std::io::Result<Option<RequestLine>> {
+    let mut line_bytes = Vec::new();
+    let (mut read_any, mut oversized) = (false, false);
+    loop {
+        let chunk = match stdin.fill_buf() {
+            Ok(chunk) => chunk,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if chunk.is_empty() {
+            // EOF — 읽은 것이 없으면 입력 끝, 있으면 개행 없는 마지막 줄이다.
+            if !read_any {
+                return Ok(None);
+            }
+            return end_request_line(line_bytes, oversized, false).map(Some);
+        }
+        read_any = true;
+        let newline_at = chunk.iter().position(|&b| b == b'\n');
+        let content = &chunk[..newline_at.unwrap_or(chunk.len())];
+        // `\r\n`의 `\r`은 줄 내용이 아니다 — 상한보다 1바이트 더 쌓아 두고 줄 끝에서 판정한다.
+        if !oversized && line_bytes.len() + content.len() <= MAX_REQUEST_LINE_BYTES + 1 {
+            line_bytes.extend_from_slice(content);
+        } else {
+            oversized = true;
+            line_bytes = Vec::new();
+        }
+        #[cfg(test)]
+        LINE_BUFFER_PEAK.with(|peak| peak.set(peak.get().max(line_bytes.len())));
+        let consumed = newline_at.map_or(chunk.len(), |at| at + 1);
+        stdin.consume(consumed);
+        if newline_at.is_some() {
+            return end_request_line(line_bytes, oversized, true).map(Some);
+        }
+    }
+}
+
+/// 다 읽은 줄 하나를 판정한다 — 개행으로 끝난 줄은 끝의 `\r`을 떼고, 그래도 상한을 넘으면 Oversized다.
+fn end_request_line(
+    mut line_bytes: Vec<u8>,
+    oversized: bool,
+    newline: bool,
+) -> std::io::Result<RequestLine> {
+    if newline && line_bytes.last() == Some(&b'\r') {
+        line_bytes.pop();
+    }
+    if oversized || line_bytes.len() > MAX_REQUEST_LINE_BYTES {
+        return Ok(RequestLine::Oversized);
+    }
+    // 예전 `lines()`가 내던 것과 같은 오류다 — 세션은 이 오류에서 끝난다(종료 2).
+    String::from_utf8(line_bytes)
+        .map(RequestLine::Text)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            )
+        })
+}
+
+/// 상한을 넘은 요청 줄에 대한 답 — 줄을 파싱하지 않았으니 id를 알 수 없어 null이다(JSON-RPC 2.0이
+/// Invalid Request에 정한 대로). 서버는 이 답을 쓰고 다음 줄을 계속 읽는다.
+fn oversized_request_error() -> Response {
+    Response {
+        jsonrpc: "2.0",
+        id: serde_json::Value::Null,
+        result: None,
+        error: Some(RpcError {
+            code: -32600,
+            message: format!(
+                "request line exceeds the 1 MiB limit ({MAX_REQUEST_LINE_BYTES} bytes) and was \
+                 discarded; send each request as one shorter line"
+            ),
+        }),
+    }
+}
+
+/// 응답 하나를 한 줄 JSON으로 쓰고 비운다 — 직렬화 실패는 stderr에 남긴다.
+fn write_response(resp: &Response, out: &mut dyn Write, err: &mut dyn Write) {
+    match serde_json::to_string(resp) {
+        Ok(s) => {
+            let _ = writeln!(out, "{s}");
+            let _ = out.flush();
+        }
+        Err(e) => {
+            let _ = writeln!(err, "mcp: encoding response: {e}");
+        }
+    }
+}
+
 /// 수확된 문서 하나를 서빙하는 서버 상태.
 pub struct Server<'d> {
     doc: &'d Document,
@@ -119,12 +231,18 @@ impl<'d> Server<'d> {
         }
     }
 
-    /// EOF까지 한 줄씩 JSON-RPC를 처리한다.
+    /// EOF까지 한 줄씩 JSON-RPC를 처리한다. [`MAX_REQUEST_LINE_BYTES`]를 넘는 줄은 쌓지 않고
+    /// 오류로 답한 뒤 다음 줄로 넘어간다.
     fn serve(&self, stdin: &mut dyn BufRead, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         let mut protocol = self.protocol.clone();
-        for line in stdin.lines() {
-            let line = match line {
-                Ok(l) => l,
+        loop {
+            let line = match read_request_line(stdin) {
+                Ok(Some(RequestLine::Text(l))) => l,
+                Ok(Some(RequestLine::Oversized)) => {
+                    write_response(&oversized_request_error(), out, err);
+                    continue;
+                }
+                Ok(None) => return 0,
                 Err(e) => {
                     let _ = writeln!(err, "mcp: reading stdin: {e}");
                     return 2;
@@ -136,17 +254,8 @@ impl<'d> Server<'d> {
             let Some(resp) = self.handle(&line, &mut protocol) else {
                 continue;
             };
-            match serde_json::to_string(&resp) {
-                Ok(s) => {
-                    let _ = writeln!(out, "{s}");
-                    let _ = out.flush();
-                }
-                Err(e) => {
-                    let _ = writeln!(err, "mcp: encoding response: {e}");
-                }
-            }
+            write_response(&resp, out, err);
         }
-        0
     }
 
     /// 메시지 하나를 디스패치한다. 알림(id 없음)은 None을 돌려 응답을 생략한다.
@@ -588,15 +697,144 @@ mod tests {
     fn session(srv: &Server<'_>, lines: &[&str]) -> Vec<serde_json::Value> {
         let input = lines.join("\n") + "\n";
         let mut in_: &[u8] = input.as_bytes();
+        served(srv, &mut in_)
+    }
+
+    /// 입력 스트림 하나를 EOF까지 서빙하고 응답 줄들을 JSON 값으로 돌려준다 — 종료 코드는 0이어야 한다.
+    fn served(srv: &Server<'_>, input: &mut dyn BufRead) -> Vec<serde_json::Value> {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = srv.serve(&mut in_, &mut out, &mut err);
+        let code = srv.serve(input, &mut out, &mut err);
         assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
         String::from_utf8(out)
             .unwrap()
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect()
+    }
+
+    /// 요청 줄 상한(1 MiB) — 시험이 상수를 거치지 않고 값을 고정한다.
+    const LINE_LIMIT: usize = 1024 * 1024;
+
+    /// 줄 내용이 정확히 `len`바이트인 ping 요청 — `pad` 문자열 길이로 맞춘다.
+    fn ping_of_len(id: u32, len: usize) -> String {
+        let bare = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping","pad":""}}"#);
+        let pad = "x".repeat(len - bare.len());
+        format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping","pad":"{pad}"}}"#)
+    }
+
+    /// 상한을 넘은 줄의 답 — id를 알 수 없어 null인 -32600(Invalid Request)이고 원인·해결이 담긴다.
+    fn assert_oversized_answer(r: &serde_json::Value) {
+        assert_eq!(r["id"], serde_json::Value::Null, "{r}");
+        assert_eq!(r["error"]["code"], -32600, "{r}");
+        let message = r["error"]["message"].as_str().unwrap();
+        assert!(message.contains("1 MiB"), "{message}");
+        assert_eq!(r.get("result"), None, "{r}");
+    }
+
+    /// 1 MiB를 넘는 요청 줄은 처리하지 않는다 — -32600 오류 하나로 답하고 그 줄을 다음 개행까지
+    /// 버린 뒤 다음 요청을 정상으로 처리한다. 개행 없이 EOF로 끝나는 거대 줄도 같다. 예전 서버는
+    /// 줄 길이 상한 없이 `lines()`로 읽어 3 MiB 줄도 그대로 처리했다 — 개행 없는 입력 하나가
+    /// 메모리를 끝없이 쌓을 수 있었다.
+    #[test]
+    fn request_lines_over_one_mebibyte_are_refused_and_skipped() {
+        let doc = test_doc();
+        let srv = server_for(&doc);
+        let huge = ping_of_len(1, 3 * LINE_LIMIT);
+        let next = r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#;
+        let res = session(&srv, &[&huge, next]);
+        assert_eq!(res.len(), 2, "{res:?}");
+        assert_oversized_answer(&res[0]);
+        assert_eq!(res[1]["id"], 2);
+        assert_eq!(res[1]["result"], serde_json::json!({}));
+        // 개행 없이 끝나는 마지막 줄 — 답한 뒤 정상 종료(0)한다.
+        let input = format!("{next}\n{huge}");
+        let res = served(&srv, &mut input.as_bytes());
+        assert_eq!(res.len(), 2, "{res:?}");
+        assert_eq!(res[0]["id"], 2);
+        assert_oversized_answer(&res[1]);
+    }
+
+    /// 거대 줄은 버퍼에 쌓이지 않는다 — 개행 없는 64 MiB 입력을 보내도 줄 버퍼가 담는 내용은
+    /// 상한(+ `\r` 한 바이트)을 넘지 않고, 그 뒤 줄은 정상으로 처리된다.
+    #[test]
+    fn oversized_request_lines_never_hold_more_than_the_limit() {
+        use std::io::Read;
+        let doc = test_doc();
+        let srv = server_for(&doc);
+        let flood = std::io::repeat(b'x').take(64 * LINE_LIMIT as u64);
+        let rest: &[u8] = b"\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n";
+        let mut reader = std::io::BufReader::new(flood.chain(rest));
+        LINE_BUFFER_PEAK.with(|peak| peak.set(0));
+        let res = served(&srv, &mut reader);
+        let peak = LINE_BUFFER_PEAK.with(std::cell::Cell::get);
+        assert!(peak <= LINE_LIMIT + 1, "line buffer held {peak} bytes");
+        assert_eq!(res.len(), 2, "{res:?}");
+        assert_oversized_answer(&res[0]);
+        assert_eq!(res[1]["id"], 2);
+        assert_eq!(MAX_REQUEST_LINE_BYTES, LINE_LIMIT);
+    }
+
+    /// 상한은 줄 끝(`\n`·`\r\n`)을 뺀 내용에 적용된다 — 정확히 1 MiB인 줄은 `\n`이든 `\r\n`이든
+    /// 처리하고, 1바이트 더 긴 줄만 거부한다. 읽기 덩어리 경계(작은 버퍼)에 걸쳐도 같다.
+    #[test]
+    fn request_line_limit_counts_content_without_the_line_ending() {
+        let doc = test_doc();
+        let srv = server_for(&doc);
+        let input = format!(
+            "{}\n{}\r\n{}\n{}\r\n",
+            ping_of_len(1, LINE_LIMIT),
+            ping_of_len(2, LINE_LIMIT),
+            ping_of_len(3, LINE_LIMIT + 1),
+            ping_of_len(4, LINE_LIMIT + 1),
+        );
+        for capacity in [1, 7, 8192, 3 * LINE_LIMIT] {
+            let mut reader = std::io::BufReader::with_capacity(capacity, input.as_bytes());
+            let res = served(&srv, &mut reader);
+            assert_eq!(res.len(), 4, "capacity {capacity}: {res:?}");
+            assert_eq!(res[0]["id"], 1, "capacity {capacity}");
+            assert_eq!(res[0]["result"], serde_json::json!({}));
+            assert_eq!(res[1]["id"], 2, "capacity {capacity}");
+            assert_eq!(res[1]["result"], serde_json::json!({}));
+            assert_oversized_answer(&res[2]);
+            assert_oversized_answer(&res[3]);
+        }
+    }
+
+    /// UTF-8이 아닌 줄은 예전 `lines()`처럼 읽기 오류다 — 앞 요청의 답은 남기고 같은 문구로 종료 2.
+    #[test]
+    fn request_lines_that_are_not_utf8_end_the_session_as_before() {
+        let doc = test_doc();
+        let srv = server_for(&doc);
+        let input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n\xff\xfe\n\
+                             {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n";
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = srv.serve(&mut &input[..], &mut out, &mut err);
+        assert_eq!(code, 2);
+        assert_eq!(out, b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "mcp: reading stdin: stream did not contain valid UTF-8\n"
+        );
+    }
+
+    /// 줄 끝 처리는 예전 `lines()`와 같다 — `\r\n`·빈 줄·공백 줄을 그대로 다루고, 개행 없는 마지막
+    /// 줄도 한 요청이다. 작은 읽기 버퍼로 `\r`과 `\n`이 다른 덩어리에 걸려도 같다.
+    #[test]
+    fn request_line_endings_match_buffered_lines() {
+        let doc = test_doc();
+        let srv = server_for(&doc);
+        let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\r\n\n  \r\n\r\n\
+                     {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n\
+                     {\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}";
+        for capacity in [1, 2, 3, 64] {
+            let mut reader = std::io::BufReader::with_capacity(capacity, input.as_bytes());
+            let ids: Vec<_> = served(&srv, &mut reader)
+                .iter()
+                .map(|r| r["id"].clone())
+                .collect();
+            assert_eq!(ids, [1, 2, 3], "capacity {capacity}");
+        }
     }
 
     #[test]

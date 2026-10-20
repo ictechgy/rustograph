@@ -103,7 +103,9 @@ rustograph impact --format language-traversal --roots-from schema-facts.json  # 
 없으면 다른 저장소를 답하지 않고 오류를 돌려줍니다 — `--dir`을 스냅샷의
 워크스페이스로 주거나 `--graph` 없이 띄우세요. 스냅샷에 적힌 경로로는 `cargo`를
 실행하지 않습니다. 부분 ID는 후보 목록과 함께 거절됩니다 —
-`rustograph_search`로 정확한 ID를 찾으세요.
+`rustograph_search`로 정확한 ID를 찾으세요. 요청은 한 줄에 1 MiB(1,048,576바이트,
+줄 끝 제외)까지입니다. 더 긴 줄은 버퍼에 쌓지 않고 `id`가 `null`인 JSON-RPC `-32600`
+오류로 답한 뒤 그 줄을 버리고 다음 요청을 계속 읽습니다.
 
 `--semantic` 문서는 `.rustograph/semantic-cache.json`에 캐시됩니다 —
 워크스페이스 소스와 매니페스트 지문이 키라, 오래되거나 깨진 캐시는

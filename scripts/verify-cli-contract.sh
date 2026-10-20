@@ -329,6 +329,19 @@ for tool in rustograph_paths rustograph_search rustograph_deps; do
 		fails=$((fails+1))
 	}
 done
+# 1 MiB를 넘는 요청 줄(여기서는 2 MiB)은 버퍼에 쌓지 않고 -32600 오류로 답한 뒤 다음 줄을 계속 읽는다(종료 0).
+big_out="$({
+	printf '%s' '{"jsonrpc":"2.0","id":1,"method":"ping","pad":"'
+	head -c 2097152 /dev/zero | tr '\0' x
+	printf '%s\n%s\n' '"}' '{"jsonrpc":"2.0","id":2,"method":"ping"}'
+} | "$BIN" mcp --dir "$FIX/fixture" 2>/dev/null)" || {
+	echo "FAIL mcp oversized line: exit $?" >&2
+	fails=$((fails+1))
+}
+if ! echo "$big_out" | grep -q '"code":-32600' || ! echo "$big_out" | grep -q '"id":2,"result"'; then
+	echo "FAIL mcp oversized line: expected a -32600 error and then the next ping answered" >&2
+	fails=$((fails+1))
+fi
 
 if [ "$fails" -gt 0 ]; then
 	echo "$fails contract checks failed" >&2
