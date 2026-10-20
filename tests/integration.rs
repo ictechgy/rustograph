@@ -1312,7 +1312,9 @@ mod cli_tests {
 
     /// 64 MiB를 넘는 모듈 파일은 읽지 않는다 — `graph`는 그 파일의 아이템 없이 limitation을 달고
     /// 종료 0으로 끝난다(이전에는 파일을 통째로 읽고 파싱 오류로 2였다). 그 파일이 선언할 하위
-    /// 모듈·include 입력을 모르므로 `--out`은 기존 출력을 교체하지 않고 새 경로에는 쓴다.
+    /// 모듈·include 입력을 모르므로 `--out`은 기존 출력을 교체하지 않고 새 경로에는 쓴다. 교체 거부는
+    /// 명령마다 다른 수확이 넘긴 입력으로 판정하므로 `graph`(문서 수확)·`schema`(정점 귀속 수확)·
+    /// `routes`(모듈 트리까지 받는 수확) 모두 본다.
     #[test]
     fn module_files_over_64_mib_are_left_out_of_the_graph() {
         let tmp = std::env::temp_dir().join(format!("rg-oversized-{}", std::process::id()));
@@ -1351,16 +1353,25 @@ mod cli_tests {
 
         let existing = tmp.join("graph.json");
         std::fs::write(&existing, "previous complete output").unwrap();
-        let (code, _, err) = run_at(&tmp, &["graph", "--out", existing.to_str().unwrap()]);
-        assert_eq!(code, 2);
-        assert!(
-            err.contains("cannot safely replace an existing output: 1 module file(s) could not be read or parsed"),
-            "{err}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&existing).unwrap(),
-            "previous complete output"
-        );
+        for command in [
+            &["graph"][..],
+            &["schema"],
+            &["routes", "--role", "server"],
+            &["routes", "--role", "client"],
+        ] {
+            let args = [command, &["--out", existing.to_str().unwrap()][..]].concat();
+            let (code, _, err) = run_at(&tmp, &args);
+            assert_eq!(code, 2, "{args:?}: {err}");
+            assert!(
+                err.contains("cannot safely replace an existing output: 1 module file(s) could not be read or parsed"),
+                "{args:?}: {err}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&existing).unwrap(),
+                "previous complete output",
+                "{args:?}"
+            );
+        }
         let fresh = tmp.join("fresh.json");
         let (code, out, err) = run_at(&tmp, &["graph", "--out", fresh.to_str().unwrap()]);
         assert_eq!(code, 0, "{err}");
