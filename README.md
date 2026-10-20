@@ -179,9 +179,15 @@ nine tools — `rustograph_summary`, `rustograph_query`, `rustograph_impact`,
 `rustograph_dead`, `rustograph_rules`, `rustograph_deps`. The document is
 harvested once at startup (or loaded via `--graph`), so every call answers
 over the same snapshot. `rustograph_deps` is the exception: it harvests the
-`--dir` workspace itself on its first call, even with `--graph`. Partial ids
-are refused with a candidate list — call `rustograph_search` or retry with an
-exact id.
+`--dir` workspace itself on its first call, because unused-dependency evidence
+needs the complete workspace graph. With `--graph`, it answers only when that
+workspace is the one the snapshot was harvested from (the snapshot's
+`workspace`, compared as a directory, so a symbolic-link spelling matches).
+Otherwise, or when the snapshot records no absolute `workspace`, it returns an
+error instead of describing another repository; start the server with `--dir`
+set to the snapshot's workspace, or without `--graph`. It never runs `cargo`
+for a path taken from the snapshot. Partial ids are refused with a candidate
+list — call `rustograph_search` or retry with an exact id.
 
 Semantic-mode documents are cached under `.rustograph/semantic-cache.json`,
 keyed by a fingerprint of workspace sources and manifests — a stale or

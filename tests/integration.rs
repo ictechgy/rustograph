@@ -712,6 +712,149 @@ mod cli_tests {
     }
 }
 
+/// 실제 바이너리로 `mcp <args>`를 띄워 도구 하나를 부른다 — (isError 여부, 답 텍스트).
+fn mcp_tool(args: &[&std::ffi::OsStr], tool: &str) -> (bool, String) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rustograph"))
+        .arg("mcp")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("rustograph binary must start");
+    let call = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": tool, "arguments": {}},
+    });
+    writeln!(child.stdin.take().expect("stdin is piped"), "{call}").unwrap();
+    let output = child.wait_with_output().expect("rustograph must finish");
+    assert!(
+        output.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let result = &response["result"];
+    (
+        result["isError"] == true,
+        result["content"][0]["text"].as_str().unwrap().to_string(),
+    )
+}
+
+/// 같은 프로세스에서 CLI를 돌린 표준 출력 — 종료 코드가 0이 아니면 stderr로 실패한다.
+fn cli_stdout(args: &[&str]) -> String {
+    let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = rustograph::cli::run(&argv, &mut out, &mut err);
+    assert_eq!(code, 0, "{args:?}: {}", String::from_utf8_lossy(&err));
+    String::from_utf8(out).unwrap()
+}
+
+/// 의존성 없는 단일 패키지 워크스페이스를 `dir`에 만든다.
+fn lone_workspace(dir: &std::path::Path, name: &str) {
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+}
+
+/// `mcp --graph`는 저장 스냅샷을 서빙하지만 rustograph_deps는 `--dir` 워크스페이스를 따로 수확한다 —
+/// 그 워크스페이스가 스냅샷이 기록한 `workspace`(cargo가 준 절대 경로)와 같은 디렉터리일 때만 답한다.
+/// 예전에는 다른 저장소의 deps를 isError 없이 답해, 에이전트가 같은 세션의 summary·query와 다른
+/// 코드를 말하는 답을 구분할 수 없었다. 기록이 없거나 절대 경로가 아니면 같음을 확인할 수 없어
+/// isError다. 스냅샷이 고른 경로에서는 cargo를 실행하지 않는다(Cargo.lock이 생기지 않는다).
+#[test]
+fn mcp_deps_answers_only_for_the_snapshot_workspace() {
+    use std::ffi::OsStr;
+    let tmp = std::env::temp_dir().join(format!("rg-mcp-deps-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let fixture = fixture();
+    let fixture_dir = fixture.to_str().unwrap();
+    let (other, decoy) = (tmp.join("other"), tmp.join("decoy"));
+    lone_workspace(&other, "other");
+    lone_workspace(&decoy, "decoy");
+    // 표준 출력 graph는 git을 띄우지 않는다 — fixture의 cargo 워크스페이스를 `workspace`로 싣는다.
+    let mut snapshot: serde_json::Value = serde_json::from_str(&cli_stdout(&[
+        "graph",
+        "--level",
+        "symbol",
+        "--dir",
+        fixture_dir,
+    ]))
+    .unwrap();
+    let workspace = snapshot["workspace"].as_str().unwrap().to_string();
+    assert_eq!(
+        std::fs::canonicalize(&workspace).unwrap(),
+        std::fs::canonicalize(&fixture).unwrap()
+    );
+    let mut write_snapshot = |name: &str, workspace: Option<&str>| {
+        match workspace {
+            Some(w) => snapshot["workspace"] = serde_json::json!(w),
+            None => {
+                snapshot.as_object_mut().unwrap().remove("workspace");
+            }
+        }
+        let path = tmp.join(name);
+        std::fs::write(&path, snapshot.to_string()).unwrap();
+        path
+    };
+    let same = write_snapshot("same.json", Some(&workspace));
+    let unrecorded = write_snapshot("unrecorded.json", None);
+    let relative = write_snapshot("relative.json", Some("."));
+    let elsewhere = write_snapshot("elsewhere.json", Some(decoy.to_str().unwrap()));
+    let missing = write_snapshot("missing.json", Some(tmp.join("gone").to_str().unwrap()));
+    let expected = cli_stdout(&["deps", "--format", "json", "--dir", fixture_dir]);
+    let graph = OsStr::new("--graph");
+    let dir = OsStr::new("--dir");
+    // 같은 워크스페이스 — CLI deps와 같은 답이다.
+    let answer = mcp_tool(
+        &[graph, same.as_os_str(), dir, fixture.as_os_str()],
+        "rustograph_deps",
+    );
+    assert_eq!(answer, (false, expected.clone()));
+    // 다른 워크스페이스·기록 없음·상대 경로 기록·다른 디렉터리·없는 디렉터리 기록은 isError — 원인과
+    // 해결을 싣는다.
+    let refused = [
+        (&same, other.as_os_str(), "not the workspace"),
+        (&unrecorded, fixture.as_os_str(), "does not record"),
+        (&relative, fixture.as_os_str(), "does not record"),
+        (&elsewhere, fixture.as_os_str(), "not the workspace"),
+        (&missing, fixture.as_os_str(), "not the workspace"),
+    ];
+    for (snapshot, dir_value, cause) in refused {
+        let (is_error, text) = mcp_tool(
+            &[graph, snapshot.as_os_str(), dir, dir_value],
+            "rustograph_deps",
+        );
+        assert!(is_error, "{snapshot:?} --dir {dir_value:?}: {text}");
+        assert!(text.contains(cause), "{text}");
+        assert!(text.contains("without --graph"), "{text}");
+    }
+    // 스냅샷이 고른 디렉터리에서는 cargo metadata를 돌리지 않았다.
+    assert!(!decoy.join("Cargo.lock").exists());
+    // `--graph` 없이 띄운 세션은 지금처럼 `--dir`을 수확해 답한다.
+    let (is_error, text) = mcp_tool(&[dir, other.as_os_str()], "rustograph_deps");
+    assert!(!is_error, "{text}");
+    // 같은 디렉터리의 다른 표기(심볼릭 링크)도 같은 워크스페이스다 — cargo는 표기를 그대로 돌려준다.
+    #[cfg(unix)]
+    {
+        let alias = tmp.join("alias");
+        std::os::unix::fs::symlink(&fixture, &alias).unwrap();
+        let answer = mcp_tool(
+            &[graph, same.as_os_str(), dir, alias.as_os_str()],
+            "rustograph_deps",
+        );
+        assert_eq!(answer, (false, expected));
+    }
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
 #[test]
 fn glob_import_expands_to_items() {
     // use fixture_core::inline::* — 글롭은 대상 모듈의 아이템을 스코프에 펼친다.

@@ -64,6 +64,13 @@ redirected from stdout, or saved from a modified work tree), or whose
 `revision-unknown:` limitation. Pass `--revision`, or regenerate the snapshot
 with `rustograph graph --level symbol --out FILE`.
 
+`rustograph mcp --graph` answers `rustograph_deps`, which harvests the `--dir`
+workspace itself, only when that workspace is the one the snapshot was
+harvested from (the snapshot's `workspace`). Otherwise, or when the snapshot
+records no absolute `workspace`, the tool returns an error instead of
+describing another repository. Start the server with `--dir` set to the
+snapshot's workspace, or without `--graph`.
+
 ## File output
 
 Graph JSON/Mermaid, schema, route, and rules-baseline files are prepared in the

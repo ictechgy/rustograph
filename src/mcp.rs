@@ -49,6 +49,9 @@ pub struct Server<'d> {
     index: analysis::QueryIndex<'d>,
     /// deps 도구가 cargo metadata를 읽을 워크스페이스 디렉터리.
     dir: PathBuf,
+    /// 문서를 `--graph` 저장 스냅샷에서 읽었는가 — 그러면 deps 도구는 `dir` 워크스페이스가 스냅샷이
+    /// 기록한 워크스페이스와 같을 때만 답한다. 수확한 세션은 문서와 deps가 같은 `dir`을 본다.
+    snapshot: bool,
     /// deps 보고서 — 첫 호출 시 한 번 만든다. 매 요청마다 syn 수확을
     /// 새로 하면 Box::leak된 AST가 서버 수명 동안 계속 쌓이고, 시작
     /// 시 무조건 수확하면 deps를 안 쓰는 세션도 수확 비용을 치른다.
@@ -77,9 +80,16 @@ pub(crate) fn cmd(
         Some(f) => Some(PathBuf::from(f)),
         None => find_config(&dir),
     };
-    let srv = Server::new(&doc, dir, cfg_path);
+    let mut srv = Server::new(&doc, dir, cfg_path);
+    srv.snapshot = a.get("graph").is_some();
     Ok(srv.serve(stdin, out, err))
 }
+
+/// 스냅샷 세션의 deps 도구가 스냅샷의 워크스페이스를 알 수 없을 때의 답 — 원인과 해결 방향.
+const UNRECORDED_WORKSPACE: &str = "the --graph snapshot does not record the absolute cargo \
+     workspace it was harvested from, so rustograph_deps cannot tell whether the --dir workspace is \
+     the same one; regenerate the snapshot with `rustograph graph --level symbol --out FILE`, or \
+     start the server without --graph";
 
 /// 디렉터리에서 규칙 파일 위치만 찾는다 — 내용 파싱은 호출 시점에 한다.
 fn find_config(dir: &Path) -> Option<PathBuf> {
@@ -99,6 +109,7 @@ impl<'d> Server<'d> {
             doc,
             index: analysis::QueryIndex::new(doc),
             dir,
+            snapshot: false,
             deps_report: std::sync::OnceLock::new(),
             cycles: Default::default(),
             cfg_path,
@@ -276,13 +287,8 @@ impl<'d> Server<'d> {
                 let max = arg_usize(args, "max")?.unwrap_or(20);
                 Ok(export::to_json(&analysis::search(self.doc, q, max)))
             }
-            // 첫 호출에 한 번 수확해 메모한다 — 자체 syn 수확으로
-            // 문서를 만드는 이유는 공유 문서가 외부 정점이 없거나
-            // 필터됐을 수 있어 사용 증거로 못 쓰기 때문이다.
-            "rustograph_deps" => self
-                .deps_report
-                .get_or_init(|| deps::report(&self.dir).map(|r| export::to_json(&r)))
-                .clone(),
+            // 첫 호출에 한 번 만들어 메모한다(오류도 세션 내내 같다).
+            "rustograph_deps" => self.deps_report.get_or_init(|| self.deps_json()).clone(),
             "rustograph_cycles" => {
                 let level = match arg_str(args, "level") {
                     Some(l) => Level::parse(l)
@@ -365,6 +371,33 @@ impl<'d> Server<'d> {
                 format!("vertex {id} not found — candidates: {}", cands.join(", "))
             }
         })
+    }
+
+    /// deps 보고서(JSON) — `dir`을 자체 syn 수확으로 만든다. 서빙하는 문서는 외부 정점이 없거나
+    /// 필터됐을 수 있어 사용 증거로 못 쓴다. 스냅샷 세션에서는 `dir` 워크스페이스가 스냅샷이 기록한
+    /// `workspace`(cargo가 준 절대 경로)와 같은 디렉터리일 때만 답한다 — 다르면 같은 세션의 summary·
+    /// query와 다른 저장소를 말하는 답이 되는데 에이전트는 구분할 수 없다. 기록이 없거나 상대 경로면
+    /// 같음을 확인할 수 없어 오류다. 스냅샷이 고른 경로에서는 cargo를 실행하지 않는다.
+    fn deps_json(&self) -> Result<String, String> {
+        if !self.snapshot {
+            return deps::report(&self.dir).map(|r| export::to_json(&r));
+        }
+        let workspace = self
+            .doc
+            .workspace
+            .as_deref()
+            .map(Path::new)
+            .filter(|w| w.is_absolute())
+            .ok_or(UNRECORDED_WORKSPACE)?;
+        match deps::report_in_workspace(&self.dir, workspace)? {
+            Ok(report) => Ok(export::to_json(&report)),
+            Err(dir_workspace) => Err(format!(
+                "rustograph_deps harvests the --dir workspace {}, which is not the workspace the \
+                 --graph snapshot was harvested from (rustograph_summary shows it); start the \
+                 server with --dir set to the snapshot's workspace, or without --graph",
+                dir_workspace.display()
+            )),
+        }
     }
 
     /// 레벨 하나의 cycles 보고서(JSON) — 첫 호출에 만들어 두고 같은 레벨의 다음 호출은
@@ -468,7 +501,7 @@ fn tool_list() -> serde_json::Value {
         },
         {
             "name": "rustograph_deps",
-            "description": "Cargo dependency report: unused declared deps (observed via graph) and duplicate versions. Needs --deps harvest for usage evidence",
+            "description": "Cargo dependency report: unused declared deps and duplicate versions, from the tool's own harvest of the --dir workspace (with --graph, only when that is the workspace the snapshot was harvested from)",
             "inputSchema": {"type": "object", "properties": {}},
         },
         {

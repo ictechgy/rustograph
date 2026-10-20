@@ -9,7 +9,7 @@ use crate::cargo_meta::{self, Metadata};
 use crate::graph::{Document, EdgeKind};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// 참조가 한 건도 관측되지 않은 선언 의존.
 #[derive(Debug, Serialize)]
@@ -49,17 +49,53 @@ pub struct DepsReport {
 /// 그래서 deps는 항상 자체 syn 수확으로 만든다.
 pub fn report(dir: &Path) -> Result<DepsReport, String> {
     let meta = cargo_meta::load(dir)?;
-    // 같은 메타데이터로 수확한다 — source::load는 cargo metadata를 한 번 더 돌린다.
+    report_with(dir, &meta)
+}
+
+/// [`report`]와 같은 보고서를, `dir`의 cargo 워크스페이스 루트가 `workspace`와 같은 디렉터리일 때만
+/// 만든다. 다르면 수확하지 않고 `Ok(Err(dir의 워크스페이스 루트))`다 — 바깥 `Err`는 메타데이터·수확
+/// 오류다. 저장 스냅샷을 서빙하는 쪽(MCP `--graph`)은 deps만 `--dir`을 따로 수확한다 — 두 워크스페이스가
+/// 다르면 한 세션의 답이 서로 다른 저장소를 말하는데 받는 쪽은 구분할 수 없다. `workspace`는 신뢰하지
+/// 않는 저장 문서의 값이라 그 경로에서는 cargo를 실행하지 않는다(문서가 Cargo.lock을 쓸 곳과 네트워크
+/// 대상을 고르게 된다). cargo는 받은 경로 표기를 그대로 돌려주므로, 같은 디렉터리의 다른 표기(심볼릭
+/// 링크)는 정규화한 경로로 같게 본다.
+pub(crate) fn report_in_workspace(
+    dir: &Path,
+    workspace: &Path,
+) -> Result<Result<DepsReport, PathBuf>, String> {
+    let meta = cargo_meta::load(dir)?;
+    if !same_directory(&meta.workspace_root, workspace) {
+        return Ok(Err(meta.workspace_root));
+    }
+    report_with(dir, &meta).map(Ok)
+}
+
+/// 이미 읽은 메타데이터로 `dir`을 수확해 보고서를 만든다 — 같은 메타데이터로 수확한다(source::load는
+/// cargo metadata를 한 번 더 돌린다).
+fn report_with(dir: &Path, meta: &Metadata) -> Result<DepsReport, String> {
     let doc = crate::source::load_with(
         dir,
-        &meta,
+        meta,
         &crate::source::Options {
             symbol_level: true,
             include_deps: true,
             ..Default::default()
         },
     )?;
-    Ok(report_from(&meta, &doc))
+    Ok(report_from(meta, &doc))
+}
+
+/// 두 경로가 같은 디렉터리인가 — 표기가 같거나, 둘 다 정규화한 경로가 같다.
+fn same_directory(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        // 정규화하지 못한 경로(없는 경로·권한 없음)는 같은 디렉터리임을 확인하지 못한 것이다 — fail-closed로
+        // 다르다고 답하고, 호출자가 그 사실을 원인과 해결 방향이 담긴 오류로 알린다.
+        _ => false,
+    }
 }
 
 #[cfg(test)]

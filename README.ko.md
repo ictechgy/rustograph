@@ -96,8 +96,14 @@ rustograph impact --format language-traversal --roots-from schema-facts.json  # 
 (`rustograph_summary`/`_query`/`_impact`/`_paths`/`_search`/`_cycles`/
 `_dead`/`_rules`/`_deps`)을 서빙합니다. 문서는 기동 시 한 번 수확해
 (또는 `--graph`로 읽어) 같은 스냅샷 위에서 답합니다. 단 `rustograph_deps`는
-`--graph`를 써도 첫 호출 때 `--dir` 워크스페이스를 따로 수확합니다. 부분 ID는
-후보 목록과 함께 거절됩니다 — `rustograph_search`로 정확한 ID를 찾으세요.
+미사용 의존 증거에 워크스페이스 전체 그래프가 필요해서 첫 호출 때 `--dir`
+워크스페이스를 따로 수확합니다. `--graph`를 쓰면 그 워크스페이스가 스냅샷을
+수확한 워크스페이스(스냅샷의 `workspace` — 디렉터리로 비교하므로 심볼릭 링크
+표기도 같습니다)일 때만 답합니다. 다르거나 스냅샷에 절대 경로 `workspace`가
+없으면 다른 저장소를 답하지 않고 오류를 돌려줍니다 — `--dir`을 스냅샷의
+워크스페이스로 주거나 `--graph` 없이 띄우세요. 스냅샷에 적힌 경로로는 `cargo`를
+실행하지 않습니다. 부분 ID는 후보 목록과 함께 거절됩니다 —
+`rustograph_search`로 정확한 ID를 찾으세요.
 
 `--semantic` 문서는 `.rustograph/semantic-cache.json`에 캐시됩니다 —
 워크스페이스 소스와 매니페스트 지문이 키라, 오래되거나 깨진 캐시는
