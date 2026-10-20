@@ -232,6 +232,17 @@ Extracted references:
   `users::columns::name` — matched against the workspace's declared
   `table!` names; same-shaped paths that match nothing stay `dynamic`
 
+SQL text is read by a token scanner, not a parser. Following the SQL-text
+rules the isthmus persistence producers share, three positions are not
+relation uses: `FROM` directly inside function arguments
+(`EXTRACT(YEAR FROM created_at)`, `TRIM(BOTH ' ' FROM name)`,
+`SUBSTRING(name FROM 2)`; a subquery inside them still counts), an
+unqualified name that is a CTE of the same `;`-separated statement
+(unquoted names compare case-insensitively, quoted names as written; the
+rule is statement-wide, so `WITH users AS (SELECT * FROM users …)` also
+drops the real `users` its body reads), and the operand of
+`IS [NOT] DISTINCT FROM`.
+
 Each fact carries `symbol: {qualifiedName, usr}` where `usr` is the id of
 the enclosing graph vertex — the same id `impact`/`reach` use, so isthmus
 `trace` can join handler reach to relation uses:

@@ -128,6 +128,15 @@ rustograph impact --format language-traversal --roots-from schema-facts.json  # 
   `users::columns::name` — 워크스페이스에 선언된 `table!` 이름과
   맞물릴 때만 정적으로 인정하고, 안 맞는 같은 모양 경로는 `dynamic`
 
+SQL 텍스트는 파서가 아니라 토큰 스캐너로 읽습니다. isthmus persistence
+생산자들이 함께 쓰는 SQL 텍스트 규칙에 따라 세 자리는 관계 사용이
+아닙니다 — 함수 인자 괄호 바로 안의 `FROM`(`EXTRACT(YEAR FROM
+created_at)`·`TRIM(BOTH ' ' FROM name)`·`SUBSTRING(name FROM 2)`. 그 안의
+하위 질의는 그대로 셉니다), `;`로 나뉜 같은 문장의 CTE 이름인 한정자 없는
+이름(비인용 이름은 대소문자 없이, 인용 이름은 쓴 그대로 비교합니다. 규칙이
+문장 단위라 `WITH users AS (SELECT * FROM users …)`는 본문이 읽는 실제
+`users`도 내지 않습니다), `IS [NOT] DISTINCT FROM`의 피연산자.
+
 사실마다 `symbol: {qualifiedName, usr}`을 싣고 `usr`는 감싸는 그래프
 정점 ID입니다 — `impact`/`reach`와 같은 ID라 isthmus `trace`가 핸들러
 도달과 관계 사용을 잇습니다. fn·impl 메서드(`Type::method`, 트레이트 impl은
