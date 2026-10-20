@@ -343,6 +343,91 @@ mod cli_tests {
         assert_eq!(code, 2);
     }
 
+    /// `rules --format sarif`의 위치는 워크스페이스 루트 상대 URI(`uriBaseId: "%SRCROOT%"`)다 —
+    /// 예전에는 정점 위치의 로컬 절대 경로를 그대로 실어, 코드 스캐닝에 올린 결과에 사용자 경로가
+    /// 남았다. `#[path]`로 루트 밖에 둔 모듈의 위반은 위치 없이 그 사실을 message에 적는다. 심볼릭
+    /// 링크를 지난 `--dir`(cargo는 링크 표기 그대로 워크스페이스 루트를 준다)과 저장 스냅샷
+    /// (`--graph`)도 같은 바이트다.
+    #[test]
+    fn rules_sarif_uris_are_relative_to_the_workspace_root() {
+        let tmp = std::env::temp_dir().join(format!("rg-sarif-uri-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let ws = tmp.join("ws");
+        layered_workspace(&ws);
+        std::fs::write(
+            ws.join("src/lib.rs"),
+            "pub mod app;\npub mod core;\n#[path = \"../../shared/edge.rs\"]\npub mod edge;\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.join("shared")).unwrap();
+        std::fs::write(
+            tmp.join("shared/edge.rs"),
+            "pub fn reach() -> u32 {\n    crate::core::value()\n}\n",
+        )
+        .unwrap();
+        let cfg = tmp.join("rules.yml");
+        std::fs::write(
+            &cfg,
+            "components:\n  app: [\"layers::app/**\"]\n  core: [\"layers::core/**\"]\n  \
+             edge: [\"layers::edge/**\"]\ndeps:\n  app: []\n  core: []\n  edge: []\n",
+        )
+        .unwrap();
+        let cfg = cfg.to_str().unwrap();
+        let sarif = &["rules", "--format", "sarif", "--config", cfg];
+        let (code, out, err) = run_at(&ws, sarif);
+        assert_eq!(code, 0, "{err}");
+        let log: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let results = log["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2, "{out}");
+        let result_from = |caller: &str| {
+            results
+                .iter()
+                .find(|r| r["message"].as_str().unwrap().contains(caller))
+                .unwrap_or_else(|| panic!("no violation from {caller}: {out}"))
+        };
+        assert_eq!(
+            result_from("layers::app::run")["locations"][0]["physicalLocation"],
+            serde_json::json!({
+                "artifactLocation": {"uri": "src/app.rs", "uriBaseId": "%SRCROOT%"},
+                "region": {"startLine": 1}
+            })
+        );
+        let from_edge = result_from("layers::edge::reach");
+        assert!(from_edge.get("locations").is_none(), "{from_edge}");
+        let text = from_edge["message"].as_str().unwrap();
+        assert!(
+            text.ends_with(" (location omitted: the file is outside the workspace root)"),
+            "{text}"
+        );
+        assert!(log["runs"][0].get("originalUriBaseIds").is_none());
+        let real = tmp.canonicalize().unwrap();
+        for spelled in [tmp.display().to_string(), real.display().to_string()] {
+            assert!(!out.contains(&spelled), "{spelled} leaked: {out}");
+        }
+        // 링크를 지난 --dir — 링크는 unix에서만 만든다.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&ws, tmp.join("link")).unwrap();
+            let (code, linked, err) = run_at(&tmp.join("link"), sarif);
+            assert_eq!(code, 0, "{err}");
+            assert_eq!(linked, out);
+        }
+        // 저장 스냅샷은 수확 때의 위치·워크스페이스를 그대로 읽는다.
+        let snapshot = tmp.join("graph.json");
+        let snapshot = snapshot.to_str().unwrap();
+        let (code, _, err) = run_at(&ws, &["graph", "--level", "symbol", "--out", snapshot]);
+        assert_eq!(code, 0, "{err}");
+        let (code, saved, err) = run_at(
+            &ws,
+            &[
+                "rules", "--format", "sarif", "--config", cfg, "--graph", snapshot,
+            ],
+        );
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(saved, out);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     /// 설정 실수는 규칙을 끈 채 통과하지 않고 설정 오류(2)다 — 예전에는 `components:`를
     /// `component:`로 잘못 쓴 설정으로 `rules --strict`가 "0 violations"·종료 0이었고, `deny`·
     /// `signature` 키 오타나 정의되지 않은 컴포넌트의 규칙은 그 규칙만 조용히 사라졌다.

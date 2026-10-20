@@ -142,6 +142,12 @@ MCP 도구 인자도 같은 상한을 넘으면 isError로 답하고, 응답은 
 (`--config sub/.rustograph.yml`의 `../base.txt`). `--dir` 밖에 둔 `--config`와 MCP 서버의
 `--dir`도 같고, 명시 `--baseline FILE`은 실행한 사람이 고른 경로라 어디든 됩니다.
 
+`rules --format sarif`의 위치는 Cargo 워크스페이스 루트 기준 상대 URI(`uriBaseId:
+"%SRCROOT%"`, `/` 구분자, RFC 3986 퍼센트 인코딩)라 로그에 로컬 절대 경로가 남지 않고,
+루트 자신의 경로도 적지 않습니다. 워크스페이스 루트 밖 파일(루트를 벗어나는 `#[path]`
+모듈 등)의 위반은 위치 없이 그 사실을 message에 적습니다. `--graph`로 읽으면 스냅샷에
+기록된 워크스페이스 루트가 기준입니다.
+
 ## persistence 사실 — `schema`
 
 `rustograph schema`는 코드가 SQL 관계를 어떻게 참조하는지 담은 isthmus

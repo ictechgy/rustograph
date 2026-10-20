@@ -285,6 +285,14 @@ so `--config sub/.rustograph.yml` can name `../base.txt`. The same holds for a
 `--config` file outside `--dir` and for the MCP server's `--dir`. An explicit
 `--baseline FILE` is your own choice and may point anywhere.
 
+`rules --format sarif` writes each location as a URI relative to the Cargo
+workspace root — `uriBaseId: "%SRCROOT%"`, `/` separators, RFC 3986
+percent-encoding — so the log carries no local absolute path; the root's own
+path is not recorded either. A violation in a file outside the workspace root,
+such as a `#[path]` module that leaves it, has no location, and its message
+says so. With `--graph`, locations are relative to the workspace root the
+snapshot recorded.
+
 ## Persistence facts — `schema`
 
 `rustograph schema` emits an isthmus `bridge-facts` v1 document
