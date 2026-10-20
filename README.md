@@ -26,9 +26,10 @@ over it, with a deterministic JSON contract meant for coding agents:
 
 - **Tentative edges are labeled, not hidden.** A method call `x.m()` has no
   type information in syntax — rustograph emits speculative fan-out edges
-  marked `tentative: true`, uses them for reachability (erring toward
-  "alive"), and excludes them from cycle and rule evidence with a counted
-  report.
+  marked `tentative: true` to the same-name methods the call could reach,
+  uses them for reachability (erring toward "alive", up to a width cap — see
+  [Graph model](#graph-model)), and excludes them from cycle and rule
+  evidence with a counted report.
 - **Limitations are measured, not boilerplate.** Unresolved paths, macro
   bodies, `#[cfg]` items, and orphan files are counted per project and travel
   with every answer.
@@ -79,7 +80,7 @@ rustograph graph --level crate --deps     # include external crates
 rustograph graph --level symbol           # call/references/implements/signature
 rustograph graph --level symbol --semantic  # + type-resolved calls (feature build)
 rustograph graph --level type --format mermaid
-rustograph graph --out .rustograph/graph.json   # persist, then reuse:
+rustograph graph --out .rustograph/graph.json   # persist (records git HEAD if the tree is clean), then reuse:
 
 rustograph cycles --graph .rustograph/graph.json --strict
 
@@ -102,7 +103,9 @@ rustograph rules --baseline base.txt      # only *new* violations fail
 # Ask about one symbol (agent-oriented JSON)
 rustograph query mycrate::module::f --depth 2
 rustograph impact mycrate::Type --depth 3  # reverse transitive closure
+rustograph impact mycrate::Type --depth 0  # no depth limit (still bounded by --max)
 rustograph paths mycrate::a mycrate::b    # bounded paths between two ids
+rustograph paths mycrate::a mycrate::b --max 50 --budget 200000  # at most 1024 / 1000000
 rustograph search entry                   # exact > suffix > substring
 #   partial ids are refused with candidates — retry with an exact id
 
@@ -112,6 +115,7 @@ rustograph deps --strict                  # exit 1 when findings exist
 
 # Trim the document before analysis
 rustograph graph --focus mycrate::sub     # keep one subtree only
+#   the retention roots and boundary-crossing edges it drops are counted in limitations
 rustograph dead --exclude-tests           # drop #[cfg(test)] subtrees
 rustograph graph --target x86_64-pc-windows-msvc  # evaluate cfg(triple)
 rustograph dead --semantic --no-cache     # bypass the semantic cache
@@ -142,6 +146,20 @@ language-traversal`) follow the isthmus family contract instead: `64` for a
 usage error (stdout stays empty) or when some roots are not graph vertices
 (the document is still written).
 
+A flag or argument that a command does not use is a usage error (`2`) instead
+of being silently ignored — for example `cycles --out`, `query --format` or
+`paths --role`. Every command that reads the graph (`graph`, `cycles`, `dead`,
+`rules`, `query`, `impact`, `paths`, `search`, `mcp`) takes `--dir` or
+`--graph` and the shared flags `--deps`, `--tests`, `--retain-public`,
+`--semantic`, `--no-cache`, `--focus`, `--target` and `--exclude-tests`;
+`rustograph help` lists each command's own flags.
+
+Numeric limits are part of the contract: `query`, `impact` and `search` take
+`--max` up to 10,000, `query` and `impact` take `--depth` up to 64 (`0` means
+no depth limit), and `paths` takes `--max` up to 1,024 and `--budget` up to
+1,000,000. A larger value is a usage error (`2`) instead of being clipped; the
+MCP tools apply the same limits.
+
 ## Graph model
 
 Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
@@ -149,6 +167,24 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
 `contains`, `call`, `references`, `implements`, `signature`.
 
 - `contains` is ownership, not a dependency — it never feeds cycles or rules.
+- Name fan-out: a method call `x.m()` whose receiver type is unknown gets
+  `tentative` call edges to the same-name workspace methods it could reach.
+  Inherent (`T::m`) and trait-declared (`Tr::m`) methods come only
+  from the calling crate, its package's library, and the crates it depends
+  on — transitively and of every kind, including dev, build, and optional
+  dependencies that the default features leave off — because a crate cannot
+  name another crate's types or traits without depending on it. Trait impl
+  methods (`T::<Tr>::m`) come from the whole workspace: `dyn` and generic
+  dispatch reach impls in crates that depend on the caller. Calls whose only
+  same-name methods are out of reach get no edges and are counted in
+  `limitations`. A call left with more than 4,096 candidates gets no edges
+  either and is counted: methods reached only through such calls are
+  reported unreachable by `dead` — whose JSON report and MCP
+  `rustograph_dead` answer carry the same limitation — and their callers are
+  missing from `query`, `impact`, and `reach`. The cap sits far above real workspaces (the
+  widest call across 27 rust-analyzer crates has 544 candidates); it bounds
+  inputs where same-name definitions grow with the workspace. Without a
+  resolve graph from `cargo metadata`, fan-out is not narrowed.
 - Levels are projections: the symbol graph is the source of truth; shallower
   levels fold edges onto owning modules/crates.
 - `signature` edges record types leaked through a function's public
@@ -158,10 +194,26 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
   of its own `#[cfg(...)]` (e.g. `feature = "x"`), and an edge's `cfg` marks
   dependencies that only exist under that condition — `use` statements,
   `contains` of gated items, bodies of gated functions.
+- `generated: true` marks code a tool wrote: one of the first 10 lines of the
+  file contains `@generated`, `auto-generated`, or `autogenerated`, or
+  contains both `generated` and `do not edit`, in any letter case. A
+  `DO NOT EDIT` line without `generated` does not count, and the two words on
+  different lines do not either. Every vertex from one file — its module or
+  crate, items, impl methods, and inline modules — carries the same value.
+  Like `cfg`, it is a fact, not a filter.
 - `unsafe` marks the boundary: vertices that are `unsafe fn`/`unsafe trait`
   or contain an `unsafe {}` block carry `unsafe: true`, and an edge made
   inside an `unsafe {}` block is an entry edge — `unsafe impl` marks its
   `implements` edge too.
+- `revision` (optional) is the source revision a saved graph was harvested
+  from: `graph --out` writes git `HEAD` when the `--dir` work tree is clean
+  (the same check, with the same git isolation, as the traversal `revision`).
+  A harvest written to standard output never carries it, so a snapshot
+  redirected from a harvest's stdout has none. Projections and filters keep
+  it, and `graph --graph` copies the input's value as is into its JSON, on
+  standard output and with `--out` alike. Keep snapshots outside the work
+  tree or in a git-ignored path such as `.rustograph/`: an untracked snapshot
+  makes the next tree look modified.
 
 ## MCP server
 
@@ -171,9 +223,25 @@ nine tools — `rustograph_summary`, `rustograph_query`, `rustograph_impact`,
 `rustograph_dead`, `rustograph_rules`, `rustograph_deps`. The document is
 harvested once at startup (or loaded via `--graph`), so every call answers
 over the same snapshot. `rustograph_deps` is the exception: it harvests the
-`--dir` workspace itself on its first call, even with `--graph`. Partial ids
-are refused with a candidate list — call `rustograph_search` or retry with an
-exact id.
+`--dir` workspace itself on its first call, because unused-dependency evidence
+needs the complete workspace graph. With `--graph`, it answers only when that
+workspace is the one the snapshot was harvested from (the snapshot's
+`workspace`, compared as a directory, so a symbolic-link spelling matches).
+Otherwise, or when the snapshot records no absolute `workspace`, it returns an
+error instead of describing another repository; start the server with `--dir`
+set to the snapshot's workspace, or without `--graph`. It never runs `cargo`
+for a path taken from the snapshot. Partial ids are refused with a candidate
+list — call `rustograph_search` or retry with an exact id.
+
+Each request is one line of at most 1 MiB (1,048,576 bytes, not counting the
+line ending). A longer line is never buffered: the server answers it with a
+JSON-RPC `-32600` error whose `id` is `null`, discards the rest of that line,
+and keeps reading the next request. Tool arguments have the CLI limits —
+`max` up to 10,000 (`rustograph_paths`: 1,024), `depth` up to 64 and `budget`
+up to 1,000,000 — and `tools/list` publishes them as JSON Schema `maximum`. A
+larger value returns an `isError` result instead of being clipped. Responses
+are never cut short: a tool answers with the complete report for the
+arguments it accepted.
 
 Semantic-mode documents are cached under `.rustograph/semantic-cache.json`,
 keyed by a fingerprint of workspace sources and manifests — a stale or
@@ -197,11 +265,36 @@ baseline: .rustograph/rules-baseline.txt  # frozen violations (optional)
 
 Unmapped modules are reported separately — a rule's blind spot is not a pass.
 
+A rules file that would silently switch rules off is a configuration error:
+an unknown key (such as `component:` for `components:`), a `deps`, `deny` or
+`signature` key that names a component `components` does not define, and a
+file that defines no component at all. `rules` exits 2 and the MCP
+`rustograph_rules` tool answers with an error, naming the cause. Only the keys
+are checked; the lists may still name components or module patterns.
+
 A baseline file freezes violations that existed when the rules were adopted:
 `rules --write-baseline` records the current set (one `rule|from|to|kind`
 key per line, `#` comments allowed), and later runs suppress matching
 violations while still reporting `baselined`/`stale_baseline` counts —
 stale entries mean the code improved and the file can be regenerated.
+
+`baseline:` is relative to the directory of the rules file and has to stay
+inside the `--dir` directory, because the rules file comes from the analyzed
+repository and `--write-baseline` creates the file and its parent directories.
+An absolute path, a path whose `..` climbs out of the `--dir` directory, and one
+that leaves it through a symbolic link are configuration errors, which `rules`
+reports before it harvests, reads or writes anything. `..` that stays inside is fine,
+so `--config sub/.rustograph.yml` can name `../base.txt`. The same holds for a
+`--config` file outside `--dir` and for the MCP server's `--dir`. An explicit
+`--baseline FILE` is your own choice and may point anywhere.
+
+`rules --format sarif` writes each location as a URI relative to the Cargo
+workspace root — `uriBaseId: "%SRCROOT%"`, `/` separators, RFC 3986
+percent-encoding — so the log carries no local absolute path; the root's own
+path is not recorded either. A violation in a file outside the workspace root,
+such as a `#[path]` module that leaves it, has no location, and its message
+says so. With `--graph`, locations are relative to the workspace root the
+snapshot recorded.
 
 ## Persistence facts — `schema`
 
@@ -224,6 +317,17 @@ Extracted references:
 - diesel DSL paths — `users::table`, `users::dsl::id`,
   `users::columns::name` — matched against the workspace's declared
   `table!` names; same-shaped paths that match nothing stay `dynamic`
+
+SQL text is read by a token scanner, not a parser. Following the SQL-text
+rules the isthmus persistence producers share, three positions are not
+relation uses: `FROM` directly inside function arguments
+(`EXTRACT(YEAR FROM created_at)`, `TRIM(BOTH ' ' FROM name)`,
+`SUBSTRING(name FROM 2)`; a subquery inside them still counts), an
+unqualified name that is a CTE of the same `;`-separated statement
+(unquoted names compare case-insensitively, quoted names as written; the
+rule is statement-wide, so `WITH users AS (SELECT * FROM users …)` also
+drops the real `users` its body reads), and the operand of
+`IS [NOT] DISTINCT FROM`.
 
 Each fact carries `symbol: {qualifiedName, usr}` where `usr` is the id of
 the enclosing graph vertex — the same id `impact`/`reach` use, so isthmus
@@ -353,8 +457,17 @@ strings as `symbol.usr` in `schema`.
   `--max-reached` 1–100,000; cuts set `truncated` with `depth` /
   `max-reached`.
 - **Identity**: `project` is the same realpath `schema` writes; `revision`
-  is `--revision` or git `HEAD` when the work tree is clean; `graphRevision`
-  is the SHA-256 of the graph JSON (with `root` normalized to the project).
+  is `--revision` or git `HEAD` when the harvested work tree is clean
+  (omitted, with a `revision-unverified:` limitation, when a clean tree cannot
+  be checked without running the repository's git configuration — a work tree
+  with submodules, see [Security: trust boundary](#security-trust-boundary)).
+  With `--graph`, rustograph does not look at git, whose `HEAD` may have moved
+  since the snapshot was saved: `revision` is `--revision` or the one the
+  snapshot records (see [Graph model](#graph-model)), and a snapshot without a
+  usable one gets no `revision` and a `revision-unknown:` limitation.
+  `graphRevision` is the SHA-256 of the graph JSON (with `root` normalized to
+  the project and the snapshot's `revision` left out, so a snapshot and a fresh
+  harvest of the same commit match).
 - **root-not-found**: ids that are not graph vertices are listed without
   `symbol`, a `root-not-found:` limitation is added, and the command exits
   `64` after writing the document.
@@ -374,8 +487,12 @@ no value are omitted — an absent `tentative` means confirmed, an absent
 another symbol does not make that symbol impacted. `query` walks both directions;
 each neighbor/direction is reported once at its shortest discovered depth, with
 all dependency edge kinds for that direction and depth. The starting symbol is
-not repeated as its own neighbor. `--max` bounds the number of result records,
-including zero; `truncated` becomes true only when a record is actually omitted.
+not repeated as its own neighbor. `--max` bounds the number of result records
+(at most 10,000), including zero; `truncated` becomes true only when a record is
+actually omitted. `--depth` is at most 64. `--depth 0` (MCP `depth: 0`) means no
+depth limit: the report covers the whole closure, still bounded by `--max`, and
+keeps `depth: 0`. The default depth is 1, except for MCP `rustograph_impact`,
+whose default is 0.
 
 ## Development
 
@@ -397,7 +514,11 @@ rustup or the active sysroot.
 ## Limitations of the MVP
 
 Syntactic analysis (syn) cannot see through macros, `dyn` dispatch, or
-generics — every such gap is counted in `limitations`. The optional
+generics — every such gap is counted in `limitations`. Name fan-out is
+bounded by the calling crate's dependencies and by a width cap of 4,096
+candidates per call; wider calls are counted instead of fanned out, so `dead`
+can report methods reached only through them (see
+[Graph model](#graph-model)). The optional
 `semantic` feature (`cargo build --features semantic`, then `--semantic`)
 augments body harvesting with rust-analyzer (`ra_ap_*`) semantics: method
 calls resolve by receiver type instead of name fan-out, macro expansions are
@@ -405,7 +526,17 @@ walked, and `dyn`/generic trait calls expand to workspace impl candidates
 (still tentative — the real impl is a runtime fact). The graph contract —
 vertices, edge kinds, `tentative`, `limitations` — is unchanged; only
 accuracy improves. Bodies the semantic engine cannot see (cfg-disabled,
-macro-generated) fall back to the syntactic path with measured counters.
+macro-generated) fall back to the syntactic path with measured counters, and
+calls it cannot resolve fall back to the same bounded name fan-out.
+
+The syntactic harvest does not read a module file — a `mod` file or a crate
+root — larger than 64 MiB. Its module or crate vertex stays, but the items and
+submodules it declares are missing, and `limitations` counts such files, so
+`dead` can report code used only from them as unreachable. `schema` counts
+them under `unparsed-sources`; `routes` and `deps` do not see them. While such
+a file is in the workspace, `--out` does not replace an existing output — write
+to a new path or to stdout. The limit sits far above real sources: the largest
+of 18,080 `.rs` files in 610 crates.io packages is 2.5 MiB.
 
 ## Security: trust boundary
 
@@ -413,36 +544,119 @@ rustograph parses source with syn, but it also runs the Rust toolchain.
 Harvesting a workspace — every analysis that does not load a saved graph with
 `--graph` — runs `cargo metadata`. Even with `--graph`, `--target` runs
 `rustc --print cfg`, and the MCP `rustograph_deps` tool runs `cargo metadata`
-for the `--dir` workspace on its first call. Analyzing an untrusted checkout
-can run programs that the checkout chooses:
+for the `--dir` workspace on its first call; the `--semantic` cache key runs
+`rustc -vV`. These commands run in the current directory, where Cargo reads
+`.cargo/config.toml` (from that directory and its parents) and rustup proxies
+look for a `rust-toolchain.toml` (or `rust-toolchain`) file the same way.
+rustograph keeps a checkout from choosing the programs they run, even when you
+run it inside that checkout — but not from running its own code inside them
+through `[env]` (below), so run it inside a checkout only if you trust it:
 
-- rustograph runs these commands in the current directory. Cargo reads
-  `.cargo/config.toml` from the current directory and its parents, not from
-  the `--dir` workspace, so running rustograph inside a checkout lets that
-  checkout's configuration — for example `build.rustc-wrapper` or
-  `build.rustc` — pick programs that run.
-  When `cargo` and `rustc` are rustup proxies, rustup also selects the
-  toolchain from a `rust-toolchain.toml` (or `rust-toolchain`) file found by
-  walking up from the current directory, and that file can name a custom
-  toolchain directory.
-- `--semantic` executes the analyzed code. rust-analyzer runs `cargo check` in
-  the analyzed workspace root, which builds and runs its build scripts
-  (`build.rs`) under that workspace's Cargo configuration, and then runs its
-  procedural macros to expand them — wherever you run rustograph from. Use
-  `--semantic` only on code you would build yourself.
+- `cargo`, `rustc`, and `rustup` come from absolute `PATH` entries only
+  (`/bin:/usr/bin` when `PATH` is unset) and run by that absolute path. Empty
+  and relative entries such as `.` or `bin` are skipped, because they resolve
+  against the current directory.
+- Every toolchain command runs with `RUSTC_WRAPPER` and
+  `RUSTC_WORKSPACE_WRAPPER` set to empty, which turns off
+  `build.rustc-wrapper` and `build.rustc-workspace-wrapper`, and with `RUSTC`
+  set, which takes precedence over `build.rustc`; without a `rustc` to set,
+  `cargo` does not run.
+- The toolchain is fixed once per run, outside the checkout. `RUSTC` is the
+  `rustc` found on `PATH`, or, when that is a rustup proxy, the path
+  `rustup which rustc` reports. When the `cargo` or `rustc` on `PATH` is a
+  rustup proxy, `RUSTUP_TOOLCHAIN` is also set, to what
+  `rustup show active-toolchain` reports. rustograph asks rustup in a new,
+  empty directory under your temporary directory, so no `rust-toolchain` file
+  is read. A `RUSTUP_TOOLCHAIN` or `RUSTC` that you set yourself is used as
+  given: set `RUSTUP_TOOLCHAIN=<channel>` to analyze with a project's own
+  toolchain.
+- When this leaves a `rust-toolchain` file in the current directory or its
+  parents unused, the document gets a `toolchain-file-ignored:` limitation.
+  When `cargo metadata` fails instead — for example on a manifest that only
+  the file's toolchain can read, such as nightly-only `cargo-features` — the
+  error ends by saying that the file was not used and which toolchain ran; set
+  `RUSTUP_TOOLCHAIN=<channel>` to analyze with the file's toolchain. If the
+  temporary directory itself sits below such a file, or rustup cannot report a
+  toolchain, the analysis fails with an error that asks you to set
+  `RUSTUP_TOOLCHAIN` and `RUSTC`.
+
+The current directory does not change, so the rest of the checkout's Cargo
+configuration — source replacement, `[patch]`, registries — still applies, as
+it does for `cargo build`. That includes two settings rustograph leaves alone:
+
+- The checkout's `[env]` table still sets environment variables for the
+  `rustc` that `cargo metadata` runs to learn the host and target, and with
+  `force = true` it overrides your own values. That is enough to run the
+  checkout's code: `LD_PRELOAD` on Linux or `DYLD_INSERT_LIBRARIES` on macOS
+  can load a library from the checkout into that `rustc`. rustograph does not
+  override `[env]`, so it applies whenever the current directory is the
+  checkout or one of its subdirectories. Running rustograph inside a checkout
+  is therefore not safe for code you do not trust; analyze such a checkout
+  from outside, as described below.
+- Credential providers (`registry.global-credential-providers`,
+  `registries.<name>.credential-provider`), which Cargo runs to authenticate
+  to registries that need it, are not overridden, because that would also
+  turn off your own provider for private registries.
+
+`--semantic` executes the analyzed code. rust-analyzer runs `cargo check` in
+the analyzed workspace root, which builds and runs its build scripts
+(`build.rs`) under that workspace's Cargo configuration, and then runs its
+procedural macros to expand them — wherever you run rustograph from. The
+protections above do not apply to the `cargo` and `rustc` that rust-analyzer
+starts. Use `--semantic` only on code you would build yourself.
 
 For untrusted repositories and pull requests from forks, run rustograph on an
 isolated runner or sandbox that holds no secrets, without `--semantic`, from a
 working directory outside the checkout (neither the checkout nor one of its
-subdirectories), and pass the checkout with `--dir`. The checkout's
-`.cargo/config.toml` and `rust-toolchain.toml` then do not apply to the
-toolchain commands rustograph runs; configuration in the working directory,
-its parents, and your Cargo home still does. `cargo metadata` resolves the
-checkout's dependencies wherever it runs. It can write `Cargo.lock` into the
-checkout, and the analysis fails if that write fails; it can also fetch
-registry and git dependencies named in the checkout's manifests, so limit the
-sandbox's network access if that matters. rustograph does not sandbox these
-commands itself.
+subdirectories, where its `[env]` table applies), and pass the checkout with
+`--dir`. The checkout's `.cargo/config.toml` — `[env]` included — and
+`rust-toolchain.toml` then do not apply to the toolchain commands rustograph
+runs at all; configuration in the working directory, its parents, and your
+Cargo home still does. `cargo metadata` resolves the checkout's dependencies
+wherever it runs. It can write `Cargo.lock` into the checkout, and the
+analysis fails if that write fails; it can also fetch registry and git
+dependencies named in the checkout's manifests, so limit the sandbox's network
+access if that matters. rustograph does not sandbox these commands itself.
+
+`reach` and `impact --format language-traversal` without `--revision` or
+`--graph`, and `graph --out` when it writes a harvested graph as JSON, also run
+`git` in the `--dir` directory, only to read the source revision
+(`git config`, `git ls-files`, `git status`, `git rev-parse`). These calls keep
+the analyzed checkout from choosing the programs that run, whether through
+`PATH` or through its git configuration:
+
+- rustograph runs the first `git` found in an absolute `PATH` entry
+  (`/bin:/usr/bin` when `PATH` is unset), by that absolute path. Empty and
+  relative entries such as `.` or `bin` are skipped: because git starts in
+  the `--dir` directory, such an entry can resolve inside the analyzed
+  checkout and run a `git` that the checkout contains. Without `git` in an
+  absolute entry, `revision` is omitted, as when git is not installed.
+- Right before each call, rustograph lists the filter drivers git sees
+  (`git config -z --includes --name-only --list`, which covers the repository,
+  your own and the system configuration) and overrides each with empty
+  `clean`, `smudge`, and `process` commands and `required=false`, so git runs
+  none of them, whether `.gitattributes` or `.git/info/attributes` names the
+  driver.
+- `core.fsmonitor`, the untracked cache, `log.showSignature`, and optional
+  locks (`GIT_OPTIONAL_LOCKS=0`) are off, so no fsmonitor hook runs and the
+  index is not rewritten (rewriting it would run the `post-index-change` hook).
+- git never runs inside a submodule: when the index records one, rustograph
+  does not run `git status` at all (`--ignore-submodules=all` otherwise).
+- When a driver name contains `=`, a control character, or invalid UTF-8,
+  rustograph runs no other git command — git's `-c` splits at the first `=`,
+  so such a driver cannot be overridden.
+
+What this changes for `revision` (and for the one `graph --out` records): a
+file that a filter normalizes (git-lfs and the like) is compared as raw
+content, so when git's stat cache is stale for it the tree looks modified and
+`revision` is omitted rather than claiming a clean `HEAD` that rustograph could
+not verify; in a checkout you trust, run `git status` first to refresh git's
+stat cache. A work tree with submodules, or a configuration with a driver name
+that cannot be overridden, gets no automatic `revision` and a
+`revision-unverified:` limitation (`graph --out` records none for it). Pass
+`--revision` to record the analyzed revision yourself. The rest of your git
+configuration, and absolute `PATH` entries as you set them (even one that
+points into the checkout), apply as usual.
 
 ## License
 

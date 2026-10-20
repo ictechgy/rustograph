@@ -7,6 +7,7 @@ pub mod routes;
 pub mod schema;
 
 use crate::cargo_meta::{self, Metadata};
+use crate::fanout;
 use crate::graph::{self, Document, Edge, EdgeKind, Kind, Level, Vertex};
 use crate::harvest::{self, BodyItem, Harvest};
 use crate::modtree::{self, ModTree};
@@ -40,27 +41,38 @@ pub struct Options {
 /// 'static으로 누수시킨다. CLI는 짧게 살다 종료하므로 해제 비용이 없다.
 type Arena = BTreeMap<PathBuf, &'static [syn::Item]>;
 
-/// 분석 대상이 경로를 고르는 소스를 읽을 때의 크기 상한이다. 생성 코드(수 MB)는 넉넉히
-/// 덮되, 상한 없는 읽기가 거대한 sparse 파일을 통째로 메모리에 올리지 않게 한다.
-/// 판단값이다(rustc의 문서화된 한도가 아니다).
+/// 분석 대상이 경로를 고르는 소스를 읽을 때의 크기 상한이다 — 모듈 파일([`parse_into`]),
+/// include 입력, `schema`가 훑는 .rs가 같은 값을 쓴다. 생성 코드(수 MB)는 넉넉히 덮되, 상한 없는
+/// 읽기가 거대한 sparse 파일을 통째로 메모리에 올리지 않게 한다(1 GiB 모듈 파일에 최대 RSS 약
+/// 2 GB였다). 판단값이다(rustc의 문서화된 한도가 아니다) — 로컬 cargo 레지스트리 .rs 18,080개
+/// 가운데 가장 큰 파일(encoding_rs data.rs)이 2.5 MiB다.
 pub(crate) const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// 분석 대상 소스를 `max_bytes`까지만 읽는다 — 정규 파일만 연다([`require_regular_file`]).
-/// 정규 파일이 아니면 `InvalidInput`, 상한을 넘으면 `InvalidData` 오류다.
+/// 정규 파일이 아니면 `InvalidInput`, 상한을 넘으면 `FileTooLarge`, 상한 안이지만 UTF-8이
+/// 아니면 `InvalidData` 오류다. 크기를 UTF-8보다 먼저 본다: 상한+1 바이트에서 끊은 읽기가 다중
+/// 바이트 문자를 가르면 상한을 넘는 정상 파일이 깨진 UTF-8로 보였다. 상한 초과를 따로 알려야
+/// 수확이 그 파일을 읽기 오류가 아니라 limitation으로 다룬다([`parse_into`]).
 pub(crate) fn read_source_bounded(path: &Path, max_bytes: u64) -> std::io::Result<String> {
     use std::io::Read;
     require_regular_file(path)?;
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     std::fs::File::open(path)?
         .take(max_bytes.saturating_add(1))
-        .read_to_string(&mut text)?;
-    if text.len() as u64 > max_bytes {
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::FileTooLarge,
             format!("{} is larger than {max_bytes} bytes", path.display()),
         ));
     }
-    Ok(text)
+    // 문구는 std `read_to_string`과 같다 — 깨진 UTF-8 파일의 "cannot read" 오류가 바뀌지 않게 한다.
+    String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+    })
 }
 
 /// 분석 대상이 경로를 고른 소스가 정규 파일인지 연기 전에 본다 — `metadata`는 stat이라
@@ -173,21 +185,37 @@ pub fn owner_spans(
     Ok((doc, sink.spans.unwrap_or_default()))
 }
 
-/// 정점 ID 집합과 정점별 소스 범위만 돌려준다 — `schema`가 relation-use 사실을
+/// [`vertex_spans`]의 결과 — (정점 ID 집합, 정점별 소스 범위, 입력을 원한 수확이면 그 수확이
+/// 읽은 입력). 입력은 문서를 파일로 쓰는 `schema --out`만 원한다.
+pub(crate) type VertexSpans = (
+    BTreeSet<String>,
+    Vec<harvest::OwnerSpan>,
+    Option<HarvestInputs>,
+);
+
+/// 정점 ID 집합과 정점별 소스 범위를 돌려준다 — `schema`가 relation-use 사실을
 /// impact와 같은 정점 ID로 귀속하는 데 쓴다. 간선은 해석하지 않는다: 본문 이름
 /// 팬아웃 간선이 대형 저장소에서 이 수확 시간·메모리의 대부분인데 귀속에는 정점과
 /// 범위만 필요하다. 정점·범위는 1패스가 다 만들므로 [`owner_spans`]와 같다.
+/// `want_inputs`면 이 수확이 읽은 입력도 넘긴다 — `schema --out`이 입력 보호 목록을 위해
+/// cargo metadata와 모듈 트리 파싱을 한 번 더 하지 않게 한다.
 pub(crate) fn vertex_spans(
     dir: &Path,
     meta: &Metadata,
-) -> Result<(BTreeSet<String>, Vec<harvest::OwnerSpan>), String> {
+    want_inputs: bool,
+) -> Result<VertexSpans, String> {
     let mut sink = Sink {
         spans: Some(Vec::new()),
         want_edges: false,
+        want_inputs,
         ..Default::default()
     };
     let (doc, _) = harvest(dir, meta, &span_options(), Some(&mut sink))?;
-    Ok((vertex_id_set(doc), sink.spans.unwrap_or_default()))
+    Ok((
+        vertex_id_set(doc),
+        sink.spans.unwrap_or_default(),
+        sink.inputs,
+    ))
 }
 
 /// 정점 범위를 쓰는 수확의 옵션 — 심볼 레벨, 외부 크레이트 정점 없음, semantic 없음.
@@ -232,6 +260,8 @@ pub(crate) struct Parts {
     pub(crate) spans: Vec<harvest::OwnerSpan>,
     pub(crate) tree: ModTree,
     arena: Arena,
+    /// 이 수확이 읽은 입력 — 입력을 원한 수확([`harvest_parts`]의 `want_inputs`)만 채운다.
+    pub(crate) inputs: Option<HarvestInputs>,
 }
 
 impl Parts {
@@ -243,12 +273,18 @@ impl Parts {
 }
 
 /// 기본 옵션(심볼 레벨)으로 수확하고 트리·아레나까지 돌려준다. 라우트 추출은
-/// 간선을 읽지 않으므로 간선 해석을 건너뛴다.
-pub(crate) fn harvest_parts(dir: &Path, meta: &Metadata) -> Result<Parts, String> {
+/// 간선을 읽지 않으므로 간선 해석을 건너뛴다. `want_inputs`면 이 수확이 읽은 입력도
+/// `Parts::inputs`로 넘긴다 — `routes --out`이 입력 보호 목록을 위해 다시 파싱하지 않게 한다.
+pub(crate) fn harvest_parts(
+    dir: &Path,
+    meta: &Metadata,
+    want_inputs: bool,
+) -> Result<Parts, String> {
     let mut sink = Sink {
         spans: Some(Vec::new()),
         want_tree: true,
         want_edges: false,
+        want_inputs,
         ..Default::default()
     };
     let (doc, _) = harvest(dir, meta, &span_options(), Some(&mut sink))?;
@@ -260,6 +296,7 @@ pub(crate) fn harvest_parts(dir: &Path, meta: &Metadata) -> Result<Parts, String
         spans: sink.spans.unwrap_or_default(),
         tree,
         arena,
+        inputs: sink.inputs,
     })
 }
 
@@ -269,8 +306,9 @@ pub(crate) fn harvest_parts(dir: &Path, meta: &Metadata) -> Result<Parts, String
 pub(crate) struct HarvestInputs {
     arena: Arena,
     orphan_files: Vec<PathBuf>,
-    /// 읽거나 파싱하지 못한 모듈 파일 — 끝까지 간 수확에는 없다(수확은 그런 파일에서
-    /// 실패한다). 관대 모드로 트리만 다시 찾은 [`input_files`]만 채운다.
+    /// 하위 모듈·include 입력을 모르는 모듈 파일(경로순) — 크기 상한을 넘어 읽지 않은 파일과,
+    /// 관대 모드로 트리만 다시 찾은 [`input_files`]에서는 읽거나 파싱하지 못한 파일도 있다
+    /// (끝까지 간 수확은 그런 파일에서 실패한다).
     unloaded: Vec<PathBuf>,
     workspace_root: PathBuf,
 }
@@ -282,8 +320,8 @@ pub(crate) struct ProtectedInputs {
     pub(crate) files: Vec<PathBuf>,
     /// 리터럴로 풀지 못한 include 경로가 있다 — 그 대상은 목록에 없다.
     pub(crate) unresolved_includes: bool,
-    /// 읽거나 파싱하지 못한 모듈 파일(경로순) — 파일은 목록에 있지만 그 파일이 선언한
-    /// 하위 모듈·include 입력은 없다.
+    /// 읽거나 파싱하지 못한 모듈 파일과 크기 상한을 넘어 읽지 않은 모듈 파일(경로순) — 파일은
+    /// 목록에 있지만 그 파일이 선언한 하위 모듈·include 입력은 없다.
     pub(crate) unloaded_modules: Vec<PathBuf>,
 }
 
@@ -338,18 +376,22 @@ fn manifests_above<'a>(paths: impl Iterator<Item = &'a PathBuf>) -> Vec<PathBuf>
     found
 }
 
-/// 문서를 만든 수확의 입력을 넘겨받지 못한 `--out`(schema·routes, semantic 캐시 적중)이
-/// 보호 목록을 다시 만든다. 모듈 트리만 키운다 — 이름 해석·정점 수확은 보호 목록에 쓰이지
-/// 않는다. 파일 목록은 [`HarvestInputs::protected_files`]와 같다. 읽거나 파싱하지 못한
-/// 모듈 파일은 오류가 아니라 `unloaded_modules`다 — 그런 파일을 limitation으로 세고 문서를
-/// 내는 명령(`schema`)이 출력 대상에 따라 성공·실패가 갈리지 않게 한다.
+/// 문서를 만든 수확의 입력을 넘겨받지 못한 `--out`(수확하지 않은 `routes --role server`, 정점
+/// 수확이 실패한 `schema`, semantic 캐시 적중)이 보호 목록을 다시 만든다. 모듈 트리만
+/// 키운다 — 이름 해석·정점 수확은 보호 목록에 쓰이지 않는다. 파일 목록은
+/// [`HarvestInputs::protected_files`]와 같다. 읽거나 파싱하지 못한 모듈 파일은 오류가 아니라
+/// `unloaded_modules`다 — 그런 파일을 limitation으로 세고 문서를 내는 명령(`schema`)이 출력
+/// 대상에 따라 성공·실패가 갈리지 않게 한다.
 pub(crate) fn input_files(dir: &Path) -> Result<ProtectedInputs, String> {
     let metadata = cargo_meta::load(dir)?;
     let found = input_tree(&metadata, true)?;
+    // 크기 상한을 넘어 읽지 않은 파일도 그 파일이 선언할 하위 모듈·include 입력을 모른다.
+    let mut unloaded = found.unloaded.unwrap_or_default();
+    unloaded.extend(found.oversized);
     let inputs = HarvestInputs {
         arena: found.arena,
         orphan_files: found.tree.orphan_files,
-        unloaded: found.unloaded.into_iter().flatten().collect(),
+        unloaded: unloaded.into_iter().collect(),
         workspace_root: metadata.workspace_root,
     };
     Ok(inputs.protected_files())
@@ -517,6 +559,13 @@ fn fingerprint(dir: &Path, meta: &Metadata, opts: &Options) -> Option<u64> {
     // RUSTFLAGS가 바뀌면 cfg 평가·의미 해석이 달라진다. 프로브
     // 실패는 지문 불가 — 캐시 없는 경로로 돌아간다.
     feed(cargo_meta::rustc_version()?.as_bytes());
+    // 메타데이터 단계의 limitation(resolve 없음, 쓰지 않은 rust-toolchain 파일)은 문서에 실린다 —
+    // 키에 넣어 다른 실행(다른 작업 디렉터리)의 캐시 문서가 그 사실을 잘못 싣거나 빠뜨리지 않게
+    // 한다. 없으면 아무것도 넣지 않아 기존 키가 그대로다.
+    for note in &meta.limitations {
+        feed(note.as_bytes());
+        feed(&[0]);
+    }
     for var in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"] {
         feed(var.as_bytes());
         feed(std::env::var(var).unwrap_or_default().as_bytes());
@@ -663,13 +712,6 @@ pub(crate) fn parsed_files() -> usize {
 
 #[cfg(test)]
 thread_local! {
-    /// 모듈 정점 규칙으로 생성 코드 마커를 판정한 횟수 — 모듈마다가 아니라 파싱한 파일마다
-    /// 한 번인지 단위 테스트가 센다(테스트 스레드마다 따로).
-    static MODULE_MARKER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-thread_local! {
     /// 캐시 커버리지 검사가 canonicalize한 파일 수 — 정점마다가 아니라 고유 파일마다
     /// 한 번만 재는지 단위 테스트가 센다(테스트 스레드마다 따로).
     static COVERAGE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -772,6 +814,7 @@ fn harvest(
         markers,
         conditional_mods,
         uses_include,
+        oversized,
         ..
     } = input_tree(meta, false)?;
     for t in source_targets(meta).filter(|t| t.kind == "bin") {
@@ -789,6 +832,14 @@ fn harvest(
         ));
     }
     push_skipped_mods(&tree.skipped_mods, &mut limitations);
+    if !oversized.is_empty() {
+        limitations.push(format!(
+            "{} module files larger than {} MiB were not read; the items and submodules they \
+             declare are missing, so dead can report code used only from them as unreachable",
+            oversized.len(),
+            MAX_SOURCE_BYTES >> 20
+        ));
+    }
 
     // 스코프 2단계: 전 모듈의 아이템 표를 먼저 채우고(1단계), 그 다음
     // `use`를 해석한다(2단계). 임포트 해석이 다른 모듈의 아이템 표를 필요로
@@ -807,7 +858,7 @@ fn harvest(
 
     // 1패스: 모듈·아이템 선언 — 정점과 contains/uses/implements 간선.
     let mut bodies: Vec<BodyItem<'_>> = Vec::new();
-    let mut impls: Vec<harvest::ImplBlock> = Vec::new();
+    let mut impls: Vec<harvest::ImplBlock<'_>> = Vec::new();
     let mut attr_refs: Vec<harvest::AttrRef> = Vec::new();
     let mut test_roots: Vec<String> = Vec::new();
     // 지역명이 fn owner_spans와 같으면 이름 해석이 함수 정점으로 읽어 거짓 순환이 된다.
@@ -851,7 +902,8 @@ fn harvest(
         #[cfg(test)]
         LINKED_ITEMS.with(|c| c.set(c.get() + bodies.len() + attr_refs.len()));
         // 메서드 이름 → ID 인덱스 — 이름 팬아웃 폴백에 쓴다(semantic에서는
-        // ra가 해석하지 못한 호출에만 쓰인다).
+        // ra가 해석하지 못한 호출에만 쓰인다). 후보는 본문 크레이트의 의존 폐포로 좁힌다.
+        let fan_out_scope = fan_out_reach(meta);
         let mut method_index: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for v in &vertices {
             if v.kind == Kind::Method {
@@ -899,7 +951,8 @@ fn harvest(
                     krate: b.module.split("::").next().unwrap_or_default(),
                     module: &b.module,
                 };
-                match eng.body_edges(&site, &ids, &method_index, &mut st) {
+                let visible = fan_out_scope.get(site.krate);
+                match eng.body_edges_within(&site, &ids, &method_index, visible, &mut st) {
                     Some(es) => {
                         // 시그니처 간선은 엔진과 무관하게 syn이 권위다.
                         edges.extend(harvest::signature_edges(b, &tree, &dep_crates));
@@ -907,11 +960,12 @@ fn harvest(
                     }
                     None => {
                         st.unmapped += 1;
-                        edges.extend(harvest::bodies(
+                        edges.extend(harvest::bodies_within(
                             std::slice::from_ref(b),
                             &tree,
                             &dep_crates,
                             &method_index,
+                            &fan_out_scope,
                             &mut harvest,
                         ));
                     }
@@ -919,20 +973,22 @@ fn harvest(
             }
             push_sem_stats(&st, eng.has_proc_macros(), &mut limitations, &mut harvest);
         } else {
-            edges.extend(harvest::bodies(
+            edges.extend(harvest::bodies_within(
                 &bodies,
                 &tree,
                 &dep_crates,
                 &method_index,
+                &fan_out_scope,
                 &mut harvest,
             ));
         }
         #[cfg(not(feature = "semantic"))]
-        edges.extend(harvest::bodies(
+        edges.extend(harvest::bodies_within(
             &bodies,
             &tree,
             &dep_crates,
             &method_index,
+            &fan_out_scope,
             &mut harvest,
         ));
 
@@ -987,7 +1043,7 @@ fn harvest(
             k.inputs = Some(HarvestInputs {
                 arena: arena.clone(),
                 orphan_files: tree.orphan_files.clone(),
-                unloaded: Vec::new(),
+                unloaded: oversized.iter().cloned().collect(),
                 workspace_root: meta.workspace_root.clone(),
             });
         }
@@ -1015,7 +1071,7 @@ fn harvest(
 /// 해석된 impl 블록(메서드 밖 연관 아이템을 self 타입에 귀속)이다.
 fn collect_owner_spans(
     tree: &ModTree,
-    impls: &[harvest::ImplBlock],
+    impls: &[harvest::ImplBlock<'_>],
     bodies: &[BodyItem<'_>],
     mut spans: Vec<harvest::OwnerSpan>,
     out: &mut Vec<harvest::OwnerSpan>,
@@ -1039,6 +1095,93 @@ fn collect_owner_spans(
         range: b.range.clone(),
     }));
     *out = spans;
+}
+
+/// 이름 팬아웃이 크레이트마다 고유·트레이트 선언 메서드를 고를 수 있는 크레이트 — 타깃 루트 이름 →
+/// (자기, 같은 패키지의 lib, 전이 의존 폐포 안 멤버 패키지의 lib).
+///
+/// 의존은 종류 전부(normal·dev·build)를 따른다 — 수확이 `#[cfg(test)]` 모듈까지 담아 dev 의존을 빼면
+/// 테스트 코드의 실제 호출을 잃는다. cargo의 resolve 그래프는 기본 feature가 켜지 않은 optional 의존을
+/// 빼지만 수확은 `#[cfg(feature)]` 뒤 코드도 담으므로, 멤버가 선언한 optional 멤버 의존도 따른다.
+/// 정확한 해석보다 넓게(살아 있는 쪽으로) 잡는다 — 의존 크레이트의 dev 의존까지 따라가도 후보가 늘 뿐
+/// 사라지지 않는다. resolve 그래프가 없으면(의존을 모르면) 빈 맵을 돌려 좁히지 않는다.
+fn fan_out_reach(meta: &Metadata) -> fanout::Reach {
+    let mut scope = fanout::Reach::new();
+    if meta
+        .limitations
+        .iter()
+        .any(|l| l == cargo_meta::NO_RESOLVE_GRAPH)
+    {
+        return scope;
+    }
+    let direct = package_dependencies(meta);
+    for (i, p) in meta.packages.iter().enumerate() {
+        if !p.workspace_member {
+            continue;
+        }
+        let libs = closure_libs(meta, &direct, i);
+        for t in p
+            .targets
+            .iter()
+            .filter(|t| matches!(t.kind.as_str(), "lib" | "bin"))
+        {
+            // 같은 이름의 lib/bin은 루트를 공유한다 — 두 타깃의 폐포를 합친다.
+            let visible = scope.entry(t.name.clone()).or_default();
+            visible.extend(libs.iter().cloned());
+            visible.insert(t.name.clone());
+        }
+    }
+    scope
+}
+
+/// 패키지 인덱스마다 직접 의존하는 패키지 인덱스 — resolve 간선(종류 전부)에, 멤버가 선언한
+/// optional 의존 중 워크스페이스 멤버인 것을 더한다(resolve에는 켜진 optional 의존만 있다).
+fn package_dependencies(meta: &Metadata) -> Vec<BTreeSet<usize>> {
+    let mut direct = vec![BTreeSet::new(); meta.packages.len()];
+    for d in &meta.dep_edges {
+        if let (Some(&from), Some(&to)) = (meta.by_id.get(&d.from), meta.by_id.get(&d.to)) {
+            direct[from].insert(to);
+        }
+    }
+    let member_index: BTreeMap<&str, usize> = meta
+        .packages
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.workspace_member)
+        .map(|(i, p)| (p.name.as_str(), i))
+        .collect();
+    for (i, p) in meta.packages.iter().enumerate() {
+        if !p.workspace_member {
+            continue;
+        }
+        for dep_name in &p.optional_deps {
+            if let Some(&to) = member_index.get(dep_name.as_str()) {
+                direct[i].insert(to);
+            }
+        }
+    }
+    direct
+}
+
+/// 패키지 `start`와 그 전이 의존 폐포 안 멤버 패키지들의 lib 타깃 이름이다. 작업 목록으로 걷는다 —
+/// 재귀 함수는 자기 분석에서 symbol 순환이 된다. 의존 순환(dev 의존)은 방문 집합이 끊는다. 외부
+/// 패키지는 메서드 정점이 없어 이름을 싣지 않지만 그 뒤의 멤버(`[patch]`로 바꾼 의존)까지는 걷는다.
+fn closure_libs(meta: &Metadata, direct: &[BTreeSet<usize>], start: usize) -> BTreeSet<String> {
+    let mut seen = BTreeSet::from([start]);
+    let mut pending = vec![start];
+    while let Some(k) = pending.pop() {
+        for &dep_index in &direct[k] {
+            if seen.insert(dep_index) {
+                pending.push(dep_index);
+            }
+        }
+    }
+    seen.into_iter()
+        .map(|k| &meta.packages[k])
+        .filter(|p| p.workspace_member)
+        .filter_map(|p| p.targets.iter().find(|t| t.kind == "lib"))
+        .map(|t| t.name.clone())
+        .collect()
 }
 
 /// 크레이트 정점과 `depends` 간선을 만든다.
@@ -1125,18 +1268,6 @@ fn emit_crate_level(
     }
 }
 
-/// 파일 머리(앞 10줄)의 생성 코드 마커 판정 — 파싱할 때 읽은 원문으로 파일마다 한 번 낸다.
-/// 인라인 모듈은 담은 파일의 판정을 쓴다: 모듈마다 파일을 다시 통째로 읽으면 인라인 모듈이
-/// 수천 개인 생성 파일(prost 출력)에서 (모듈 수 × 파일 크기)를 읽었다. 모듈 정점과 아이템
-/// 정점의 규칙이 서로 달라 둘 다 둔다 — 합치면 기존 generated 플래그가 바뀐다.
-#[derive(Clone, Copy, Default)]
-struct FileMarkers {
-    /// 모듈 정점의 generated — [`text_has_marker`] 규칙.
-    module: bool,
-    /// 아이템·impl 메서드 정점의 generated — harvest의 규칙.
-    items: bool,
-}
-
 /// 수확 입력 — 워크스페이스 멤버의 모듈 트리와 그 파일들의 AST 아레나다.
 /// 수확과 `--out` 입력 보호가 [`input_tree`] 하나로 만들어, 보호 목록이 수확이 실제로
 /// 읽은 파일과 갈라지지 않는다.
@@ -1145,8 +1276,12 @@ struct InputTree {
     /// 전 워크스페이스가 한 트리 — 크레이트 간 `othercrate::x` 해석이 가능해야 한다.
     tree: ModTree,
     arena: Arena,
-    /// 아레나 파일마다의 생성 코드 마커 — 파싱할 때 읽은 원문으로 판정해 둔다.
-    markers: BTreeMap<PathBuf, FileMarkers>,
+    /// 아레나 파일마다의 generated — 파일 머리(앞 10줄)의 생성 코드 마커를 파싱할 때 읽은 원문으로
+    /// 파일마다 한 번 판정해 둔다([`harvest::text_has_generated_marker`]). 그 파일의 모듈(크레이트)·
+    /// 아이템·impl 메서드 정점이 모두 이 값을 쓰고, 인라인 모듈은 담은 파일의 값을 쓴다 — 규칙이 둘이면
+    /// 한 파일이 모듈로는 생성물, 함수로는 손으로 쓴 코드가 됐다. 모듈마다 파일을 다시 통째로 읽으면
+    /// 인라인 모듈이 수천 개인 생성 파일(prost 출력)에서 (모듈 수 × 파일 크기)를 읽었다.
+    markers: BTreeMap<PathBuf, bool>,
     /// `#[cfg]` 뒤의 mod 선언 수 — 수확이 limitation으로 올린다.
     conditional_mods: usize,
     /// 수확 파일 중 include! 계열 매크로를 쓰는 파일이 있는가 — 캐시 판정에 쓴다.
@@ -1154,8 +1289,13 @@ struct InputTree {
     /// 읽거나 파싱하지 못한 모듈 파일 — Some이면 관대 모드다. 수확(None)은 그런 파일에서
     /// 오류로 끝나지만, `--out` 입력 보호는 파일을 적고 나머지 트리를 계속 찾는다. `schema`는
     /// 그런 파일을 unparsed-sources로 세고 문서를 내는데, 보호 목록 수집이 실패하면 `--out`일
-    /// 때만 종료 2가 됐다.
+    /// 때만 종료 2가 됐다. 크기 상한을 넘은 파일은 여기가 아니라 `oversized`에 적는다.
     unloaded: Option<BTreeSet<PathBuf>>,
+    /// 크기 상한([`MAX_SOURCE_BYTES`])을 넘어 읽지 않은 모듈 파일 — 두 모드 모두 오류가 아니다.
+    /// 수확은 limitation으로 세고 그 파일의 아이템·하위 모듈 없이 계속한다. 그 파일이 선언할 하위
+    /// 모듈·include 입력을 모르므로 `--out` 입력 보호는 싣지 못한 모듈 파일처럼 다룬다(기존 출력
+    /// 교체 거부).
+    oversized: BTreeSet<PathBuf>,
 }
 
 impl InputTree {
@@ -1307,17 +1447,24 @@ fn scan_orphans(dir: &Path, known: &BTreeSet<PathBuf>, tree: &mut ModTree) {
 /// 실전에서는 조건부 생성 파일이 깨진 문법을 가질 수 있어 빈 목록으로 둔다.
 /// 정규 파일이 아니면 열지 않고 "cannot read" 오류다 — `mod` 대상은 collect_submodules가,
 /// 타깃 루트는 grow_tree가 미리 거르지만, stat이 실패해 걸러지지 않은 대상과 검사 뒤에 바뀐
-/// 파일도 여기서 막는다. 크기 상한은 두지 않는다(정상인 거대 생성 파일을 오류로 할지
-/// limitation으로 할지 정하지 않았다 — 정규 파일은 끝이 있다).
+/// 파일도 여기서 막는다. [`MAX_SOURCE_BYTES`]를 넘는 파일은 넘는지 알 만큼(상한+1 바이트)만
+/// 읽고 오류 대신 `oversized`에 적는다 — 상한 없는 읽기는 거대한 sparse 파일을 통째로 메모리에
+/// 올렸고, 정상인 거대 생성 파일일 수도 있다. 그 파일은 아레나에 없어 아이템·하위 모듈이 그래프에
+/// 없고, 수확이 그 수를 limitation으로 센다.
 fn parse_into(found: &mut InputTree, file: &Path) -> Result<(), String> {
-    if found.arena.contains_key(file) {
+    if found.arena.contains_key(file) || found.oversized.contains(file) {
         return Ok(());
     }
     #[cfg(test)]
     PARSED_FILES.with(|c| c.set(c.get() + 1));
-    let src = require_regular_file(file)
-        .and_then(|()| std::fs::read_to_string(file))
-        .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+    let src = match read_source_bounded(file, MAX_SOURCE_BYTES) {
+        Ok(src) => src,
+        Err(e) if e.kind() == std::io::ErrorKind::FileTooLarge => {
+            found.oversized.insert(file.to_path_buf());
+            return Ok(());
+        }
+        Err(e) => return Err(format!("cannot read {}: {e}", file.display())),
+    };
     // include! 계열은 파일 경로 인자를 받아 별도 입력을 읽는다 —
     // 그 입력 파일은 정점 위치에 안 나타나 지문 밖이다.
     if !found.uses_include
@@ -1329,11 +1476,9 @@ fn parse_into(found: &mut InputTree, file: &Path) -> Result<(), String> {
     }
     match syn::parse_file(&src) {
         Ok(ast) => {
-            let markers = FileMarkers {
-                module: text_has_marker(&src),
-                items: harvest::text_has_generated_marker(&src),
-            };
-            found.markers.insert(file.to_path_buf(), markers);
+            found
+                .markers
+                .insert(file.to_path_buf(), harvest::text_has_generated_marker(&src));
             found
                 .arena
                 .insert(file.to_path_buf(), Box::leak(ast.items.into_boxed_slice()));
@@ -1407,12 +1552,13 @@ struct ModuleHarvest<'a> {
 }
 
 /// 한 모듈의 선언을 수확한다 — 모듈 정점, contains/uses 간선, 본문 보관.
-/// 생성 코드 마커는 파싱할 때 파일마다 판정해 둔 `markers`에서 찾는다. 모듈 파일과 그룹
-/// 파일은 모두 아레나에 있다(엄격 수확은 싣지 못한 파일에서 오류로 끝난다).
+/// 생성 코드 마커는 파싱할 때 파일마다 판정해 둔 `markers`에서 찾는다 — 모듈 정점과 그 아이템
+/// 정점이 같은 판정을 쓴다. 크기 상한을 넘어 읽지 않은 파일은 아레나에 없어 그 모듈은 아이템 없이
+/// 정점만 남는다(generated는 거짓). 그 밖에 싣지 못한 파일에서는 엄격 수확이 오류로 끝난다.
 fn harvest_module<'a>(
     tree: &mut ModTree,
     arena: &'a Arena,
-    markers: &BTreeMap<PathBuf, FileMarkers>,
+    markers: &BTreeMap<PathBuf, bool>,
     mp: &str,
     out: &mut Harvest,
     dep_vertices: &BTreeSet<String>,
@@ -1423,13 +1569,13 @@ fn harvest_module<'a>(
     let markers_of = |f: &Path| markers.get(f).copied().unwrap_or_default();
     // 파라미터 이름이 fn harvest와 충돌하면 ident 경로가 함수 정점으로
     // 해석돼 거짓 간선·사이클이 생긴다 — 지역명은 `out`으로 둔다.
-    let decls = harvest::decls_with_markers(mp, &krate, &groups, &|f| markers_of(f).items, out);
+    let decls = harvest::decls_with_markers(mp, &krate, &groups, &markers_of, out);
 
     // 모듈 정점 — 타깃 루트는 크레이트 정점을 겸한다(rustc 의미론).
     // 위치는 파일 시작, exported는 `pub mod` 여부를 따른다.
     let is_root = !mp.contains("::");
     let public = tree.modules[mp].public;
-    let generated = markers_of(&file).module;
+    let generated = markers_of(&file);
     let mod_cfg = tree.modules[mp].cfg.clone();
     let vertex = Vertex {
         id: mp.to_string(),
@@ -1501,18 +1647,6 @@ fn owner_module(tree: &ModTree, id: &str) -> Option<String> {
     }
 }
 
-/// 원문 앞 10줄에 생성 코드 마커가 있는지 본다 — 모듈 정점의 generated 규칙이다.
-/// 아이템 정점의 harvest 규칙과 다르다('do not edit'만 있어도 참, 'autogenerated'는 거짓).
-/// 규칙을 합치면 기존 플래그가 바뀌어, 둘 다 두고 [`parse_into`]가 읽은 원문만 같이 쓴다.
-fn text_has_marker(src: &str) -> bool {
-    #[cfg(test)]
-    MODULE_MARKER_SCANS.with(|c| c.set(c.get() + 1));
-    src.lines().take(10).any(|l| {
-        let l = l.to_lowercase();
-        l.contains("do not edit") || l.contains("@generated") || l.contains("auto-generated")
-    })
-}
-
 /// 정점 없이 건너뛴 `mod` 선언을 사유별 limitation 문장으로 옮긴다 — 셀 것이 없는
 /// 사유는 조용하다. 순환 선언을 오류(2)로 만들지 않는 것은 cfg로 막혀 rustc가 받는
 /// 크레이트가 있어서다.
@@ -1564,6 +1698,25 @@ fn push_limitations(h: &Harvest, limitations: &mut Vec<String>) {
             h.fanned_method_calls
         ));
     }
+    if h.out_of_reach_method_calls > 0 {
+        limitations.push(format!(
+            "{} method calls name only inherent or trait-declared methods of crates the calling \
+             crate does not depend on; no fan-out edges were added",
+            h.out_of_reach_method_calls
+        ));
+    }
+    if h.capped_method_calls > 0 {
+        // 가운데 구절은 dead 보고서가 이 문장을 찾는 표지다(`Document::capped_fan_out_limitations`).
+        limitations.push(format!(
+            "{} method calls ({} names) match more than {}{}methods reached only through them are \
+             reported unreachable by dead, and their callers are missing from query, impact, and \
+             reach",
+            h.capped_method_calls,
+            h.capped_method_names.len(),
+            fanout::MAX_CANDIDATES,
+            graph::CAPPED_FAN_OUT_MARK
+        ));
+    }
     if h.external_macros > 0 {
         limitations.push(format!(
             "{} macro invocations resolve to std/external macros and were omitted; \
@@ -1593,6 +1746,10 @@ fn push_sem_stats(
     out: &mut Harvest,
 ) {
     out.fanned_method_calls += st.fanned;
+    out.out_of_reach_method_calls += st.out_of_reach;
+    out.capped_method_calls += st.capped;
+    out.capped_method_names
+        .extend(st.capped_names.iter().cloned());
     out.unresolved_paths += st.unresolved;
     limitations.push(format!(
         "semantic analysis: {} call/reference edges resolved via types; \
@@ -1700,6 +1857,16 @@ mod tests {
         // 캐시 파일이 워크스페이스 안에 있어도 지문을 바꾸지 않는다 —
         // .rustograph는 숨김 디렉터리라 지문 걷기에서 빠진다.
         assert_eq!(k2, fingerprint(&tmp, &meta, &opts).unwrap());
+        // 메타데이터 limitation은 문서에 실리므로 키에 들어간다 — 쓰지 않은 rust-toolchain 파일을
+        // 알린 실행의 캐시 문서가 그 파일이 없는 실행에 재사용되지 않는다.
+        let noted = Metadata {
+            packages: vec![],
+            by_id: BTreeMap::new(),
+            dep_edges: vec![],
+            workspace_root: tmp.clone(),
+            limitations: vec!["toolchain-file-ignored: example".to_string()],
+        };
+        assert_ne!(k2, fingerprint(&tmp, &noted, &opts).unwrap());
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -1901,7 +2068,7 @@ mod tests {
             let full_ids: BTreeSet<String> = full.vertices.iter().map(|v| v.id.clone()).collect();
             let full_spans = span_keys(sink.spans.as_deref().unwrap());
             let (tree, arena) = (sink.tree.unwrap(), sink.arena.unwrap());
-            let (ids, spans) = vertex_spans(&dir, &meta).unwrap();
+            let (ids, spans, _) = vertex_spans(&dir, &meta, false).unwrap();
             assert_eq!(ids, full_ids, "{name}");
             assert_eq!(span_keys(&spans), full_spans, "{name}");
             // 공개 owner_spans는 그대로 간선까지 만든 완전한 문서다.
@@ -1909,7 +2076,7 @@ mod tests {
             let json = |d: &Document| serde_json::to_string(d).unwrap();
             assert_eq!(json(&doc), json(&full), "{name}");
             assert_eq!(span_keys(&owners), full_spans, "{name}");
-            let parts = harvest_parts(&dir, &meta).unwrap();
+            let parts = harvest_parts(&dir, &meta, false).unwrap();
             assert_eq!(parts.vertex_ids, full_ids, "{name}");
             assert_eq!(span_keys(&parts.spans), full_spans, "{name}");
             assert!(parts.tree.modules.keys().eq(tree.modules.keys()), "{name}");
@@ -1922,7 +2089,7 @@ mod tests {
     /// 전부의 매니페스트 확인이다. 새 경로가 같은 파일 집합을 내는지 비교하는 오라클이다.
     fn protected_files_by_full_harvest(dir: &Path) -> (Vec<PathBuf>, bool) {
         let metadata = cargo_meta::load(dir).unwrap();
-        let parts = harvest_parts(dir, &metadata).unwrap();
+        let parts = harvest_parts(dir, &metadata, false).unwrap();
         let mut files: BTreeSet<PathBuf> = parts.arena.keys().cloned().collect();
         let unresolved_includes = include_inputs(&parts.arena, &mut files);
         files.extend(parts.tree.orphan_files);
@@ -1949,9 +2116,10 @@ mod tests {
         (files.into_iter().collect(), unresolved_includes)
     }
 
-    /// `--out` 보호 목록은 문서를 만든 수확의 입력으로 만들든(graph·rules) 모듈 트리만 다시
-    /// 키워 만들든(schema·routes) 옛 구현과 같은 파일 집합·include 미해석 표시다. 조상
-    /// 디렉터리는 한 번씩만 본다 — 파일마다 조상 전부를 stat하면 깊은 트리에서 수만 번이었다.
+    /// `--out` 보호 목록은 문서를 만든 수확의 입력으로 만들든(graph·rules·schema·routes) 모듈
+    /// 트리만 다시 키워 만들든(수확 입력이 없을 때) 옛 구현과 같은 파일 집합·include 미해석
+    /// 표시다. 조상 디렉터리는 한 번씩만 본다 — 파일마다 조상 전부를 stat하면 깊은 트리에서
+    /// 수만 번이었다.
     #[test]
     fn output_protection_matches_the_full_harvest_and_probes_each_directory_once() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1972,16 +2140,23 @@ mod tests {
                 expected,
                 "{name}"
             );
-            let (_, inputs) = load_with_inputs(&dir, &span_options()).unwrap();
-            let reused = inputs
-                .expect("a harvest hands over what it read")
-                .protected_files();
-            assert!(reused.unloaded_modules.is_empty(), "{name}");
-            assert_eq!(
-                (reused.files, reused.unresolved_includes),
-                expected,
-                "{name}"
-            );
+            // graph·rules는 문서 수확이, schema는 정점 귀속 수확이, routes는 트리까지 받는
+            // 수확이 읽은 입력을 넘긴다 — 셋 다 같은 목록이어야 한다.
+            let (_, from_document) = load_with_inputs(&dir, &span_options()).unwrap();
+            let metadata = cargo_meta::load(&dir).unwrap();
+            let (_, _, from_spans) = vertex_spans(&dir, &metadata, true).unwrap();
+            let from_parts = harvest_parts(&dir, &metadata, true).unwrap().inputs;
+            for handed in [from_document, from_spans, from_parts] {
+                let reused = handed
+                    .expect("a harvest hands over what it read")
+                    .protected_files();
+                assert!(reused.unloaded_modules.is_empty(), "{name}");
+                assert_eq!(
+                    (reused.files, reused.unresolved_includes),
+                    expected,
+                    "{name}"
+                );
+            }
             let directories: BTreeSet<&Path> = expected
                 .0
                 .iter()
@@ -2072,7 +2247,7 @@ mod tests {
         std::fs::write(&fits, "fn a() {}").unwrap();
         assert_eq!(read_source_bounded(&fits, 9).unwrap(), "fn a() {}");
         let over = read_source_bounded(&fits, 8).unwrap_err();
-        assert_eq!(over.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(over.kind(), std::io::ErrorKind::FileTooLarge);
         let fifo = tmp.join("pipe.rs");
         let made = std::process::Command::new("mkfifo")
             .arg(&fifo)
@@ -2090,6 +2265,107 @@ mod tests {
         }
         let missing = read_source_bounded(&tmp.join("missing.rs"), MAX_SOURCE_BYTES).unwrap_err();
         assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 상한은 UTF-8 검사보다 먼저 본다 — 상한+1 바이트에서 끊은 읽기가 다중 바이트 문자를 가르면
+    /// 상한을 넘는 정상 UTF-8 파일이 깨진 UTF-8로 보고됐다(수확이 그 파일을 limitation 대신 읽기
+    /// 오류로 다룬다). 상한 초과는 `FileTooLarge`, 상한 안의 깨진 UTF-8은 그대로 `InvalidData`다.
+    #[test]
+    fn bounded_source_judges_the_size_before_utf8() {
+        let tmp =
+            std::env::temp_dir().join(format!("rustograph-bounded-utf8-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file = tmp.join("text.rs");
+        // 'a'(1바이트) 뒤 3바이트 문자 — 상한 1·2의 읽기(2·3바이트)는 문자 한가운데서 끊긴다.
+        std::fs::write(&file, "a한").unwrap();
+        assert_eq!(read_source_bounded(&file, 4).unwrap(), "a한");
+        for max_bytes in [1, 2, 3] {
+            let err = read_source_bounded(&file, max_bytes).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge, "{max_bytes}");
+            assert!(
+                err.to_string()
+                    .ends_with(&format!("is larger than {max_bytes} bytes")),
+                "{max_bytes}: {err}"
+            );
+        }
+        std::fs::write(&file, b"fn a() {}\n// \xff\n").unwrap();
+        let err = read_source_bounded(&file, 64).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "stream did not contain valid UTF-8");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// `len` 바이트의 sparse 파일 — 내용이 0바이트라 Rust로 파싱되지 않고 디스크도 거의 쓰지 않는다.
+    fn sparse_source(path: &Path, len: u64) {
+        std::fs::File::create(path).unwrap().set_len(len).unwrap();
+    }
+
+    /// 크기 상한([`MAX_SOURCE_BYTES`])을 넘는 모듈 파일은 읽지 않고 limitation으로 센다 — 상한 없는
+    /// 읽기는 거대한 sparse 파일을 통째로 메모리에 올렸다(1 GiB 파일에 최대 RSS 약 2 GB). 그 파일의
+    /// 모듈 정점은 상위 `mod` 선언이 만들어 남고, 아이템과 그 파일이 선언할 하위 모듈은 없다. 타깃
+    /// 루트 파일이면 크레이트 정점만 남는다. 하위 모듈·include 입력을 모르므로 `--out` 입력 보호는
+    /// 수확이 넘긴 입력과 관대 모드 재수집 모두 그 파일을 싣지 못한 모듈 파일로 다룬다(기존 출력 교체
+    /// 거부). 상한과 같은 크기는 읽는다 — 0바이트로 찬 파일이라 파싱 오류가 읽었다는 증거다.
+    #[test]
+    fn module_files_over_the_size_limit_are_left_out_with_a_limitation() {
+        let tmp = std::env::temp_dir().join(format!("rustograph-oversized-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let unread_note = "1 module files larger than 64 MiB were not read; the items and \
+                           submodules they declare are missing, so dead can report code used \
+                           only from them as unreachable"
+            .to_string();
+        let files: [(&str, &[u8]); 2] = [
+            (
+                "src/lib.rs",
+                b"pub mod big;\npub mod small;\npub fn top() {}\n",
+            ),
+            ("src/small.rs", b"pub fn f() {}\n"),
+        ];
+        let dir = write_crate(&tmp, "oversized", None, &files);
+        let big = dir.join("src/big.rs");
+        sparse_source(&big, MAX_SOURCE_BYTES + 1);
+        let root_dir = write_crate(&tmp, "oversized_root", None, &[]);
+        sparse_source(&root_dir.join("src/lib.rs"), MAX_SOURCE_BYTES + 1);
+        for (crate_dir, unread_file, kept) in [
+            (
+                &dir,
+                &big,
+                &[
+                    "oversized",
+                    "oversized::big",
+                    "oversized::small",
+                    "oversized::small::f",
+                    "oversized::top",
+                ][..],
+            ),
+            (
+                &root_dir,
+                &root_dir.join("src/lib.rs"),
+                &["oversized_root"][..],
+            ),
+        ] {
+            let doc = load(crate_dir, &span_options()).unwrap();
+            let mut vertex_ids: Vec<&str> = doc.vertices.iter().map(|v| v.id.as_str()).collect();
+            vertex_ids.sort_unstable();
+            assert_eq!(vertex_ids, kept);
+            let notes: Vec<&String> = doc
+                .limitations
+                .iter()
+                .filter(|l| l.contains("64 MiB"))
+                .collect();
+            assert_eq!(notes, [&unread_note], "{}", crate_dir.display());
+            let (_, inputs) = load_with_inputs(crate_dir, &span_options()).unwrap();
+            let harvested = inputs.expect("a fresh harvest hands over its inputs");
+            for listed in [harvested.protected_files(), input_files(crate_dir).unwrap()] {
+                assert_eq!(listed.unloaded_modules, std::slice::from_ref(unread_file));
+                assert!(listed.files.contains(unread_file));
+            }
+        }
+        sparse_source(&big, MAX_SOURCE_BYTES);
+        let err = load(&dir, &span_options()).unwrap_err();
+        assert!(err.starts_with("parse error in"), "{err}");
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -2166,6 +2442,150 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// 의존 폐포로 좁힌 뒤에도 같은 이름 후보가 팬아웃 폭 상한을 넘는 호출은 간선을 달지 않고 센다 —
+    /// 상한이 없으면 같은 이름 정의가 워크스페이스 크기에 비례해 는 입력에서 추정 간선이 코드 크기의
+    /// 제곱으로 늘었다. 정확히 상한인 호출은 그대로 펼친다. 같은 이름의 호출이 두 번이면 두 번 센다.
+    #[test]
+    fn fan_out_beyond_the_width_cap_is_counted_without_edges() {
+        let tmp = std::env::temp_dir().join(format!("rustograph-fan-cap-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let max = fanout::MAX_CANDIDATES;
+        let mut lib = String::new();
+        for i in 0..=max {
+            lib.push_str(&format!(
+                "pub struct T{i};\nimpl T{i} {{\n    pub fn get(&self) {{}}\n}}\n"
+            ));
+        }
+        for i in 0..max {
+            lib.push_str(&format!("impl T{i} {{\n    pub fn put(&self) {{}}\n}}\n"));
+        }
+        lib.push_str("pub fn call(x: Unknown) {\n    x.get();\n    x.put();\n    x.get();\n}\n");
+        let dir = write_crate(&tmp, "wide", None, &[("src/lib.rs", lib.as_bytes())]);
+        let doc = load(&dir, &span_options()).unwrap();
+        let targets = call_targets(&doc, "wide::call");
+        assert_eq!(targets.len(), max, "only `put` is fanned out");
+        assert!(targets
+            .iter()
+            .all(|(to, tentative)| to.ends_with("::put") && *tentative));
+        let capped = format!(
+            "2 method calls (1 names) match more than {max} candidate methods and were not fanned \
+             out; methods reached only through them are reported unreachable by dead, and their \
+             callers are missing from query, impact, and reach"
+        );
+        assert!(doc.limitations.contains(&capped), "{:?}", doc.limitations);
+        assert!(doc.limitations.contains(
+            &"1 method calls resolved by name fan-out (no type information; errs toward alive)"
+                .to_string()
+        ));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 이름 팬아웃 폐포 시험용 패키지 — 타깃은 (이름, 종류) 목록, optional은 선언된 optional 의존이다.
+    fn reach_package(
+        name: &str,
+        member: bool,
+        targets: &[(&str, &str)],
+        optional: &[&str],
+    ) -> cargo_meta::Package {
+        cargo_meta::Package {
+            name: name.to_string(),
+            version: "0.1.0".to_string(),
+            targets: targets
+                .iter()
+                .map(|(target, kind)| cargo_meta::Target {
+                    name: target.to_string(),
+                    kind: kind.to_string(),
+                    src: PathBuf::from("src/lib.rs"),
+                })
+                .collect(),
+            workspace_member: member,
+            proc_macro: false,
+            optional_deps: optional.iter().map(|o| o.to_string()).collect(),
+        }
+    }
+
+    /// 패키지 ID(여기서는 이름) 사이의 resolve 간선.
+    fn reach_edge(from: &str, to: &str, kind: &str) -> cargo_meta::DepEdge {
+        cargo_meta::DepEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: kind.to_string(),
+            lib_name: to.to_string(),
+        }
+    }
+
+    /// 의존 폐포 시험 메타데이터 — app은 dep(→ base, lib 이름이 다르다)·외부 ext(→ `[patch]`로 바꾼
+    /// 멤버 patched)·proc-macro 멤버 macros에 의존하고, testdep에 dev 의존(testdep은 app에 dev 의존 —
+    /// 순환), opt에 optional 의존(resolve 간선 없음)이다. tool은 lib과 bin 둘이고, other는 아무와도
+    /// 잇지 않는다.
+    fn reach_metadata() -> Metadata {
+        let packages = vec![
+            reach_package("app", true, &[("app", "lib")], &["opt", "not_a_member"]),
+            reach_package("dep", true, &[("dep", "lib")], &[]),
+            reach_package("base", true, &[("base_lib", "lib")], &[]),
+            reach_package("testdep", true, &[("testdep", "lib")], &[]),
+            reach_package("opt", true, &[("opt", "lib")], &[]),
+            reach_package("ext", false, &[("ext", "lib")], &[]),
+            reach_package("patched", true, &[("patched", "lib")], &[]),
+            reach_package("tool", true, &[("tool", "lib"), ("tool_cli", "bin")], &[]),
+            reach_package("other", true, &[("other", "lib")], &[]),
+            reach_package("macros", true, &[], &[]),
+        ];
+        let by_id = packages
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.name.clone(), i))
+            .collect();
+        Metadata {
+            packages,
+            by_id,
+            dep_edges: vec![
+                reach_edge("app", "dep", ""),
+                reach_edge("dep", "base", ""),
+                reach_edge("app", "ext", ""),
+                reach_edge("ext", "patched", ""),
+                reach_edge("app", "macros", ""),
+                reach_edge("app", "testdep", "dev"),
+                reach_edge("testdep", "app", "dev"),
+            ],
+            workspace_root: PathBuf::from("/w"),
+            limitations: vec![],
+        }
+    }
+
+    /// 크레이트 이름 집합 — 기대값을 짧게 쓰기 위한 도우미.
+    fn crate_names(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// 이름 팬아웃 폐포는 타깃 루트 이름마다 자기와 같은 패키지의 lib, 그리고 의존 종류 전부(dev 포함,
+    /// 순환은 끊는다)와 선언된 optional 멤버 의존을 따라 닿는 멤버 lib이다. 외부 패키지는 이름을 싣지
+    /// 않지만 그 뒤의 멤버까지 걷는다. lib이 없는 멤버(proc-macro)는 이름이 없다. resolve 그래프가
+    /// 없으면 의존을 모르니 맵이 비어 좁히지 않는다.
+    #[test]
+    fn fan_out_reach_follows_every_dependency_kind_and_optional_members() {
+        let scope = fan_out_reach(&reach_metadata());
+        let everything_app_sees =
+            crate_names(&["app", "base_lib", "dep", "opt", "patched", "testdep"]);
+        assert_eq!(scope["app"], everything_app_sees);
+        assert_eq!(scope["testdep"], everything_app_sees);
+        assert_eq!(scope["dep"], crate_names(&["base_lib", "dep"]));
+        assert_eq!(scope["base_lib"], crate_names(&["base_lib"]));
+        assert_eq!(scope["tool"], crate_names(&["tool"]));
+        assert_eq!(scope["tool_cli"], crate_names(&["tool", "tool_cli"]));
+        assert_eq!(scope["other"], crate_names(&["other"]));
+        assert!(
+            !scope.contains_key("ext"),
+            "external packages have no entry"
+        );
+        let mut unresolved = reach_metadata();
+        unresolved.dep_edges.clear();
+        unresolved
+            .limitations
+            .push(cargo_meta::NO_RESOLVE_GRAPH.to_string());
+        assert!(fan_out_reach(&unresolved).is_empty());
+    }
+
     /// 정점 ID의 generated 플래그 — 정점이 없으면 None이다.
     fn generated_flag(doc: &Document, id: &str) -> Option<bool> {
         doc.vertices
@@ -2177,7 +2597,7 @@ mod tests {
     /// 생성 코드 마커는 파싱할 때 읽은 원문으로 파일마다 한 번 판정한다 — 모듈(인라인 모듈
     /// 포함)마다 같은 파일을 다시 통째로 읽으면 인라인 모듈이 수천 개인 생성 파일(prost
     /// 출력)에서 (모듈 수 × 파일 크기)를 읽었다. 인라인 모듈의 모듈·아이템·impl 메서드
-    /// 정점은 담은 파일의 판정을 그대로 받는다.
+    /// 정점은 담은 파일의 판정을 그대로 받고, 모듈 정점도 같은 판정이라 규칙을 따로 돌리지 않는다.
     #[test]
     fn generated_markers_are_judged_once_per_parsed_file() {
         let tmp =
@@ -2199,25 +2619,12 @@ mod tests {
                 ("src/plain.rs", b"pub fn p() {}\n".as_slice()),
             ],
         );
-        let scans_now = || {
-            (
-                MODULE_MARKER_SCANS.with(std::cell::Cell::get),
-                harvest::generated_marker_scans(),
-            )
-        };
-        let (parsed_before, scans_before) = (parsed_files(), scans_now());
+        let (parsed_before, scans_before) = (parsed_files(), harvest::generated_marker_scans());
         let doc = load(&dir, &span_options()).unwrap();
         let parsed = parsed_files() - parsed_before;
-        let scans = (
-            scans_now().0 - scans_before.0,
-            scans_now().1 - scans_before.1,
-        );
+        let scans = harvest::generated_marker_scans() - scans_before;
         assert_eq!(parsed, 2, "lib.rs and plain.rs");
-        assert_eq!(
-            scans,
-            (parsed, parsed),
-            "(module rule, item rule) marker scans for {parsed} parsed files"
-        );
+        assert_eq!(scans, parsed, "marker scans for {parsed} parsed files");
         for id in [
             "markers_once",
             "markers_once::m7",
@@ -2234,11 +2641,14 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// 모듈 정점과 아이템 정점의 생성 마커 규칙은 서로 다르다 — 읽기만 공유하고 규칙은
-    /// 합치지 않는다(합치면 기존 generated 플래그가 바뀐다). 둘 다 원문 앞 10줄만 본다:
-    /// 'do not edit'만 있으면 모듈 정점만, 'autogenerated'만 있으면 아이템 정점만 참이다.
+    /// 모듈 정점과 아이템·impl 메서드 정점은 생성 마커 규칙 하나(harvest 규칙)를 쓴다 — 같은
+    /// 파일을 모듈로는 생성물, 함수로는 손으로 쓴 코드로 받으면 generated로 편집 여부를 고르는
+    /// 에이전트가 생성 파일을 고치거나 손으로 쓴 파일을 건너뛴다. 규칙은 원문 앞 10줄 가운데 한
+    /// 줄에 'generated'와 'do not edit'(또는 '@generated')가 함께 있거나 'auto-generated'·
+    /// 'autogenerated'가 있는 것이다(대소문자 무시). 'do not edit'만 있는 손 관리 파일은 거짓이고,
+    /// 두 낱말이 다른 줄에 있으면 규칙 밖이다.
     #[test]
-    fn generated_marker_rules_stay_distinct_for_modules_and_items() {
+    fn module_and_item_vertices_share_one_generated_marker_rule() {
         let tmp =
             std::env::temp_dir().join(format!("rustograph-marker-rules-{}", std::process::id()));
         std::fs::remove_dir_all(&tmp).ok();
@@ -2246,12 +2656,33 @@ mod tests {
         // 주석 `marker`를 `line`번째 줄에 둔 파일 머리.
         let marker_at =
             |line: usize, marker: &str| format!("{}// {marker}\n", "\n".repeat(line - 1));
-        // (모듈 이름, 파일 머리, 모듈 정점 generated, 아이템 정점 generated)
+        // (모듈 이름, 파일 머리, 그 파일에서 나온 모든 정점의 generated)
         let cases = [
-            ("at_ten", marker_at(10, "@generated"), true, true),
-            ("at_eleven", marker_at(11, "@generated"), false, false),
-            ("edit_only", marker_at(1, "DO NOT EDIT"), true, false),
-            ("autogen", marker_at(1, "autogenerated"), false, true),
+            (
+                "first_line",
+                marker_at(1, "Code generated by protoc-gen-rust. DO NOT EDIT."),
+                true,
+            ),
+            ("at_ten", marker_at(10, "@generated"), true),
+            ("at_eleven", marker_at(11, "@generated"), false),
+            (
+                "edit_by_hand",
+                marker_at(1, "DO NOT EDIT: keep in sync with the spec by hand"),
+                false,
+            ),
+            (
+                "autogen",
+                marker_at(1, "This file is autogenerated by build tooling"),
+                true,
+            ),
+            (
+                "split_lines",
+                format!(
+                    "{}// DO NOT EDIT\n",
+                    marker_at(1, "This file was generated by a tool.")
+                ),
+                false,
+            ),
         ];
         let lib: String = cases
             .iter()
@@ -2270,16 +2701,12 @@ mod tests {
         let dir = write_crate(&tmp, "marker_rules", None, &files);
         let doc = load(&dir, &span_options()).unwrap();
         assert_eq!(generated_flag(&doc, "marker_rules"), Some(false));
-        for (name, _, module_flag, item_flag) in &cases {
+        for (name, _, generated) in &cases {
             let module = format!("marker_rules::{name}");
-            assert_eq!(
-                generated_flag(&doc, &module),
-                Some(*module_flag),
-                "{module}"
-            );
-            for item in ["f", "S", "S::m"] {
-                let id = format!("{module}::{item}");
-                assert_eq!(generated_flag(&doc, &id), Some(*item_flag), "{id}");
+            for id in std::iter::once(module.clone())
+                .chain(["f", "S", "S::m"].map(|item| format!("{module}::{item}")))
+            {
+                assert_eq!(generated_flag(&doc, &id), Some(*generated), "{id}");
             }
         }
         std::fs::remove_dir_all(&tmp).ok();

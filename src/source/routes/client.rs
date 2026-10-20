@@ -20,6 +20,7 @@ use super::template::template_problem;
 use super::wrappers::Wrapper;
 use crate::cargo_meta;
 use crate::source::schema::{rfc3339_utc_now, BridgeFactsTool, BridgeLocation, FactSymbol};
+use crate::source::HarvestInputs;
 use index::Index;
 use scan::{scan_crate, CallSite, Collected, Libs, Mode, Shared};
 use serde::Serialize;
@@ -125,12 +126,25 @@ pub fn client_routes(
     tool_version: &str,
     opts: &ClientOptions,
 ) -> Result<ClientDocument, String> {
+    client_routes_with_inputs(dir, tool_version, opts, false).map(|(doc, _)| doc)
+}
+
+/// [`client_routes`]와 같은 문서와, `want_inputs`면 호출을 찾으려고 한 수확이 읽은 입력을
+/// 돌려준다 — `routes --role client --out`이 입력 보호 목록을 위해 cargo metadata와 모듈 트리
+/// 파싱을 한 번 더 하지 않게 한다.
+pub(crate) fn client_routes_with_inputs(
+    dir: &Path,
+    tool_version: &str,
+    opts: &ClientOptions,
+    want_inputs: bool,
+) -> Result<(ClientDocument, Option<HarvestInputs>), String> {
     let root = dir
         .canonicalize()
         .map_err(|e| format!("cannot resolve {}: {e}", dir.display()))?;
     let meta = cargo_meta::load(dir)?;
     let members = members(&meta);
-    let parts = crate::source::harvest_parts(dir, &meta)?;
+    let mut parts = crate::source::harvest_parts(dir, &meta, want_inputs)?;
+    let inputs = parts.inputs.take();
     let ctx = Ctx::new(&parts, root.clone());
     let krates: Vec<String> = members.iter().flat_map(|m| m.roots.clone()).collect();
     let index = Index::build(&ctx, &krates);
@@ -164,7 +178,7 @@ pub fn client_routes(
     }
     limitations.sort();
     limitations.dedup();
-    Ok(ClientDocument {
+    let doc = ClientDocument {
         format: "bridge-facts",
         version: 1,
         tool: BridgeFactsTool {
@@ -180,7 +194,8 @@ pub fn client_routes(
         source_sets: ClientSourceSets { tests: "excluded" },
         facts,
         limitations,
-    })
+    };
+    Ok((doc, inputs))
 }
 
 /// 래퍼 선언의 service가 문서 service와 다르면 isthmus가 문서를 거부한다 — 먼저 막는다.

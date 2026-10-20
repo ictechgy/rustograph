@@ -61,6 +61,25 @@ fn note_indexed(n: usize) {
     INDEXED.with(|c| c.set(c.get() + n));
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 경로 탐색이 만든 경로 정점 문자열 수 — 부분 경로마다 경로 전체를 복제하지 않고 보고할 경로만
+    /// 만드는지 단위 테스트가 센다(테스트 스레드마다 따로).
+    static PATH_VERTEX_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 테스트용 — 이 스레드에서 지금까지 경로 탐색이 만든 경로 정점 문자열 수.
+#[cfg(test)]
+fn path_vertex_copies() -> usize {
+    PATH_VERTEX_COPIES.with(std::cell::Cell::get)
+}
+
+/// 테스트용 — 경로 정점 문자열 `n`개를 만들었다고 센다.
+#[cfg(test)]
+fn note_path_copies(n: usize) {
+    PATH_VERTEX_COPIES.with(|c| c.set(c.get() + n));
+}
+
 /// 한 문서 위의 질의 색인 — 정점 ID 집합, 양방향·역방향 이웃, 경로 인접, 도달 인접을 처음
 /// 쓰는 질의가 한 번 만들고 같은 문서의 다음 질의가 재사용한다. MCP 서버는 불변 스냅샷
 /// 하나에 query·impact를 세션 내내 묻는다 — 호출마다 전 간선을 다시 색인하면 답이 이웃 몇
@@ -367,22 +386,18 @@ fn paths_bounded(
         return report;
     }
     let adj = index.path_adjacency();
-    // 부분 경로 상태 — 경로 내부 재방문 금지로 단순 경로만 나온다.
-    struct State {
-        vertices: Vec<String>,
-        edges: Vec<EdgeKind>,
-        tentative: bool,
-    }
-    let mut queue: VecDeque<State> = VecDeque::from([State {
-        vertices: vec![from.to_string()],
-        edges: Vec::new(),
+    // 부분 경로 상태는 아레나의 칸 번호로 큐에 넣는다 — 경로 내부 재방문 금지로 단순 경로만 나온다.
+    let mut steps = vec![PathStep {
+        vertex: from,
+        via: None,
         tentative: false,
-    }]);
+    }];
+    let mut queue: VecDeque<usize> = VecDeque::from([0]);
     let mut pending_states = 1usize;
     let mut pending_paths = 0usize;
     *peak_pending = 1;
-    while let Some(s) = queue.pop_front() {
-        let cur = s.vertices.last().expect("state is never empty").clone();
+    while let Some(at) = queue.pop_front() {
+        let cur = steps[at].vertex;
         if cur == to {
             pending_paths -= 1;
         } else {
@@ -396,11 +411,7 @@ fn paths_bounded(
                 report.truncated = true;
                 break;
             }
-            report.paths.push(Path {
-                vertices: s.vertices,
-                edges: s.edges,
-                tentative: s.tentative,
-            });
+            report.paths.push(path_ending_at(&steps, at));
             continue; // 목적지 도달 — 그 너머는 같은 경로의 연장일 뿐이다.
         }
         // 확장 예산이 찼으면 큐를 펼치지 않고 비우며 목적지만 거둔다 —
@@ -410,11 +421,11 @@ fn paths_bounded(
             continue;
         }
         report.expanded += 1;
-        for (nbr, kind, tent) in adj.get(cur.as_str()).into_iter().flatten() {
-            if s.vertices.iter().any(|v| v.as_str() == *nbr) {
+        for (nbr, kind, tent) in adj.get(cur).into_iter().flatten() {
+            if path_visits(&steps, at, nbr) {
                 continue;
             }
-            // 확장할 수 없는 부분 경로는 복제 전에 버린다. 완성 경로는
+            // 확장할 수 없는 부분 경로는 칸을 만들기 전에 버린다. 완성 경로는
             // 별도 슬롯을 사용해 예산이 찼어도 이미 찾은 증거를 보존한다.
             if *nbr != to && report.expanded.saturating_add(pending_states) >= budget {
                 report.truncated = true;
@@ -424,19 +435,18 @@ fn paths_bounded(
                 report.truncated = true;
                 continue;
             }
-            let mut next = State {
-                vertices: s.vertices.clone(),
-                edges: s.edges.clone(),
-                tentative: s.tentative || *tent,
-            };
-            next.vertices.push((*nbr).to_string());
-            next.edges.push(*kind);
+            let tentative = steps[at].tentative || *tent;
+            steps.push(PathStep {
+                vertex: nbr,
+                via: Some((at, *kind)),
+                tentative,
+            });
             if *nbr == to {
                 pending_paths += 1;
             } else {
                 pending_states += 1;
             }
-            queue.push_back(next);
+            queue.push_back(steps.len() - 1);
             *peak_pending = (*peak_pending).max(queue.len());
         }
     }
@@ -447,6 +457,56 @@ fn paths_bounded(
     }
     report.found = !report.paths.is_empty();
     report
+}
+
+/// 경로 탐색 상태 한 칸 — 부분 경로는 앞 칸을 거슬러 올라가 읽는다. 상태마다 경로 전체를 복제하면
+/// 메모리가 예산 × 경로 길이가 된다(30층×폭 6 DAG, 예산 100만에 514MB). 한 칸은 수십 바이트이고
+/// 칸 수는 예산과 경로 상한으로 묶인다(비목적지 칸은 예산 이하, 목적지 칸은 상한 + 1 이하).
+struct PathStep<'s> {
+    /// 이 상태가 끝나는 정점.
+    vertex: &'s str,
+    /// 앞 상태의 칸 번호와 그 정점에서 건넌 간선 종류 — 출발 상태는 None이다.
+    via: Option<(usize, EdgeKind)>,
+    /// 경로에 추정 간선이 하나라도 섞였는가.
+    tentative: bool,
+}
+
+/// 칸 `at`에서 끝나는 부분 경로가 `vertex`를 지나는가 — 단순 경로만 내기 위한 재방문 검사다.
+/// 경로 길이만큼 거슬러 오른다(예전 복제본 선형 탐색과 같은 비용).
+fn path_visits(steps: &[PathStep<'_>], at: usize, vertex: &str) -> bool {
+    let mut cursor = Some(at);
+    while let Some(i) = cursor {
+        if steps[i].vertex == vertex {
+            return true;
+        }
+        cursor = steps[i].via.map(|(parent, _)| parent);
+    }
+    false
+}
+
+/// 칸 `at`에서 끝나는 경로를 보고 형태로 만든다 — 정점 문자열은 보고하는 경로에만 만든다.
+fn path_ending_at(steps: &[PathStep<'_>], at: usize) -> Path {
+    let (mut vertices, mut edges) = (Vec::new(), Vec::new());
+    let mut cursor = Some(at);
+    while let Some(i) = cursor {
+        vertices.push(steps[i].vertex.to_string());
+        cursor = match steps[i].via {
+            Some((parent, kind)) => {
+                edges.push(kind);
+                Some(parent)
+            }
+            None => None,
+        };
+    }
+    vertices.reverse();
+    edges.reverse();
+    #[cfg(test)]
+    note_path_copies(vertices.len());
+    Path {
+        vertices,
+        edges,
+        tentative: steps[at].tentative,
+    }
 }
 
 /// 검색 히트 하나 — 정점과 그 식별 정보.
@@ -780,7 +840,8 @@ pub struct Finding {
 pub struct DeadReport {
     pub roots: Vec<String>,
     pub findings: Vec<Finding>,
-    /// 이 분석의 실측 한계 — 문서의 것과 별개로 판정 관련 한계.
+    /// 이 분석의 실측 한계 — 문서의 것과 별개로 판정 관련 한계. 문서 limitation 가운데서는 판정의
+    /// 입력(보존 루트·들어오는 간선)을 지운 `--focus` 경계 문장만 옮겨 싣는다.
     pub limitations: Vec<String>,
 }
 
@@ -874,6 +935,12 @@ fn dead_with(doc: &Document, out: &ReachMap<'_>, roots: &[String]) -> DeadReport
             "{method_findings} unreachable methods may be invoked via trait objects, generics, or external crates — dispatch not visible to syntactic analysis"
         ));
     }
+    // 이름 팬아웃 폭 상한을 넘은 호출에는 간선이 없고, `--focus`는 보존 루트·들어오는 간선을 지운다.
+    // 둘 다 이 판정의 입력을 줄이므로 그 문서 limitation은 판정 한계로도 싣는다 — JSON 보고서만 읽는
+    // 소비자가 거짓 unreachable을 완전한 답으로 받지 않게. 수확 문장(폭 상한)을 포커스 문장보다 먼저
+    // 싣는다 — rustograph가 만든 문서에 실린 순서와 같다.
+    limitations.extend(doc.capped_fan_out_limitations().cloned());
+    limitations.extend(doc.focus_limitations().cloned());
     DeadReport {
         roots: roots.to_vec(),
         findings,
@@ -930,6 +997,124 @@ mod tests {
         )
     }
 
+    /// 예전 경로 탐색 — 부분 경로 상태마다 경로 전체를 복제하던 구현 그대로다. 아레나 탐색이 같은 BFS
+    /// 순서·잘림·예산 소비·대기 상태 최대치를 내는지 대조하는 기준이다.
+    fn paths_by_copying(
+        index: &QueryIndex<'_>,
+        from: &str,
+        to: &str,
+        max_paths: usize,
+        budget: usize,
+        peak_pending: &mut usize,
+    ) -> PathsReport {
+        let mut report = PathsReport {
+            from: from.to_string(),
+            to: to.to_string(),
+            found: false,
+            truncated: false,
+            expanded: 0,
+            paths: Vec::new(),
+        };
+        if !index.has_vertex(from) || !index.has_vertex(to) {
+            return report; // 끝점이 없으면 경로도 없다 — 호출자가 404를 처리한다.
+        }
+        if from == to {
+            // 자기 경로도 max_paths=0이면 보고할 수 없다 — 0은 "없다"가
+            // 아니라 "제한"이니 truncated로 표시한다.
+            report.found = max_paths > 0;
+            report.truncated = max_paths == 0;
+            if max_paths > 0 {
+                report.paths.push(Path {
+                    vertices: vec![from.to_string()],
+                    edges: Vec::new(),
+                    tentative: false,
+                });
+            }
+            return report;
+        }
+        let adj = index.path_adjacency();
+        // 부분 경로 상태 — 경로 내부 재방문 금지로 단순 경로만 나온다.
+        struct State {
+            vertices: Vec<String>,
+            edges: Vec<EdgeKind>,
+            tentative: bool,
+        }
+        let mut queue: VecDeque<State> = VecDeque::from([State {
+            vertices: vec![from.to_string()],
+            edges: Vec::new(),
+            tentative: false,
+        }]);
+        let mut pending_states = 1usize;
+        let mut pending_paths = 0usize;
+        *peak_pending = 1;
+        while let Some(s) = queue.pop_front() {
+            let cur = s.vertices.last().expect("state is never empty").clone();
+            if cur == to {
+                pending_paths -= 1;
+            } else {
+                pending_states -= 1;
+            }
+            // 목적지 확인이 예산 검사보다 먼저다 — 대기 중인 완성 경로는
+            // 예산을 쓰지 않고 수확한다. 경로 수 상한을 넘는 하나가 더
+            // 보이면 잘림이 확정이다 — 더 찾지 않고 멈춘다.
+            if cur == to {
+                if report.paths.len() >= max_paths {
+                    report.truncated = true;
+                    break;
+                }
+                report.paths.push(Path {
+                    vertices: s.vertices,
+                    edges: s.edges,
+                    tentative: s.tentative,
+                });
+                continue; // 목적지 도달 — 그 너머는 같은 경로의 연장일 뿐이다.
+            }
+            // 확장 예산이 찼으면 큐를 펼치지 않고 비우며 목적지만 거둔다 —
+            // 비목적지 상태 뒤에 대기 중인 완성 경로가 버려지면 안 된다.
+            if report.expanded >= budget {
+                report.truncated = true;
+                continue;
+            }
+            report.expanded += 1;
+            for (nbr, kind, tent) in adj.get(cur.as_str()).into_iter().flatten() {
+                if s.vertices.iter().any(|v| v.as_str() == *nbr) {
+                    continue;
+                }
+                // 확장할 수 없는 부분 경로는 복제 전에 버린다. 완성 경로는
+                // 별도 슬롯을 사용해 예산이 찼어도 이미 찾은 증거를 보존한다.
+                if *nbr != to && report.expanded.saturating_add(pending_states) >= budget {
+                    report.truncated = true;
+                    continue;
+                }
+                if *nbr == to && report.paths.len().saturating_add(pending_paths) > max_paths {
+                    report.truncated = true;
+                    continue;
+                }
+                let mut next = State {
+                    vertices: s.vertices.clone(),
+                    edges: s.edges.clone(),
+                    tentative: s.tentative || *tent,
+                };
+                next.vertices.push((*nbr).to_string());
+                next.edges.push(*kind);
+                if *nbr == to {
+                    pending_paths += 1;
+                } else {
+                    pending_states += 1;
+                }
+                queue.push_back(next);
+                *peak_pending = (*peak_pending).max(queue.len());
+            }
+        }
+        // 남은 큐가 있으면 처리하지 못한 경로가 있다 — 잘렸다고 표시한다.
+        // max_paths만 차고 큐가 비었으면 자연 종료라 truncated가 아니다.
+        if !queue.is_empty() {
+            report.truncated = true;
+        }
+        report.found = !report.paths.is_empty();
+        report
+    }
+
     #[test]
     fn path_budget_bounds_queued_copies_and_keeps_completed_paths() {
         let mut graph = doc();
@@ -956,6 +1141,106 @@ mod tests {
         assert!(peak <= 3, "unbounded pending states: {peak}");
     }
 
+    /// 층마다 앞 층 전부와 이어진 DAG(`layers`층 × 폭 `width`, 정점 `c::lLL_W`)와 어디서도 닿지 않는
+    /// `c::goal` — 출발점에서 단순 경로 상태가 층마다 폭 배로 불어난다.
+    fn layered_doc(layers: usize, width: usize) -> Document {
+        let id = |l: usize, w: usize| format!("c::l{l:02}_{w}");
+        let mut d = doc();
+        d.vertices = (0..layers * width)
+            .map(|i| v(&id(i / width, i % width), Kind::Fn))
+            .collect();
+        d.vertices.push(v("c::goal", Kind::Fn));
+        d.edges = (width..layers * width)
+            .flat_map(|i| (0..width).map(move |a| (i, a)))
+            .map(|(i, a)| {
+                let layer = i / width;
+                Edge::new(id(layer - 1, a), id(layer, i % width), EdgeKind::Call)
+            })
+            .collect();
+        d
+    }
+
+    /// 경로 탐색은 부분 경로마다 경로 전체를 복제하지 않는다 — 상태는 (정점, 앞 상태, 간선 종류, 추정)
+    /// 한 칸이고 경로 정점 문자열은 보고하는 경로에만 만든다. 예전 구현은 상태마다 경로 전체를 복제해
+    /// 메모리가 예산 × 경로 길이였다(30층×폭 6 DAG, 예산 100만에 514MB).
+    #[test]
+    fn paths_materialize_only_the_reported_paths() {
+        let deep = layered_doc(12, 4);
+        let shallow = layered_doc(6, 3);
+        for (d, to, max_paths, reported_paths) in [
+            (&deep, "c::goal", 10, 0),
+            (&shallow, "c::l05_2", 5, 5),
+            (&shallow, "c::l05_2", 1_024, 81),
+        ] {
+            let before = path_vertex_copies();
+            let r = paths(d, "c::l00_0", to, max_paths, 20_000);
+            let copies = path_vertex_copies() - before;
+            assert_eq!(r.paths.len(), reported_paths, "{to}");
+            let reported: usize = r.paths.iter().map(|p| p.vertices.len()).sum();
+            assert_eq!(
+                copies, reported,
+                "{to}: {copies} path vertices made for {reported} reported"
+            );
+        }
+    }
+
+    /// 아레나 탐색은 예전 복제 탐색과 같은 답을 낸다 — 무작위 작은 그래프(추정·비의존·dangling·자기
+    /// 루프·중복 간선)와 작은 예산·경로 상한에서 보고 전체(경로 순서·간선 종류·tentative·found·
+    /// truncated·expanded)와 대기 상태 최대치가 같다.
+    #[test]
+    fn paths_match_the_copying_search_on_random_graphs() {
+        let kinds = [
+            EdgeKind::Call,
+            EdgeKind::References,
+            EdgeKind::Contains,
+            EdgeKind::Implements,
+        ];
+        let mut rng = Lcg(0xa7e4a);
+        let (mut found, mut truncated, mut tentative) = (0, 0, 0);
+        for _ in 0..4_000 {
+            let count = 2 + rng.below(6);
+            let vertex_names: Vec<String> = (0..count)
+                .map(|i| format!("c::v{i}"))
+                .chain(["x::gone".to_string()])
+                .collect();
+            let mut d = doc();
+            d.vertices = vertex_names[..count]
+                .iter()
+                .map(|id| v(id, Kind::Fn))
+                .collect();
+            d.edges = (0..rng.below(24))
+                .map(|_| {
+                    let from = vertex_names[rng.below(vertex_names.len())].clone();
+                    let to = vertex_names[rng.below(vertex_names.len())].clone();
+                    let mut e = Edge::new(from, to, kinds[rng.below(kinds.len())]);
+                    e.tentative = rng.below(4) == 0;
+                    e
+                })
+                .collect();
+            let from = &vertex_names[rng.below(count)];
+            let to = &vertex_names[rng.below(vertex_names.len())];
+            let (max_paths, budget) = (rng.below(6), rng.below(14));
+            let index = QueryIndex::new(&d);
+            let (mut peak, mut want_peak) = (0, 0);
+            let got = paths_bounded(&index, from, to, max_paths, budget, &mut peak);
+            let want = paths_by_copying(&index, from, to, max_paths, budget, &mut want_peak);
+            assert_eq!(
+                serde_json::to_value(&got).unwrap(),
+                serde_json::to_value(&want).unwrap(),
+                "{from} -> {to}, max {max_paths}, budget {budget}: {:?}",
+                d.edges
+            );
+            assert_eq!(peak, want_peak, "{from} -> {to}: {:?}", d.edges);
+            found += usize::from(got.found);
+            truncated += usize::from(got.truncated);
+            tentative += usize::from(got.paths.iter().any(|p| p.tentative));
+        }
+        assert!(
+            found > 500 && truncated > 500 && tentative > 100,
+            "found {found}, truncated {truncated}, tentative {tentative}"
+        );
+    }
+
     #[test]
     fn reachable_follows_tentative_but_roots_gate() {
         let d = doc();
@@ -974,6 +1259,58 @@ mod tests {
         assert_eq!(rep.roots, vec!["c::a"]);
         assert_eq!(rep.findings[0].state, "unreachable");
         assert_eq!(rep.findings[0].reason, "not reachable from retention roots");
+    }
+
+    /// `--focus`가 보존 루트·들어오는 간선을 지운 문서에서는 dead 판정 자체가 부분이다 — 보고서가 그
+    /// limitation을 싣는다(호출자가 루트를 바꿔 묻는 MCP 경로도 같다). 문서의 다른 limitation은
+    /// 지금처럼 보고서에 옮기지 않는다.
+    #[test]
+    fn dead_carries_the_focus_boundary_limitation_only() {
+        let mut d = doc();
+        d.limitations.push("harvest note".into());
+        assert!(dead(&d).unwrap().limitations.is_empty());
+        let focused = d.focus(&["c::b".to_string()]);
+        let note: Vec<String> = focused.focus_limitations().cloned().collect();
+        assert_eq!(note.len(), 1);
+        assert!(note[0].starts_with("--focus dropped 1 retention roots and 2 dependency edges "));
+        let rep = dead(&focused).unwrap();
+        assert!(rep.roots.is_empty());
+        assert_eq!(rep.findings[0].id, "c::b");
+        assert_eq!(rep.limitations, note);
+        let rooted = QueryIndex::new(&focused)
+            .dead(&["c::b".to_string()])
+            .unwrap();
+        assert!(rooted.findings.is_empty());
+        assert_eq!(rooted.limitations, note);
+    }
+
+    /// 이름 팬아웃 폭 상한을 넘은 호출은 간선이 없어, 그 호출로만 닿는 메서드가 unreachable로 나온다 —
+    /// 보고서가 그 수확 limitation을 판정 한계로 싣는다(호출자가 루트를 바꿔 묻는 MCP 경로도 같다).
+    /// 포커스 문장과 함께면 수확 문장이 먼저다. 팬아웃 계수 같은 다른 수확 limitation은 옮기지 않는다.
+    #[test]
+    fn dead_carries_the_fan_out_cap_limitation() {
+        let mut d = doc();
+        let capped = format!(
+            "2 method calls (1 names) match more than 4096{}methods reached only through them are \
+             reported unreachable by dead, and their callers are missing from query, impact, and \
+             reach",
+            crate::graph::CAPPED_FAN_OUT_MARK
+        );
+        d.limitations.push(
+            "1 method calls resolved by name fan-out (no type information; errs toward alive)"
+                .into(),
+        );
+        d.limitations.push(capped.clone());
+        assert_eq!(dead(&d).unwrap().limitations, std::slice::from_ref(&capped));
+        let rooted = QueryIndex::new(&d).dead(&["c::b".to_string()]).unwrap();
+        assert_eq!(rooted.limitations, std::slice::from_ref(&capped));
+        let focused = d.focus(&["c::b".to_string()]);
+        let note: Vec<String> = focused.focus_limitations().cloned().collect();
+        assert_eq!(note.len(), 1);
+        assert_eq!(
+            dead(&focused).unwrap().limitations,
+            [capped, note[0].clone()]
+        );
     }
 
     #[test]

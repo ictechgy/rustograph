@@ -138,6 +138,48 @@ pub(crate) fn parse(args: &[String]) -> Result<Args, String> {
     Ok(a)
 }
 
+/// 그래프 문서를 얻는 명령이 모두 받는 플래그 — 문서 출처(`--dir`·`--graph`)와 USAGE의 공유 플래그.
+/// 공유 플래그는 문서화된 계약이라, 명령이 그 효과를 쓰지 않아도(`cycles --tests`) 기존 호출을 깨지
+/// 않도록 계속 받는다.
+pub(crate) const DOCUMENT_FLAGS: &[&str] = &[
+    "dir",
+    "graph",
+    "deps",
+    "tests",
+    "retain-public",
+    "semantic",
+    "no-cache",
+    "focus",
+    "target",
+    "exclude-tests",
+];
+
+/// 명령이 쓰지 않는 플래그나 남는 위치 인자를 사용법 오류로 거부한다 — 순회 형식을 뺀 명령이 이
+/// 검사 하나를 쓴다. `accepted`는 이 명령이 읽는 플래그 목록들(대개 [`DOCUMENT_FLAGS`]와 명령 고유
+/// 플래그), `positionals`는 받는 위치 인자의 최대 개수다. 조용히 무시하면 사용자는 플래그가 적용됐다고
+/// 믿는다 — `cycles --out`은 파일 없이 0으로 끝났고 `query --format mermaid`는 JSON을 냈다. 허용
+/// 목록이라 나중에 추가되는 플래그도 그 명령이 읽기 전까지는 거부된다. 빠진 위치 인자는 명령마다
+/// 고유한 안내가 있어 여기서 보지 않는다.
+pub(crate) fn reject_unused(
+    a: &Args,
+    accepted: &[&[&str]],
+    positionals: usize,
+) -> Result<(), String> {
+    if let Some(flag) = a.unsupported_flag(&accepted.concat()) {
+        return Err(format!(
+            "{} does not support {flag}; remove it (`rustograph help` lists the flags each command takes)",
+            a.cmd
+        ));
+    }
+    if let Some(extra) = a.positional.get(positionals) {
+        return Err(format!(
+            "{} does not take the argument {extra:?}; remove it (`rustograph help` lists the arguments each command takes)",
+            a.cmd
+        ));
+    }
+    Ok(())
+}
+
 /// 수확 또는 저장 문서 로드 — 모든 명령이 같은 경로로 문서를 얻는다.
 /// --focus/--target/--exclude-tests 필터는 저장 문서에도 같은 순서로
 /// 적용된다 — 필터는 문서 변환이라 수확 방식과 무관하다.
@@ -229,6 +271,95 @@ pub(crate) fn usize_arg(a: &Args, key: &str, default: usize) -> Result<usize, St
             .parse::<usize>()
             .map_err(|_| format!("invalid --{key} {s:?} — expected a non-negative integer")),
         None => Ok(default),
+    }
+}
+
+/// query·impact·search가 한 번에 돌려주는 레코드 수(`--max`, MCP `max`)의 상한 — 10,000.
+/// 계열 schemagraph MCP의 `MAX_RESULTS`와 같고 기본값(query·impact 200, search 20)의 50배다. 이보다 긴
+/// 목록은 에이전트가 한 번에 읽을 답이 아니다. 방문 수도 이 값이 묶는다: 이웃 걷기는 보고 수가 `max`에
+/// 닿으면 멈추므로 깊이 제한 없는 `--depth 0`도 정점을 `max`+1개보다 많이 방문하지 않는다.
+pub(crate) const MAX_RESULTS: usize = 10_000;
+
+/// query·impact 깊이(`--depth`, MCP `depth`)의 상한 — 64. 계열 schemagraph MCP의 `MAX_DEPTH`와 같다.
+/// 0(깊이 제한 없음)은 상한 안이다. 64홉보다 먼 의존자를 원하면 0이 그 답이다(보고 수는 `max`가 묶는다).
+pub(crate) const MAX_DEPTH: usize = 64;
+
+/// paths가 보고하는 경로 수(`--max`, MCP `max`)의 상한 — 1,024. 계열 schemagraph MCP의 `MAX_PATHS`와
+/// 같고 기본값 10의 100배다.
+pub(crate) const MAX_PATHS: usize = 1_024;
+
+/// paths 확장 예산(`--budget`, MCP `budget`)의 상한 — 1,000,000(기본값 50,000의 20배). 대기 부분 경로
+/// 상태가 예산까지 쌓이므로 메모리와 시간이 예산에 비례한다. 30층×폭 6 완전 연결 DAG에서 100만은
+/// release 0.15초·75MB다(상태 한 칸 40바이트). 상태마다 경로 전체를 복제하던 때는 같은 입력에서
+/// 511MB였고, 리뷰 실측으로 1,000만은 7.1GB였다 — 상한이 없으면 호출 하나가 이만큼 쓴다.
+pub(crate) const MAX_PATH_BUDGET: usize = 1_000_000;
+
+/// 상한 오류가 인자를 부르는 표기 — CLI는 플래그(`--max`), MCP는 도구 인자 이름(`max`)이다.
+#[derive(Clone, Copy)]
+pub(crate) enum ArgSpelling {
+    Flag,
+    ToolArgument,
+}
+
+/// query·impact의 `depth`·`max`가 상한 안인지 본다 — CLI `query`·`impact`와 MCP query·impact 도구가 이
+/// 함수 하나로 같은 값을 거부한다(CLI 종료 2, MCP isError).
+pub(crate) fn check_neighbor_limits(
+    spelling: ArgSpelling,
+    depth: usize,
+    max: usize,
+) -> Result<(), String> {
+    let hint = " (0 walks without a depth limit)";
+    at_most(spelling, "depth", depth, MAX_DEPTH, hint)?;
+    at_most(spelling, "max", max, MAX_RESULTS, "")
+}
+
+/// search의 `max`가 상한 안인지 본다 — CLI `search`와 MCP search 도구가 함께 쓴다.
+pub(crate) fn check_search_limit(spelling: ArgSpelling, max: usize) -> Result<(), String> {
+    at_most(spelling, "max", max, MAX_RESULTS, "")
+}
+
+/// paths의 `max`·`budget`이 상한 안인지 본다 — CLI `paths`와 MCP paths 도구가 함께 쓴다.
+pub(crate) fn check_paths_limits(
+    spelling: ArgSpelling,
+    max: usize,
+    budget: usize,
+) -> Result<(), String> {
+    at_most(spelling, "max", max, MAX_PATHS, "")?;
+    at_most(spelling, "budget", budget, MAX_PATH_BUDGET, "")
+}
+
+/// 인자 하나가 `limit` 이하인지 본다. 넘는 값을 조용히 깎지 않는다 — 깎은 답은 요청한 크기의 답처럼
+/// 읽히고, 그대로 받으면 호출 하나가 메모리·시간을 호출자 마음대로 쓴다. `hint`는 해결 방향에 덧붙인다.
+fn at_most(
+    spelling: ArgSpelling,
+    name: &str,
+    value: usize,
+    limit: usize,
+    hint: &str,
+) -> Result<(), String> {
+    if value <= limit {
+        return Ok(());
+    }
+    let shown = match spelling {
+        ArgSpelling::Flag => format!("--{name}"),
+        ArgSpelling::ToolArgument => name.to_string(),
+    };
+    Err(format!(
+        "{shown} {value} exceeds the limit of {limit}; pass a value from 0 to {limit}{hint}"
+    ))
+}
+
+/// query·impact의 깊이 인자를 분석 함수에 넘길 깊이로 바꾼다 — CLI `--depth`와 MCP `depth`가 이 함수
+/// 하나를 지난다. 0은 "깊이 제한 없음"(전체 폐포, 보고 수는 `max`가 묶는다)이다: MCP 도구 설명
+/// ("0 = full closure")과 순회 형식(`--depth 0`은 상한 128)이 0을 "끝까지"로 문서화했는데 CLI만 빈
+/// 결과를 내, 같은 `depth: 0, truncated: false`가 통로마다 반대 뜻이었다. 보고 JSON의 `depth`에는
+/// 호출자가 요청값을 다시 싣는다(`usize::MAX`는 계약이 아니다). analysis 라이브러리 함수의 깊이 뜻
+/// (0 = 이웃 없음)은 라이브러리 호출자를 위해 그대로 둔다.
+pub(crate) fn walk_depth(requested: usize) -> usize {
+    if requested == 0 {
+        usize::MAX
+    } else {
+        requested
     }
 }
 

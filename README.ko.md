@@ -24,9 +24,10 @@ Rust에는 `cargo-modules`, `cargo deps`, 그리고 syn/tree-sitter 기반 콜�
 결정적 JSON 계약의 독자는 코딩 에이전트입니다.
 
 - **추정 간선은 숨기지 않고 표시합니다.** `x.m()` 메서드 호출은 구문만으로
-  타입을 알 수 없습니다 — `tentative: true`로 표시된 팬아웃 간선을 만들어
-  도달성에는 쓰고("살아 있다" 편향), 순환·규칙 증거에서는 제외 수와 함께
-  제외합니다.
+  타입을 알 수 없습니다 — 그 호출이 닿을 수 있는 같은 이름 메서드로
+  `tentative: true`로 표시된 팬아웃 간선을 만들어 도달성에는 쓰고("살아 있다"
+  편향 — 폭 상한까지, [MVP의 한계](#mvp의-한계) 참고), 순환·규칙 증거에서는
+  제외 수와 함께 제외합니다.
 - **limitation은 상용구가 아니라 실측입니다.** 미해석 경로·매크로 본문·
   `#[cfg]` 아이템·orphan 파일을 프로젝트별로 세어 모든 응답에 싣습니다.
 - **삭제 판정을 내지 않습니다.** `dead`는 그래프 사실 `unreachable`만
@@ -61,7 +62,7 @@ rustograph graph --level symbol --semantic
 ```bash
 rustograph graph --level crate --deps    # 크레이트 + 의존 그래프
 rustograph graph --level symbol          # call/references/implements/signature
-rustograph graph --out .rustograph/graph.json
+rustograph graph --out .rustograph/graph.json  # 저장(트리가 깨끗하면 git HEAD를 revision으로 기록)
 rustograph cycles --graph .rustograph/graph.json --strict
 rustograph dead --retain-public --tests
 rustograph dead --explain mycrate::f     # 왜 살아 있나 — 도달 경로
@@ -70,11 +71,12 @@ rustograph rules --format sarif          # GitHub 코드 스캐닝용
 rustograph rules --write-baseline        # 기존 위반을 기준선으로 얼림
 rustograph query mycrate::module::f --depth 2
 rustograph impact mycrate::Type --depth 3
+rustograph impact mycrate::Type --depth 0  # 깊이 제한 없는 전체 폐포(--max로만 묶임, MCP depth 0과 같음)
 rustograph paths mycrate::a mycrate::b   # 두 정점 사이 제한된 경로 탐색
 rustograph search entry                  # 정확 > 꼬리 > 부분 문자열 순위
 rustograph deps                          # 미사용 의존 + 중복 버전 보고
 rustograph deps --strict                 # 발견이 있으면 종료 코드 1
-rustograph graph --focus mycrate::sub    # 서브트리만 남김
+rustograph graph --focus mycrate::sub    # 서브트리만 남김(버린 보존 루트·경계 간선 수는 limitations에 셈)
 rustograph dead --exclude-tests          # #[cfg(test)] 서브트리 제외
 rustograph graph --target x86_64-pc-windows-msvc  # cfg(트리플) 평가
 rustograph mcp                           # MCP stdio 서버 — 에이전트가 되묻는 통로
@@ -95,8 +97,16 @@ rustograph impact --format language-traversal --roots-from schema-facts.json  # 
 (`rustograph_summary`/`_query`/`_impact`/`_paths`/`_search`/`_cycles`/
 `_dead`/`_rules`/`_deps`)을 서빙합니다. 문서는 기동 시 한 번 수확해
 (또는 `--graph`로 읽어) 같은 스냅샷 위에서 답합니다. 단 `rustograph_deps`는
-`--graph`를 써도 첫 호출 때 `--dir` 워크스페이스를 따로 수확합니다. 부분 ID는
-후보 목록과 함께 거절됩니다 — `rustograph_search`로 정확한 ID를 찾으세요.
+미사용 의존 증거에 워크스페이스 전체 그래프가 필요해서 첫 호출 때 `--dir`
+워크스페이스를 따로 수확합니다. `--graph`를 쓰면 그 워크스페이스가 스냅샷을
+수확한 워크스페이스(스냅샷의 `workspace` — 디렉터리로 비교하므로 심볼릭 링크
+표기도 같습니다)일 때만 답합니다. 다르거나 스냅샷에 절대 경로 `workspace`가
+없으면 다른 저장소를 답하지 않고 오류를 돌려줍니다 — `--dir`을 스냅샷의
+워크스페이스로 주거나 `--graph` 없이 띄우세요. 스냅샷에 적힌 경로로는 `cargo`를
+실행하지 않습니다. 부분 ID는 후보 목록과 함께 거절됩니다 —
+`rustograph_search`로 정확한 ID를 찾으세요. 요청은 한 줄에 1 MiB(1,048,576바이트,
+줄 끝 제외)까지입니다. 더 긴 줄은 버퍼에 쌓지 않고 `id`가 `null`인 JSON-RPC `-32600`
+오류로 답한 뒤 그 줄을 버리고 다음 요청을 계속 읽습니다.
 
 `--semantic` 문서는 `.rustograph/semantic-cache.json`에 캐시됩니다 —
 워크스페이스 소스와 매니페스트 지문이 키라, 오래되거나 깨진 캐시는
@@ -106,6 +116,37 @@ rustograph impact --format language-traversal --roots-from schema-facts.json  # 
 순회 명령(`reach`, `impact --format language-traversal`)은 isthmus 계열
 계약을 따릅니다 — 사용법 오류는 표준 출력을 비운 채 `64`, 그래프 정점이
 아닌 root가 섞이면 문서를 쓴 뒤 `64`입니다.
+
+명령이 쓰지 않는 플래그·위치 인자는 조용히 무시하지 않고 사용법 오류(`2`)입니다
+(예: `cycles --out`, `query --format`, `paths --role`). 그래프를 읽는 명령
+(`graph`·`cycles`·`dead`·`rules`·`query`·`impact`·`paths`·`search`·`mcp`)은
+모두 `--dir`이나 `--graph`와 공유 플래그(`--deps`·`--tests`·`--retain-public`·
+`--semantic`·`--no-cache`·`--focus`·`--target`·`--exclude-tests`)를 받습니다.
+명령별 플래그는 `rustograph help`로 봅니다.
+
+숫자 인자에는 상한이 있습니다: `query`·`impact`·`search`의 `--max`는 10,000,
+`query`·`impact`의 `--depth`는 64(`0`은 깊이 제한 없음), `paths`의 `--max`는 1,024·
+`--budget`은 1,000,000까지입니다. 넘는 값은 조용히 깎지 않고 사용법 오류(`2`)입니다.
+MCP 도구 인자도 같은 상한을 넘으면 isError로 답하고, 응답은 자르지 않습니다.
+
+`.rustograph.yml`이 규칙을 조용히 끄는 설정이면 설정 오류입니다: 모르는 키
+(`components:` 대신 `component:` 등), `components`에 없는 컴포넌트를 가리키는
+`deps`·`deny`·`signature` 키, 컴포넌트가 하나도 없는 파일. `rules`는 원인을 적고
+종료 코드 `2`, MCP `rustograph_rules`는 isError로 답합니다. 키만 검사하므로 목록에는
+여전히 컴포넌트 이름이나 모듈 패턴을 쓸 수 있습니다.
+
+설정의 `baseline:`은 설정 파일 디렉터리 기준 상대 경로이고 `--dir` 디렉터리 안이어야
+합니다. 설정은 분석 대상 저장소에서 오고, `--write-baseline`은 그 경로에 파일과 상위
+디렉터리를 만들기 때문입니다. 절대 경로, `..`로 `--dir` 밖으로 나가는 경로, 심볼릭 링크를
+따라 밖으로 나가는 경로는 수확·읽기·쓰기 전에 설정 오류입니다. 안에 머무는 `..`는 됩니다
+(`--config sub/.rustograph.yml`의 `../base.txt`). `--dir` 밖에 둔 `--config`와 MCP 서버의
+`--dir`도 같고, 명시 `--baseline FILE`은 실행한 사람이 고른 경로라 어디든 됩니다.
+
+`rules --format sarif`의 위치는 Cargo 워크스페이스 루트 기준 상대 URI(`uriBaseId:
+"%SRCROOT%"`, `/` 구분자, RFC 3986 퍼센트 인코딩)라 로그에 로컬 절대 경로가 남지 않고,
+루트 자신의 경로도 적지 않습니다. 워크스페이스 루트 밖 파일(루트를 벗어나는 `#[path]`
+모듈 등)의 위반은 위치 없이 그 사실을 message에 적습니다. `--graph`로 읽으면 스냅샷에
+기록된 워크스페이스 루트가 기준입니다.
 
 ## persistence 사실 — `schema`
 
@@ -127,6 +168,15 @@ rustograph impact --format language-traversal --roots-from schema-facts.json  # 
 - diesel DSL 경로 — `users::table`, `users::dsl::id`,
   `users::columns::name` — 워크스페이스에 선언된 `table!` 이름과
   맞물릴 때만 정적으로 인정하고, 안 맞는 같은 모양 경로는 `dynamic`
+
+SQL 텍스트는 파서가 아니라 토큰 스캐너로 읽습니다. isthmus persistence
+생산자들이 함께 쓰는 SQL 텍스트 규칙에 따라 세 자리는 관계 사용이
+아닙니다 — 함수 인자 괄호 바로 안의 `FROM`(`EXTRACT(YEAR FROM
+created_at)`·`TRIM(BOTH ' ' FROM name)`·`SUBSTRING(name FROM 2)`. 그 안의
+하위 질의는 그대로 셉니다), `;`로 나뉜 같은 문장의 CTE 이름인 한정자 없는
+이름(비인용 이름은 대소문자 없이, 인용 이름은 쓴 그대로 비교합니다. 규칙이
+문장 단위라 `WITH users AS (SELECT * FROM users …)`는 본문이 읽는 실제
+`users`도 내지 않습니다), `IS [NOT] DISTINCT FROM`의 피연산자.
 
 사실마다 `symbol: {qualifiedName, usr}`을 싣고 `usr`는 감싸는 그래프
 정점 ID입니다 — `impact`/`reach`와 같은 ID라 isthmus `trace`가 핸들러
@@ -228,8 +278,20 @@ isthmus [`language-traversal` v1](https://github.com/ictechgy/isthmus/blob/main/
   미해석 호출 수가 완전하다고 말할 수 없어 `dispatch`·`unresolvedCalls`는
   싣지 않습니다.
 - `--max-depth` 1~128(기본 128, `--depth 0`은 128), `--max-reached` 1~100,000.
-- `project`는 `schema`와 같은 realpath, `revision`은 `--revision` 또는 작업
-  트리가 깨끗할 때의 git HEAD, `graphRevision`은 그래프 JSON의 SHA-256입니다.
+- `project`는 `schema`와 같은 realpath, `revision`은 `--revision` 또는 수확한 작업
+  트리가 깨끗할 때의 git HEAD(저장소의 git 설정을 실행하지 않고는 깨끗한지 확인할
+  수 없는 작업 트리 — 서브모듈이 있는 트리, [보안: 신뢰 경계](#보안-신뢰-경계) 절 — 는 생략하고
+  `revision-unverified:` limitation으로 알립니다), `graphRevision`은 그래프 JSON(root는
+  project로, 스냅샷의 `revision`은 빼고)의 SHA-256입니다.
+- `--graph`로 읽은 스냅샷은 저장한 뒤 HEAD가 움직였을 수 있어 git을 보지 않습니다.
+  `revision`은 `--revision` 또는 스냅샷이 기록한 값입니다. `graph --out`이 `--dir` 작업
+  트리가 깨끗할 때의 git HEAD를 그래프 문서의 선택 필드 `revision`으로 기록합니다(수확한
+  그래프를 표준 출력으로 낼 때는 싣지 않으니 그 출력을 리디렉트한 스냅샷에는 없습니다.
+  `graph --graph`는 입력의 값을 표준 출력과 `--out`의 JSON에 그대로 옮깁니다). 쓸 수
+  있는 기록이 없으면 `revision`을 싣지 않고 `revision-unknown:` limitation으로
+  알립니다. 같은 커밋의 스냅샷과 새 수확은 같은 `graphRevision`입니다. 스냅샷은 작업
+  트리 밖이나 `.rustograph/`처럼 git이 무시하는 경로에 두세요 — 추적하지 않는 스냅샷이
+  있으면 다음 실행의 트리가 바뀐 것으로 보입니다.
 - 그래프 정점이 아닌 root는 `symbol` 없이 싣고 `root-not-found:` limitation을
   더한 문서를 쓴 뒤 64로 끝납니다.
 
@@ -256,7 +318,33 @@ feature(`--features semantic` 빌드 후 `--semantic`)는 rust-analyzer
 워크스페이스 impl 후보로 펼칩니다(실제 impl은 런타임 사실이라 여전히
 추정 간선). 그래프 계약은 그대로이고 정확도만 올라갑니다 — 의미 해석이
 보지 못하는 본문(cfg 비활성·매크로 생성)은 syn 경로로 되돌아가고 그 수를
-셉니다.
+셉니다. 의미 해석도 해석하지 못한 메서드 호출은 아래와 같은 이름 팬아웃으로
+돌아갑니다.
+
+이름 팬아웃(수신자 타입을 모르는 `x.m()`)의 후보는 호출 크레이트의 의존으로
+좁힙니다. 고유 메서드(`T::m`)와 트레이트 선언 메서드(`Tr::m`)는 호출 크레이트,
+같은 패키지의 lib, 그 크레이트가 의존하는 크레이트(전이, 종류 전부 —
+dev·build, 기본 feature가 켜지 않는 optional 의존 포함)에서만 고릅니다 — 의존하지
+않는 크레이트의 타입·트레이트는 이름 붙일 수 없기 때문입니다. 트레이트 impl
+메서드(`T::<Tr>::m`)는 `dyn`·제네릭 디스패치가 호출 크레이트에 의존하는
+크레이트의 impl에도 닿으므로 워크스페이스 전체에서 고릅니다. 같은 이름 메서드가
+전부 닿을 수 없는 호출은 간선 없이 `limitations`에 셉니다. `cargo metadata`가
+resolve 그래프를 주지 않으면 좁히지 않습니다.
+
+좁힌 뒤에도 후보가 4,096개를 넘는 호출(폭 상한)도 간선 없이 `limitations`에
+셉니다. 그런 호출로만 닿는 메서드는 `dead`가 unreachable로 보고하고(그래서
+`dead --format json`과 MCP `rustograph_dead` 보고서의 `limitations`에도 같은 문장이
+실립니다), 그 호출자는 `query`·`impact`·`reach`에 나오지 않습니다. 상한은 실제 워크스페이스보다 훨씬
+큽니다(rust-analyzer 크레이트 27개에서 가장 넓은 호출의 후보가 544개) — 같은
+이름 정의가 워크스페이스 크기에 비례해 느는 입력만 묶습니다.
+
+구문 수확은 64 MiB를 넘는 모듈 파일(`mod` 파일·크레이트 루트)을 읽지 않습니다.
+그 모듈·크레이트 정점은 남지만 그 파일이 선언한 아이템과 하위 모듈은 빠지고,
+`limitations`가 그런 파일 수를 셉니다 — 그 파일에서만 쓰는 코드를 `dead`가
+unreachable로 보고할 수 있습니다. `schema`는 그런 파일을 `unparsed-sources`로 세고,
+`routes`·`deps`는 보지 못합니다. 그런 파일이 워크스페이스에 있으면 `--out`은 기존
+출력을 교체하지 않습니다 — 새 경로나 표준 출력에 쓰세요. 상한은 실제 소스보다 훨씬
+큽니다(crates.io 패키지 610개의 `.rs` 18,080개 가운데 가장 큰 파일이 2.5 MiB).
 
 ## 보안: 신뢰 경계
 
@@ -264,32 +352,103 @@ rustograph는 소스를 syn으로 파싱하지만 Rust 툴체인도 실행합니
 수확(`--graph`로 저장 그래프를 읽지 않는 모든 분석)은 `cargo metadata`를
 실행합니다. `--graph`를 써도 `--target`이면 `rustc --print cfg`를 실행하고,
 MCP `rustograph_deps` 도구는 첫 호출 때 `--dir` 워크스페이스를 대상으로
-`cargo metadata`를 실행합니다. 신뢰할 수 없는 체크아웃을 분석하면 그
-체크아웃이 고른 프로그램이 실행될 수 있습니다.
+`cargo metadata`를 실행합니다. `--semantic` 캐시 키를 만들 때는 `rustc -vV`를
+실행합니다. 이 명령들은 현재 디렉터리에서 돌고, Cargo는 그 디렉터리와 부모의
+`.cargo/config.toml`을, rustup 프록시는 같은 방식으로 `rust-toolchain.toml`(또는
+`rust-toolchain`) 파일을 찾습니다. rustograph는 체크아웃 안에서 실행해도 그
+체크아웃이 이 명령들이 실행할 프로그램을 고르지 못하게 합니다. 다만 그 프로그램
+안에서 체크아웃의 코드가 `[env]`로 실행되는 것은 막지 못하므로(아래), 체크아웃
+안에서는 신뢰하는 체크아웃만 분석하세요.
 
-- rustograph는 이 명령들을 현재 디렉터리에서 실행합니다. Cargo는 `--dir`
-  워크스페이스가 아니라 현재 디렉터리와 그 부모의 `.cargo/config.toml`을
-  읽으므로, 체크아웃 안에서 실행하면 그 체크아웃의 설정(예:
-  `build.rustc-wrapper`, `build.rustc`)이 고른 프로그램이 실행됩니다.
-  `cargo`와 `rustc`가 rustup 프록시이면 rustup도 현재 디렉터리에서 위로
-  올라가며 찾은 `rust-toolchain.toml`(또는 `rust-toolchain`) 파일로 툴체인을
-  고르고, 이 파일은 사용자 지정 툴체인 디렉터리를 가리킬 수 있습니다.
-- `--semantic`은 분석 대상 코드를 실행합니다. rust-analyzer가 분석 대상
-  워크스페이스 루트에서 `cargo check`를 실행해, 그 워크스페이스의 Cargo 설정
-  아래에서 빌드 스크립트(`build.rs`)를 빌드·실행하고, 매크로를 펼치려고 proc
-  매크로를 실행합니다. rustograph를 어느 디렉터리에서 실행하든 같습니다.
-  `--semantic`은 직접 빌드해도 되는 코드에만 쓰세요.
+- `cargo`·`rustc`·`rustup`은 `PATH`의 절대 경로 항목(`PATH`가 없으면
+  `/bin:/usr/bin`)에서만 찾아 그 절대 경로로 실행합니다. 빈 항목과 `.`·`bin` 같은
+  상대 항목은 현재 디렉터리 기준으로 풀리므로 건너뜁니다.
+- 모든 툴체인 명령에 `RUSTC_WRAPPER`·`RUSTC_WORKSPACE_WRAPPER`를 빈 값으로 줘
+  `build.rustc-wrapper`·`build.rustc-workspace-wrapper`를 끄고, `build.rustc`보다
+  앞서는 `RUSTC`를 줍니다. 줄 `rustc`가 없으면 `cargo`를 실행하지 않습니다.
+- 툴체인은 실행마다 한 번, 체크아웃 밖에서 정합니다. `RUSTC`는 `PATH`에서 찾은
+  `rustc`이고, 그것이 rustup 프록시면 `rustup which rustc`가 알려 준 경로입니다.
+  `PATH`의 `cargo`나 `rustc`가 rustup 프록시면 `rustup show active-toolchain`이
+  알려 준 툴체인을 `RUSTUP_TOOLCHAIN`으로도 줍니다. rustup에는 임시 디렉터리
+  아래 새 빈 디렉터리에서 묻기 때문에 `rust-toolchain` 파일을 읽지 않습니다.
+  직접 설정한 `RUSTUP_TOOLCHAIN`·`RUSTC`는 그대로 씁니다. 프로젝트 툴체인으로
+  분석하려면 `RUSTUP_TOOLCHAIN=<channel>`을 주세요.
+- 그 때문에 현재 디렉터리나 부모의 `rust-toolchain` 파일을 쓰지 않았으면 문서에
+  `toolchain-file-ignored:` limitation이 붙습니다. 그 대신 `cargo metadata`가
+  실패하면(그 파일의 툴체인이어야 읽히는 매니페스트 — nightly 전용 `cargo-features`
+  등) 오류 끝에 그 파일을 쓰지 않았다는 사실과 실행한 툴체인을 알립니다. 그
+  파일의 툴체인으로 분석하려면 `RUSTUP_TOOLCHAIN=<channel>`을 주세요. 임시 디렉터리
+  자체가 그런 파일 아래에 있거나 rustup이 툴체인을 알려 주지 못하면,
+  `RUSTUP_TOOLCHAIN`과 `RUSTC`를 직접 주라는 오류로 분석이 실패합니다.
+
+현재 디렉터리는 바꾸지 않으므로 체크아웃의 나머지 Cargo 설정(source
+replacement, `[patch]`, 레지스트리)은 `cargo build`처럼 그대로 적용됩니다.
+rustograph가 덮지 않는 두 설정도 마찬가지입니다.
+
+- 체크아웃의 `[env]` 표는 `cargo metadata`가 호스트·타깃 정보를 얻으려고 실행하는
+  `rustc`의 환경 변수를 여전히 정하고, `force = true`면 사용자가 준 값도 덮습니다.
+  그것만으로 체크아웃의 코드를 실행할 수 있습니다. Linux의 `LD_PRELOAD`나 macOS의
+  `DYLD_INSERT_LIBRARIES`로 체크아웃 안의 라이브러리를 그 `rustc`에 실을 수 있습니다.
+  rustograph는 `[env]`를 덮지 않으므로 현재 디렉터리가 체크아웃이나 그 하위
+  디렉터리이면 늘 적용됩니다. 그래서 신뢰하지 않는 코드를 체크아웃 안에서 분석하는
+  것은 안전하지 않습니다. 그런 체크아웃은 아래처럼 체크아웃 밖에서 분석하세요.
+- Cargo가 인증이 필요한 레지스트리에 쓰는 자격 증명 공급자
+  (`registry.global-credential-providers`, `registries.<name>.credential-provider`)는
+  덮지 않습니다. 덮으면 사설 레지스트리에 쓰는 사용자 자신의 공급자도 꺼지기
+  때문입니다.
+
+`--semantic`은 분석 대상 코드를 실행합니다. rust-analyzer가 분석 대상
+워크스페이스 루트에서 `cargo check`를 실행해, 그 워크스페이스의 Cargo 설정
+아래에서 빌드 스크립트(`build.rs`)를 빌드·실행하고, 매크로를 펼치려고 proc
+매크로를 실행합니다. rustograph를 어느 디렉터리에서 실행하든 같습니다. 위의
+보호는 rust-analyzer가 띄우는 `cargo`·`rustc`에는 적용되지 않습니다.
+`--semantic`은 직접 빌드해도 되는 코드에만 쓰세요.
 
 신뢰할 수 없는 저장소나 포크 PR은 비밀이 없는 격리 러너나 샌드박스에서
-`--semantic` 없이, 체크아웃 밖(체크아웃 자신도 그 하위 디렉터리도 아닌 곳)의
-작업 디렉터리에서 `--dir`로 체크아웃을 넘겨 분석하세요. 그러면 rustograph가
-실행하는 툴체인 명령에 체크아웃의 `.cargo/config.toml`과 `rust-toolchain.toml`이
-적용되지 않습니다. 작업 디렉터리와 그 부모, Cargo 홈의 설정은 여전히
-적용됩니다. `cargo metadata`는 어디서 실행하든 체크아웃의 의존성을 해석합니다.
+`--semantic` 없이, 체크아웃 밖(체크아웃 자신도 그 하위 디렉터리도 아닌 곳 —
+그 안에서는 체크아웃의 `[env]`가 적용됩니다)의 작업 디렉터리에서 `--dir`로
+체크아웃을 넘겨 분석하세요. 그러면 rustograph가 실행하는 툴체인 명령에 체크아웃의
+`.cargo/config.toml`(`[env]` 포함)과 `rust-toolchain.toml`이 전혀 적용되지 않습니다.
+작업 디렉터리와 그 부모, Cargo 홈의 설정은 여전히 적용됩니다. `cargo metadata`는
+어디서 실행하든 체크아웃의 의존성을 해석합니다.
 체크아웃에 `Cargo.lock`을 쓸 수 있고, 그 쓰기가 실패하면 분석도 실패합니다.
 체크아웃의 매니페스트에 적힌 레지스트리·git 의존을 네트워크로 가져올 수도
 있으니, 필요하면 샌드박스의 네트워크 접근을 제한하세요. rustograph가 이
 명령들을 직접 격리하지는 않습니다.
+
+`--revision`·`--graph` 없는 `reach`·`impact --format language-traversal`과, 수확한
+그래프를 JSON으로 저장하는 `graph --out`은 소스 revision을 읽으려고만 `--dir`
+디렉터리에서 `git`도 실행합니다(`git config`, `git ls-files`, `git status`,
+`git rev-parse`). 이 호출은 분석 대상 체크아웃이 `PATH`로든 git 설정으로든 실행할
+프로그램을 고르지 못하게 합니다.
+
+- `PATH`의 절대 경로 항목(`PATH`가 없으면 `/bin:/usr/bin`)에서 처음 찾은 `git`을
+  그 절대 경로로 실행합니다. 빈 항목과 `.`·`bin` 같은 상대 항목은 건너뜁니다.
+  git은 `--dir` 디렉터리에서 시작하므로 그런 항목이 분석 대상 체크아웃 안으로
+  풀려 체크아웃에 든 `git`을 실행할 수 있습니다. 절대 경로 항목에 `git`이
+  없으면 git이 없을 때처럼 `revision`을 싣지 않습니다.
+- 호출 바로 앞에서 git이 보는 filter 드라이버를 모읍니다
+  (`git config -z --includes --name-only --list` — 저장소·사용자·시스템 설정을
+  모두 봅니다). 드라이버마다 `clean`·`smudge`·`process`를 빈 명령으로,
+  `required`를 `false`로 덮어 git이 하나도 실행하지 않게 합니다.
+  `.gitattributes`와 `.git/info/attributes` 어느 쪽에서 건 드라이버든 같습니다.
+- `core.fsmonitor`, untracked cache, `log.showSignature`, 선택 잠금
+  (`GIT_OPTIONAL_LOCKS=0`)을 꺼서 fsmonitor 훅이 돌지 않고 index를 다시 쓰지
+  않습니다(다시 쓰면 `post-index-change` 훅이 돕니다).
+- 서브모듈 안에서는 git을 띄우지 않습니다. index에 서브모듈이 있으면 `git status`를
+  아예 실행하지 않습니다(없으면 `--ignore-submodules=all`).
+- 이름에 `=`·제어 문자·깨진 UTF-8이 든 드라이버가 있으면 다른 git 명령을 실행하지
+  않습니다. git의 `-c`는 첫 `=`에서 나누므로 그런 드라이버는 덮을 수 없습니다.
+
+그래서 `revision`(과 `graph --out`이 기록하는 revision)이 달라집니다. filter가
+정규화하던 파일(git-lfs 등)은 원문으로 비교하므로, git의 stat 캐시가 낡으면 바뀐
+파일로 보여 확인하지 못한 깨끗한 `HEAD`를 주장하지 않고 `revision`을 싣지 않습니다.
+신뢰하는 checkout이면 먼저 `git status`로 git의 stat 캐시를 새로 고치세요. 서브모듈이
+있는 작업 트리나 덮을 수 없는 드라이버 이름이 있는 설정은 `revision`을 자동으로 싣지
+않고 `revision-unverified:` limitation으로 알립니다(`graph --out`도 기록하지 않습니다).
+분석한 revision은 `--revision`으로 직접 줄 수 있습니다.
+나머지 git 설정과, 설정한 그대로의 `PATH` 절대 경로 항목(체크아웃 안을 가리키는
+항목이라도)은 평소대로 적용됩니다.
 
 ## 라이선스
 

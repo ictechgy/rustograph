@@ -254,7 +254,8 @@ fn saved_graph_baseline_preserves_default_config_outside_snapshot_root() {
     std::fs::create_dir_all(&directory).unwrap();
     for name in [".rustograph.yml", ".rustograph.yaml"] {
         let config = directory.join(name);
-        let original = "components: {}\ndeps: {}\n";
+        // 컴포넌트 하나짜리 최소 유효 설정 — 컴포넌트가 없는 설정은 출력 보호에 닿기 전에 설정 오류다.
+        let original = "components:\n  lib: [\"safety_fixture/**\"]\n";
         std::fs::write(&config, original).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_rustograph"))
             .args(["rules", "--write-baseline", "--graph"])

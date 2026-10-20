@@ -220,9 +220,14 @@ mod cli_tests {
     use std::io::Write;
 
     fn run(args: &[&str]) -> (i32, String, String) {
+        run_at(&fixture(), args)
+    }
+
+    /// `dir`을 `--dir`로 붙여 같은 프로세스에서 CLI를 돌린다 — (종료 코드, stdout, stderr).
+    fn run_at(dir: &std::path::Path, args: &[&str]) -> (i32, String, String) {
         let mut argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         argv.push("--dir".into());
-        argv.push(fixture().display().to_string());
+        argv.push(dir.display().to_string());
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = cli::run(&argv, &mut out, &mut err);
@@ -231,6 +236,35 @@ mod cli_tests {
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap(),
         )
+    }
+
+    /// [`layered_workspace`]에 위반 하나(app → core 호출)를 내는 규칙.
+    const LAYERED_RULES: &str =
+        "components:\n  app: [\"layers::app/**\"]\n  core: [\"layers::core/**\"]\n\
+         deps:\n  app: []\n  core: []\n";
+
+    /// app 모듈이 core 모듈을 부르는 단일 패키지 워크스페이스를 `dir`에 만든다. 설정의 `baseline:`은
+    /// `--dir` 안이어야 하니 설정·기준선을 둘 수 있는 워크스페이스가 필요하다 — tests/fixture는 저장소
+    /// 안이라 쓸 수 없다. 미해석 include가 없어 기존 출력 교체가 막히지 않는다(tests/fixture와 다르다) —
+    /// 루트 밖 기존 파일을 지키는 것이 경로 경계인지 가려낸다.
+    fn layered_workspace(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"layers\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub mod app;\npub mod core;\n").unwrap();
+        std::fs::write(
+            dir.join("src/app.rs"),
+            "pub fn run() -> u32 {\n    crate::core::value()\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/core.rs"),
+            "pub fn value() -> u32 {\n    1\n}\n",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -307,6 +341,138 @@ mod cli_tests {
         // 설정 없으면 오류.
         let (code, _, _) = run(&["rules"]);
         assert_eq!(code, 2);
+    }
+
+    /// `rules --format sarif`의 위치는 워크스페이스 루트 상대 URI(`uriBaseId: "%SRCROOT%"`)다 —
+    /// 예전에는 정점 위치의 로컬 절대 경로를 그대로 실어, 코드 스캐닝에 올린 결과에 사용자 경로가
+    /// 남았다. `#[path]`로 루트 밖에 둔 모듈의 위반은 위치 없이 그 사실을 message에 적는다. 심볼릭
+    /// 링크를 지난 `--dir`(cargo는 링크 표기 그대로 워크스페이스 루트를 준다)과 저장 스냅샷
+    /// (`--graph`)도 같은 바이트다.
+    #[test]
+    fn rules_sarif_uris_are_relative_to_the_workspace_root() {
+        let tmp = std::env::temp_dir().join(format!("rg-sarif-uri-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let ws = tmp.join("ws");
+        layered_workspace(&ws);
+        std::fs::write(
+            ws.join("src/lib.rs"),
+            "pub mod app;\npub mod core;\n#[path = \"../../shared/edge.rs\"]\npub mod edge;\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.join("shared")).unwrap();
+        std::fs::write(
+            tmp.join("shared/edge.rs"),
+            "pub fn reach() -> u32 {\n    crate::core::value()\n}\n",
+        )
+        .unwrap();
+        let cfg = tmp.join("rules.yml");
+        std::fs::write(
+            &cfg,
+            "components:\n  app: [\"layers::app/**\"]\n  core: [\"layers::core/**\"]\n  \
+             edge: [\"layers::edge/**\"]\ndeps:\n  app: []\n  core: []\n  edge: []\n",
+        )
+        .unwrap();
+        let cfg = cfg.to_str().unwrap();
+        let sarif = &["rules", "--format", "sarif", "--config", cfg];
+        let (code, out, err) = run_at(&ws, sarif);
+        assert_eq!(code, 0, "{err}");
+        let log: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let results = log["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2, "{out}");
+        let result_from = |caller: &str| {
+            results
+                .iter()
+                .find(|r| r["message"].as_str().unwrap().contains(caller))
+                .unwrap_or_else(|| panic!("no violation from {caller}: {out}"))
+        };
+        assert_eq!(
+            result_from("layers::app::run")["locations"][0]["physicalLocation"],
+            serde_json::json!({
+                "artifactLocation": {"uri": "src/app.rs", "uriBaseId": "%SRCROOT%"},
+                "region": {"startLine": 1}
+            })
+        );
+        let from_edge = result_from("layers::edge::reach");
+        assert!(from_edge.get("locations").is_none(), "{from_edge}");
+        let text = from_edge["message"].as_str().unwrap();
+        assert!(
+            text.ends_with(" (location omitted: the file is outside the workspace root)"),
+            "{text}"
+        );
+        assert!(log["runs"][0].get("originalUriBaseIds").is_none());
+        let real = tmp.canonicalize().unwrap();
+        for spelled in [tmp.display().to_string(), real.display().to_string()] {
+            assert!(!out.contains(&spelled), "{spelled} leaked: {out}");
+        }
+        // 링크를 지난 --dir — 링크는 unix에서만 만든다.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&ws, tmp.join("link")).unwrap();
+            let (code, linked, err) = run_at(&tmp.join("link"), sarif);
+            assert_eq!(code, 0, "{err}");
+            assert_eq!(linked, out);
+        }
+        // 저장 스냅샷은 수확 때의 위치·워크스페이스를 그대로 읽는다.
+        let snapshot = tmp.join("graph.json");
+        let snapshot = snapshot.to_str().unwrap();
+        let (code, _, err) = run_at(&ws, &["graph", "--level", "symbol", "--out", snapshot]);
+        assert_eq!(code, 0, "{err}");
+        let (code, saved, err) = run_at(
+            &ws,
+            &[
+                "rules", "--format", "sarif", "--config", cfg, "--graph", snapshot,
+            ],
+        );
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(saved, out);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 설정 실수는 규칙을 끈 채 통과하지 않고 설정 오류(2)다 — 예전에는 `components:`를
+    /// `component:`로 잘못 쓴 설정으로 `rules --strict`가 "0 violations"·종료 0이었고, `deny`·
+    /// `signature` 키 오타나 정의되지 않은 컴포넌트의 규칙은 그 규칙만 조용히 사라졌다.
+    /// `--config`로 준 설정과 `--dir`에서 찾은 설정이 같다(수확 전에 끝난다).
+    #[test]
+    fn rules_rejects_configs_that_would_silently_disable_rules() {
+        let tmp = std::env::temp_dir().join(format!("rg-rules-strict-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mapped = "components:\n  app: [\"fixture_app/**\"]\n  core: [\"fixture_core/**\"]\n";
+        for (text, cause) in [
+            (
+                "component:\n  app: [\"fixture_app/**\"]\ndeny:\n  app: [core]\n".to_string(),
+                "unknown field `component`",
+            ),
+            (
+                format!("{mapped}deps:\n  app: []\n  core: []\nsignatures:\n  app: [app]\n"),
+                "unknown field `signatures`",
+            ),
+            (
+                format!("{mapped}deps:\n  app: []\n  core: []\ndeny:\n  nope: [core]\n"),
+                "deny has rules for component \"nope\"",
+            ),
+            (
+                "components: {}\ndeps: {}\n".to_string(),
+                "components defines no component",
+            ),
+        ] {
+            let cfg = tmp.join("rules.yml");
+            std::fs::write(&cfg, &text).unwrap();
+            let (code, out, err) = run(&["rules", "--strict", "--config", cfg.to_str().unwrap()]);
+            assert_eq!(code, 2, "{text:?}: {out}");
+            assert!(err.contains(cause), "{text:?}: {err}");
+            std::fs::rename(&cfg, tmp.join(".rustograph.yml")).unwrap();
+            let argv: Vec<String> = ["rules", "--strict", "--dir", tmp.to_str().unwrap()]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = cli::run(&argv, &mut out, &mut err);
+            let err = String::from_utf8(err).unwrap();
+            assert_eq!(code, 2, "{text:?}: {err}");
+            assert!(err.contains(cause), "{text:?}: {err}");
+        }
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
@@ -401,6 +567,71 @@ mod cli_tests {
         assert!(out.contains("\"found\": true"));
     }
 
+    /// 질의 인자에는 문서화된 상한이 있다 — query·impact·search `--max` 10,000, query·impact `--depth`
+    /// 64(0은 깊이 제한 없음), paths `--max` 1,024·`--budget` 1,000,000. 상한까지는 그대로 받고, 1만 넘어도
+    /// 조용히 깎지 않고 사용법 오류(2)다. 예전에는 상한이 없어 `paths --budget`·`--max` 하나로 메모리를
+    /// 수 GB까지 쓸 수 있었다. 순회 형식의 자체 상한(`--depth`/`--max-depth` 1~128)은 그대로다.
+    #[test]
+    fn query_arguments_past_their_limits_are_usage_errors() {
+        let (from, to) = ("fixture_app::main", "fixture_core::entry");
+        for (args, flag, limit) in [
+            (&["query", to, "--max", "10001"][..], "--max 10001", "10000"),
+            (&["query", to, "--depth", "65"][..], "--depth 65", "64"),
+            (
+                &["impact", to, "--max", "10001"][..],
+                "--max 10001",
+                "10000",
+            ),
+            (&["impact", to, "--depth", "65"][..], "--depth 65", "64"),
+            (
+                &["search", "entry", "--max", "10001"][..],
+                "--max 10001",
+                "10000",
+            ),
+            (
+                &["paths", from, to, "--max", "1025"][..],
+                "--max 1025",
+                "1024",
+            ),
+            (
+                &["paths", from, to, "--budget", "1000001"][..],
+                "--budget 1000001",
+                "1000000",
+            ),
+            (
+                &["paths", from, to, "--budget", "1000000000000"][..],
+                "--budget 1000000000000",
+                "1000000",
+            ),
+        ] {
+            let (code, out, err) = run(args);
+            assert_eq!(code, 2, "{args:?}: {err}");
+            assert!(out.is_empty(), "{args:?}: {out}");
+            assert!(
+                err.contains(flag) && err.contains(&format!("limit of {limit}")),
+                "{args:?}: {err}"
+            );
+        }
+        for args in [
+            &["query", to, "--depth", "64", "--max", "10000"][..],
+            &["query", to, "--depth", "0", "--max", "10000"][..],
+            &["impact", to, "--depth", "64", "--max", "10000"][..],
+            &["search", "entry", "--max", "10000"][..],
+            &["paths", from, to, "--max", "1024", "--budget", "1000000"][..],
+            &[
+                "impact",
+                "--format",
+                "language-traversal",
+                to,
+                "--depth",
+                "128",
+            ][..],
+        ] {
+            let (code, _, err) = run(args);
+            assert_eq!(code, 0, "{args:?}: {err}");
+        }
+    }
+
     #[test]
     fn deps_rejects_document_filters() {
         // deps는 자체 수확을 쓴다 — 필터·저장 그래프·semantic은
@@ -415,6 +646,127 @@ mod cli_tests {
             assert_eq!(code, 2, "{args:?}: {err}");
             assert!(err.contains("not supported"), "{args:?}: {err}");
         }
+    }
+
+    /// 명령이 쓰지 않는 플래그·위치 인자는 조용히 무시하지 않고 사용법 오류(2)다. `cycles --out`은
+    /// 파일을 쓰지 않은 채 0으로 끝나 CI의 다음 단계가 이전 실행의 파일을 읽었고, `query --format
+    /// mermaid`는 JSON을 냈다. 오류는 명령과 그 플래그(인자)를 대고, 수확 전에 끝나 표준 출력이 비어 있다.
+    #[test]
+    fn commands_reject_flags_and_arguments_they_do_not_use() {
+        let tmp = std::env::temp_dir().join(format!("rg-unused-{}", std::process::id()));
+        let out = tmp.join("written.json");
+        let out = out.to_str().unwrap();
+        for (args, unused) in [
+            (&["cycles", "--format", "json", "--out", out][..], "--out"),
+            (
+                &["query", "fixture_core::entry", "--format", "mermaid"][..],
+                "--format",
+            ),
+            (
+                &["impact", "fixture_core::Used", "--format", "json"][..],
+                "--format",
+            ),
+            (
+                &["impact", "fixture_core::Used", "--max-depth", "3"][..],
+                "--max-depth",
+            ),
+            (
+                &[
+                    "paths",
+                    "fixture_app::main",
+                    "fixture_core::entry",
+                    "--role",
+                    "server",
+                ][..],
+                "--role",
+            ),
+            (&["search", "entry", "--budget", "5"][..], "--budget"),
+            (&["dead", "--level", "module"][..], "--level"),
+            (&["graph", "--strict"][..], "--strict"),
+            (&["rules", "--depth", "3"][..], "--depth"),
+            (&["cycles", "--root", "fixture_app::main"][..], "--root"),
+            (&["deps", "--out", out][..], "--out"),
+            (&["cycles", "stray"][..], "\"stray\""),
+            (
+                &["query", "fixture_core::entry", "fixture_core::Used"][..],
+                "\"fixture_core::Used\"",
+            ),
+            (
+                &["paths", "fixture_app::main", "fixture_core::entry", "x"][..],
+                "\"x\"",
+            ),
+            (&["search", "entry", "more"][..], "\"more\""),
+        ] {
+            let (code, stdout, err) = run(args);
+            assert_eq!(code, 2, "{args:?}: {err}");
+            assert!(stdout.is_empty(), "{args:?}: {stdout}");
+            assert!(
+                err.contains(args[0]) && err.contains(unused),
+                "{args:?}: {err}"
+            );
+        }
+        assert!(!std::path::Path::new(out).exists());
+    }
+
+    /// 거부는 명령이 쓰지 않는 조합만이다 — USAGE의 공유 플래그와 `--dir`·`--graph`는 문서를 얻는 모든
+    /// 명령이 계속 받고, 명령 고유 플래그(`graph --root`·`dead --root`, `deps --deps`)도 그대로다.
+    #[test]
+    fn commands_keep_accepting_documented_shared_flags() {
+        let shared = [
+            "--deps",
+            "--tests",
+            "--retain-public",
+            "--no-cache",
+            "--focus",
+            "fixture_core",
+            "--target",
+            "x86_64-pc-windows-msvc",
+        ];
+        let cfg = std::env::temp_dir().join(format!("rg-shared-{}.yml", std::process::id()));
+        std::fs::write(
+            &cfg,
+            "components:\n  core: [\"fixture_core/**\"]\ndeps:\n  core: []\n",
+        )
+        .unwrap();
+        let cfg = cfg.to_str().unwrap().to_string();
+        for command in [
+            &[
+                "graph",
+                "--level",
+                "symbol",
+                "--root",
+                "fixture_core::entry",
+            ][..],
+            &[
+                "cycles", "--level", "module", "--format", "json", "--strict",
+            ][..],
+            &["dead", "--root", "fixture_core::entry", "--format", "json"][..],
+            &["query", "fixture_core::entry", "--depth", "2", "--max", "5"][..],
+            &["impact", "fixture_core::Used", "--depth", "0"][..],
+            &[
+                "paths",
+                "fixture_core::entry",
+                "fixture_core::Used",
+                "--budget",
+                "9",
+            ][..],
+            &["search", "entry", "--max", "3"][..],
+            &["rules", "--config", &cfg, "--format", "json"][..],
+        ] {
+            let args: Vec<&str> = command.iter().chain(&shared).copied().collect();
+            let (code, _, err) = run(&args);
+            assert_eq!(code, 0, "{args:?}: {err}");
+            let args: Vec<&str> = command
+                .iter()
+                .chain(&["--exclude-tests"])
+                .copied()
+                .collect();
+            let (code, _, err) = run(&args);
+            assert_eq!(code, 0, "{args:?}: {err}");
+        }
+        let (code, _, err) = run(&["deps", "--deps", "--format", "json"]);
+        assert_eq!(code, 0, "{err}");
+        std::fs::remove_file(&cfg).unwrap();
     }
 
     #[test]
@@ -459,6 +811,152 @@ mod cli_tests {
         assert_eq!(code, 0);
         assert!(!out.contains("\"fixture_core::unix_only\""));
         assert!(out.contains("cfg-gated vertices excluded"));
+    }
+
+    /// 출력 JSON의 `limitations` 가운데 `--focus` 경계 문장 — 키가 없으면(빈 목록) 비어 있다.
+    fn focus_notes(out: &str) -> Vec<String> {
+        let value: serde_json::Value = serde_json::from_str(out).expect("output must be JSON");
+        value["limitations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|l| l.as_str())
+            .filter(|l| l.starts_with("--focus dropped "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// `--focus`가 버린 보존 루트·경계 의존 간선은 문서·dead 보고서·순회 문서의 limitation으로
+    /// 센다 — 포커스 밖 루트·호출자를 잃은 dead·reach 결과가 완전한 답처럼 읽히면 안 된다. 수는
+    /// 포커스 없는 그래프에서 직접 센 값(contains 제외, 추정 포함)과 같다. dead 텍스트에는 한 번만
+    /// 나오고, 순회 문서의 잘림 표시는 그대로다. 포커스가 문서 전체를 덮으면 조용하다.
+    #[test]
+    fn focus_counts_what_it_drops_as_a_limitation() {
+        let (code, full, err) = run(&["graph", "--level", "symbol"]);
+        assert_eq!(code, 0, "{err}");
+        let full: serde_json::Value = serde_json::from_str(&full).unwrap();
+        let inside = |id: &serde_json::Value| {
+            let id = id.as_str().unwrap();
+            id == "fixture_core" || id.starts_with("fixture_core::")
+        };
+        let roots = full["roots"].as_array().unwrap();
+        let dropped_roots = roots.iter().filter(|r| !inside(r)).count();
+        let crossing = full["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] != "contains" && inside(&e["from"]) != inside(&e["to"]))
+            .count();
+        // fixture_app::main이 포커스 밖 루트이고, 그 main이 fixture_core를 부른다.
+        assert_eq!(dropped_roots, 1);
+        assert!(crossing > 0);
+        let head = format!(
+            "--focus dropped {dropped_roots} retention roots and {crossing} dependency edges \
+             that cross the focus boundary; "
+        );
+        let focused = ["--focus", "fixture_core"];
+        let with_focus = |args: &[&str]| -> (i32, String, String) {
+            let argv: Vec<&str> = args.iter().chain(&focused).copied().collect();
+            run(&argv)
+        };
+        for args in [
+            &["graph", "--level", "symbol"][..],
+            &["dead", "--format", "json"][..],
+            &["reach", "fixture_core::entry", "--revision", "r1"][..],
+        ] {
+            let (code, out, err) = with_focus(args);
+            assert_eq!(code, 0, "{args:?}: {err}");
+            let notes = focus_notes(&out);
+            assert_eq!(notes.len(), 1, "{args:?}: {notes:?}");
+            assert!(notes[0].starts_with(&head), "{args:?}: {}", notes[0]);
+        }
+        let (_, reach, _) = with_focus(&["reach", "fixture_core::entry", "--revision", "r1"]);
+        let reach: serde_json::Value = serde_json::from_str(&reach).unwrap();
+        assert_eq!(reach["truncated"], false);
+        assert!(reach.get("truncationReasons").is_none());
+        let (code, text, _) = with_focus(&["dead"]);
+        assert_eq!(code, 0);
+        assert_eq!(text.matches("limitation: --focus dropped ").count(), 1);
+        // 포커스가 없거나 모든 크레이트를 덮으면 문장이 없다.
+        let (_, out, _) = run(&["dead", "--format", "json"]);
+        assert!(focus_notes(&out).is_empty());
+        let (code, out, err) = run(&[
+            "dead",
+            "--format",
+            "json",
+            "--focus",
+            "fixture_core",
+            "--focus",
+            "fixture_app",
+            "--focus",
+            "fixture_macros",
+        ]);
+        assert_eq!(code, 0, "{err}");
+        assert!(focus_notes(&out).is_empty(), "{out}");
+    }
+
+    /// 의존 폐포로 좁힌 뒤에도 같은 이름 후보가 4,096개를 넘는 호출은 간선 없이 센다 — 그 호출로만 닿는
+    /// 메서드(여기서는 실제로 불리는 것을 포함한 `get` 4,097개)를 dead가 unreachable로 낸다. 그 수확
+    /// limitation은 그래프 문서뿐 아니라 dead JSON 보고서의 `limitations`에도 실린다(MCP rustograph_dead도
+    /// 같은 보고서다) — JSON만 읽는 소비자가 거짓 unreachable을 완전한 답으로 받지 않게. 텍스트에는 한 번만
+    /// 나온다.
+    #[test]
+    fn dead_reports_carry_the_fan_out_width_cap() {
+        let dir = std::env::temp_dir().join(format!("rg-fan-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"wide\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        let mut main = String::from("fn main() {\n    let x = make();\n    x.get();\n}\n");
+        for i in 0..=4096 {
+            main.push_str(&format!(
+                "struct T{i};\nimpl T{i} {{\n    fn get(&self) {{}}\n}}\n"
+            ));
+        }
+        std::fs::write(dir.join("src/main.rs"), main).unwrap();
+        let capped =
+            "1 method calls (1 names) match more than 4096 candidate methods and were not \
+                      fanned out; methods reached only through them are reported unreachable by \
+                      dead, and their callers are missing from query, impact, and reach";
+        let limitations = |out: &str| -> Vec<String> {
+            let value: serde_json::Value = serde_json::from_str(out).expect("output must be JSON");
+            value["limitations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|l| l.as_str().map(str::to_string))
+                .collect()
+        };
+        let (code, graph, err) = run_at(&dir, &["graph", "--level", "symbol"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(limitations(&graph).iter().any(|l| l == capped));
+        let (code, report, err) = run_at(&dir, &["dead", "--format", "json"]);
+        assert_eq!(code, 0, "{err}");
+        let carried = limitations(&report);
+        assert_eq!(
+            carried.iter().filter(|l| *l == capped).count(),
+            1,
+            "{carried:?}"
+        );
+        let report: serde_json::Value = serde_json::from_str(&report).unwrap();
+        let unreachable_gets = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["id"].as_str().is_some_and(|id| id.ends_with("::get")))
+            .count();
+        assert_eq!(unreachable_gets, 4097);
+        let (code, text, err) = run_at(&dir, &["dead"]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(
+            text.matches(capped).count(),
+            1,
+            "dead text must print the cap limitation once"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -512,31 +1010,135 @@ mod cli_tests {
         let _ = std::fs::remove_file(&base);
     }
 
-    /// README의 기준선 흐름 — 설정 옆 `.rustograph/rules-baseline.txt`가 아직 없으면 도입
-    /// 전으로 보고, `--write-baseline`이 디렉터리째 만들어 얼린 뒤 strict가 억누른다.
+    /// README의 기준선 흐름 — `--dir`에서 찾은 `.rustograph.yml`이 가리키는
+    /// `.rustograph/rules-baseline.txt`가 아직 없으면 도입 전으로 보고, `--write-baseline`이
+    /// 디렉터리째 만들어 얼린 뒤 strict가 억누른다. 설정의 baseline은 `--dir` 안이어야 하므로
+    /// 설정과 기준선을 수확하는 워크스페이스 안에 둔다.
     #[test]
     fn rules_baseline_under_dot_rustograph_round_trips() {
         let tmp = std::env::temp_dir().join(format!("rg-dot-base-{}", std::process::id()));
         std::fs::remove_dir_all(&tmp).ok();
-        std::fs::create_dir_all(&tmp).unwrap();
-        let cfg = tmp.join(".rustograph.yml");
+        layered_workspace(&tmp);
         std::fs::write(
-            &cfg,
-            "components:\n  app: [\"fixture_app/**\"]\n  core: [\"fixture_core/**\"]\n\
-             deps:\n  app: []\n  core: []\nbaseline: .rustograph/rules-baseline.txt\n",
+            tmp.join(".rustograph.yml"),
+            format!("{LAYERED_RULES}baseline: .rustograph/rules-baseline.txt\n"),
         )
         .unwrap();
-        let cfgp = cfg.to_str().unwrap();
-        let (code, _, err) = run(&["rules", "--strict", "--config", cfgp]);
+        let (code, _, err) = run_at(&tmp, &["rules", "--strict"]);
         assert_eq!(code, 1, "{err}");
-        let (code, out, err) = run(&["rules", "--config", cfgp, "--write-baseline"]);
+        let (code, out, err) = run_at(&tmp, &["rules", "--write-baseline"]);
         assert_eq!(code, 0, "{err}");
         assert!(out.contains("wrote baseline"));
         let frozen = std::fs::read_to_string(tmp.join(".rustograph/rules-baseline.txt")).unwrap();
-        assert!(frozen.contains("allow|fixture_app"), "{frozen}");
-        let (code, out, err) = run(&["rules", "--strict", "--config", cfgp]);
+        assert!(frozen.contains("allow|layers::app"), "{frozen}");
+        let (code, out, err) = run_at(&tmp, &["rules", "--strict"]);
         assert_eq!(code, 0, "{err}");
         assert!(out.contains("suppressed by baseline"));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 설정의 `baseline:`은 분석 대상 저장소가 고른다 — `--write-baseline`이 그 경로에 중간
+    /// 디렉터리까지 만들어 쓰므로, `--dir` 밖을 가리키는 값(`..`, 절대 경로, 밖을 가리키는 심볼릭
+    /// 링크 디렉터리)은 수확 전에 2로 끝나고 밖에 아무것도 쓰거나 만들지 않는다. 예전에는 저장소 밖
+    /// 기존 파일을 기준선 텍스트로 덮어썼다. 읽기(`rules --strict`)도 같고, `--dir` 밖에 둔 명시
+    /// `--config`의 상대 baseline도 같다. 명시 `--baseline`은 실행한 사람이 고른 입력이라 밖도 된다.
+    #[test]
+    fn config_baselines_stay_inside_the_dir_directory() {
+        let tmp = std::env::temp_dir().join(format!("rg-base-bound-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let (ws, outside) = (tmp.join("ws"), tmp.join("outside"));
+        layered_workspace(&ws);
+        std::fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("victim.txt");
+        std::fs::write(&victim, "keep\n").unwrap();
+        let absolute = outside.join("absolute.txt").display().to_string();
+        let cases = [
+            ("../outside/victim.txt", "outside the --dir directory"),
+            ("../outside/new/deep/x.txt", "outside the --dir directory"),
+            (absolute.as_str(), "is an absolute path"),
+        ];
+        // 저장소 안 심볼릭 링크 디렉터리가 밖을 가리키는 경우 — 링크는 unix에서만 만든다.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, ws.join("escape")).unwrap();
+        let linked: &[(&str, &str)] = if cfg!(unix) {
+            &[("escape/link.txt", "outside the --dir directory")]
+        } else {
+            &[]
+        };
+        let cfg = ws.join(".rustograph.yml");
+        for (raw, cause) in cases.iter().chain(linked) {
+            let quoted = serde_json::to_string(raw).unwrap();
+            std::fs::write(&cfg, format!("{LAYERED_RULES}baseline: {quoted}\n")).unwrap();
+            for args in [
+                &["rules", "--write-baseline"][..],
+                &["rules", "--strict"][..],
+            ] {
+                let (code, out, err) = run_at(&ws, args);
+                assert_eq!(code, 2, "{raw} {args:?}: {out}");
+                assert!(
+                    err.contains(cause) && err.contains("or pass --baseline FILE"),
+                    "{raw} {args:?}: {err}"
+                );
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
+        let entries = std::fs::read_dir(&outside).unwrap().count();
+        assert_eq!(entries, 1, "nothing may appear outside the --dir directory");
+        // `--dir` 밖에 둔 명시 --config의 상대 baseline도 루트 밖이다.
+        let outside_cfg = outside.join("rules.yml");
+        std::fs::write(
+            &outside_cfg,
+            format!("{LAYERED_RULES}baseline: rules-baseline.txt\n"),
+        )
+        .unwrap();
+        let (code, _, err) = run_at(
+            &ws,
+            &[
+                "rules",
+                "--strict",
+                "--config",
+                outside_cfg.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(code, 2, "{err}");
+        assert!(err.contains("outside the --dir directory"), "{err}");
+        // 명시 --baseline은 루트 밖도 쓴다.
+        std::fs::write(&cfg, LAYERED_RULES).unwrap();
+        let explicit = outside.join("explicit.txt");
+        let (code, _, err) = run_at(
+            &ws,
+            &[
+                "rules",
+                "--write-baseline",
+                "--baseline",
+                explicit.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(code, 0, "{err}");
+        let frozen = std::fs::read_to_string(&explicit).unwrap();
+        assert!(frozen.contains("allow|layers::app"), "{frozen}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 루트 안이면 `..`도 된다 — 모노레포 하위 설정 `sub/.rustograph.yml`의 `../base.txt`는
+    /// `--dir` 루트의 base.txt다. 쓰고, 다음 실행이 그 파일로 억누른다.
+    #[test]
+    fn config_baselines_may_climb_within_the_dir_directory() {
+        let tmp = std::env::temp_dir().join(format!("rg-base-climb-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        layered_workspace(&tmp);
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        let cfg = tmp.join("sub/.rustograph.yml");
+        std::fs::write(&cfg, format!("{LAYERED_RULES}baseline: ../base.txt\n")).unwrap();
+        let cfg = cfg.to_str().unwrap();
+        let (code, out, err) = run_at(&tmp, &["rules", "--config", cfg, "--write-baseline"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("wrote baseline"), "{out}");
+        let frozen = std::fs::read_to_string(tmp.join("base.txt")).unwrap();
+        assert!(frozen.contains("allow|layers::app"), "{frozen}");
+        let (code, out, err) = run_at(&tmp, &["rules", "--strict", "--config", cfg]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("suppressed by baseline"), "{out}");
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -549,7 +1151,8 @@ mod cli_tests {
     fn rules_refuses_special_config_and_baseline_files() {
         let tmp = std::env::temp_dir().join(format!("rg-special-{}", std::process::id()));
         std::fs::remove_dir_all(&tmp).ok();
-        std::fs::create_dir_all(&tmp).unwrap();
+        // 설정의 baseline은 --dir 안이어야 열어 보므로 FIFO를 수확하는 워크스페이스 안에 둔다.
+        layered_workspace(&tmp);
         let fifo = tmp.join("pipe");
         let made = std::process::Command::new("mkfifo")
             .arg(&fifo)
@@ -557,11 +1160,7 @@ mod cli_tests {
             .expect("mkfifo must run");
         assert!(made.success());
         let cfg = tmp.join("rules.yml");
-        std::fs::write(
-            &cfg,
-            "components:\n  app: [\"fixture_app/**\"]\ndeps:\n  app: []\nbaseline: pipe\n",
-        )
-        .unwrap();
+        std::fs::write(&cfg, format!("{LAYERED_RULES}baseline: pipe\n")).unwrap();
         let cfgp = cfg.to_str().unwrap();
         for (args, cause, why) in [
             // 설정의 baseline이 FIFO — 열지 않는다.
@@ -577,7 +1176,7 @@ mod cli_tests {
                 "larger than",
             ),
         ] {
-            let (code, _, err) = run(&args);
+            let (code, _, err) = run_at(&tmp, &args);
             assert_eq!(code, 2, "{args:?}: {err}");
             assert!(err.contains(cause) && err.contains(why), "{args:?}: {err}");
         }
@@ -710,6 +1309,221 @@ mod cli_tests {
         }
         std::fs::remove_dir_all(&tmp).unwrap();
     }
+
+    /// 64 MiB를 넘는 모듈 파일은 읽지 않는다 — `graph`는 그 파일의 아이템 없이 limitation을 달고
+    /// 종료 0으로 끝난다(이전에는 파일을 통째로 읽고 파싱 오류로 2였다). 그 파일이 선언할 하위
+    /// 모듈·include 입력을 모르므로 `--out`은 기존 출력을 교체하지 않고 새 경로에는 쓴다. 교체 거부는
+    /// 명령마다 다른 수확이 넘긴 입력으로 판정하므로 `graph`(문서 수확)·`schema`(정점 귀속 수확)·
+    /// `routes`(모듈 트리까지 받는 수확) 모두 본다.
+    #[test]
+    fn module_files_over_64_mib_are_left_out_of_the_graph() {
+        let tmp = std::env::temp_dir().join(format!("rg-oversized-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        layered_workspace(&tmp);
+        std::fs::write(
+            tmp.join("src/lib.rs"),
+            "pub mod app;\npub mod core;\npub mod big;\n",
+        )
+        .unwrap();
+        std::fs::File::create(tmp.join("src/big.rs"))
+            .unwrap()
+            .set_len(64 * 1024 * 1024 + 1)
+            .unwrap();
+        let (code, out, err) = run_at(&tmp, &["graph", "--level", "symbol"]);
+        assert_eq!(code, 0, "{err}");
+        let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let vertex_ids: Vec<&str> = doc["vertices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect();
+        assert!(vertex_ids.contains(&"layers::big"), "{vertex_ids:?}");
+        assert!(vertex_ids.contains(&"layers::app::run"), "{vertex_ids:?}");
+        assert!(!vertex_ids.iter().any(|id| id.starts_with("layers::big::")));
+        let notes: Vec<&str> = doc["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|l| l.as_str())
+            .filter(|l| l.contains("larger than 64 MiB"))
+            .collect();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("1 module files larger than 64 MiB were not read"));
+
+        let existing = tmp.join("graph.json");
+        std::fs::write(&existing, "previous complete output").unwrap();
+        for command in [
+            &["graph"][..],
+            &["schema"],
+            &["routes", "--role", "server"],
+            &["routes", "--role", "client"],
+        ] {
+            let args = [command, &["--out", existing.to_str().unwrap()][..]].concat();
+            let (code, _, err) = run_at(&tmp, &args);
+            assert_eq!(code, 2, "{args:?}: {err}");
+            assert!(
+                err.contains("cannot safely replace an existing output: 1 module file(s) could not be read or parsed"),
+                "{args:?}: {err}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&existing).unwrap(),
+                "previous complete output",
+                "{args:?}"
+            );
+        }
+        let fresh = tmp.join("fresh.json");
+        let (code, out, err) = run_at(&tmp, &["graph", "--out", fresh.to_str().unwrap()]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("wrote"), "{out}");
+        assert!(std::fs::read_to_string(&fresh)
+            .unwrap()
+            .contains("larger than 64 MiB"));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+}
+
+/// 실제 바이너리로 `mcp <args>`를 띄워 도구 하나를 부른다 — (isError 여부, 답 텍스트).
+fn mcp_tool(args: &[&std::ffi::OsStr], tool: &str) -> (bool, String) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rustograph"))
+        .arg("mcp")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("rustograph binary must start");
+    let call = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": tool, "arguments": {}},
+    });
+    writeln!(child.stdin.take().expect("stdin is piped"), "{call}").unwrap();
+    let output = child.wait_with_output().expect("rustograph must finish");
+    assert!(
+        output.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let result = &response["result"];
+    (
+        result["isError"] == true,
+        result["content"][0]["text"].as_str().unwrap().to_string(),
+    )
+}
+
+/// 같은 프로세스에서 CLI를 돌린 표준 출력 — 종료 코드가 0이 아니면 stderr로 실패한다.
+fn cli_stdout(args: &[&str]) -> String {
+    let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = rustograph::cli::run(&argv, &mut out, &mut err);
+    assert_eq!(code, 0, "{args:?}: {}", String::from_utf8_lossy(&err));
+    String::from_utf8(out).unwrap()
+}
+
+/// 의존성 없는 단일 패키지 워크스페이스를 `dir`에 만든다.
+fn lone_workspace(dir: &std::path::Path, name: &str) {
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+}
+
+/// `mcp --graph`는 저장 스냅샷을 서빙하지만 rustograph_deps는 `--dir` 워크스페이스를 따로 수확한다 —
+/// 그 워크스페이스가 스냅샷이 기록한 `workspace`(cargo가 준 절대 경로)와 같은 디렉터리일 때만 답한다.
+/// 예전에는 다른 저장소의 deps를 isError 없이 답해, 에이전트가 같은 세션의 summary·query와 다른
+/// 코드를 말하는 답을 구분할 수 없었다. 기록이 없거나 절대 경로가 아니면 같음을 확인할 수 없어
+/// isError다. 스냅샷이 고른 경로에서는 cargo를 실행하지 않는다(Cargo.lock이 생기지 않는다).
+#[test]
+fn mcp_deps_answers_only_for_the_snapshot_workspace() {
+    use std::ffi::OsStr;
+    let tmp = std::env::temp_dir().join(format!("rg-mcp-deps-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let fixture = fixture();
+    let fixture_dir = fixture.to_str().unwrap();
+    let (other, decoy) = (tmp.join("other"), tmp.join("decoy"));
+    lone_workspace(&other, "other");
+    lone_workspace(&decoy, "decoy");
+    // 표준 출력 graph는 git을 띄우지 않는다 — fixture의 cargo 워크스페이스를 `workspace`로 싣는다.
+    let mut snapshot: serde_json::Value = serde_json::from_str(&cli_stdout(&[
+        "graph",
+        "--level",
+        "symbol",
+        "--dir",
+        fixture_dir,
+    ]))
+    .unwrap();
+    let workspace = snapshot["workspace"].as_str().unwrap().to_string();
+    assert_eq!(
+        std::fs::canonicalize(&workspace).unwrap(),
+        std::fs::canonicalize(&fixture).unwrap()
+    );
+    let mut write_snapshot = |name: &str, workspace: Option<&str>| {
+        match workspace {
+            Some(w) => snapshot["workspace"] = serde_json::json!(w),
+            None => {
+                snapshot.as_object_mut().unwrap().remove("workspace");
+            }
+        }
+        let path = tmp.join(name);
+        std::fs::write(&path, snapshot.to_string()).unwrap();
+        path
+    };
+    let same = write_snapshot("same.json", Some(&workspace));
+    let unrecorded = write_snapshot("unrecorded.json", None);
+    let relative = write_snapshot("relative.json", Some("."));
+    let elsewhere = write_snapshot("elsewhere.json", Some(decoy.to_str().unwrap()));
+    let missing = write_snapshot("missing.json", Some(tmp.join("gone").to_str().unwrap()));
+    let expected = cli_stdout(&["deps", "--format", "json", "--dir", fixture_dir]);
+    let graph = OsStr::new("--graph");
+    let dir = OsStr::new("--dir");
+    // 같은 워크스페이스 — CLI deps와 같은 답이다.
+    let answer = mcp_tool(
+        &[graph, same.as_os_str(), dir, fixture.as_os_str()],
+        "rustograph_deps",
+    );
+    assert_eq!(answer, (false, expected.clone()));
+    // 다른 워크스페이스·기록 없음·상대 경로 기록·다른 디렉터리·없는 디렉터리 기록은 isError — 원인과
+    // 해결을 싣는다.
+    let refused = [
+        (&same, other.as_os_str(), "not the workspace"),
+        (&unrecorded, fixture.as_os_str(), "does not record"),
+        (&relative, fixture.as_os_str(), "does not record"),
+        (&elsewhere, fixture.as_os_str(), "not the workspace"),
+        (&missing, fixture.as_os_str(), "not the workspace"),
+    ];
+    for (snapshot, dir_value, cause) in refused {
+        let (is_error, text) = mcp_tool(
+            &[graph, snapshot.as_os_str(), dir, dir_value],
+            "rustograph_deps",
+        );
+        assert!(is_error, "{snapshot:?} --dir {dir_value:?}: {text}");
+        assert!(text.contains(cause), "{text}");
+        assert!(text.contains("without --graph"), "{text}");
+    }
+    // 스냅샷이 고른 디렉터리에서는 cargo metadata를 돌리지 않았다.
+    assert!(!decoy.join("Cargo.lock").exists());
+    // `--graph` 없이 띄운 세션은 지금처럼 `--dir`을 수확해 답한다.
+    let (is_error, text) = mcp_tool(&[dir, other.as_os_str()], "rustograph_deps");
+    assert!(!is_error, "{text}");
+    // 같은 디렉터리의 다른 표기(심볼릭 링크)도 같은 워크스페이스다 — cargo는 표기를 그대로 돌려준다.
+    #[cfg(unix)]
+    {
+        let alias = tmp.join("alias");
+        std::os::unix::fs::symlink(&fixture, &alias).unwrap();
+        let answer = mcp_tool(
+            &[graph, same.as_os_str(), dir, alias.as_os_str()],
+            "rustograph_deps",
+        );
+        assert_eq!(answer, (false, expected));
+    }
+    std::fs::remove_dir_all(&tmp).unwrap();
 }
 
 #[test]
@@ -947,6 +1761,118 @@ pub fn nested_fn() { let _ = { fn go(helper: u32) -> u32 { helper } go(1) }; }
         .edges
         .iter()
         .any(|e| e.from == "locals::S::me" && e.to == "locals"));
+}
+
+/// 함수 본문의 최상위 문장은 중첩 블록의 문장과 방문 규칙이 다르다. 수확이 본문을 복제하지 않고
+/// 아레나의 문장을 직접 돌아도 이 규칙이 그대로여야 그래프가 바뀌지 않는다.
+/// - `let .. else`의 else 블록은 묶음보다 먼저 본다 — 그 안의 같은 이름은 아이템이다.
+/// - `;`로 끝난 문장 위치 매크로는 표현식 매크로처럼 인자를 파싱해 호출을 잡는다.
+/// - 최상위 아이템(`fn` 본문 바로 안의 `fn`)은 방문하지 않는다.
+/// - 중첩 블록은 syn 기본 순회를 따른다: 블록 안 아이템은 방문하고, `;`로 끝난 문장 매크로의
+///   인자는 파싱하지 않는다. 의도한 의미라기보다 지금의 출력이다 — 바꾸면 간선이 달라지므로
+///   본문 순회를 고칠 때 함께 바뀌지 않게 여기서 고정한다.
+/// - 정점의 unsafe 표시도 같은 범위를 본다(최상위 아이템·매크로 토큰 안은 보지 않는다).
+#[test]
+fn top_level_body_statements_keep_their_visit_rules() {
+    let tmp = std::env::temp_dir().join(format!("rg-top-stmts-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("src")).unwrap();
+    std::fs::write(
+        tmp.join("Cargo.toml"),
+        "[package]\nname = \"topstmt\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.join("src/lib.rs"),
+        r#"
+pub fn helper() -> u32 { 2 }
+pub fn item() -> u32 { 3 }
+pub fn other() -> u32 { 4 }
+macro_rules! mac { ($e:expr) => { $e } }
+
+pub fn let_else(o: Option<u32>) -> u32 { let Some(helper) = o else { return helper(); }; helper }
+pub fn top_macro() { println!("{}", helper()); }
+pub fn crate_macro() { mac!(item()); }
+pub fn nested_macro(c: bool) { if c { println!("{}", item()); } }
+pub fn top_item() { fn inner() -> u32 { helper() } }
+pub fn block_item() { { fn inner() -> u32 { other() } } }
+pub struct Q;
+impl Q {
+    pub fn method(&self, o: Option<u32>) -> u32 {
+        let Some(helper) = o else { return helper(); };
+        println!("{}", item());
+        helper
+    }
+    pub fn unsafe_method(&self) { unsafe {} }
+}
+pub trait T { fn provided(&self) { mac!(other()); } }
+
+pub fn unsafe_top() { unsafe {} }
+pub fn unsafe_let() { let _x = unsafe { 1 }; }
+pub fn unsafe_else(o: Option<u32>) { let Some(_y) = o else { unsafe { return } }; }
+pub fn unsafe_block_item() { { fn g() { unsafe {} } } }
+pub fn unsafe_top_item() { fn g() { unsafe {} } }
+pub fn unsafe_in_macro() { mac!(unsafe { 1 }); }
+pub const C: u32 = unsafe { 1 };
+pub static S: u32 = unsafe { 2 };
+pub trait U { fn provided(&self) { unsafe {} } fn required(&self); }
+"#,
+    )
+    .unwrap();
+    let d = source::load(
+        &tmp,
+        &source::Options {
+            symbol_level: true,
+            ..Default::default()
+        },
+    )
+    .expect("temp crate harvest failed");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let has = |from: &str, to: &str| {
+        let (from, to) = (format!("topstmt::{from}"), format!("topstmt::{to}"));
+        d.edges.iter().any(|e| e.from == from && e.to == to)
+    };
+    // let-else의 else 블록은 묶음 전에 본다 — 자유 함수와 impl 메서드 모두.
+    assert!(has("let_else", "helper"), "let-else diverge in a fn");
+    assert!(has("Q::method", "helper"), "let-else diverge in a method");
+    // 최상위 문장 매크로는 인자를 파싱한다 — std 매크로, 크레이트 매크로, 트레이트 기본 메서드.
+    assert!(has("top_macro", "helper"));
+    assert!(has("crate_macro", "mac") && has("crate_macro", "item"));
+    assert!(has("Q::method", "item"));
+    assert!(has("T::provided", "mac") && has("T::provided", "other"));
+    // 중첩 블록: 아이템은 방문하고, `;`로 끝난 문장 매크로 인자는 파싱하지 않는다.
+    assert!(has("block_item", "other"));
+    assert!(!has("nested_macro", "item"), "nested statement macro");
+    // 최상위 아이템은 방문하지 않는다.
+    assert!(!has("top_item", "helper"), "top-level item");
+    let is_unsafe = |id: &str| {
+        let id = format!("topstmt::{id}");
+        d.vertices
+            .iter()
+            .find(|v| v.id == id)
+            .unwrap_or_else(|| panic!("missing vertex {id}"))
+            .unsafe_
+    };
+    for id in [
+        "unsafe_top",
+        "unsafe_let",
+        "unsafe_else",
+        "unsafe_block_item",
+        "C",
+        "S",
+        "U::provided",
+        "Q::unsafe_method",
+    ] {
+        assert!(is_unsafe(id), "{id} should be unsafe");
+    }
+    for id in [
+        "unsafe_top_item",
+        "unsafe_in_macro",
+        "U::required",
+        "let_else",
+    ] {
+        assert!(!is_unsafe(id), "{id} should not be unsafe");
+    }
 }
 
 /// src 아래 파일들로 임시 크레이트(`pathcycle` 패키지)를 만든다 — 공유 fixture의 계수를
@@ -1329,4 +2255,68 @@ fn path_attribute_fixture_modules_are_kept() {
         assert!(ids.contains(id), "missing module {id}");
     }
     assert_eq!(skipped_mod_lines(&d.limitations), Vec::<&str>::new());
+}
+
+#[path = "support/fan_out.rs"]
+mod fan_out;
+
+/// `from` 본문이 단 추정(tentative) call 간선의 대상 — 정렬한 목록이다.
+fn tentative_calls(d: &rustograph::graph::Document, from: &str) -> Vec<String> {
+    let mut found: Vec<String> = d
+        .edges
+        .iter()
+        .filter(|e| e.from == from && e.kind == EdgeKind::Call && e.tentative)
+        .map(|e| e.to.clone())
+        .collect();
+    found.sort();
+    found
+}
+
+/// 이름 팬아웃(수신자 타입을 모르는 `x.m()`)은 고유 메서드와 트레이트 선언 메서드를 호출 크레이트와
+/// 그 전이 의존 폐포에서만 고른다. 폐포는 의존 종류 전부(dev 의존 — 수확이 `#[cfg(test)]` 모듈까지
+/// 담는다), 기본 feature가 켜지 않아 cargo의 resolve 그래프에 없는 optional 의존(수확이
+/// `#[cfg(feature)]` 뒤 코드도 담는다), 같은 패키지의 lib(bin이 자기 lib을 부른다)을 따른다. 그 밖의
+/// 크레이트 타입·트레이트는 호출 크레이트가 이름 붙이거나 값으로 얻을 수 없어 정적으로 호출할 수
+/// 없다 — 워크스페이스 전체를 후보로 삼던 예전 색인은 의존 관계가 없는 크레이트로도 간선을 퍼뜨렸다.
+/// 트레이트 impl 메서드는 dyn·제네릭 디스패치로 의존 없이 닿으니(역방향 의존 크레이트의 impl)
+/// 그대로 전체에서 고르고, 후보가 전부 걸러진 호출은 limitation으로 센다.
+#[test]
+fn name_fan_out_stays_within_the_calling_crates_dependencies() {
+    let dir = fan_out::write_workspace("syn");
+    let d = source::load(
+        &dir,
+        &source::Options {
+            symbol_level: true,
+            ..Default::default()
+        },
+    )
+    .expect("fan-out workspace harvest failed");
+    let _ = std::fs::remove_dir_all(&dir);
+    // other::O::get(고유)과 other::Spin::spin(트레이트 선언)은 app이 의존하지 않는 크레이트 것이다.
+    assert_eq!(tentative_calls(&d, "app::calls"), ["dep::D::get"]);
+    assert_eq!(
+        tentative_calls(&d, "app::hooks"),
+        ["app::Hook::fire", "other::O::<Hook>::fire"]
+    );
+    assert_eq!(
+        tentative_calls(&d, "app::tuned"),
+        ["dep::D::get", "opt::P::tune"]
+    );
+    assert_eq!(
+        tentative_calls(&d, "app::tests::probed"),
+        ["testdep::T::probe"]
+    );
+    // bin은 같은 패키지 lib의 메서드를 고르고, 의존하지 않는 dep·other의 get은 고르지 않는다.
+    assert_eq!(tentative_calls(&d, "tool_cli::turn"), ["tool::K::knob"]);
+    assert!(
+        d.limitations.iter().any(|l| l == fan_out::OUT_OF_REACH),
+        "{:?}",
+        d.limitations
+    );
+    assert!(
+        d.limitations.iter().any(|l| l
+            == "6 method calls resolved by name fan-out (no type information; errs toward alive)"),
+        "{:?}",
+        d.limitations
+    );
 }

@@ -55,6 +55,14 @@ check 2 "impact missing"    impact fixture_core::missing
 check 2 "rules no config"   rules --strict
 check 0 "rules"             rules --config "$FIX/rules.yml"
 check 0 "rules sarif"       rules --config "$FIX/rules.yml" --format sarif
+# 설정 실수는 규칙을 끈 채 통과하지 않는다 — 모르는 키(components 오타), 정의되지 않은
+# 컴포넌트를 가리키는 규칙 키, 컴포넌트 없는 설정은 설정 오류 2다(이전에는 0 위반·0).
+printf 'component:\n  app: ["fixture_app/**"]\ndeny:\n  app: [core]\n' > "$FIX/typo.yml"
+printf 'components:\n  app: ["fixture_app/**"]\ndeny:\n  nope: [app]\n' > "$FIX/undefined.yml"
+printf 'components: {}\n' > "$FIX/empty.yml"
+check 2 "rules typo key"    rules --strict --config "$FIX/typo.yml"
+check 2 "rules undefined"   rules --strict --config "$FIX/undefined.yml"
+check 2 "rules empty"       rules --strict --config "$FIX/empty.yml"
 check 0 "version"           version
 check 0 "--version"         --version
 # --version은 isthmus 설치 버전 대조가 읽는 별칭이다 — 하위 명령과 출력이 같아야 한다.
@@ -65,6 +73,19 @@ fi
 check 2 "unknown command"   frobnicate
 check 2 "bad level"         graph --level bogus
 check 2 "bad format"        graph --format xml
+# 명령이 쓰지 않는 플래그·위치 인자는 조용히 무시하지 않고 사용법 오류(2)다 — `cycles --out`은
+# 파일 없이 0으로 끝났었다. 문서화된 공유 플래그는 그래프를 읽는 모든 명령이 계속 받는다(0).
+check 2 "cycles out"        cycles --format json --out "$FIX/cycles.json"
+check 2 "query format"      query fixture_core::entry --format mermaid
+check 2 "paths role"        paths fixture_app::main fixture_core::entry --role server
+check 2 "dead level"        dead --level module
+check 2 "query extra arg"   query fixture_core::entry fixture_core::Used
+check 2 "deps out"          deps --out "$FIX/deps.txt"
+check 0 "cycles shared"     cycles --deps --retain-public --no-cache --exclude-tests --focus fixture_core --target x86_64-pc-windows-msvc
+if [ -e "$FIX/cycles.json" ] || [ -e "$FIX/deps.txt" ]; then
+	echo "FAIL unused --out: a file was written" >&2
+	fails=$((fails+1))
+fi
 
 # 신규 질의 — paths/search/deps와 문서 필터의 종료 코드 계약.
 check 0 "paths"             paths fixture_app::main fixture_core::entry
@@ -72,6 +93,14 @@ check 2 "paths missing to"  paths fixture_app::main fixture_core::nope
 check 2 "paths one arg"     paths fixture_app::main
 check 2 "paths ambiguous"   paths nest fixture_core::entry
 check 0 "search"            search entry
+# 숫자 인자 상한 — 상한까지는 0, 넘는 값은 조용히 깎지 않고 사용법 오류(2)다(MCP 도구는 isError).
+check 0 "paths at caps"     paths fixture_app::main fixture_core::entry --max 1024 --budget 1000000
+check 2 "paths budget cap"  paths fixture_app::main fixture_core::entry --budget 1000001
+check 2 "paths max cap"     paths fixture_app::main fixture_core::entry --max 1025
+check 0 "query at caps"     query fixture_core::entry --depth 64 --max 10000
+check 2 "query max cap"     query fixture_core::entry --max 10001
+check 2 "impact depth cap"  impact fixture_core::Used --depth 65
+check 2 "search max cap"    search entry --max 10001
 check 0 "deps"              deps
 check 0 "deps json"         deps --format json
 check 1 "deps strict"       deps --strict
@@ -141,6 +170,16 @@ grep -q "allow|fixture_app" "$FIX/base.txt" || {
 	echo "FAIL baseline file: no violation key written" >&2
 	fails=$((fails+1))
 }
+# 설정의 baseline:은 설정 파일 기준이고 --dir 안이어야 한다 — 저장소가 고른 값이라 루트 밖·절대
+# 경로는 수확 전에 2이고 바깥에 파일·디렉터리를 만들지 않는다. 명시 --baseline은 위 줄처럼 어디든 된다.
+{ cat "$FIX/deny.yml"; echo 'baseline: ../escaped/new/base.txt'; } > "$FIX/fixture/escape.yml"
+{ cat "$FIX/deny.yml"; echo "baseline: $FIX/absolute.txt"; } > "$FIX/fixture/absolute.yml"
+check 2 "baseline escape"   rules --config "$FIX/fixture/escape.yml" --write-baseline
+check 2 "baseline absolute" rules --config "$FIX/fixture/absolute.yml" --write-baseline
+if [ -e "$FIX/escaped" ] || [ -e "$FIX/absolute.txt" ]; then
+	echo "FAIL baseline bound: wrote outside --dir" >&2
+	fails=$((fails+1))
+fi
 
 # --semantic — opt-in feature 계약: feature 빌드면 분석 성공(0), 아니면
 # 무엇을 빌드해야 하는지 알려주는 명확한 오류(2)여야 한다. 조용한 syn
@@ -316,6 +355,19 @@ for tool in rustograph_paths rustograph_search rustograph_deps; do
 		fails=$((fails+1))
 	}
 done
+# 1 MiB를 넘는 요청 줄(여기서는 2 MiB)은 버퍼에 쌓지 않고 -32600 오류로 답한 뒤 다음 줄을 계속 읽는다(종료 0).
+big_out="$({
+	printf '%s' '{"jsonrpc":"2.0","id":1,"method":"ping","pad":"'
+	head -c 2097152 /dev/zero | tr '\0' x
+	printf '%s\n%s\n' '"}' '{"jsonrpc":"2.0","id":2,"method":"ping"}'
+} | "$BIN" mcp --dir "$FIX/fixture" 2>/dev/null)" || {
+	echo "FAIL mcp oversized line: exit $?" >&2
+	fails=$((fails+1))
+}
+if ! echo "$big_out" | grep -q '"code":-32600' || ! echo "$big_out" | grep -q '"id":2,"result"'; then
+	echo "FAIL mcp oversized line: expected a -32600 error and then the next ping answered" >&2
+	fails=$((fails+1))
+fi
 
 if [ "$fails" -gt 0 ]; then
 	echo "$fails contract checks failed" >&2

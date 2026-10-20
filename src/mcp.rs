@@ -40,6 +40,118 @@ struct RpcError {
     message: String,
 }
 
+/// 요청 한 줄의 최대 바이트 수(줄 끝 `\n`·`\r\n` 제외) — 1 MiB. 계열 MCP 서버(schemagraph·cartograph의
+/// 1 MiB 요청 상한)와 같다. 이 서버의 요청은 정점 ID와 정수 몇 개라 수백 바이트면 된다 — 상한이 없으면
+/// 개행 없는 입력 하나가 서버 메모리를 끝없이 쌓는다.
+const MAX_REQUEST_LINE_BYTES: usize = 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// 요청 줄 버퍼가 담았던 가장 긴 내용(바이트) — 상한을 넘는 줄도 버퍼가 상한에 묶이는지
+    /// 단위 테스트가 본다(테스트 스레드마다 따로).
+    static LINE_BUFFER_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// stdin에서 읽은 요청 줄 하나.
+enum RequestLine {
+    /// 줄 끝을 뗀 줄 내용(UTF-8).
+    Text(String),
+    /// 상한을 넘은 줄 — 내용을 쌓지 않고 다음 개행(또는 EOF)까지 읽어 버렸다.
+    Oversized,
+}
+
+/// 다음 요청 줄을 읽는다 — EOF면 None. 줄 내용은 [`MAX_REQUEST_LINE_BYTES`]까지만 버퍼에 쌓고, 넘으면
+/// 나머지는 읽어 버리기만 해 메모리가 상한에 묶인다. 줄 끝·오류 처리는 예전 `BufRead::lines`와 같다:
+/// `\n`을 떼고 그 앞 `\r`도 떼며, 개행 없이 EOF로 끝난 마지막 줄도 한 줄이고, UTF-8이 아닌 줄은 읽기 오류다.
+fn read_request_line(stdin: &mut dyn BufRead) -> std::io::Result<Option<RequestLine>> {
+    let mut line_bytes = Vec::new();
+    let (mut read_any, mut oversized) = (false, false);
+    loop {
+        let chunk = match stdin.fill_buf() {
+            Ok(chunk) => chunk,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if chunk.is_empty() {
+            // EOF — 읽은 것이 없으면 입력 끝, 있으면 개행 없는 마지막 줄이다.
+            if !read_any {
+                return Ok(None);
+            }
+            return end_request_line(line_bytes, oversized, false).map(Some);
+        }
+        read_any = true;
+        let newline_at = chunk.iter().position(|&b| b == b'\n');
+        let content = &chunk[..newline_at.unwrap_or(chunk.len())];
+        // `\r\n`의 `\r`은 줄 내용이 아니다 — 상한보다 1바이트 더 쌓아 두고 줄 끝에서 판정한다.
+        if !oversized && line_bytes.len() + content.len() <= MAX_REQUEST_LINE_BYTES + 1 {
+            line_bytes.extend_from_slice(content);
+        } else {
+            oversized = true;
+            line_bytes = Vec::new();
+        }
+        #[cfg(test)]
+        LINE_BUFFER_PEAK.with(|peak| peak.set(peak.get().max(line_bytes.len())));
+        let consumed = newline_at.map_or(chunk.len(), |at| at + 1);
+        stdin.consume(consumed);
+        if newline_at.is_some() {
+            return end_request_line(line_bytes, oversized, true).map(Some);
+        }
+    }
+}
+
+/// 다 읽은 줄 하나를 판정한다 — 개행으로 끝난 줄은 끝의 `\r`을 떼고, 그래도 상한을 넘으면 Oversized다.
+fn end_request_line(
+    mut line_bytes: Vec<u8>,
+    oversized: bool,
+    newline: bool,
+) -> std::io::Result<RequestLine> {
+    if newline && line_bytes.last() == Some(&b'\r') {
+        line_bytes.pop();
+    }
+    if oversized || line_bytes.len() > MAX_REQUEST_LINE_BYTES {
+        return Ok(RequestLine::Oversized);
+    }
+    // 예전 `lines()`가 내던 것과 같은 오류다 — 세션은 이 오류에서 끝난다(종료 2).
+    String::from_utf8(line_bytes)
+        .map(RequestLine::Text)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            )
+        })
+}
+
+/// 상한을 넘은 요청 줄에 대한 답 — 줄을 파싱하지 않았으니 id를 알 수 없어 null이다(JSON-RPC 2.0이
+/// Invalid Request에 정한 대로). 서버는 이 답을 쓰고 다음 줄을 계속 읽는다.
+fn oversized_request_error() -> Response {
+    Response {
+        jsonrpc: "2.0",
+        id: serde_json::Value::Null,
+        result: None,
+        error: Some(RpcError {
+            code: -32600,
+            message: format!(
+                "request line exceeds the 1 MiB limit ({MAX_REQUEST_LINE_BYTES} bytes) and was \
+                 discarded; send each request as one shorter line"
+            ),
+        }),
+    }
+}
+
+/// 응답 하나를 한 줄 JSON으로 쓰고 비운다 — 직렬화 실패는 stderr에 남긴다.
+fn write_response(resp: &Response, out: &mut dyn Write, err: &mut dyn Write) {
+    match serde_json::to_string(resp) {
+        Ok(s) => {
+            let _ = writeln!(out, "{s}");
+            let _ = out.flush();
+        }
+        Err(e) => {
+            let _ = writeln!(err, "mcp: encoding response: {e}");
+        }
+    }
+}
+
 /// 수확된 문서 하나를 서빙하는 서버 상태.
 pub struct Server<'d> {
     doc: &'d Document,
@@ -49,6 +161,9 @@ pub struct Server<'d> {
     index: analysis::QueryIndex<'d>,
     /// deps 도구가 cargo metadata를 읽을 워크스페이스 디렉터리.
     dir: PathBuf,
+    /// 문서를 `--graph` 저장 스냅샷에서 읽었는가 — 그러면 deps 도구는 `dir` 워크스페이스가 스냅샷이
+    /// 기록한 워크스페이스와 같을 때만 답한다. 수확한 세션은 문서와 deps가 같은 `dir`을 본다.
+    snapshot: bool,
     /// deps 보고서 — 첫 호출 시 한 번 만든다. 매 요청마다 syn 수확을
     /// 새로 하면 Box::leak된 AST가 서버 수명 동안 계속 쌓이고, 시작
     /// 시 무조건 수확하면 deps를 안 쓰는 세션도 수확 비용을 치른다.
@@ -71,15 +186,24 @@ pub(crate) fn cmd(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<i32, String> {
+    // `--root`는 서빙하는 문서의 보존 루트를 바꾼다(summary·dead 도구가 쓴다).
+    cli_args::reject_unused(a, &[cli_args::DOCUMENT_FLAGS, &["config", "root"]], 0)?;
     let doc = cli_args::document_for(a, true)?;
     let dir = PathBuf::from(a.get("dir").unwrap_or("."));
     let cfg_path = match a.get("config") {
         Some(f) => Some(PathBuf::from(f)),
         None => find_config(&dir),
     };
-    let srv = Server::new(&doc, dir, cfg_path);
+    let mut srv = Server::new(&doc, dir, cfg_path);
+    srv.snapshot = a.get("graph").is_some();
     Ok(srv.serve(stdin, out, err))
 }
+
+/// 스냅샷 세션의 deps 도구가 스냅샷의 워크스페이스를 알 수 없을 때의 답 — 원인과 해결 방향.
+const UNRECORDED_WORKSPACE: &str = "the --graph snapshot does not record the absolute cargo \
+     workspace it was harvested from, so rustograph_deps cannot tell whether the --dir workspace is \
+     the same one; regenerate the snapshot with `rustograph graph --level symbol --out FILE`, or \
+     start the server without --graph";
 
 /// 디렉터리에서 규칙 파일 위치만 찾는다 — 내용 파싱은 호출 시점에 한다.
 fn find_config(dir: &Path) -> Option<PathBuf> {
@@ -99,6 +223,7 @@ impl<'d> Server<'d> {
             doc,
             index: analysis::QueryIndex::new(doc),
             dir,
+            snapshot: false,
             deps_report: std::sync::OnceLock::new(),
             cycles: Default::default(),
             cfg_path,
@@ -106,12 +231,18 @@ impl<'d> Server<'d> {
         }
     }
 
-    /// EOF까지 한 줄씩 JSON-RPC를 처리한다.
+    /// EOF까지 한 줄씩 JSON-RPC를 처리한다. [`MAX_REQUEST_LINE_BYTES`]를 넘는 줄은 쌓지 않고
+    /// 오류로 답한 뒤 다음 줄로 넘어간다.
     fn serve(&self, stdin: &mut dyn BufRead, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         let mut protocol = self.protocol.clone();
-        for line in stdin.lines() {
-            let line = match line {
-                Ok(l) => l,
+        loop {
+            let line = match read_request_line(stdin) {
+                Ok(Some(RequestLine::Text(l))) => l,
+                Ok(Some(RequestLine::Oversized)) => {
+                    write_response(&oversized_request_error(), out, err);
+                    continue;
+                }
+                Ok(None) => return 0,
                 Err(e) => {
                     let _ = writeln!(err, "mcp: reading stdin: {e}");
                     return 2;
@@ -123,17 +254,8 @@ impl<'d> Server<'d> {
             let Some(resp) = self.handle(&line, &mut protocol) else {
                 continue;
             };
-            match serde_json::to_string(&resp) {
-                Ok(s) => {
-                    let _ = writeln!(out, "{s}");
-                    let _ = out.flush();
-                }
-                Err(e) => {
-                    let _ = writeln!(err, "mcp: encoding response: {e}");
-                }
-            }
+            write_response(&resp, out, err);
         }
-        0
     }
 
     /// 메시지 하나를 디스패치한다. 알림(id 없음)은 None을 돌려 응답을 생략한다.
@@ -245,24 +367,23 @@ impl<'d> Server<'d> {
             "rustograph_query" => {
                 let id = arg_str(args, "id").ok_or("query needs an \"id\" argument")?;
                 let id = self.require_id(id)?;
+                // depth 0은 CLI `--depth 0`과 같은 해석 함수로 "깊이 제한 없음"이다 — 보고에는 요청값을 싣는다.
                 let depth = arg_usize(args, "depth")?.unwrap_or(1);
                 let max = arg_usize(args, "max")?.unwrap_or(200);
-                Ok(export::to_json(&self.index.query(&id, depth, max)))
+                cli_args::check_neighbor_limits(cli_args::ArgSpelling::ToolArgument, depth, max)?;
+                let mut r = self.index.query(&id, cli_args::walk_depth(depth), max);
+                r.depth = depth;
+                Ok(export::to_json(&r))
             }
             "rustograph_impact" => {
                 let id = arg_str(args, "id").ok_or("impact needs an \"id\" argument")?;
                 let id = self.require_id(id)?;
-                // depth 0은 "전체 전이 클로저" — 내부에서는 무제한으로 바꾸되
-                // 보고에는 요청값을 싣는다(usize::MAX는 계약이 아니다).
-                let requested = arg_usize(args, "depth")?.unwrap_or(0);
-                let effective = if requested == 0 {
-                    usize::MAX
-                } else {
-                    requested
-                };
+                // 기본 깊이는 0(깊이 제한 없음)이다 — query와 같은 해석 함수를 지나고 보고에는 요청값을 싣는다.
+                let depth = arg_usize(args, "depth")?.unwrap_or(0);
                 let max = arg_usize(args, "max")?.unwrap_or(200);
-                let mut r = self.index.impact(&id, effective, max);
-                r.depth = requested;
+                cli_args::check_neighbor_limits(cli_args::ArgSpelling::ToolArgument, depth, max)?;
+                let mut r = self.index.impact(&id, cli_args::walk_depth(depth), max);
+                r.depth = depth;
                 Ok(export::to_json(&r))
             }
             "rustograph_paths" => {
@@ -272,20 +393,17 @@ impl<'d> Server<'d> {
                 let to = self.require_id(to)?;
                 let max = arg_usize(args, "max")?.unwrap_or(10);
                 let budget = arg_usize(args, "budget")?.unwrap_or(50_000);
+                cli_args::check_paths_limits(cli_args::ArgSpelling::ToolArgument, max, budget)?;
                 Ok(export::to_json(&self.index.paths(&from, &to, max, budget)))
             }
             "rustograph_search" => {
                 let q = arg_str(args, "q").ok_or("search needs a \"q\" argument")?;
                 let max = arg_usize(args, "max")?.unwrap_or(20);
+                cli_args::check_search_limit(cli_args::ArgSpelling::ToolArgument, max)?;
                 Ok(export::to_json(&analysis::search(self.doc, q, max)))
             }
-            // 첫 호출에 한 번 수확해 메모한다 — 자체 syn 수확으로
-            // 문서를 만드는 이유는 공유 문서가 외부 정점이 없거나
-            // 필터됐을 수 있어 사용 증거로 못 쓰기 때문이다.
-            "rustograph_deps" => self
-                .deps_report
-                .get_or_init(|| deps::report(&self.dir).map(|r| export::to_json(&r)))
-                .clone(),
+            // 첫 호출에 한 번 만들어 메모한다(오류도 세션 내내 같다).
+            "rustograph_deps" => self.deps_report.get_or_init(|| self.deps_json()).clone(),
             "rustograph_cycles" => {
                 let level = match arg_str(args, "level") {
                     Some(l) => Level::parse(l)
@@ -332,13 +450,20 @@ impl<'d> Server<'d> {
                 // 설정은 호출마다 다시 읽는다(세션 중 바뀔 수 있다) — 명시 --config여도 정규
                 // 파일만 연다. 한 번만 읽히는 파이프는 두 번째 호출에서 멈추거나 빈 설정을 읽는다.
                 let cfg = config::load_file(cfg_path, config::FileKinds::RegularOnly)?;
-                let mut rep = rules::check(self.doc, &cfg);
-                // 설정에 선언된 기준선을 적용한다 — CLI rules와 같은 계약.
+                // 설정에 선언된 기준선을 적용한다 — CLI rules와 같은 계약. 경로는 서버의
+                // --dir 안으로 가둔다(config::resolve_baseline) — 설정은 분석 대상 저장소가 고른다.
                 // NotFound만 도입 전으로 본다 — 권한 오류나 깨진 파일을
                 // 조용히 넘기면 억제가 안 먹힌 채로 지나간다. 장치·FIFO는
                 // 열지 않고 상한까지만 읽는다 — 서버가 멈추면 안 된다.
-                if let Some(b) = &cfg.baseline {
-                    let path = cfg_path.parent().unwrap_or(self.dir.as_path()).join(b);
+                let baseline_path = match &cfg.baseline {
+                    Some(b) => {
+                        let cfg_dir = cfg_path.parent().unwrap_or(self.dir.as_path());
+                        Some(config::resolve_baseline(cfg_dir, &self.dir, b)?)
+                    }
+                    None => None,
+                };
+                let mut rep = rules::check(self.doc, &cfg);
+                if let Some(path) = baseline_path {
                     match config::read_bounded_text(
                         &path,
                         config::MAX_FILE_BYTES,
@@ -370,6 +495,33 @@ impl<'d> Server<'d> {
         })
     }
 
+    /// deps 보고서(JSON) — `dir`을 자체 syn 수확으로 만든다. 서빙하는 문서는 외부 정점이 없거나
+    /// 필터됐을 수 있어 사용 증거로 못 쓴다. 스냅샷 세션에서는 `dir` 워크스페이스가 스냅샷이 기록한
+    /// `workspace`(cargo가 준 절대 경로)와 같은 디렉터리일 때만 답한다 — 다르면 같은 세션의 summary·
+    /// query와 다른 저장소를 말하는 답이 되는데 에이전트는 구분할 수 없다. 기록이 없거나 상대 경로면
+    /// 같음을 확인할 수 없어 오류다. 스냅샷이 고른 경로에서는 cargo를 실행하지 않는다.
+    fn deps_json(&self) -> Result<String, String> {
+        if !self.snapshot {
+            return deps::report(&self.dir).map(|r| export::to_json(&r));
+        }
+        let workspace = self
+            .doc
+            .workspace
+            .as_deref()
+            .map(Path::new)
+            .filter(|w| w.is_absolute())
+            .ok_or(UNRECORDED_WORKSPACE)?;
+        match deps::report_in_workspace(&self.dir, workspace)? {
+            Ok(report) => Ok(export::to_json(&report)),
+            Err(dir_workspace) => Err(format!(
+                "rustograph_deps harvests the --dir workspace {}, which is not the workspace the \
+                 --graph snapshot was harvested from (rustograph_summary shows it); start the \
+                 server with --dir set to the snapshot's workspace, or without --graph",
+                dir_workspace.display()
+            )),
+        }
+    }
+
     /// 레벨 하나의 cycles 보고서(JSON) — 첫 호출에 만들어 두고 같은 레벨의 다음 호출은
     /// 그대로 돌려준다. 문서 레벨이면 투영할 것이 없다 — view()는 같은 레벨에서 문서를
     /// 통째로 복제한다.
@@ -388,8 +540,11 @@ impl<'d> Server<'d> {
     }
 }
 
-/// 도구 목록과 입력 스키마 — 계열의 이름 규칙(`<tool>_<query>`)을 따른다.
+/// 도구 목록과 입력 스키마 — 계열의 이름 규칙(`<tool>_<query>`)을 따른다. 정수 인자의 상한은 서버가
+/// 거부하는 값과 같은 상수로 JSON Schema `maximum`과 설명에 싣는다 — 클라이언트가 보내기 전에 안다.
 fn tool_list() -> serde_json::Value {
+    let (max_results, max_depth) = (cli_args::MAX_RESULTS, cli_args::MAX_DEPTH);
+    let (max_paths, max_budget) = (cli_args::MAX_PATHS, cli_args::MAX_PATH_BUDGET);
     serde_json::json!([
         {
             "name": "rustograph_summary",
@@ -403,8 +558,8 @@ fn tool_list() -> serde_json::Value {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "vertex ID, e.g. mycrate::mod::func"},
-                    "depth": {"type": "integer", "description": "neighbor depth (default 1)"},
-                    "max": {"type": "integer", "description": "max neighbors (default 200)"},
+                    "depth": {"type": "integer", "minimum": 0, "maximum": max_depth, "description": format!("neighbor depth (default 1, at most {max_depth}); 0 = no depth limit, bounded by max")},
+                    "max": {"type": "integer", "minimum": 0, "maximum": max_results, "description": format!("max neighbors (default 200, at most {max_results})")},
                 },
                 "required": ["id"],
             },
@@ -416,8 +571,8 @@ fn tool_list() -> serde_json::Value {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "vertex ID"},
-                    "depth": {"type": "integer", "description": "max depth; 0 = full closure"},
-                    "max": {"type": "integer", "description": "max dependers (default 200)"},
+                    "depth": {"type": "integer", "minimum": 0, "maximum": max_depth, "description": format!("max depth (default 0, at most {max_depth}); 0 = no depth limit, the full closure bounded by max")},
+                    "max": {"type": "integer", "minimum": 0, "maximum": max_results, "description": format!("max dependers (default 200, at most {max_results})")},
                 },
                 "required": ["id"],
             },
@@ -451,8 +606,8 @@ fn tool_list() -> serde_json::Value {
                 "properties": {
                     "from": {"type": "string", "description": "start vertex ID"},
                     "to": {"type": "string", "description": "goal vertex ID"},
-                    "max": {"type": "integer", "description": "max paths (default 10)"},
-                    "budget": {"type": "integer", "description": "max vertex expansions (default 50000)"},
+                    "max": {"type": "integer", "minimum": 0, "maximum": max_paths, "description": format!("max paths (default 10, at most {max_paths})")},
+                    "budget": {"type": "integer", "minimum": 0, "maximum": max_budget, "description": format!("max vertex expansions (default 50000, at most {max_budget})")},
                 },
                 "required": ["from", "to"],
             },
@@ -464,19 +619,19 @@ fn tool_list() -> serde_json::Value {
                 "type": "object",
                 "properties": {
                     "q": {"type": "string", "description": "query string"},
-                    "max": {"type": "integer", "description": "max hits (default 20)"},
+                    "max": {"type": "integer", "minimum": 0, "maximum": max_results, "description": format!("max hits (default 20, at most {max_results})")},
                 },
                 "required": ["q"],
             },
         },
         {
             "name": "rustograph_deps",
-            "description": "Cargo dependency report: unused declared deps (observed via graph) and duplicate versions. Needs --deps harvest for usage evidence",
+            "description": "Cargo dependency report: unused declared deps and duplicate versions, from the tool's own harvest of the --dir workspace (with --graph, only when that is the workspace the snapshot was harvested from)",
             "inputSchema": {"type": "object", "properties": {}},
         },
         {
             "name": "rustograph_rules",
-            "description": "Check layer rules from .rustograph.yml; returns violations and unmapped vertices",
+            "description": "Check layer rules from .rustograph.yml; returns violations and unmapped vertices. A rules file with an unknown key, a rule keyed by a component that components does not define, or no component is an error, and so is a baseline: path that leaves the --dir directory",
             "inputSchema": {"type": "object", "properties": {}},
         },
     ])
@@ -556,15 +711,144 @@ mod tests {
     fn session(srv: &Server<'_>, lines: &[&str]) -> Vec<serde_json::Value> {
         let input = lines.join("\n") + "\n";
         let mut in_: &[u8] = input.as_bytes();
+        served(srv, &mut in_)
+    }
+
+    /// 입력 스트림 하나를 EOF까지 서빙하고 응답 줄들을 JSON 값으로 돌려준다 — 종료 코드는 0이어야 한다.
+    fn served(srv: &Server<'_>, input: &mut dyn BufRead) -> Vec<serde_json::Value> {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = srv.serve(&mut in_, &mut out, &mut err);
+        let code = srv.serve(input, &mut out, &mut err);
         assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
         String::from_utf8(out)
             .unwrap()
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect()
+    }
+
+    /// 요청 줄 상한(1 MiB) — 시험이 상수를 거치지 않고 값을 고정한다.
+    const LINE_LIMIT: usize = 1024 * 1024;
+
+    /// 줄 내용이 정확히 `len`바이트인 ping 요청 — `pad` 문자열 길이로 맞춘다.
+    fn ping_of_len(id: u32, len: usize) -> String {
+        let bare = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping","pad":""}}"#);
+        let pad = "x".repeat(len - bare.len());
+        format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping","pad":"{pad}"}}"#)
+    }
+
+    /// 상한을 넘은 줄의 답 — id를 알 수 없어 null인 -32600(Invalid Request)이고 원인·해결이 담긴다.
+    fn assert_oversized_answer(r: &serde_json::Value) {
+        assert_eq!(r["id"], serde_json::Value::Null, "{r}");
+        assert_eq!(r["error"]["code"], -32600, "{r}");
+        let message = r["error"]["message"].as_str().unwrap();
+        assert!(message.contains("1 MiB"), "{message}");
+        assert_eq!(r.get("result"), None, "{r}");
+    }
+
+    /// 1 MiB를 넘는 요청 줄은 처리하지 않는다 — -32600 오류 하나로 답하고 그 줄을 다음 개행까지
+    /// 버린 뒤 다음 요청을 정상으로 처리한다. 개행 없이 EOF로 끝나는 거대 줄도 같다. 예전 서버는
+    /// 줄 길이 상한 없이 `lines()`로 읽어 3 MiB 줄도 그대로 처리했다 — 개행 없는 입력 하나가
+    /// 메모리를 끝없이 쌓을 수 있었다.
+    #[test]
+    fn request_lines_over_one_mebibyte_are_refused_and_skipped() {
+        let doc = test_doc();
+        let srv = server_for(&doc);
+        let huge = ping_of_len(1, 3 * LINE_LIMIT);
+        let next = r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#;
+        let res = session(&srv, &[&huge, next]);
+        assert_eq!(res.len(), 2, "{res:?}");
+        assert_oversized_answer(&res[0]);
+        assert_eq!(res[1]["id"], 2);
+        assert_eq!(res[1]["result"], serde_json::json!({}));
+        // 개행 없이 끝나는 마지막 줄 — 답한 뒤 정상 종료(0)한다.
+        let input = format!("{next}\n{huge}");
+        let res = served(&srv, &mut input.as_bytes());
+        assert_eq!(res.len(), 2, "{res:?}");
+        assert_eq!(res[0]["id"], 2);
+        assert_oversized_answer(&res[1]);
+    }
+
+    /// 거대 줄은 버퍼에 쌓이지 않는다 — 개행 없는 64 MiB 입력을 보내도 줄 버퍼가 담는 내용은
+    /// 상한(+ `\r` 한 바이트)을 넘지 않고, 그 뒤 줄은 정상으로 처리된다.
+    #[test]
+    fn oversized_request_lines_never_hold_more_than_the_limit() {
+        use std::io::Read;
+        let doc = test_doc();
+        let srv = server_for(&doc);
+        let flood = std::io::repeat(b'x').take(64 * LINE_LIMIT as u64);
+        let rest: &[u8] = b"\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n";
+        let mut reader = std::io::BufReader::new(flood.chain(rest));
+        LINE_BUFFER_PEAK.with(|peak| peak.set(0));
+        let res = served(&srv, &mut reader);
+        let peak = LINE_BUFFER_PEAK.with(std::cell::Cell::get);
+        assert!(peak <= LINE_LIMIT + 1, "line buffer held {peak} bytes");
+        assert_eq!(res.len(), 2, "{res:?}");
+        assert_oversized_answer(&res[0]);
+        assert_eq!(res[1]["id"], 2);
+        assert_eq!(MAX_REQUEST_LINE_BYTES, LINE_LIMIT);
+    }
+
+    /// 상한은 줄 끝(`\n`·`\r\n`)을 뺀 내용에 적용된다 — 정확히 1 MiB인 줄은 `\n`이든 `\r\n`이든
+    /// 처리하고, 1바이트 더 긴 줄만 거부한다. 읽기 덩어리 경계(작은 버퍼)에 걸쳐도 같다.
+    #[test]
+    fn request_line_limit_counts_content_without_the_line_ending() {
+        let doc = test_doc();
+        let srv = server_for(&doc);
+        let input = format!(
+            "{}\n{}\r\n{}\n{}\r\n",
+            ping_of_len(1, LINE_LIMIT),
+            ping_of_len(2, LINE_LIMIT),
+            ping_of_len(3, LINE_LIMIT + 1),
+            ping_of_len(4, LINE_LIMIT + 1),
+        );
+        for capacity in [1, 7, 8192, 3 * LINE_LIMIT] {
+            let mut reader = std::io::BufReader::with_capacity(capacity, input.as_bytes());
+            let res = served(&srv, &mut reader);
+            assert_eq!(res.len(), 4, "capacity {capacity}: {res:?}");
+            assert_eq!(res[0]["id"], 1, "capacity {capacity}");
+            assert_eq!(res[0]["result"], serde_json::json!({}));
+            assert_eq!(res[1]["id"], 2, "capacity {capacity}");
+            assert_eq!(res[1]["result"], serde_json::json!({}));
+            assert_oversized_answer(&res[2]);
+            assert_oversized_answer(&res[3]);
+        }
+    }
+
+    /// UTF-8이 아닌 줄은 예전 `lines()`처럼 읽기 오류다 — 앞 요청의 답은 남기고 같은 문구로 종료 2.
+    #[test]
+    fn request_lines_that_are_not_utf8_end_the_session_as_before() {
+        let doc = test_doc();
+        let srv = server_for(&doc);
+        let input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n\xff\xfe\n\
+                             {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n";
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = srv.serve(&mut &input[..], &mut out, &mut err);
+        assert_eq!(code, 2);
+        assert_eq!(out, b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "mcp: reading stdin: stream did not contain valid UTF-8\n"
+        );
+    }
+
+    /// 줄 끝 처리는 예전 `lines()`와 같다 — `\r\n`·빈 줄·공백 줄을 그대로 다루고, 개행 없는 마지막
+    /// 줄도 한 요청이다. 작은 읽기 버퍼로 `\r`과 `\n`이 다른 덩어리에 걸려도 같다.
+    #[test]
+    fn request_line_endings_match_buffered_lines() {
+        let doc = test_doc();
+        let srv = server_for(&doc);
+        let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\r\n\n  \r\n\r\n\
+                     {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n\
+                     {\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}";
+        for capacity in [1, 2, 3, 64] {
+            let mut reader = std::io::BufReader::with_capacity(capacity, input.as_bytes());
+            let ids: Vec<_> = served(&srv, &mut reader)
+                .iter()
+                .map(|r| r["id"].clone())
+                .collect();
+            assert_eq!(ids, [1, 2, 3], "capacity {capacity}");
+        }
     }
 
     #[test]
@@ -660,8 +944,42 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// rules 도구도 설정·기준선을 상한 읽기로 연다 — 장치를 가리키는 baseline과 FIFO
-    /// 설정 파일은 서버를 멈추거나 메모리를 다 쓰지 않고 isError로 답한다.
+    /// rules 도구도 CLI와 같은 설정 검증을 쓴다 — `components:` 오타나 정의되지 않은 컴포넌트를
+    /// 가리키는 규칙은 보고서(0 위반) 대신 원인을 담은 isError다. 예전에는 규칙이 꺼진 채 답했다.
+    #[test]
+    fn rules_tool_rejects_configs_that_would_silently_disable_rules() {
+        let dir = std::env::temp_dir().join(format!("rg-mcp-strict-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = test_doc();
+        let mut srv = server_for(&doc);
+        for (text, cause) in [
+            (
+                "component:\n  all: [\"c/**\"]\n",
+                "unknown field `component`",
+            ),
+            (
+                "components:\n  all: [\"c/**\"]\ndeny:\n  nope: [all]\n",
+                "deny has rules for component \"nope\"",
+            ),
+        ] {
+            let cfg = dir.join("rules.yml");
+            std::fs::write(&cfg, text).unwrap();
+            srv.cfg_path = Some(cfg.clone());
+            let result = call_rules(&srv);
+            assert_eq!(result["isError"], true, "{text:?}: {result}");
+            let message = result["content"][0]["text"].as_str().unwrap();
+            assert!(
+                message.starts_with(&format!("bad {}: ", cfg.display())) && message.contains(cause),
+                "{message}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// rules 도구도 설정·기준선을 상한 읽기로 연다 — `--dir` 안의 FIFO를 가리키는 baseline과
+    /// FIFO 설정 파일은 서버를 멈추지 않고 isError로 답한다(장치 같은 절대 경로 baseline은
+    /// 경로 경계가 먼저 거부한다 — `rules_tool_keeps_config_baselines_inside_the_dir_directory`).
     #[cfg(unix)]
     #[test]
     fn rules_tool_refuses_special_config_and_baseline_files() {
@@ -674,18 +992,18 @@ mod tests {
             .status()
             .expect("mkfifo must run");
         assert!(made.success());
-        let device_baseline = dir.join("rules.yml");
+        let fifo_baseline = dir.join("rules.yml");
         std::fs::write(
-            &device_baseline,
-            "components:\n  all: [\"c/**\"]\nbaseline: /dev/zero\n",
+            &fifo_baseline,
+            "components:\n  all: [\"c/**\"]\nbaseline: pipe.yml\n",
         )
         .unwrap();
         let doc = test_doc();
-        let mut srv = server_for(&doc);
+        let mut srv = Server::new(&doc, dir.clone(), None);
         for (cfg, cause) in [
             (
-                device_baseline,
-                "cannot read baseline /dev/zero: ".to_string(),
+                fifo_baseline,
+                format!("cannot read baseline {}: ", fifo.display()),
             ),
             (fifo.clone(), format!("cannot read {}: ", fifo.display())),
         ] {
@@ -699,6 +1017,49 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// rules 도구도 설정의 baseline을 서버의 `--dir` 안으로 가둔다 — 루트 밖과 절대 경로(장치
+    /// 포함)는 열지 않고 isError다. 예전에는 저장소 밖 파일을 기준선으로 읽어 그 줄 수를
+    /// stale_baseline으로 답했다. MCP에는 `--baseline`이 없으니 오류가 그것을 권하지 않는다.
+    /// 루트 안 기준선은 그대로 읽는다.
+    #[test]
+    fn rules_tool_keeps_config_baselines_inside_the_dir_directory() {
+        let tmp = std::env::temp_dir().join(format!("rg-mcp-bound-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let root = tmp.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(tmp.join("outside.txt"), "allow|x|y|call\n").unwrap();
+        let doc = test_doc();
+        let mut srv = Server::new(&doc, root.clone(), None);
+        let cfg = root.join("rules.yml");
+        srv.cfg_path = Some(cfg.clone());
+        for (raw, cause) in [
+            ("../outside.txt", "outside the --dir directory"),
+            ("/dev/zero", "is an absolute path"),
+        ] {
+            std::fs::write(
+                &cfg,
+                format!("components:\n  all: [\"c/**\"]\nbaseline: {raw}\n"),
+            )
+            .unwrap();
+            let result = call_rules(&srv);
+            assert_eq!(result["isError"], true, "{raw}: {result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.starts_with(&format!("baseline {raw:?} from the rules file "))
+                    && text.contains(cause)
+                    && !text.contains("--baseline"),
+                "{text}"
+            );
+        }
+        std::fs::write(root.join("base.txt"), "allow|x|y|call\n").unwrap();
+        std::fs::write(&cfg, "components:\n  all: [\"c/**\"]\nbaseline: base.txt\n").unwrap();
+        let result = call_rules(&srv);
+        assert_eq!(result["isError"], serde_json::Value::Null, "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"stale_baseline\": 1"), "{text}");
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// 정점 30개 사슬에 갈래·순환·추정 간선·공개 정점을 섞은 문서 — 도구마다 비지 않은 답이 있다.
@@ -870,6 +1231,182 @@ mod tests {
         }
         // 같은 줄을 한 번 더 보내도 같은 답이다.
         assert_eq!(session(&srv, &lines), res);
+    }
+
+    /// 도구 호출 하나의 결과 — (isError인가, 본문).
+    fn tool_result(srv: &Server<'_>, name: &str, arguments: serde_json::Value) -> (bool, String) {
+        let res = session(srv, &[&call_line(1, name, arguments)]);
+        let result = &res[0]["result"];
+        (
+            result["isError"] == true,
+            result["content"][0]["text"].as_str().unwrap().to_string(),
+        )
+    }
+
+    /// 도구 인자도 CLI와 같은 상한을 지난다 — query·impact·search `max` 10,000, query·impact `depth` 64,
+    /// paths `max` 1,024·`budget` 1,000,000. 상한까지는 답하고, 넘으면 조용히 깎지 않고 isError로 답한다.
+    /// 예전에는 `budget` 하나로 단일 스레드 서버의 메모리를 수 GB까지 쓰게 할 수 있었다.
+    #[test]
+    fn tool_arguments_past_their_limits_are_errors() {
+        let doc = branching_doc();
+        let srv = server_for(&doc);
+        let (from, to) = ("c::f00", "c::f13");
+        for (name, arguments, shown, limit) in [
+            (
+                "rustograph_query",
+                serde_json::json!({"id": to, "max": 10001}),
+                "max 10001",
+                "10000",
+            ),
+            (
+                "rustograph_query",
+                serde_json::json!({"id": to, "depth": 65}),
+                "depth 65",
+                "64",
+            ),
+            (
+                "rustograph_impact",
+                serde_json::json!({"id": to, "max": 10001}),
+                "max 10001",
+                "10000",
+            ),
+            (
+                "rustograph_impact",
+                serde_json::json!({"id": to, "depth": 65}),
+                "depth 65",
+                "64",
+            ),
+            (
+                "rustograph_search",
+                serde_json::json!({"q": "f1", "max": 10001}),
+                "max 10001",
+                "10000",
+            ),
+            (
+                "rustograph_paths",
+                serde_json::json!({"from": from, "to": to, "max": 1025}),
+                "max 1025",
+                "1024",
+            ),
+            (
+                "rustograph_paths",
+                serde_json::json!({"from": from, "to": to, "budget": 1_000_000_000_000u64}),
+                "budget 1000000000000",
+                "1000000",
+            ),
+        ] {
+            let (is_error, text) = tool_result(&srv, name, arguments.clone());
+            assert!(is_error, "{name} {arguments}: {text}");
+            assert!(
+                text.starts_with(shown) && text.contains(&format!("limit of {limit}")),
+                "{name} {arguments}: {text}"
+            );
+        }
+        for (name, arguments) in [
+            (
+                "rustograph_query",
+                serde_json::json!({"id": to, "depth": 64, "max": 10000}),
+            ),
+            (
+                "rustograph_impact",
+                serde_json::json!({"id": to, "depth": 64, "max": 10000}),
+            ),
+            (
+                "rustograph_impact",
+                serde_json::json!({"id": to, "depth": 0, "max": 10000}),
+            ),
+            (
+                "rustograph_search",
+                serde_json::json!({"q": "f1", "max": 10000}),
+            ),
+            (
+                "rustograph_paths",
+                serde_json::json!({"from": from, "to": to, "max": 1024, "budget": 1_000_000}),
+            ),
+        ] {
+            let (is_error, text) = tool_result(&srv, name, arguments.clone());
+            assert!(!is_error, "{name} {arguments}: {text}");
+        }
+    }
+
+    /// `depth: 0`(깊이 제한 없음)의 방문 수는 `max` 상한이 묶는다 — 의존자 10,001개 사슬에서 최대
+    /// `max`(10,000)인 impact는 정확히 10,000개를 싣고 truncated다. 이웃 걷기는 보고 수가 `max`에
+    /// 닿으면 멈춘다.
+    #[test]
+    fn unlimited_depth_is_bounded_by_the_result_limit() {
+        let id = |i: usize| format!("c::f{i:05}");
+        let vertices = (0..10_002).map(|i| v(&id(i), Kind::Fn, false)).collect();
+        let edges = (0..10_001)
+            .map(|i| Edge::new(id(i + 1), id(i), EdgeKind::Call))
+            .collect();
+        let doc = document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec![id(10_001)],
+            vertices,
+            edges,
+            vec![],
+        );
+        let srv = server_for(&doc);
+        let arguments = serde_json::json!({"id": id(0), "depth": 0, "max": 10000});
+        let (is_error, text) = tool_result(&srv, "rustograph_impact", arguments);
+        assert!(!is_error, "{text}");
+        let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(report["impacted"].as_array().unwrap().len(), 10_000);
+        assert_eq!(report["truncated"], true);
+        assert_eq!(report["depth"], 0);
+    }
+
+    /// tools/list의 입력 스키마가 상한을 JSON Schema `maximum`으로 싣는다 — 클라이언트가 보내기 전에
+    /// 알 수 있고, 서버가 거부하는 값과 같다.
+    #[test]
+    fn tool_schemas_publish_the_argument_limits() {
+        let res = session(
+            &server_for(&test_doc()),
+            &[r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#],
+        );
+        let tools = res[0]["result"]["tools"].as_array().unwrap();
+        let maximum = |tool: &str, field: &str| {
+            let t = tools.iter().find(|t| t["name"] == tool).unwrap();
+            t["inputSchema"]["properties"][field]["maximum"].clone()
+        };
+        for (tool, field, limit) in [
+            ("rustograph_query", "max", 10_000),
+            ("rustograph_query", "depth", 64),
+            ("rustograph_impact", "max", 10_000),
+            ("rustograph_impact", "depth", 64),
+            ("rustograph_search", "max", 10_000),
+            ("rustograph_paths", "max", 1_024),
+            ("rustograph_paths", "budget", 1_000_000),
+        ] {
+            assert_eq!(maximum(tool, field), limit, "{tool}.{field}");
+        }
+    }
+
+    /// `rustograph mcp`도 쓰지 않는 플래그·위치 인자를 수확 전에 거부한다(CLI와 같은 공용 검사) —
+    /// `--root`(서빙하는 문서의 보존 루트)와 공유 플래그는 받는다.
+    #[test]
+    fn mcp_command_rejects_flags_it_does_not_use() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture");
+        let dir = fixture.to_str().unwrap();
+        let start = |argv: &[&str]| {
+            let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            let parsed = cli_args::parse(&argv).unwrap();
+            let mut stdin: &[u8] = b"";
+            cmd(&parsed, &mut stdin, &mut Vec::new(), &mut Vec::new())
+        };
+        for (argv, unused) in [
+            (&["mcp", "--out", "x.json", "--dir", dir][..], "--out"),
+            (&["mcp", "--level", "module", "--dir", dir][..], "--level"),
+            (&["mcp", "--strict", "--dir", dir][..], "--strict"),
+            (&["mcp", "stray", "--dir", dir][..], "\"stray\""),
+        ] {
+            let e = start(argv).unwrap_err();
+            assert!(e.starts_with("mcp does not") && e.contains(unused), "{e}");
+        }
+        let kept = ["mcp", "--root", "fixture_core::entry", "--retain-public"];
+        assert_eq!(start(&[&kept[..], &["--dir", dir]].concat()), Ok(0));
     }
 
     #[test]

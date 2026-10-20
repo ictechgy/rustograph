@@ -428,6 +428,40 @@ pub fn korean_dyn(sql_text: &str) {
     assert_eq!(at("&sql_text"), byte_column("sqlx::query(&sql_text)"));
 }
 
+/// 같은 문장의 CTE 이름, 함수 인자 안의 FROM(`EXTRACT(EPOCH FROM col)`), `IS [NOT]
+/// DISTINCT FROM`의 피연산자는 relation-use가 아니다(계열 공통 규칙 R1~R3) — isthmus는
+/// 선언과 잇지 못한 정적 relation-use를 `relation-use-without-decl` error로 판정한다.
+/// 리터럴(줄)마다 정적 사실 집합을 보고, 읽지 못한 근거(dynamic 사실)도 없는지 본다.
+#[test]
+fn sql_literals_skip_cte_function_and_distinct_operands() {
+    let lib = concat!(
+        "pub const RECENT: &str = \"WITH recent AS (SELECT * FROM orders WHERE created > $1) SELECT * FROM recent\";\n",
+        "pub const EPOCH: &str = \"SELECT id FROM events WHERE EXTRACT(EPOCH FROM created_at) > $1\";\n",
+        "pub const SAME: &str = \"SELECT * FROM audit WHERE kind IS NOT DISTINCT FROM $1\";\n",
+        "pub const PURGED: &str = \"WITH d AS MATERIALIZED (DELETE FROM sessions RETURNING *) SELECT * FROM d\";\n",
+    );
+    let dir = temp_workspace("sql-shared-rules", lib);
+    let d = serde_json::to_value(schema::facts(&dir, "test").expect("schema facts")).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut per_line: std::collections::BTreeMap<u64, std::collections::BTreeSet<&str>> =
+        std::collections::BTreeMap::new();
+    for f in d["facts"].as_array().unwrap() {
+        assert_eq!(f["dynamic"], false, "unexpected dynamic fact {f}");
+        per_line
+            .entry(f["location"]["line"].as_u64().unwrap())
+            .or_default()
+            .insert(f["channel"].as_str().unwrap());
+    }
+    let want: std::collections::BTreeMap<u64, std::collections::BTreeSet<&str>> = [
+        (1, ["orders"].into()),
+        (2, ["events"].into()),
+        (3, ["audit"].into()),
+        (4, ["sessions"].into()),
+    ]
+    .into();
+    assert_eq!(per_line, want);
+}
+
 #[test]
 fn cli_schema_prints_document_and_writes_out() {
     let mut out = Cursor::new(Vec::new());

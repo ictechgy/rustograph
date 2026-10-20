@@ -21,7 +21,7 @@ errors with `?` or handle them explicitly.
 This source compatibility change is the reason for the 0.5 minor version rather
 than a 0.4 patch. The serialized graph document remains version 1.
 
-Two library changes after 0.5.0 are source-incompatible for some callers:
+Seven library changes after 0.5.0 are source-incompatible for some callers:
 
 - `rustograph::modtree::ModTree` has a new public field, `skipped_mods`.
   `collect_submodules` no longer loads a `mod` declaration whose file re-enters
@@ -33,6 +33,45 @@ Two library changes after 0.5.0 are source-incompatible for some callers:
 - `rustograph::mcp::Server` now borrows the document it serves and is
   `Server<'d>`. It has no public constructor or methods, so only code that names
   the type is affected.
+- `rustograph::graph::Document` has a new public field, `revision`
+  (`Option<String>`): the source revision a saved graph was harvested from.
+  `graph::document` leaves it `None`, and `graph --out` fills it (see below).
+  Code that builds a `Document` with a struct literal must add the field, and
+  code that destructures every field must add it or `..`. The serialized
+  document stays version 1: the key is omitted when empty, and readers that
+  ignore unknown fields still load snapshots that have it.
+- `rustograph::harvest::Harvest` has new public fields,
+  `out_of_reach_method_calls`, `capped_method_calls`, and
+  `capped_method_names`. `harvest::bodies` and `harvest::body_edges` keep their
+  signatures and still fan out over the given method index without narrowing
+  it to the calling crate's dependencies (they have no dependency graph), but
+  a call with more than 4,096 same-name candidates now gets no edges and is
+  counted in the new fields instead. `source::load` narrows the fan-out (see
+  the README's Graph model). Code that builds a `Harvest` with a struct
+  literal must add the fields or use `..Default::default()`.
+- `rustograph::cargo_meta::Package` has a new public field, `optional_deps`:
+  the declared optional dependencies, which the resolve graph omits when
+  default features leave them off. Code that builds a `Package` with a struct
+  literal must add the field, and code that destructures every field must add
+  it or `..`.
+- `rustograph::sem::Stats` (the `semantic` feature) has new public fields,
+  `out_of_reach`, `capped`, and `capped_names`, with the same meaning for
+  calls the semantic engine cannot resolve. `sem::Engine::body_edges` keeps
+  its signature and, like `harvest::bodies`, does not narrow. Code that builds
+  a `Stats` with a struct literal must add the fields or use
+  `..Default::default()`.
+- `rustograph::harvest` borrows function bodies from the parsed syntax tree
+  instead of copying them. `ImplBlock` is now `ImplBlock<'a>`, and its
+  `methods` field is `Vec<&'a syn::ImplItemFn>`. `BodyItem` replaces
+  `exprs: Vec<syn::Expr>` with `body: harvest::Body<'a>`, which is
+  `Body::Stmts` for a function, method, or provided trait method body and
+  `Body::Expr` for a `const` or `static` initializer. `ModuleDecls::impls`
+  holds `ImplBlock<'a>`, and `harvest::impls` takes `&[ImplBlock<'a>]` and
+  returns bodies that borrow the syntax tree rather than the block slice.
+  `harvest::bodies` and `harvest::body_edges` keep their signatures and
+  produce the same edges. Code that reads `exprs`, builds an `ImplBlock` or a
+  `BodyItem` with a struct literal, or stores an `ImplBlock` in its own type
+  must use the new field and lifetime.
 
 ## Saved snapshots and MCP
 
@@ -46,6 +85,24 @@ a control character (C0, DEL or C1, including NEL) or U+2028/U+2029 is rejected
 with exit 2 before any output, and `mcp --graph` fails to start. rustograph never
 writes such ids, so the error names the field and code point; regenerate the
 snapshot instead of passing another tool's ids to the terminal or to Mermaid.
+
+`graph --out` records the source revision of a harvested graph as `revision`:
+git `HEAD` when the `--dir` work tree is clean. `graph --graph` copies a
+recorded value to its JSON output, on stdout and with `--out` alike. `reach`
+and `impact --format language-traversal` with `--graph` use that value instead
+of the current git `HEAD`, which may have moved since the snapshot was saved,
+and run no git. A snapshot that records none (written before this change,
+redirected from a harvest's stdout, or saved from a modified work tree), or
+whose `revision` breaks the `--revision` rules, gets no `revision` and a
+`revision-unknown:` limitation. Pass `--revision`, or regenerate the snapshot
+with `rustograph graph --level symbol --out FILE`.
+
+`rustograph mcp --graph` answers `rustograph_deps`, which harvests the `--dir`
+workspace itself, only when that workspace is the one the snapshot was
+harvested from (the snapshot's `workspace`). Otherwise, or when the snapshot
+records no absolute `workspace`, the tool returns an error instead of
+describing another repository. Start the server with `--dir` set to the
+snapshot's workspace, or without `--graph`.
 
 ## File output
 
@@ -69,7 +126,11 @@ the file under `unparsed-sources` and writes the same document to a fresh output
 path. The unreadable file is protected, but the modules and include inputs it
 declares are unknown, so replacing an existing output is rejected conservatively
 with an error that names the file. Commands that need the symbol graph, such as
-`graph` and `rules`, still exit 2 on such a file.
+`graph` and `rules`, still exit 2 on such a file. A module file larger than
+64 MiB is the exception: it is not read at all, and the harvest goes on without
+its items and submodules and counts it in `limitations`, so `graph` and `rules`
+no longer exit 2 on it — but replacing an existing output is still rejected the
+same way.
 
 The rename is a single-file publication, not a multi-file transaction or a
 power-loss durability guarantee. On systems that reject replacing an open or
@@ -87,6 +148,31 @@ substitutions such as `--config /dev/stdin` or `--baseline <(…)`. The
 `rustograph mcp --config` file must be a regular file, because the server reads
 it again on every rules call.
 
+Rules files are checked before any rule runs. An unknown key, a `deps`, `deny`
+or `signature` key that names a component missing from `components`, and a
+file with no component (including an empty file or `components: {}`) are
+configuration errors: `rules` exits 2 and `rustograph_rules` answers with an
+error. Earlier releases ignored them, so a misspelled `components:` key left
+every module unmapped while `rules --strict` still exited 0, and a misspelled
+`deny` or `signature` key dropped that rule. Correct the key or define the
+component; a placeholder file needs at least one component. Library callers
+get the same checks from `rustograph::config::load_file` and `config::load`,
+and deserializing `rustograph::config::Config` directly now rejects unknown keys.
+
+A `baseline:` in a rules file has to stay inside the `--dir` directory. It is
+still relative to the rules file, and `..` may climb within the `--dir`
+directory, but an absolute path, a path that climbs out of it, and a path that
+leaves it through a symbolic link are configuration errors (exit 2, or an error
+from `rustograph_rules`) before `rules` harvests, reads or writes anything.
+Earlier releases followed the path wherever it led, so a rules file from an
+untrusted branch could make `rules --write-baseline` replace a file outside the
+repository. This also applies when `--config` names a file outside `--dir`,
+including `--config /dev/stdin`, whose relative baseline resolves under `/dev`:
+move the baseline under the `--dir` directory, or pass `--baseline FILE`, which
+is not restricted. When the `baseline:` path contains `..`,
+`rules --write-baseline` reports the normalized path it wrote. Library callers
+can apply the same rule with the new `rustograph::config::resolve_baseline`.
+
 ## Mermaid output
 
 Mermaid labels write `"`, `%`, `<`, `>` and `&` as Mermaid entity codes
@@ -97,7 +183,14 @@ HTML tag. Lines without those characters are unchanged.
 
 ## Path budgets
 
-The path expansion budget also limits queued partial-path copies. Completed
+The path expansion budget also limits queued partial paths. Completed
 paths use separate bounded slots, so a known direct path remains available even
 when partial paths have exhausted the budget. Dropped search states set
 `truncated`; a partial search is never reported as complete.
+
+`paths` now accepts `--max` up to 1,024 and `--budget` up to 1,000,000, and MCP
+`rustograph_paths` the same `max` and `budget`. A larger value is a usage error
+(exit 2) or an `isError` result instead of a search whose memory grows with the
+budget. `query`, `impact` and `search` have matching limits: `--max` (MCP `max`)
+up to 10,000 and `--depth` (MCP `depth`) up to 64, where `0` still means no
+depth limit.

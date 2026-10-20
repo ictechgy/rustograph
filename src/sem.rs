@@ -12,6 +12,7 @@
 //! signature)는 전부 syn 수확이 권위다 — 이 모듈은 본문 간선만 낸다.
 
 use crate::cargo_meta::normalize_name;
+use crate::fanout::{self, Fanned};
 use crate::graph::{Edge, EdgeKind};
 use ra_ap_hir::db::HirDatabase;
 use ra_ap_hir::{
@@ -61,6 +62,14 @@ pub struct Stats {
     pub trait_sites: usize,
     /// ra도 해석하지 못해 이름 팬아웃으로 되돌아간 메서드 호출 수.
     pub fanned: usize,
+    /// 그 팬아웃의 같은 이름 메서드가 전부 본문 크레이트의 의존 폐포 밖 크레이트의 고유·트레이트
+    /// 선언 메서드라 간선을 달지 않은 호출 수 — syn의 out_of_reach_method_calls와 같은 버킷.
+    pub out_of_reach: usize,
+    /// 좁힌 후보가 팬아웃 폭 상한을 넘어 간선을 달지 않은 호출 수 — syn의 capped_method_calls와
+    /// 같은 버킷.
+    pub capped: usize,
+    /// 그 호출들의 메서드 이름(중복 없음).
+    pub capped_names: BTreeSet<String>,
     /// 그래프 밖(의존 크레이트·std·derive 생성 정의)으로 해석된 타깃 수.
     pub external: usize,
     /// 해석된 외부·std 매크로 호출 수 — syn의 external_macros와 같은 버킷.
@@ -289,11 +298,26 @@ impl Engine {
     /// `site`의 파일·범위는 syn이 본 소유 아이템의 소스 위치다 — 정규 ID가
     /// 같아도 소스 정체가 다르면(cfg 변형·블록 지역 정의) 다른 정의이므로
     /// None으로 되돌려 syn 폴백시킨다. 시그니처 간선은 항상 syn 경로다.
+    /// ra가 해석하지 못한 메서드 호출의 이름 팬아웃은 `method_index`의 같은 이름 메서드 전부를 후보로
+    /// 삼는다(크레이트로 좁히지 않는다). 워크스페이스 수확은 의존 폐포로 좁히는 변형을 쓴다.
     pub fn body_edges(
         &self,
         site: &OwnerSite<'_>,
         ids: &BTreeSet<&str>,
         method_index: &BTreeMap<String, Vec<String>>,
+        st: &mut Stats,
+    ) -> Option<Vec<Edge>> {
+        self.body_edges_within(site, ids, method_index, None, st)
+    }
+
+    /// [`Engine::body_edges`]와 같되 이름 팬아웃의 고유·트레이트 선언 메서드 후보를 `visible`(본문
+    /// 크레이트의 의존 폐포, None이면 좁히지 않음)로 좁힌다 — syn 폴백과 같은 규칙([`fanout::select`]).
+    pub(crate) fn body_edges_within(
+        &self,
+        site: &OwnerSite<'_>,
+        ids: &BTreeSet<&str>,
+        method_index: &BTreeMap<String, Vec<String>>,
+        visible: Option<&BTreeSet<String>>,
         st: &mut Stats,
     ) -> Option<Vec<Edge>> {
         let entries = self.defs.get(site.id)?;
@@ -349,6 +373,7 @@ impl Engine {
                 cfg: site.cfg,
                 ids,
                 method_index,
+                visible,
                 sites: &self.sites,
                 impls: &self.impls,
                 matrix: &self.matrix,
@@ -1254,6 +1279,9 @@ struct Walker<'a, 'b> {
     cfg: &'a Option<String>,
     ids: &'a BTreeSet<&'a str>,
     method_index: &'a BTreeMap<String, Vec<String>>,
+    /// 본문 크레이트의 의존 폐포 — 이름 팬아웃의 고유·트레이트 선언 메서드 후보를 좁힌다(None이면
+    /// 좁히지 않는다).
+    visible: Option<&'a BTreeSet<String>>,
     /// 정규 ID → syn이 수확한 선언 위치 — 생성·충돌 정의를 가른다.
     sites: &'a BTreeMap<String, Vec<SynSite>>,
     /// 크레이트 스코프 impl 집합 — fn 블록 모듈의 impl 구분에 쓴다.
@@ -1525,22 +1553,30 @@ impl<'a, 'b> Walker<'a, 'b> {
         }
     }
 
-    /// ra도 못 잡은 메서드 호출 — syn과 같은 이름 팬아웃 폴백.
-    /// 후보가 하나도 없으면 간선 없는 미해석이다 — 세지 않으면
+    /// ra도 못 잡은 메서드 호출 — syn과 같은 이름 팬아웃 폴백([`fanout::select`]).
+    /// 같은 이름 메서드가 하나도 없으면 간선 없는 미해석이다 — 세지 않으면
     /// limitation이 거짓말을 한다.
     fn fan_out(&mut self, name: Option<&str>, un: bool) {
         let Some(name) = name else {
             self.st.unresolved += 1;
             return;
         };
-        match self.method_index.get(name) {
-            Some(ids) => {
-                for mid in ids {
-                    self.push(mid.clone(), EdgeKind::Call, true, un);
+        let Some(ids) = self.method_index.get(name) else {
+            self.st.unresolved += 1;
+            return;
+        };
+        match fanout::select(ids, self.visible) {
+            Fanned::Candidates(picked) => {
+                for mid in picked {
+                    self.push(mid.to_string(), EdgeKind::Call, true, un);
                 }
                 self.st.fanned += 1;
             }
-            None => self.st.unresolved += 1,
+            Fanned::OutOfReach => self.st.out_of_reach += 1,
+            Fanned::Capped => {
+                self.st.capped += 1;
+                self.st.capped_names.insert(name.to_string());
+            }
         }
     }
 

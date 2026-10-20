@@ -18,9 +18,10 @@ rustograph — queryable dependency graph for Rust codebases
 
 usage:
   rustograph graph [--level crate|module|type|symbol] [--format json|mermaid]
-                   [--dir DIR] [--deps] [--tests] [--out FILE]
+                   [--dir DIR] [--deps] [--tests] [--root ID] [--out FILE]
   rustograph cycles [--level L] [--strict] [--format text|json]
   rustograph dead [--strict] [--explain ID] [--root ID] [--retain-public] [--tests]
+                  [--format text|json]
   rustograph rules [--strict] [--format text|json|sarif] [--config FILE]
                    [--baseline FILE] [--write-baseline]
   rustograph deps [--strict] [--format text|json]
@@ -31,7 +32,8 @@ usage:
   rustograph impact --format language-traversal ID... (same options as reach)
   rustograph paths FROM TO [--max N] [--budget N]
   rustograph search QUERY [--max N]
-  rustograph mcp [--dir DIR] [--graph FILE] [--config FILE] [--deps] [--tests]
+  rustograph mcp [--dir DIR] [--graph FILE] [--config FILE] [--root ID] [--deps]
+                 [--tests]
   rustograph schema [--dir DIR] [--out FILE]
   rustograph routes --role server [--dir DIR] [--out FILE] [--framework axum|actix]
   rustograph routes --role client [--dir DIR] [--out FILE] [--wrappers FILE]
@@ -43,6 +45,18 @@ shared flags: --deps --tests --retain-public --semantic --no-cache
   --semantic resolves method calls and macro expansions with rust-analyzer
   semantics (requires a build with `--features semantic`; results cached
   in .rustograph/semantic-cache.json unless --no-cache)
+
+graph, cycles, dead, rules, query, impact, paths, search and mcp read the graph
+from --dir DIR (default .) or --graph FILE and take the shared flags; deps
+takes only --dir, --deps, --strict and --format. A flag or argument that a
+command does not use is a usage error (exit 2) instead of being ignored.
+
+query / impact --depth 0 walks without a depth limit (the whole closure, still
+bounded by --max); the report keeps \"depth\": 0.
+
+query / impact / search take --max up to 10000 and query / impact --depth up
+to 64; paths takes --max up to 1024 and --budget up to 1000000. A larger value
+is a usage error (exit 2) instead of being clipped.
 
 reach / impact --format language-traversal emit an isthmus language-traversal
 v1 document (dependencies / dependents) for many roots in one pass; ids that
@@ -141,11 +155,11 @@ fn cmd_schema(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
         ));
     }
     let dir = PathBuf::from(a.get("dir").unwrap_or("."));
-    let doc = source::schema::facts(&dir, VERSION)?;
+    let (doc, inputs) = source::schema::facts_with_inputs(&dir, VERSION, a.get("out").is_some())?;
     let text = export::to_json(&doc);
     match a.get("out") {
         Some(p) => {
-            write_output(a, Path::new(p), &text, &[], None)?;
+            write_output(a, Path::new(p), &text, &[], inputs.as_ref())?;
             writeln!(out, "wrote {p}").ok();
         }
         None => {
@@ -159,7 +173,7 @@ fn cmd_schema(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
 /// actix-web `route-decl`, 클라이언트는 reqwest·ureq·선언된 래퍼의 `route-call`이다.
 /// `--role`은 필수다 — 생략을 한쪽으로 읽으면 명령의 뜻이 역할에 따라 흔들린다.
 fn cmd_routes(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
-    let text = match a.get("role") {
+    let (text, inputs) = match a.get("role") {
         Some("server") => routes_server(a)?,
         Some("client") => routes_client(a)?,
         Some(other) => {
@@ -171,7 +185,7 @@ fn cmd_routes(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     };
     match a.get("out") {
         Some(p) => {
-            write_output(a, Path::new(p), &text, &[], None)?;
+            write_output(a, Path::new(p), &text, &[], inputs.as_ref())?;
             writeln!(out, "wrote {p}").ok();
         }
         None => {
@@ -181,8 +195,8 @@ fn cmd_routes(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     Ok(0)
 }
 
-/// 서버 route-decl 문서(JSON 텍스트).
-fn routes_server(a: &Args) -> Result<String, String> {
+/// 서버 route-decl 문서(JSON 텍스트)와, `--out`이면 그 문서를 만든 수확이 읽은 입력.
+fn routes_server(a: &Args) -> Result<(String, Option<source::HarvestInputs>), String> {
     if let Some(bad) = a.unsupported(&["dir", "out", "role", "framework"]) {
         return Err(format!(
             "routes --role server takes only --dir, --out and --framework — {bad} is not supported"
@@ -197,12 +211,13 @@ fn routes_server(a: &Args) -> Result<String, String> {
     };
     let dir = PathBuf::from(a.get("dir").unwrap_or("."));
     let opts = source::routes::RouteOptions { framework };
-    let doc = source::routes::routes(&dir, VERSION, &opts)?;
-    Ok(export::to_json(&doc))
+    let (doc, inputs) =
+        source::routes::routes_with_inputs(&dir, VERSION, &opts, a.get("out").is_some())?;
+    Ok((export::to_json(&doc), inputs))
 }
 
-/// 클라이언트 route-call 문서(JSON 텍스트).
-fn routes_client(a: &Args) -> Result<String, String> {
+/// 클라이언트 route-call 문서(JSON 텍스트)와, `--out`이면 그 문서를 만든 수확이 읽은 입력.
+fn routes_client(a: &Args) -> Result<(String, Option<source::HarvestInputs>), String> {
     if let Some(bad) = a.unsupported(&["dir", "out", "role", "wrappers", "service"]) {
         return Err(format!(
             "routes --role client takes only --dir, --out, --wrappers and --service — {bad} is not supported"
@@ -224,13 +239,18 @@ fn routes_client(a: &Args) -> Result<String, String> {
     };
     let dir = PathBuf::from(a.get("dir").unwrap_or("."));
     let opts = source::routes::client::ClientOptions { wrappers, service };
-    let doc = source::routes::client::client_routes(&dir, VERSION, &opts)?;
-    Ok(export::to_json(&doc))
+    let (doc, inputs) = source::routes::client::client_routes_with_inputs(
+        &dir,
+        VERSION,
+        &opts,
+        a.get("out").is_some(),
+    )?;
+    Ok((export::to_json(&doc), inputs))
 }
 
 /// 출력 형식과 무관하게 그래프 입력과 수확 원본을 보호한다. `harvested`는 결과 문서를 만든
-/// 수확이 읽은 입력이다 — 없으면(schema·routes, semantic 캐시 적중) 보호 목록을 위해
-/// 모듈 트리를 다시 찾는다.
+/// 수확이 읽은 입력이다 — 없으면(수확하지 않은 `routes --role server`, 정점 수확이 실패한
+/// `schema`, semantic 캐시 적중) 보호 목록을 위해 모듈 트리를 다시 찾는다.
 fn write_output(
     a: &Args,
     path: &Path,
@@ -281,11 +301,24 @@ fn replacement_refusal(listed: &source::ProtectedInputs) -> Option<String> {
 }
 
 fn cmd_graph(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    cli_args::reject_unused(
+        a,
+        &[
+            cli_args::DOCUMENT_FLAGS,
+            &["level", "format", "out", "root"],
+        ],
+        0,
+    )?;
     let level = cli_args::level_of(a)?;
+    let format = a.get("format").unwrap_or("json");
     // 수확은 항상 최대 깊이로 — 얕은 레벨은 투영이다.
     let (doc, inputs) = cli_args::document_with_inputs(a, true, a.get("out").is_some())?;
-    let doc = doc.view(level)?;
-    let text = match a.get("format").unwrap_or("json") {
+    let mut doc = doc.view(level)?;
+    // `--graph` 입력은 그 문서의 기록을 그대로 옮긴다(다시 판독하지 않는다).
+    if a.get("graph").is_none() {
+        doc.revision = recorded_revision(a, format);
+    }
+    let text = match format {
         "json" => export::to_json(&doc),
         "mermaid" => export::to_mermaid(&doc),
         f => return Err(format!("unknown format {f} (json|mermaid)")),
@@ -309,7 +342,24 @@ fn cmd_graph(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     Ok(0)
 }
 
+/// 수확한 그래프에 기록할 출처 revision — 파일로 저장하는 JSON 스냅샷(`--out`)에만 싣는다. 순회 명령이
+/// `--graph`로 그 스냅샷을 읽을 때 지금의 HEAD 대신 이 값을 쓴다. 수확한 그래프의 표준 출력 문서는 지금과
+/// 같은 바이트라 git을 실행하지 않고, Mermaid에는 실을 자리가 없다. 값은 `--dir` 작업 트리가 깨끗할 때의
+/// git HEAD다(순회 문서의 revision과 같은 판정). 캐시에서 온 문서도 이 값으로 덮어 수확 경로가 출처를 정한다.
+/// 수확 경로에서만 부른다 — `--graph` 입력은 그 문서의 값을 JSON 출력(표준 출력과 `--out` 모두)에 옮긴다.
+fn recorded_revision(a: &Args, format: &str) -> Option<String> {
+    if format != "json" || a.get("out").is_none() {
+        return None;
+    }
+    reach::clean_head(Path::new(a.get("dir").unwrap_or(".")))
+}
+
 fn cmd_cycles(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    cli_args::reject_unused(
+        a,
+        &[cli_args::DOCUMENT_FLAGS, &["level", "format", "strict"]],
+        0,
+    )?;
     let level = cli_args::level_of(a)?;
     let doc = cli_args::document_for(a, true)?.view(level)?;
     let rep = analysis::cycles(&doc);
@@ -343,6 +393,14 @@ fn cmd_cycles(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
 }
 
 fn cmd_dead(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    cli_args::reject_unused(
+        a,
+        &[
+            cli_args::DOCUMENT_FLAGS,
+            &["strict", "explain", "root", "format"],
+        ],
+        0,
+    )?;
     // dead는 항상 심볼 레벨 — 도달성은 심볼에서만 의미 있다.
     let doc = cli_args::document_for(a, true)?;
     if let Some(target) = a.get("explain") {
@@ -373,7 +431,12 @@ fn cmd_dead(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
                 .ok();
             }
             writeln!(out, "{} unreachable", report.findings.len()).ok();
-            for l in report.limitations.iter().chain(doc.limitations.iter()) {
+            // 보고서가 문서에서 옮겨 온 limitation(`--focus` 경계)은 한 번만 쓴다.
+            let document_only = doc
+                .limitations
+                .iter()
+                .filter(|l| !report.limitations.contains(l));
+            for l in report.limitations.iter().chain(document_only) {
                 writeln!(out, "limitation: {l}").ok();
             }
             Some(())
@@ -388,6 +451,14 @@ fn cmd_dead(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
 }
 
 fn cmd_rules(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    cli_args::reject_unused(
+        a,
+        &[
+            cli_args::DOCUMENT_FLAGS,
+            &["strict", "format", "config", "baseline", "write-baseline"],
+        ],
+        0,
+    )?;
     let dir = PathBuf::from(a.get("dir").unwrap_or("."));
     // --config이 주어지면 기준선 상대 경로의 기준은 그 파일의 디렉터리다.
     let cfg_dir = a
@@ -402,13 +473,19 @@ fn cmd_rules(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
             None => return Err(format!("no .rustograph.yml in {}", dir.display())),
         },
     };
+    // 기준선 경로 — --baseline이 cfg.baseline을 이긴다. 설정의 baseline:은 분석 대상 저장소가
+    // 고른 값이라 --dir 안으로 가둔다(config::resolve_baseline). 명시 --baseline은 실행한 사람이
+    // 고른 입력이라 그대로 쓴다. 수확 전에 푼다 — 거부할 설정에 수확 비용을 쓰지 않는다.
+    let baseline_path = match (a.get("baseline"), cfg.baseline.as_deref()) {
+        (Some(explicit), _) => Some(PathBuf::from(explicit)),
+        (None, Some(raw)) => Some(
+            config::resolve_baseline(&cfg_dir, &dir, raw)
+                .map_err(|e| format!("{e}, or pass --baseline FILE"))?,
+        ),
+        (None, None) => None,
+    };
     let (doc, inputs) = cli_args::document_with_inputs(a, true, a.has("write-baseline"))?;
     let mut report = rules::check(&doc, &cfg);
-    // 기준선 경로 — --baseline이 cfg.baseline을 이긴다.
-    let baseline_path = a
-        .get("baseline")
-        .map(PathBuf::from)
-        .or_else(|| cfg.baseline.as_ref().map(|b| cfg_dir.join(b)));
     // --write-baseline: 현재 위반을 기준선으로 기록하고 끝낸다 —
     // 레거시 도입의 첫 단계는 "기존 위반을 얼리는 것"이다.
     if a.has("write-baseline") {
@@ -524,6 +601,7 @@ fn require_id(doc: &crate::graph::Document, id: &str) -> Result<String, String> 
 }
 
 fn cmd_paths(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    cli_args::reject_unused(a, &[cli_args::DOCUMENT_FLAGS, &["max", "budget"]], 2)?;
     let Some(from) = a.positional.first() else {
         return Err("usage: paths FROM TO".to_string());
     };
@@ -532,6 +610,7 @@ fn cmd_paths(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     };
     let max = cli_args::usize_arg(a, "max", 10)?;
     let budget = cli_args::usize_arg(a, "budget", 50_000)?;
+    cli_args::check_paths_limits(cli_args::ArgSpelling::Flag, max, budget)?;
     let doc = cli_args::document_for(a, true)?;
     let from = require_id(&doc, from)?;
     let to = require_id(&doc, to)?;
@@ -541,10 +620,12 @@ fn cmd_paths(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
 }
 
 fn cmd_search(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    cli_args::reject_unused(a, &[cli_args::DOCUMENT_FLAGS, &["max"]], 1)?;
     let Some(q) = a.positional.first() else {
         return Err("usage: search QUERY".to_string());
     };
     let max = cli_args::usize_arg(a, "max", 20)?;
+    cli_args::check_search_limit(cli_args::ArgSpelling::Flag, max)?;
     let doc = cli_args::document_for(a, true)?;
     write!(out, "{}", export::to_json(&analysis::search(&doc, q, max))).ok();
     Ok(0)
@@ -552,7 +633,8 @@ fn cmd_search(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
 
 fn cmd_deps(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     // deps는 자체 syn 수확으로 문서를 만든다 — 문서 필터나 저장
-    // 그래프를 받으면 사용 증거가 지워져 거짓 미사용이 나온다.
+    // 그래프를 받으면 사용 증거가 지워져 거짓 미사용이 나온다. 그런 플래그는
+    // 이유를 붙여 거부하고, 그 밖에 쓰지 않는 플래그는 공용 검사가 거부한다.
     for flag in [
         "graph",
         "focus",
@@ -572,6 +654,8 @@ fn cmd_deps(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
             ));
         }
     }
+    // `--deps`는 공유 플래그다 — deps 보고서는 늘 외부 크레이트까지 수확하니 뜻이 어긋나지 않는다.
+    cli_args::reject_unused(a, &[&["dir", "deps", "format", "strict"]], 0)?;
     let dir = PathBuf::from(a.get("dir").unwrap_or("."));
     let report = deps::report(&dir)?;
     match a.get("format").unwrap_or("text") {
@@ -620,18 +704,32 @@ fn cmd_deps(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
 }
 
 fn cmd_query(a: &Args, out: &mut dyn Write, reverse: bool) -> Result<i32, String> {
+    // impact의 --format은 순회 문서(language-traversal)를 고르는 값 하나뿐이다 — 그 값은 run_inner가
+    // 순회 명령으로 보냈으니, 여기 온 --format은 보고서에 적용되지 않는다.
+    if let (true, Some(f)) = (reverse, a.get("format")) {
+        return Err(format!(
+            "impact --format {f} is not supported; impact prints its JSON report without --format, \
+             or a traversal document with --format language-traversal"
+        ));
+    }
+    cli_args::reject_unused(a, &[cli_args::DOCUMENT_FLAGS, &["depth", "max"]], 1)?;
     let Some(id) = a.positional.first() else {
         return Err("query/impact needs a vertex ID".to_string());
     };
     let depth = cli_args::usize_arg(a, "depth", 1)?;
     let max = cli_args::usize_arg(a, "max", 200)?;
+    cli_args::check_neighbor_limits(cli_args::ArgSpelling::Flag, depth, max)?;
     let doc = cli_args::document_for(a, true)?;
     let id = require_id(&doc, id)?;
+    // 0은 깊이 제한 없음이다(MCP와 같은 해석 함수) — 보고에는 요청한 깊이를 싣는다.
+    let walk = cli_args::walk_depth(depth);
     if reverse {
-        let r = analysis::impact(&doc, &id, depth, max);
+        let mut r = analysis::impact(&doc, &id, walk, max);
+        r.depth = depth;
         write!(out, "{}", export::to_json(&r)).ok();
     } else {
-        let r = analysis::query(&doc, &id, depth, max);
+        let mut r = analysis::query(&doc, &id, walk, max);
+        r.depth = depth;
         write!(out, "{}", export::to_json(&r)).ok();
     }
     Ok(0)
@@ -712,6 +810,58 @@ mod tests {
         assert!(err.contains("vertex ID"));
     }
 
+    /// 기존 출력을 바꾸는 `graph --out`이 보호 입력을 canonicalize하는 횟수는 정점 수와 무관하다 —
+    /// 정점 위치마다 경로를 넣던 보호 목록은 덮어쓸 때마다 정점 수의 두 배를 풀었다(실제 수확
+    /// 9,394정점 스냅샷에서 덮어쓰기 0.27초 대 새 경로 0.07초). 수확한 그래프(문서 정점과 수확
+    /// 입력이 같은 파일을 겹쳐 싣는다)와 저장 스냅샷(`--graph`) 둘 다 본다.
+    #[test]
+    fn replacing_outputs_resolves_inputs_per_file_not_per_vertex() {
+        let tmp =
+            std::env::temp_dir().join(format!("rustograph-cli-probes-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(
+            tmp.join("Cargo.toml"),
+            "[package]\nname = \"probes\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let (snapshot, out) = (tmp.join("snapshot.json"), tmp.join("graph.json"));
+        let (dir, snapshot, out) = (
+            tmp.to_str().unwrap(),
+            snapshot.to_str().unwrap(),
+            out.to_str().unwrap(),
+        );
+        let probes_replacing = |args: &[&str]| {
+            std::fs::write(out, "previous").unwrap();
+            let before = export::input_probes();
+            let (code, _, err) = run_cli(args);
+            assert_eq!(code, 0, "{args:?}: {err}");
+            export::input_probes() - before
+        };
+        let mut counted = Vec::new();
+        for functions in [20, 40] {
+            let body: String = (0..functions)
+                .map(|i| format!("pub fn f{i}() {{}}\n"))
+                .collect();
+            std::fs::write(tmp.join("src/lib.rs"), format!("pub mod m;\n{body}")).unwrap();
+            std::fs::write(tmp.join("src/m.rs"), &body).unwrap();
+            std::fs::remove_file(snapshot).ok();
+            let (code, _, err) = run_cli(&[
+                "graph", "--level", "symbol", "--dir", dir, "--out", snapshot,
+            ]);
+            assert_eq!(code, 0, "{err}");
+            counted.push((
+                probes_replacing(&["graph", "--level", "symbol", "--dir", dir, "--out", out]),
+                probes_replacing(&[
+                    "graph", "--level", "symbol", "--graph", snapshot, "--out", out,
+                ]),
+            ));
+        }
+        assert!(counted[0].0 > 0 && counted[0].1 > 0, "{counted:?}");
+        assert_eq!(counted[0], counted[1]);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
     /// `graph --out`·`rules --write-baseline`은 문서를 만든 수확이 읽은 입력으로 보호 목록을
     /// 만든다 — 보호 목록 때문에 워크스페이스를 다시 수확하면 대형 저장소에서 시간과 누수 AST
     /// 메모리가 두 배였다. 표준 출력 실행과 같은 수의 파일만 파싱해야 한다.
@@ -723,7 +873,8 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::create_dir_all(&tmp).unwrap();
         let rules_config = tmp.join("rules.yml");
-        std::fs::write(&rules_config, "components: {}\ndeps: {}\n").unwrap();
+        // 컴포넌트 하나짜리 최소 유효 설정 — 컴포넌트가 없는 설정은 설정 오류다(config::load_file).
+        std::fs::write(&rules_config, "components:\n  app: [\"fixture_app/**\"]\n").unwrap();
         let parsed_by = |args: &[&str]| {
             let before = source::parsed_files();
             let (code, _, err) = run_cli(args);
@@ -750,6 +901,47 @@ mod tests {
             baseline,
         ]);
         assert_eq!((to_file, to_baseline), (stdout, stdout));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// `schema`·`routes --out`도 문서를 만든 수확이 읽은 입력으로 보호 목록을 만든다 — 보호
+    /// 목록을 위해 cargo metadata와 모듈 트리 읽기·파싱을 한 번 더 하면 합성 8만 줄
+    /// 워크스페이스에서 `--out`이 표준 출력보다 시간 1.4~1.8배, 최대 메모리 1.3~1.4배였다(먼저
+    /// 파싱한 AST는 누수 아레나라 함께 산다). 새 경로에 쓰든 방금 쓴 출력을 바꾸든 표준 출력
+    /// 실행과 같은 수의 파일만 파싱해야 한다.
+    #[test]
+    fn bridge_outputs_reuse_their_harvest() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let tmp =
+            std::env::temp_dir().join(format!("rustograph-cli-bridge-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let facts_out = tmp.join("facts.json");
+        let facts_out = facts_out.to_str().unwrap();
+        let parsed_by = |args: &[&str]| {
+            let before = source::parsed_files();
+            let (code, _, err) = run_cli(args);
+            assert_eq!(code, 0, "{args:?}: {err}");
+            source::parsed_files() - before
+        };
+        let commands: [(&str, &[&str]); 3] = [
+            ("tests/fixture-schema", &["schema"]),
+            (
+                "tests/fixture-routes/axum08",
+                &["routes", "--role", "server"],
+            ),
+            ("tests/fixture-client/app", &["routes", "--role", "client"]),
+        ];
+        for (fixture, command) in commands {
+            let fixture_dir = repo.join(fixture);
+            let fixture_dir = fixture_dir.to_str().unwrap();
+            let stdout = parsed_by(&[command, &["--dir", fixture_dir]].concat());
+            assert!(stdout > 0, "{fixture}: the harvest must parse the fixture");
+            std::fs::remove_file(facts_out).ok();
+            let to_file = [command, &["--dir", fixture_dir, "--out", facts_out]].concat();
+            let (fresh, replacing) = (parsed_by(&to_file), parsed_by(&to_file));
+            assert_eq!((fresh, replacing), (stdout, stdout), "{fixture}");
+        }
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 }

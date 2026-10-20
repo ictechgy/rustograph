@@ -24,6 +24,7 @@
 //! 조인하지 못하는 이유를 소비자가 셀 수 있어야 한다.
 
 use crate::cargo_meta;
+use crate::source::HarvestInputs;
 use proc_macro2::{Span, TokenStream, TokenTree};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -112,6 +113,18 @@ pub struct BridgeFactsDocument {
 /// bridge-facts 문서를 만든다.
 /// 워크스페이스를 못 읽으면 오류다 — 빈 문서로 성공한 척하지 않는다.
 pub fn facts(dir: &Path, tool_version: &str) -> Result<BridgeFactsDocument, String> {
+    facts_with_inputs(dir, tool_version, false).map(|(doc, _)| doc)
+}
+
+/// [`facts`]와 같은 문서와, `want_inputs`면 정점 귀속 수확이 읽은 입력을 돌려준다 —
+/// `schema --out`이 입력 보호 목록을 위해 cargo metadata와 모듈 트리 파싱을 한 번 더 하지
+/// 않게 한다. 정점 귀속 수확이 실패하면(사실은 usr 없이 낸다) 입력은 None이다 — 호출자가
+/// 싣지 못한 모듈 파일까지 적는 관대 모드로 다시 찾는다.
+pub(crate) fn facts_with_inputs(
+    dir: &Path,
+    tool_version: &str,
+    want_inputs: bool,
+) -> Result<(BridgeFactsDocument, Option<HarvestInputs>), String> {
     let root = dir
         .canonicalize()
         .map_err(|e| format!("cannot resolve {}: {e}", dir.display()))?;
@@ -157,9 +170,9 @@ pub fn facts(dir: &Path, tool_version: &str) -> Result<BridgeFactsDocument, Stri
     // 얻는다(간선은 귀속에 필요 없어 만들지 않는다). 그래프를 못 만들면 사실은
     // 그대로 내되 usr는 싣지 않는다 — 사실 수확을 그래프 성공에 묶으면 파싱
     // 실패 하나로 문서 전체를 잃는다.
-    let graph = crate::source::vertex_spans(dir, &meta);
+    let graph = crate::source::vertex_spans(dir, &meta, want_inputs);
     let index = match &graph {
-        Ok((ids, spans)) => Some(OwnerIndex::new(ids, spans)),
+        Ok((ids, spans, _)) => Some(OwnerIndex::new(ids, spans)),
         Err(_) => {
             scan.graph_failed = true;
             None
@@ -168,7 +181,8 @@ pub fn facts(dir: &Path, tool_version: &str) -> Result<BridgeFactsDocument, Stri
     scan.missing_usrs = attach_symbols(&mut facts, &root, index.as_ref());
     facts.sort_by(fact_cmp);
     let limitations = scan.limitations();
-    Ok(BridgeFactsDocument {
+    let inputs = graph.ok().and_then(|(_, _, inputs)| inputs);
+    let doc = BridgeFactsDocument {
         format: "bridge-facts",
         version: 1,
         tool: BridgeFactsTool {
@@ -186,7 +200,8 @@ pub fn facts(dir: &Path, tool_version: &str) -> Result<BridgeFactsDocument, Stri
         project: root.display().to_string(),
         facts,
         limitations,
-    })
+    };
+    Ok((doc, inputs))
 }
 
 /// 파일별 정점 범위 색인 — 그래프에 실제로 있는 정점 ID만 담는다.
@@ -1621,8 +1636,12 @@ fn is_relation_keyword(word: &str) -> bool {
 /// 식별자("a.b")는 한 세그먼트로 읽는다 — escape는 사실 기록 시에 한다.
 /// 두 번째 반환은 관계 자리의 피연산자를 읽지 못했음을 뜻한다 —
 /// `FROM {}` 같은 플레이스홀더를 사실 없이 조용히 넘기지 않기 위해서다.
+/// 계열 공통 규칙(R1 함수 인자 안의 FROM, R2 같은 문장의 CTE 이름, R3
+/// IS [NOT] DISTINCT FROM)이 관계가 아니라고 정한 자리는 내지 않는다 —
+/// isthmus가 선언과 잇지 못한 정적 relation-use를 오류로 판정하기 때문이다.
 fn sql_relations(text: &str) -> (Vec<String>, bool) {
     let tokens = lex_sql(text);
+    let shape = sql_shape(&tokens);
     let mut out = Vec::new();
     let mut seen = BTreeSet::new(); // 겹치는 키워드 창의 중복을 막는다
     let mut consumed = vec![false; tokens.len()]; // 이름·별칭·수식어로 소비된 토큰
@@ -1706,7 +1725,14 @@ fn sql_relations(text: &str) -> (Vec<String>, bool) {
             }
             // grant·revoke의 FROM은 권한 주체 자리다 — 관계가 아니므로
             // from·join을 그 문장에서는 열지 않는다.
-            "from" | "join" => !grant_stmt,
+            "join" => !grant_stmt,
+            // FROM은 함수 인자 괄호 바로 안(R1, `EXTRACT(YEAR FROM d)`)이거나
+            // `IS [NOT] DISTINCT FROM` 비교 연산자의 일부(R3)일 때도 열지 않는다.
+            "from" => {
+                !grant_stmt
+                    && !shape.in_function_arguments(&tokens, i)
+                    && !is_distinct_from(&tokens, i)
+            }
             _ => true,
         };
         if !fires {
@@ -1829,10 +1855,14 @@ fn sql_relations(text: &str) -> (Vec<String>, bool) {
                                 None => break,
                             }
                         } else {
-                            if buffered_grant {
-                                buf.push(name);
-                            } else if seen.insert(name.clone()) {
-                                out.push(name);
+                            // R2: 한정자 없는 이름이 같은 문장의 CTE 이름이면 관계가
+                            // 아니다 — 이름은 소비했으니 별칭·쉼표 목록은 그대로 잇는다.
+                            if next > j + 1 || !shape.is_cte(&tokens, j) {
+                                if buffered_grant {
+                                    buf.push(name);
+                                } else if seen.insert(name.clone()) {
+                                    out.push(name);
+                                }
                             }
                             next
                         }
@@ -1896,6 +1926,182 @@ fn sql_relations(text: &str) -> (Vec<String>, bool) {
         }
     }
     (out, unresolved)
+}
+
+/// `sql_relations`가 토큰을 한 번 훑어 미리 계산하는 문장·괄호 모양이다 — R1·R2가
+/// 키워드마다 괄호 짝이나 문장 경계를 다시 훑으면 닫히지 않은 괄호가 반복되는
+/// 입력에서 작업이 토큰 수의 제곱이 된다. 재귀 없이 스택으로 센다.
+struct SqlShape {
+    /// 토큰 → 문장 번호(인용되지 않은 `;`를 지날 때마다 1씩 는다).
+    statement: Vec<usize>,
+    /// 토큰 → 같은 문장 안에서 그 토큰을 감싼 가장 안쪽 `(` 위치(R1).
+    enclosing: Vec<Option<usize>>,
+    /// `(` 위치 → 짝 `)` 다음 위치(닫히지 않으면 토큰 수). `(`가 아닌 칸은 쓰지 않는다.
+    close_after: Vec<usize>,
+    /// 문장 번호 → 그 문장의 CTE 이름 비교 키(R2).
+    ctes: Vec<BTreeSet<String>>,
+    /// CTE 본문을 여는 `(` 위치 — 함수 인자 괄호가 아니다(R1).
+    cte_bodies: BTreeSet<usize>,
+}
+
+/// 토큰 목록의 [`SqlShape`]를 계산한다 — 괄호·문장을 먼저 표시하고, 그 짝으로
+/// CTE 정의의 열 목록 괄호를 건너뛰어 이름을 모은다.
+fn sql_shape(tokens: &[SqlToken]) -> SqlShape {
+    let mut shape = SqlShape {
+        statement: vec![0; tokens.len()],
+        enclosing: vec![None; tokens.len()],
+        close_after: vec![tokens.len(); tokens.len()],
+        ctes: Vec::new(),
+        cte_bodies: BTreeSet::new(),
+    };
+    let statements = mark_parens(&mut shape, tokens);
+    shape.ctes = vec![BTreeSet::new(); statements];
+    mark_ctes(&mut shape, tokens);
+    shape
+}
+
+/// 토큰마다 문장 번호와 감싼 괄호를, `(`마다 짝 `)` 다음 위치를 기록하고 문장 수를
+/// 돌려준다. 짝은 텍스트 전체의 스택으로 찾는다 — `skip_parens`의 깊이 세기와 같은
+/// 짝이고, 짝 없는 `)`는 건너뛴다. 감싼 괄호는 문장마다 새로 센다 — 닫히지 않은 함수
+/// 괄호가 다음 문장의 FROM까지 삼키지 않게 한다.
+fn mark_parens(shape: &mut SqlShape, tokens: &[SqlToken]) -> usize {
+    let mut pairs: Vec<usize> = Vec::new(); // 텍스트 전체에서 아직 닫히지 않은 `(`
+    let mut groups: Vec<usize> = Vec::new(); // 이 문장에서 아직 닫히지 않은 `(`
+    let mut statement = 0;
+    for (i, t) in tokens.iter().enumerate() {
+        shape.statement[i] = statement;
+        shape.enclosing[i] = groups.last().copied();
+        if t.quoted {
+            continue; // 인용 식별자는 기호가 아니다(`"("`라는 이름일 수 있다).
+        }
+        match t.text.as_str() {
+            ";" => {
+                statement += 1;
+                groups.clear();
+            }
+            "(" => {
+                pairs.push(i);
+                groups.push(i);
+            }
+            ")" => {
+                if let Some(open) = pairs.pop() {
+                    shape.close_after[open] = i + 1;
+                }
+                groups.pop();
+            }
+            _ => {}
+        }
+    }
+    statement + 1
+}
+
+/// 문장마다 CTE 이름 비교 키를 모은다(R2) — `WITH [RECURSIVE] name [(cols)] AS [NOT]
+/// [MATERIALIZED] (`와 `, name [(cols)] AS [NOT] [MATERIALIZED] (`의 name이다. 본문을 여는
+/// `(`도 기록한다 — MATERIALIZED 뒤 괄호를 함수 인자(R1)로 읽으면
+/// `WITH d AS MATERIALIZED (DELETE FROM t …)`의 t를 잃는다.
+fn mark_ctes(shape: &mut SqlShape, tokens: &[SqlToken]) {
+    for i in 0..tokens.len() {
+        let name = if token_is(tokens, i, "with") {
+            if token_is(tokens, i + 1, "recursive") {
+                i + 2
+            } else {
+                i + 1
+            }
+        } else if token_is(tokens, i, ",") {
+            i + 1
+        } else {
+            continue;
+        };
+        if let Some(body) = cte_body(tokens, &shape.close_after, name) {
+            shape.ctes[shape.statement[i]].insert(cte_key(&tokens[name]));
+            shape.cte_bodies.insert(body);
+        }
+    }
+}
+
+/// `name` 위치에서 `name [(cols)] AS [NOT] [MATERIALIZED] (`가 시작하면 본문 `(` 위치를
+/// 돌려준다. 열 목록 괄호는 미리 계산한 짝(`close_after`)으로 건너뛴다.
+fn cte_body(tokens: &[SqlToken], close_after: &[usize], name: usize) -> Option<usize> {
+    let tok = tokens.get(name)?;
+    if !(is_name_token(tok) || (tok.quoted && !tok.text.is_empty())) {
+        return None;
+    }
+    let mut k = name + 1;
+    if token_is(tokens, k, "(") {
+        k = close_after[k];
+    }
+    if !token_is(tokens, k, "as") {
+        return None;
+    }
+    k += 1;
+    if token_is(tokens, k, "not") {
+        k += 1;
+    }
+    if token_is(tokens, k, "materialized") {
+        k += 1;
+    }
+    token_is(tokens, k, "(").then_some(k)
+}
+
+/// CTE 이름과 한정자 없는 피연산자의 비교 키다(R2). 비인용 이름은 소문자로 접고
+/// 인용 이름은 그대로 둔다 — PostgreSQL의 식별자 규칙이고 isthmus 참조 구현과 같다
+/// (공통 계약은 대소문자가 다른 경우를 정하지 않는다).
+fn cte_key(tok: &SqlToken) -> String {
+    if tok.quoted {
+        tok.text.clone()
+    } else {
+        tok.text.to_lowercase()
+    }
+}
+
+impl SqlShape {
+    /// i번째 토큰(FROM)이 함수 인자 괄호 바로 안에 있는지 본다(R1). 함수 인자 괄호는
+    /// 바로 앞이 함수 이름이고 첫 토큰이 SELECT·WITH·VALUES(하위 질의)가 아닌 괄호다.
+    /// 함수 이름은 절 키워드도 관계 키워드도 아닌 비인용 식별자이고, CTE 본문 괄호는
+    /// 함수 인자가 아니다 — `AS (DELETE FROM t …)`·`MATERIALIZED (…)`의 FROM은 관계를 낸다.
+    fn in_function_arguments(&self, tokens: &[SqlToken], i: usize) -> bool {
+        let Some(open) = self.enclosing[i] else {
+            return false;
+        };
+        if open == 0 || self.cte_bodies.contains(&open) {
+            return false;
+        }
+        let callee = &tokens[open - 1];
+        if !is_name_token(callee)
+            || is_clause_word(&callee.text)
+            || is_relation_keyword(&callee.text)
+        {
+            return false;
+        }
+        !["select", "with", "values"]
+            .iter()
+            .any(|w| token_is(tokens, open + 1, w))
+    }
+
+    /// j번째 토큰(한정자 없는 피연산자)이 같은 문장의 CTE 이름인지 본다(R2).
+    fn is_cte(&self, tokens: &[SqlToken], j: usize) -> bool {
+        self.ctes[self.statement[j]].contains(&cte_key(&tokens[j]))
+    }
+}
+
+/// i번째 FROM이 `IS [NOT] DISTINCT FROM` 비교 연산자의 일부인지 본다(R3) — 바로 앞이
+/// 인용되지 않은 distinct이고 그 앞이 is 또는 is not이다. `SELECT DISTINCT * FROM t`의
+/// FROM은 관계를 연다.
+fn is_distinct_from(tokens: &[SqlToken], i: usize) -> bool {
+    let word_before = |steps: usize, word: &str| {
+        i.checked_sub(steps)
+            .is_some_and(|k| token_is(tokens, k, word))
+    };
+    word_before(1, "distinct")
+        && (word_before(2, "is") || (word_before(2, "not") && word_before(3, "is")))
+}
+
+/// k번째 토큰이 인용되지 않은 `text`(단어는 대소문자 없이, 기호는 그대로)인지 본다 —
+/// 범위 밖이면 false다.
+fn token_is(tokens: &[SqlToken], k: usize, text: &str) -> bool {
+    tokens
+        .get(k)
+        .is_some_and(|t| !t.quoted && t.text.eq_ignore_ascii_case(text))
 }
 
 /// GRANT/REVOKE의 권한 단어인지 본다 — `ON`이 관계 자리임을 확정하는 근거다.
@@ -2379,6 +2585,195 @@ mod tests {
             sql_relations("FROM (SELECT * FROM a) t"),
             (vec!["a".to_string()], false)
         );
+    }
+
+    /// `sql_relations` 결과를 순서 없는 집합으로 대조한다 — 공통 사례의 relations는
+    /// 집합이고(순서·중복은 생산자 규칙), 미해석 근거 유무는 따로 본다.
+    fn assert_relation_set(label: &str, sql: &str, want: &[&str], want_unresolved: bool) {
+        let (got, unresolved) = sql_relations(sql);
+        let got: BTreeSet<&str> = got.iter().map(String::as_str).collect();
+        let want: BTreeSet<&str> = want.iter().copied().collect();
+        assert_eq!(got, want, "{label}: {sql}");
+        assert_eq!(unresolved, want_unresolved, "{label} unresolved: {sql}");
+    }
+
+    /// 계열 공통 사례(D2 — R1 함수 인자 안의 FROM, R2 같은 문장의 CTE 이름, R3
+    /// IS [NOT] DISTINCT FROM)다. 7개 persistence 생산자와 isthmus conformance 벡터가 같은
+    /// SQL·같은 기대값을 쓰므로 사례 파일의 id·sql·relations를 그대로 옮긴다. 자리표시자·
+    /// 테이블 값 함수가 없는 SQL이라 미해석 근거(dynamic 사실)도 없어야 한다.
+    #[test]
+    fn sql_relations_follow_shared_family_cases() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                "cte/simple",
+                "WITH recent AS (SELECT * FROM orders) SELECT * FROM recent",
+                &["orders"],
+            ),
+            (
+                "cte/recursive-with-columns",
+                "WITH RECURSIVE tree(id, parent_id) AS (SELECT id, parent_id FROM nodes UNION ALL SELECT n.id, n.parent_id FROM nodes n JOIN tree t ON n.parent_id = t.id) SELECT * FROM tree",
+                &["nodes"],
+            ),
+            (
+                "cte/multiple-materialized",
+                "WITH a AS (SELECT 1), b AS MATERIALIZED (SELECT * FROM orders) SELECT * FROM a JOIN b ON true",
+                &["orders"],
+            ),
+            (
+                "cte/not-materialized",
+                "WITH c AS NOT MATERIALIZED (SELECT * FROM orders) SELECT * FROM c",
+                &["orders"],
+            ),
+            (
+                "cte/insert-select",
+                "WITH staged AS (SELECT * FROM imports) INSERT INTO orders SELECT * FROM staged",
+                &["imports", "orders"],
+            ),
+            (
+                "cte/scope-is-one-statement",
+                "WITH recent AS (SELECT 1) SELECT * FROM recent; SELECT * FROM recent",
+                &["recent"],
+            ),
+            (
+                "function-from/extract",
+                "SELECT EXTRACT(YEAR FROM created_at) FROM orders",
+                &["orders"],
+            ),
+            (
+                "function-from/trim",
+                "SELECT TRIM(BOTH ' ' FROM name) FROM users",
+                &["users"],
+            ),
+            (
+                "function-from/substring",
+                "SELECT SUBSTRING(name FROM 2 FOR 3) FROM users",
+                &["users"],
+            ),
+            (
+                "subquery/derived-table-still-fires",
+                "SELECT * FROM (SELECT * FROM orders) AS sub",
+                &["orders"],
+            ),
+            (
+                "subquery/scalar-still-fires",
+                "SELECT (SELECT max(id) FROM users) FROM orders",
+                &["users", "orders"],
+            ),
+            (
+                "subquery/in-select-still-fires",
+                "SELECT * FROM orders WHERE id IN (SELECT order_id FROM payments)",
+                &["orders", "payments"],
+            ),
+            (
+                "distinct-from/is",
+                "SELECT * FROM events WHERE a IS DISTINCT FROM b",
+                &["events"],
+            ),
+            (
+                "distinct-from/is-not",
+                "SELECT * FROM events WHERE a IS NOT DISTINCT FROM b",
+                &["events"],
+            ),
+        ];
+        for (id, sql, want) in cases {
+            assert_relation_set(id, sql, want, false);
+        }
+    }
+
+    /// 세 공통 규칙의 경계다 — 규칙 문구를 이 스캐너에 맞게 좁힌 해석(CTE 본문 괄호는
+    /// 함수 인자가 아님, `;`마다 괄호 문맥을 새로 셈, CTE 이름 대소문자 비교)과 기존 규칙의
+    /// 보존을 고정한다.
+    #[test]
+    fn sql_relations_keep_shared_rule_boundaries() {
+        // R1: CTE 본문 괄호(`AS (`·`MATERIALIZED (`)는 함수 인자가 아니다 — DML 본문의 관계는 남는다.
+        let r1: &[(&str, &[&str], bool)] = &[
+            (
+                "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
+                &["t"],
+                false,
+            ),
+            (
+                "WITH d AS MATERIALIZED (DELETE FROM t RETURNING *) SELECT * FROM d",
+                &["t"],
+                false,
+            ),
+            // 함수 인자 괄호 바로 안의 FROM만 막는다 — 그 안의 하위 질의는 관계를 낸다.
+            (
+                "SELECT EXTRACT(YEAR FROM (SELECT max(ts) FROM t)) FROM u",
+                &["t", "u"],
+                false,
+            ),
+            (
+                "SELECT COALESCE((SELECT max(id) FROM users), 0) FROM orders",
+                &["users", "orders"],
+                false,
+            ),
+            // 함수 인자 FROM 뒤는 관계 자리가 아니다 — 읽지 못한 근거로도 세지 않는다.
+            // 바깥 FROM의 자리표시자는 그대로 미해석이다.
+            (
+                "SELECT SUBSTRING(name FROM 'x') FROM users",
+                &["users"],
+                false,
+            ),
+            ("SELECT EXTRACT(YEAR FROM ts) FROM {}", &[], true),
+            // 관계 키워드(`table`)는 함수 이름이 아니다 — 뒤 괄호는 열 목록 자리다.
+            ("INSERT INTO table (id FROM x)", &["table", "x"], false),
+            // 닫히지 않은 함수 괄호가 다음 문장의 FROM까지 삼키지 않는다.
+            ("SELECT EXTRACT(YEAR; SELECT * FROM t", &["t"], false),
+        ];
+        // R2: 비인용 이름은 대소문자 없이, 인용 이름은 쓴 그대로 비교한다. 한정 이름은
+        // CTE가 아니다. 규칙이 문장 단위라 같은 이름 테이블을 읽는 본문의 관계도 사라진다.
+        let r2: &[(&str, &[&str], bool)] = &[
+            ("WITH Recent AS (SELECT 1) SELECT * FROM RECENT", &[], false),
+            (
+                r#"WITH "recent" AS (SELECT 1) SELECT * FROM recent"#,
+                &[],
+                false,
+            ),
+            (
+                r#"WITH "Recent" AS (SELECT 1) SELECT * FROM recent"#,
+                &["recent"],
+                false,
+            ),
+            (
+                "WITH recent AS (SELECT 1) SELECT * FROM s.recent",
+                &["s.recent"],
+                false,
+            ),
+            (
+                "WITH users AS (SELECT * FROM users WHERE active) SELECT * FROM users",
+                &[],
+                false,
+            ),
+        ];
+        // R3: IS [NOT] 없는 DISTINCT 뒤 FROM은 관계를 연다. 비교 피연산자 자리의
+        // 자리표시자는 관계도 미해석 근거도 아니고, 관계 자리(`FROM {}`)의 것은 그대로
+        // 미해석이다.
+        let r3: &[(&str, &[&str], bool)] = &[
+            ("SELECT DISTINCT * FROM t", &["t"], false),
+            (
+                "SELECT * FROM events WHERE kind IS DISTINCT FROM $1",
+                &["events"],
+                false,
+            ),
+            (
+                "SELECT * FROM events WHERE kind IS DISTINCT FROM ?",
+                &["events"],
+                false,
+            ),
+            ("SELECT * FROM {} WHERE a IS DISTINCT FROM b", &[], true),
+            // 기존 규칙 보존: upsert의 `ON CONFLICT .. DO UPDATE SET`은 관계가 아니다.
+            (
+                "INSERT INTO t (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET x = 1",
+                &["t"],
+                false,
+            ),
+        ];
+        for (label, group) in [("R1", r1), ("R2", r2), ("R3", r3)] {
+            for (sql, want, unresolved) in group {
+                assert_relation_set(label, sql, want, *unresolved);
+            }
+        }
     }
 
     #[test]
