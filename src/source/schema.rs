@@ -2023,7 +2023,7 @@ fn mark_ctes(shape: &mut SqlShape, tokens: &[SqlToken]) {
 /// 돌려준다. 열 목록 괄호는 미리 계산한 짝(`close_after`)으로 건너뛴다.
 fn cte_body(tokens: &[SqlToken], close_after: &[usize], name: usize) -> Option<usize> {
     let tok = tokens.get(name)?;
-    if !is_name_token(tok) && !(tok.quoted && !tok.text.is_empty()) {
+    if !(is_name_token(tok) || (tok.quoted && !tok.text.is_empty())) {
         return None;
     }
     let mut k = name + 1;
