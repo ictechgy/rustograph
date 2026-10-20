@@ -174,11 +174,19 @@ fn is_absolute_text(path: &str) -> bool {
         || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
 }
 
-/// 경로를 어휘적으로 정규화한 조각 — `/`와 `\`를 구분자로 보고, 빈 조각·`.`은 버리고 `..`은 앞
-/// 조각을 지운다. 상대 경로가 `..`로 시작점 위로 올라가면 None이다(절대 경로의 `/..`은 `/`다).
+/// 경로를 어휘적으로 정규화한 조각 — `/`를 구분자로 보고, `/`로 시작하지 않는 경로(드라이브 문자나
+/// `\`로 시작하는 Windows 경로, 다른 도구가 만든 상대 위치)에서는 `\`도 구분자로 본다. 유닉스 절대
+/// 경로의 `\`는 파일 이름의 글자라 조각에 남긴다(`%5C`로 인코딩된다) — 구분자로 읽으면 uri가 다른
+/// 파일을 가리킨다. 빈 조각·`.`은 버리고 `..`은 앞 조각을 지운다. 상대 경로가 `..`로 시작점 위로
+/// 올라가면 None이다(절대 경로의 `/..`은 `/`다).
 fn normalized_segments(path: &str, absolute: bool) -> Option<Vec<&str>> {
+    let separators: &[char] = if path.starts_with('/') {
+        &['/']
+    } else {
+        &['/', '\\']
+    };
     let mut segments = Vec::new();
-    for segment in path.split(['/', '\\']) {
+    for segment in path.split(separators) {
         match segment {
             "" | "." => {}
             ".." => {
@@ -374,6 +382,19 @@ mod tests {
         assert_nested_lib(Some(r"C:\work"), r"C:\work\src\nested\lib.rs:2");
         assert_nested_lib(Some(r"C:\work"), r"C:\work/src\nested/lib.rs:2");
         assert_nested_lib(None, r"src\nested\lib.rs:2");
+    }
+
+    /// 유닉스 절대 경로(`/` 시작)의 `\`는 구분자가 아니라 파일 이름의 글자다 — 조각에 남겨 `%5C`로
+    /// 인코딩해야 그 파일을 가리킨다. 예전에는 `\`를 늘 구분자로 읽어 `#[path]`로 이은 `src/we\ird.rs`가
+    /// 없는 파일 `src/we/ird.rs`를 가리켰다. 루트 표기도 같은 규칙이라 이름에 `\`가 든 루트의 접두가 맞는다.
+    #[test]
+    fn backslashes_in_unix_paths_stay_in_the_file_name() {
+        assert_eq!(uri_at(r"/work/space/src/we\ird.rs:3"), "src/we%5Cird.rs");
+        let log = sarif_for(".", Some(r"/work/sp\ace"), r"/work/sp\ace/src/lib.rs:2");
+        assert_eq!(
+            place(&log["runs"][0]["results"][0]),
+            (json!("src/lib.rs"), json!(2))
+        );
     }
 
     /// 루트 안에 머무는 `..`·`.`·겹친 구분자는 어휘적으로 접는다 — 위치 파일을 이 머신에서
