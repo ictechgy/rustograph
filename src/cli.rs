@@ -343,9 +343,10 @@ fn cmd_graph(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
 }
 
 /// 수확한 그래프에 기록할 출처 revision — 파일로 저장하는 JSON 스냅샷(`--out`)에만 싣는다. 순회 명령이
-/// `--graph`로 그 스냅샷을 읽을 때 지금의 HEAD 대신 이 값을 쓴다. 표준 출력 문서는 지금과 같은 바이트라
-/// git을 실행하지 않고, Mermaid에는 실을 자리가 없다. 값은 `--dir` 작업 트리가 깨끗할 때의 git HEAD다
-/// (순회 문서의 revision과 같은 판정). 캐시에서 온 문서도 이 값으로 덮어 수확 경로가 출처를 정한다.
+/// `--graph`로 그 스냅샷을 읽을 때 지금의 HEAD 대신 이 값을 쓴다. 수확한 그래프의 표준 출력 문서는 지금과
+/// 같은 바이트라 git을 실행하지 않고, Mermaid에는 실을 자리가 없다. 값은 `--dir` 작업 트리가 깨끗할 때의
+/// git HEAD다(순회 문서의 revision과 같은 판정). 캐시에서 온 문서도 이 값으로 덮어 수확 경로가 출처를 정한다.
+/// 수확 경로에서만 부른다 — `--graph` 입력은 그 문서의 값을 JSON 출력(표준 출력과 `--out` 모두)에 옮긴다.
 fn recorded_revision(a: &Args, format: &str) -> Option<String> {
     if format != "json" || a.get("out").is_none() {
         return None;

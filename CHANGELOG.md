@@ -43,14 +43,15 @@
   `revision`을 싣지 않고 `revision-unverified:` limitation으로 이유를 알린다. `revision`이 필요하면 `--revision`으로 준다.
 - `graph --out`: 수확한 그래프를 JSON으로 저장할 때 `--dir` 작업 트리가 깨끗하면 git `HEAD`를 문서의 선택 필드
   `revision`에 기록한다. 그 판독은 순회 `revision`과 같은 판정·같은 git 격리로 `--dir`에서 git을 실행한다. 문서 버전은
-  1 그대로이고(값이 없으면 키가 빠진다), 표준 출력과 Mermaid에는 싣지 않으며, `graph --graph`는 입력의 값을 그대로
-  옮긴다. 추적하지 않는 스냅샷을 작업 트리 안에 두면 다음 `graph --out`에서 트리가 바뀐 것으로 보여 기록이 빠진다 —
-  스냅샷은 작업 트리 밖이나 git이 무시하는 경로(`.rustograph/` 등)에 둔다.
+  1 그대로이고(값이 없으면 키가 빠진다), 수확한 그래프를 표준 출력으로 낼 때와 Mermaid에는 싣지 않으며,
+  `graph --graph`는 입력의 값을 JSON 출력(표준 출력과 `--out` 모두)에 그대로 옮긴다. 추적하지 않는 스냅샷을 작업 트리
+  안에 두면 다음 `graph --out`에서 트리가 바뀐 것으로 보여 기록이 빠진다 — 스냅샷은 작업 트리 밖이나 git이 무시하는
+  경로(`.rustograph/` 등)에 둔다.
 - `reach`·`impact --format language-traversal`의 `--graph`: 현재 git `HEAD` 대신 스냅샷이 기록한 `revision`을 쓰고 git을
-  실행하지 않는다. 기록이 없거나(옛 스냅샷, 표준 출력을 리디렉트해 만든 스냅샷, 깨끗함을 확인하지 못한 트리에서 저장한
-  스냅샷) `--revision`과 같은 규칙을 어기면 `revision`을 싣지 않고 `revision-unknown:` limitation을 단다. 이전에는 옛
-  스냅샷에 현재 `HEAD`를 붙여 stale 분석을 최신처럼 보이게 했다. 필요하면 `--revision`으로 준다. `graphRevision`은
-  스냅샷의 `revision`을 빼고 해시한다(같은 커밋의 스냅샷과 새 수확이 같은 값이다).
+  실행하지 않는다. 기록이 없거나(옛 스냅샷, 수확한 그래프의 표준 출력을 리디렉트해 만든 스냅샷, 깨끗함을 확인하지
+  못한 트리에서 저장한 스냅샷) `--revision`과 같은 규칙을 어기면 `revision`을 싣지 않고 `revision-unknown:` limitation을
+  단다. 이전에는 옛 스냅샷에 현재 `HEAD`를 붙여 stale 분석을 최신처럼 보이게 했다. 필요하면 `--revision`으로 준다.
+  `graphRevision`은 스냅샷의 `revision`을 빼고 해시한다(같은 커밋의 스냅샷과 새 수확이 같은 값이다).
 - `schema`: SQL 리터럴의 관계 판독이 계열 생산자 공통 규칙을 따른다. 같은 `;` 문장의 CTE 이름(인용하지 않은 이름은
   대소문자 없이 비교), 함수 인자 괄호 바로 안의 `FROM`(`EXTRACT`·`TRIM`·`SUBSTRING` 등), `IS [NOT] DISTINCT FROM`의
   피연산자를 relation-use로 내지 않는다 — isthmus가 이 이름들을 선언과 잇지 못해 거짓 `relation-use-without-decl`

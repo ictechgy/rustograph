@@ -87,12 +87,13 @@ writes such ids, so the error names the field and code point; regenerate the
 snapshot instead of passing another tool's ids to the terminal or to Mermaid.
 
 `graph --out` records the source revision of a harvested graph as `revision`:
-git `HEAD` when the `--dir` work tree is clean. `reach` and
-`impact --format language-traversal` with `--graph` use that value instead of
-the current git `HEAD`, which may have moved since the snapshot was saved, and
-run no git. A snapshot that records none (written before this change,
-redirected from stdout, or saved from a modified work tree), or whose
-`revision` breaks the `--revision` rules, gets no `revision` and a
+git `HEAD` when the `--dir` work tree is clean. `graph --graph` copies a
+recorded value to its JSON output, on stdout and with `--out` alike. `reach`
+and `impact --format language-traversal` with `--graph` use that value instead
+of the current git `HEAD`, which may have moved since the snapshot was saved,
+and run no git. A snapshot that records none (written before this change,
+redirected from a harvest's stdout, or saved from a modified work tree), or
+whose `revision` breaks the `--revision` rules, gets no `revision` and a
 `revision-unknown:` limitation. Pass `--revision`, or regenerate the snapshot
 with `rustograph graph --level symbol --out FILE`.
 

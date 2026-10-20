@@ -208,10 +208,12 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
 - `revision` (optional) is the source revision a saved graph was harvested
   from: `graph --out` writes git `HEAD` when the `--dir` work tree is clean
   (the same check, with the same git isolation, as the traversal `revision`).
-  Standard output never carries it, so a snapshot redirected from stdout has
-  none. Projections and filters keep it, and `graph --graph` copies it as is.
-  Keep snapshots outside the work tree or in a git-ignored path such as
-  `.rustograph/`: an untracked snapshot makes the next tree look modified.
+  A harvest written to standard output never carries it, so a snapshot
+  redirected from a harvest's stdout has none. Projections and filters keep
+  it, and `graph --graph` copies the input's value as is into its JSON, on
+  standard output and with `--out` alike. Keep snapshots outside the work
+  tree or in a git-ignored path such as `.rustograph/`: an untracked snapshot
+  makes the next tree look modified.
 
 ## MCP server
 

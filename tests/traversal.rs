@@ -975,6 +975,10 @@ fn snapshot_traversal_reports_the_revision_the_snapshot_records() {
     ]);
     assert_eq!(code, 0, "{err}");
     assert_eq!(read_json(&copy)["revision"], c1.as_str());
+    // 표준 출력으로 내도 옮긴다 — revision을 싣지 않는 표준 출력은 수확한 그래프의 것뿐이다.
+    let (code, projected, err) = run(&["graph", "--graph", &snapshot, "--level", "module"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(json(&projected)["revision"], c1.as_str());
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&saved);
 }

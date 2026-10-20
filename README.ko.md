@@ -285,12 +285,13 @@ isthmus [`language-traversal` v1](https://github.com/ictechgy/isthmus/blob/main/
   project로, 스냅샷의 `revision`은 빼고)의 SHA-256입니다.
 - `--graph`로 읽은 스냅샷은 저장한 뒤 HEAD가 움직였을 수 있어 git을 보지 않습니다.
   `revision`은 `--revision` 또는 스냅샷이 기록한 값입니다. `graph --out`이 `--dir` 작업
-  트리가 깨끗할 때의 git HEAD를 그래프 문서의 선택 필드 `revision`으로 기록합니다(표준
-  출력에는 싣지 않으니 리디렉트한 스냅샷에는 없습니다). 쓸 수 있는 기록이 없으면
-  `revision`을 싣지 않고 `revision-unknown:` limitation으로 알립니다. 같은 커밋의
-  스냅샷과 새 수확은 같은 `graphRevision`입니다. 스냅샷은 작업 트리 밖이나
-  `.rustograph/`처럼 git이 무시하는 경로에 두세요 — 추적하지 않는 스냅샷이 있으면 다음
-  실행의 트리가 바뀐 것으로 보입니다.
+  트리가 깨끗할 때의 git HEAD를 그래프 문서의 선택 필드 `revision`으로 기록합니다(수확한
+  그래프를 표준 출력으로 낼 때는 싣지 않으니 그 출력을 리디렉트한 스냅샷에는 없습니다.
+  `graph --graph`는 입력의 값을 표준 출력과 `--out`의 JSON에 그대로 옮깁니다). 쓸 수
+  있는 기록이 없으면 `revision`을 싣지 않고 `revision-unknown:` limitation으로
+  알립니다. 같은 커밋의 스냅샷과 새 수확은 같은 `graphRevision`입니다. 스냅샷은 작업
+  트리 밖이나 `.rustograph/`처럼 git이 무시하는 경로에 두세요 — 추적하지 않는 스냅샷이
+  있으면 다음 실행의 트리가 바뀐 것으로 보입니다.
 - 그래프 정점이 아닌 root는 `symbol` 없이 싣고 `root-not-found:` limitation을
   더한 문서를 쓴 뒤 64로 끝납니다.
 
