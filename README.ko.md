@@ -76,7 +76,7 @@ rustograph paths mycrate::a mycrate::b   # 두 정점 사이 제한된 경로 �
 rustograph search entry                  # 정확 > 꼬리 > 부분 문자열 순위
 rustograph deps                          # 미사용 의존 + 중복 버전 보고
 rustograph deps --strict                 # 발견이 있으면 종료 코드 1
-rustograph graph --focus mycrate::sub    # 서브트리만 남김
+rustograph graph --focus mycrate::sub    # 서브트리만 남김(버린 보존 루트·경계 간선 수는 limitations에 셈)
 rustograph dead --exclude-tests          # #[cfg(test)] 서브트리 제외
 rustograph graph --target x86_64-pc-windows-msvc  # cfg(트리플) 평가
 rustograph mcp                           # MCP stdio 서버 — 에이전트가 되묻는 통로

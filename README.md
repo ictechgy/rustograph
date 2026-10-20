@@ -115,6 +115,7 @@ rustograph deps --strict                  # exit 1 when findings exist
 
 # Trim the document before analysis
 rustograph graph --focus mycrate::sub     # keep one subtree only
+#   the retention roots and boundary-crossing edges it drops are counted in limitations
 rustograph dead --exclude-tests           # drop #[cfg(test)] subtrees
 rustograph graph --target x86_64-pc-windows-msvc  # evaluate cfg(triple)
 rustograph dead --semantic --no-cache     # bypass the semantic cache

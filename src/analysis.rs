@@ -840,7 +840,8 @@ pub struct Finding {
 pub struct DeadReport {
     pub roots: Vec<String>,
     pub findings: Vec<Finding>,
-    /// 이 분석의 실측 한계 — 문서의 것과 별개로 판정 관련 한계.
+    /// 이 분석의 실측 한계 — 문서의 것과 별개로 판정 관련 한계. 문서 limitation 가운데서는 판정의
+    /// 입력(보존 루트·들어오는 간선)을 지운 `--focus` 경계 문장만 옮겨 싣는다.
     pub limitations: Vec<String>,
 }
 
@@ -934,6 +935,9 @@ fn dead_with(doc: &Document, out: &ReachMap<'_>, roots: &[String]) -> DeadReport
             "{method_findings} unreachable methods may be invoked via trait objects, generics, or external crates — dispatch not visible to syntactic analysis"
         ));
     }
+    // `--focus`가 지운 보존 루트·들어오는 간선은 이 판정의 입력이라, 그 문서 limitation은 판정
+    // 한계로도 싣는다 — JSON 보고서만 읽는 소비자가 거짓 unreachable을 완전한 답으로 받지 않게.
+    limitations.extend(doc.focus_limitations().cloned());
     DeadReport {
         roots: roots.to_vec(),
         findings,
@@ -1252,6 +1256,29 @@ mod tests {
         assert_eq!(rep.roots, vec!["c::a"]);
         assert_eq!(rep.findings[0].state, "unreachable");
         assert_eq!(rep.findings[0].reason, "not reachable from retention roots");
+    }
+
+    /// `--focus`가 보존 루트·들어오는 간선을 지운 문서에서는 dead 판정 자체가 부분이다 — 보고서가 그
+    /// limitation을 싣는다(호출자가 루트를 바꿔 묻는 MCP 경로도 같다). 문서의 다른 limitation은
+    /// 지금처럼 보고서에 옮기지 않는다.
+    #[test]
+    fn dead_carries_the_focus_boundary_limitation_only() {
+        let mut d = doc();
+        d.limitations.push("harvest note".into());
+        assert!(dead(&d).unwrap().limitations.is_empty());
+        let focused = d.focus(&["c::b".to_string()]);
+        let note: Vec<String> = focused.focus_limitations().cloned().collect();
+        assert_eq!(note.len(), 1);
+        assert!(note[0].starts_with("--focus dropped 1 retention roots and 2 dependency edges "));
+        let rep = dead(&focused).unwrap();
+        assert!(rep.roots.is_empty());
+        assert_eq!(rep.findings[0].id, "c::b");
+        assert_eq!(rep.limitations, note);
+        let rooted = QueryIndex::new(&focused)
+            .dead(&["c::b".to_string()])
+            .unwrap();
+        assert!(rooted.findings.is_empty());
+        assert_eq!(rooted.limitations, note);
     }
 
     #[test]

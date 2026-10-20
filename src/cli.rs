@@ -430,7 +430,12 @@ fn cmd_dead(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
                 .ok();
             }
             writeln!(out, "{} unreachable", report.findings.len()).ok();
-            for l in report.limitations.iter().chain(doc.limitations.iter()) {
+            // 보고서가 문서에서 옮겨 온 limitation(`--focus` 경계)은 한 번만 쓴다.
+            let document_only = doc
+                .limitations
+                .iter()
+                .filter(|l| !report.limitations.contains(l));
+            for l in report.limitations.iter().chain(document_only) {
                 writeln!(out, "limitation: {l}").ok();
             }
             Some(())

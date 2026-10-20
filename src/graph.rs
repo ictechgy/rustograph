@@ -10,6 +10,11 @@ use std::collections::{BTreeMap, BTreeSet};
 /// 문서 스키마 버전. 형식이 깨지는 변경이 있으면 올린다.
 pub const DOCUMENT_VERSION: u32 = 1;
 
+/// [`Document::focus`]가 버린 보존 루트·경계 간선을 알리는 limitation의 머리 — 쓰는 쪽과
+/// 찾는 쪽([`Document::focus_limitations`])이 같은 값을 쓴다. 다른 limitation은 숫자나 낱말로
+/// 시작해 `--`로 시작하는 이 머리와 겹치지 않는다.
+const FOCUS_LIMITATION_PREFIX: &str = "--focus dropped ";
+
 /// serde skip 조건 — 0인 카운터는 키를 뺀다("없는 것"과 "0"을 구분하는 계약).
 pub fn is_zero(n: &usize) -> bool {
     *n == 0
@@ -454,15 +459,61 @@ impl Document {
     /// `--focus` — 주어진 경로 아래의 부분 트리만 남긴다.
     /// `c::a::b`를 포커스하면 `c::a::b`와 그 후손만 남는다. 조상은
     /// 남기지 않는다 — 포커스는 "이 서브트리만 보겠다"는 의미다.
+    /// 그래서 버린 보존 루트와 경계를 넘는 의존 간선은 [`Document::for_target`]처럼 limitation
+    /// 한 문장으로 센다 — 포커스 문서 위의 dead·impact·reach는 밖의 루트·호출자·의존을 못 본다.
+    /// 그 부분 결과가 완전한 답처럼 읽히면 안 된다. 셀 것이 없으면 싣지 않는다.
     pub fn focus(&self, prefixes: &[String]) -> Document {
-        self.filtered(
+        let mut d = self.filtered(
             |v, _| {
                 prefixes
                     .iter()
                     .any(|p| v.id == *p || v.id.starts_with(&format!("{p}::")))
             },
             |_| true,
-        )
+        );
+        let (roots, edges) = self.count_focus_drops(&d.vertex_ids());
+        if roots > 0 || edges > 0 {
+            d.limitations.push(format!(
+                "{FOCUS_LIMITATION_PREFIX}{roots} retention roots and {edges} dependency edges that \
+                 cross the focus boundary; dead can report code kept alive from outside the focus \
+                 as unreachable, and query, impact, paths and reach miss what lies outside it — \
+                 omit --focus for complete results"
+            ));
+        }
+        d
+    }
+
+    /// 포커스가 버린 것을 센다 — (`kept` 밖 보존 루트 수, 한쪽 끝만 `kept` 안인 의존 간선 수).
+    /// 루트는 ID로 센다 — 저장 스냅샷은 정렬·중복 제거 없이 읽혀 같은 루트가 두 번 있을 수 있다.
+    /// 간선은 추정 간선도 센다(도달성이 따라간다). contains는 소유라 세지 않는다 — 포커스 루트를
+    /// 품는 부모의 간선은 늘 경계를 넘지만 질의가 잃는 증거가 아니다. 양끝이 다 밖인 간선은
+    /// 포커스 안의 결과와 무관하다.
+    fn count_focus_drops(&self, kept: &BTreeSet<&str>) -> (usize, usize) {
+        let dropped_roots: BTreeSet<&str> = self
+            .roots
+            .iter()
+            .map(String::as_str)
+            .filter(|r| !kept.contains(r))
+            .collect();
+        let crossing_edges = self
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind.is_dependency()
+                    && kept.contains(e.from.as_str()) != kept.contains(e.to.as_str())
+            })
+            .count();
+        (dropped_roots.len(), crossing_edges)
+    }
+
+    /// 이 문서가 싣고 있는 `--focus` 경계 limitation — [`Document::focus`]가 쓴 문장이다. 저장
+    /// 스냅샷에도 남으므로 그 스냅샷을 다시 읽은 실행도 찾는다. dead 보고서는 문서 limitation과
+    /// 따로 판정 한계를 싣는데, 포커스는 도달성의 두 입력(보존 루트·들어오는 간선)을 지우므로
+    /// 이 문장만 판정 한계로 옮긴다.
+    pub(crate) fn focus_limitations(&self) -> impl Iterator<Item = &String> {
+        self.limitations
+            .iter()
+            .filter(|l| l.starts_with(FOCUS_LIMITATION_PREFIX))
     }
 
     /// `--exclude-tests` — `cfg(test)` 없이는 성립하지 않는 코드를 지운다.
@@ -892,6 +943,67 @@ mod tests {
         assert!(d.edges.is_empty());
         assert!(d.roots.is_empty());
         assert!(no_dangling(&d));
+    }
+
+    /// 포커스가 버린 보존 루트(같은 ID는 하나)와 한쪽 끝만 포커스 안인 의존 간선(추정 포함, 들어오는·
+    /// 나가는 방향 모두)을 한 문장으로 센다. contains는 소유라 경계를 넘어도 세지 않고, 양끝이 모두 밖인
+    /// 간선은 포커스와 무관하다. 문서의 기존 limitation은 그대로 앞에 남는다.
+    #[test]
+    fn focus_counts_dropped_roots_and_boundary_dependency_edges() {
+        let mut d = doc();
+        d.limitations.push("harvest note".into());
+        // 저장 스냅샷은 정렬되지 않아 같은 루트가 두 번 있을 수 있다.
+        d.roots = vec!["c::a::f".into(), "c::b::T::m".into(), "c::a::f".into()];
+        d.edges.extend([
+            Edge::new("c::b::T::m".into(), "c::a::f".into(), EdgeKind::Call),
+            Edge::new("c".into(), "c::b".into(), EdgeKind::Contains),
+            Edge::new("c".into(), "c::a".into(), EdgeKind::Contains),
+            Edge::new("c::b".into(), "c::b::T".into(), EdgeKind::Contains),
+        ]);
+        let focused = d.focus(&["c::b".to_string()]);
+        assert_eq!(focused.roots, vec!["c::b::T::m".to_string()]);
+        // 경계를 넘는 의존 간선: a→b uses, a::f→T::m call, a::f→T 추정 call, T::m→a::f call.
+        assert_eq!(
+            focused.limitations,
+            vec![
+                "harvest note".to_string(),
+                "--focus dropped 1 retention roots and 4 dependency edges that cross the focus \
+                 boundary; dead can report code kept alive from outside the focus as unreachable, \
+                 and query, impact, paths and reach miss what lies outside it — omit --focus for \
+                 complete results"
+                    .to_string(),
+            ]
+        );
+        assert_eq!(focused.focus_limitations().count(), 1);
+        assert_eq!(d.focus_limitations().count(), 0);
+        // 버린 것이 루트뿐이어도 싣는다 — 간선 수는 0으로 적는다.
+        let roots_only = d.focus(&["c::b::T::m".to_string()]);
+        assert!(roots_only.limitations[1]
+            .starts_with("--focus dropped 1 retention roots and 2 dependency edges "));
+        let mut lone = doc();
+        lone.edges.clear();
+        let lone = lone.focus(&["c::b".to_string()]);
+        assert!(lone.limitations[0]
+            .starts_with("--focus dropped 1 retention roots and 0 dependency edges "));
+    }
+
+    /// 셀 것이 없으면 조용하다 — 포커스가 모든 루트를 품고, 경계를 넘는 간선이 소유(contains)뿐이거나
+    /// 아예 없으면 limitation을 더하지 않는다(여러 `--focus`가 문서 전체를 덮는 경우 포함).
+    #[test]
+    fn focus_without_boundary_losses_adds_no_limitation() {
+        let whole = doc().focus(&["c::a".to_string(), "c::b".to_string(), "c".to_string()]);
+        assert_eq!(whole.vertices.len(), doc().vertices.len());
+        assert!(whole.limitations.is_empty(), "{:?}", whole.limitations);
+        let mut d = doc();
+        d.edges = vec![
+            Edge::new("c".into(), "c::a".into(), EdgeKind::Contains),
+            Edge::new("c::a".into(), "c::a::f".into(), EdgeKind::Contains),
+            Edge::new("c::b::T".into(), "c::b::T::m".into(), EdgeKind::Call),
+        ];
+        let focused = d.focus(&["c::a".to_string()]);
+        assert_eq!(focused.roots, vec!["c::a::f".to_string()]);
+        assert!(focused.limitations.is_empty(), "{:?}", focused.limitations);
+        assert_eq!(focused.focus_limitations().count(), 0);
     }
 
     #[test]

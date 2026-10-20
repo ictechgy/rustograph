@@ -728,6 +728,88 @@ mod cli_tests {
         assert!(out.contains("cfg-gated vertices excluded"));
     }
 
+    /// 출력 JSON의 `limitations` 가운데 `--focus` 경계 문장 — 키가 없으면(빈 목록) 비어 있다.
+    fn focus_notes(out: &str) -> Vec<String> {
+        let value: serde_json::Value = serde_json::from_str(out).expect("output must be JSON");
+        value["limitations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|l| l.as_str())
+            .filter(|l| l.starts_with("--focus dropped "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// `--focus`가 버린 보존 루트·경계 의존 간선은 문서·dead 보고서·순회 문서의 limitation으로
+    /// 센다 — 포커스 밖 루트·호출자를 잃은 dead·reach 결과가 완전한 답처럼 읽히면 안 된다. 수는
+    /// 포커스 없는 그래프에서 직접 센 값(contains 제외, 추정 포함)과 같다. dead 텍스트에는 한 번만
+    /// 나오고, 순회 문서의 잘림 표시는 그대로다. 포커스가 문서 전체를 덮으면 조용하다.
+    #[test]
+    fn focus_counts_what_it_drops_as_a_limitation() {
+        let (code, full, err) = run(&["graph", "--level", "symbol"]);
+        assert_eq!(code, 0, "{err}");
+        let full: serde_json::Value = serde_json::from_str(&full).unwrap();
+        let inside = |id: &serde_json::Value| {
+            let id = id.as_str().unwrap();
+            id == "fixture_core" || id.starts_with("fixture_core::")
+        };
+        let roots = full["roots"].as_array().unwrap();
+        let dropped_roots = roots.iter().filter(|r| !inside(r)).count();
+        let crossing = full["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] != "contains" && inside(&e["from"]) != inside(&e["to"]))
+            .count();
+        // fixture_app::main이 포커스 밖 루트이고, 그 main이 fixture_core를 부른다.
+        assert_eq!(dropped_roots, 1);
+        assert!(crossing > 0);
+        let head = format!(
+            "--focus dropped {dropped_roots} retention roots and {crossing} dependency edges \
+             that cross the focus boundary; "
+        );
+        let focused = ["--focus", "fixture_core"];
+        let with_focus = |args: &[&str]| -> (i32, String, String) {
+            let argv: Vec<&str> = args.iter().chain(&focused).copied().collect();
+            run(&argv)
+        };
+        for args in [
+            &["graph", "--level", "symbol"][..],
+            &["dead", "--format", "json"][..],
+            &["reach", "fixture_core::entry", "--revision", "r1"][..],
+        ] {
+            let (code, out, err) = with_focus(args);
+            assert_eq!(code, 0, "{args:?}: {err}");
+            let notes = focus_notes(&out);
+            assert_eq!(notes.len(), 1, "{args:?}: {notes:?}");
+            assert!(notes[0].starts_with(&head), "{args:?}: {}", notes[0]);
+        }
+        let (_, reach, _) = with_focus(&["reach", "fixture_core::entry", "--revision", "r1"]);
+        let reach: serde_json::Value = serde_json::from_str(&reach).unwrap();
+        assert_eq!(reach["truncated"], false);
+        assert!(reach.get("truncationReasons").is_none());
+        let (code, text, _) = with_focus(&["dead"]);
+        assert_eq!(code, 0);
+        assert_eq!(text.matches("limitation: --focus dropped ").count(), 1);
+        // 포커스가 없거나 모든 크레이트를 덮으면 문장이 없다.
+        let (_, out, _) = run(&["dead", "--format", "json"]);
+        assert!(focus_notes(&out).is_empty());
+        let (code, out, err) = run(&[
+            "dead",
+            "--format",
+            "json",
+            "--focus",
+            "fixture_core",
+            "--focus",
+            "fixture_app",
+            "--focus",
+            "fixture_macros",
+        ]);
+        assert_eq!(code, 0, "{err}");
+        assert!(focus_notes(&out).is_empty(), "{out}");
+    }
+
     #[test]
     fn rules_baseline_freezes_existing_violations() {
         let tmp = std::env::temp_dir().join(format!("rg-base-{}", std::process::id()));
