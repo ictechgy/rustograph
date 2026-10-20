@@ -24,6 +24,7 @@
 //! 조인하지 못하는 이유를 소비자가 셀 수 있어야 한다.
 
 use crate::cargo_meta;
+use crate::source::HarvestInputs;
 use proc_macro2::{Span, TokenStream, TokenTree};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -112,6 +113,18 @@ pub struct BridgeFactsDocument {
 /// bridge-facts 문서를 만든다.
 /// 워크스페이스를 못 읽으면 오류다 — 빈 문서로 성공한 척하지 않는다.
 pub fn facts(dir: &Path, tool_version: &str) -> Result<BridgeFactsDocument, String> {
+    facts_with_inputs(dir, tool_version, false).map(|(doc, _)| doc)
+}
+
+/// [`facts`]와 같은 문서와, `want_inputs`면 정점 귀속 수확이 읽은 입력을 돌려준다 —
+/// `schema --out`이 입력 보호 목록을 위해 cargo metadata와 모듈 트리 파싱을 한 번 더 하지
+/// 않게 한다. 정점 귀속 수확이 실패하면(사실은 usr 없이 낸다) 입력은 None이다 — 호출자가
+/// 싣지 못한 모듈 파일까지 적는 관대 모드로 다시 찾는다.
+pub(crate) fn facts_with_inputs(
+    dir: &Path,
+    tool_version: &str,
+    want_inputs: bool,
+) -> Result<(BridgeFactsDocument, Option<HarvestInputs>), String> {
     let root = dir
         .canonicalize()
         .map_err(|e| format!("cannot resolve {}: {e}", dir.display()))?;
@@ -157,9 +170,9 @@ pub fn facts(dir: &Path, tool_version: &str) -> Result<BridgeFactsDocument, Stri
     // 얻는다(간선은 귀속에 필요 없어 만들지 않는다). 그래프를 못 만들면 사실은
     // 그대로 내되 usr는 싣지 않는다 — 사실 수확을 그래프 성공에 묶으면 파싱
     // 실패 하나로 문서 전체를 잃는다.
-    let graph = crate::source::vertex_spans(dir, &meta);
+    let graph = crate::source::vertex_spans(dir, &meta, want_inputs);
     let index = match &graph {
-        Ok((ids, spans)) => Some(OwnerIndex::new(ids, spans)),
+        Ok((ids, spans, _)) => Some(OwnerIndex::new(ids, spans)),
         Err(_) => {
             scan.graph_failed = true;
             None
@@ -168,7 +181,8 @@ pub fn facts(dir: &Path, tool_version: &str) -> Result<BridgeFactsDocument, Stri
     scan.missing_usrs = attach_symbols(&mut facts, &root, index.as_ref());
     facts.sort_by(fact_cmp);
     let limitations = scan.limitations();
-    Ok(BridgeFactsDocument {
+    let inputs = graph.ok().and_then(|(_, _, inputs)| inputs);
+    let doc = BridgeFactsDocument {
         format: "bridge-facts",
         version: 1,
         tool: BridgeFactsTool {
@@ -186,7 +200,8 @@ pub fn facts(dir: &Path, tool_version: &str) -> Result<BridgeFactsDocument, Stri
         project: root.display().to_string(),
         facts,
         limitations,
-    })
+    };
+    Ok((doc, inputs))
 }
 
 /// 파일별 정점 범위 색인 — 그래프에 실제로 있는 정점 ID만 담는다.

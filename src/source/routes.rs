@@ -27,6 +27,7 @@ use crate::cargo_meta;
 use crate::source::schema::{
     dynamic_channel, rfc3339_utc_now, BridgeFactsTool, BridgeLocation, FactSymbol,
 };
+use crate::source::HarvestInputs;
 use common::{Anchor, Ctx, Decl, DeclPath, Gap, Handler, Output, ScopeSpec, Trailing};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -156,6 +157,18 @@ pub fn routes(
     tool_version: &str,
     opts: &RouteOptions,
 ) -> Result<RoutesDocument, String> {
+    routes_with_inputs(dir, tool_version, opts, false).map(|(doc, _)| doc)
+}
+
+/// [`routes`]와 같은 문서와, `want_inputs`면 라우트를 찾으려고 한 수확이 읽은 입력을 돌려준다 —
+/// `routes --out`이 입력 보호 목록을 위해 cargo metadata와 모듈 트리 파싱을 한 번 더 하지 않게
+/// 한다. 프레임워크 의존이 없으면 수확하지 않으므로 입력은 None이다(호출자가 다시 찾는다).
+pub(crate) fn routes_with_inputs(
+    dir: &Path,
+    tool_version: &str,
+    opts: &RouteOptions,
+    want_inputs: bool,
+) -> Result<(RoutesDocument, Option<HarvestInputs>), String> {
     let root = dir
         .canonicalize()
         .map_err(|e| format!("cannot resolve {}: {e}", dir.display()))?;
@@ -185,7 +198,8 @@ pub fn routes(
                 .to_string(),
         ),
         Some(f) => {
-            let parts = crate::source::harvest_parts(dir, &meta)?;
+            let mut parts = crate::source::harvest_parts(dir, &meta, want_inputs)?;
+            let inputs = parts.inputs.take();
             let ctx = Ctx::new(&parts, root.clone());
             for u in uses.iter().filter(|u| u.framework == f) {
                 extract_use(&ctx, u, &mut out);
@@ -198,10 +212,12 @@ pub fn routes(
                     ),
                 );
             }
-            return assemble(&ctx, out, dispatch, tool_version, &root, &meta);
+            let doc = assemble(&ctx, out, dispatch, tool_version, &root, &meta)?;
+            return Ok((doc, inputs));
         }
     }
-    finish(out, dispatch, tool_version, &root, &meta, Vec::new())
+    let doc = finish(out, dispatch, tool_version, &root, &meta, Vec::new())?;
+    Ok((doc, None))
 }
 
 /// 멤버 하나의 루트들에서 추출한다.

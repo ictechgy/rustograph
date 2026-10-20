@@ -174,21 +174,37 @@ pub fn owner_spans(
     Ok((doc, sink.spans.unwrap_or_default()))
 }
 
-/// 정점 ID 집합과 정점별 소스 범위만 돌려준다 — `schema`가 relation-use 사실을
+/// [`vertex_spans`]의 결과 — (정점 ID 집합, 정점별 소스 범위, 입력을 원한 수확이면 그 수확이
+/// 읽은 입력). 입력은 문서를 파일로 쓰는 `schema --out`만 원한다.
+pub(crate) type VertexSpans = (
+    BTreeSet<String>,
+    Vec<harvest::OwnerSpan>,
+    Option<HarvestInputs>,
+);
+
+/// 정점 ID 집합과 정점별 소스 범위를 돌려준다 — `schema`가 relation-use 사실을
 /// impact와 같은 정점 ID로 귀속하는 데 쓴다. 간선은 해석하지 않는다: 본문 이름
 /// 팬아웃 간선이 대형 저장소에서 이 수확 시간·메모리의 대부분인데 귀속에는 정점과
 /// 범위만 필요하다. 정점·범위는 1패스가 다 만들므로 [`owner_spans`]와 같다.
+/// `want_inputs`면 이 수확이 읽은 입력도 넘긴다 — `schema --out`이 입력 보호 목록을 위해
+/// cargo metadata와 모듈 트리 파싱을 한 번 더 하지 않게 한다.
 pub(crate) fn vertex_spans(
     dir: &Path,
     meta: &Metadata,
-) -> Result<(BTreeSet<String>, Vec<harvest::OwnerSpan>), String> {
+    want_inputs: bool,
+) -> Result<VertexSpans, String> {
     let mut sink = Sink {
         spans: Some(Vec::new()),
         want_edges: false,
+        want_inputs,
         ..Default::default()
     };
     let (doc, _) = harvest(dir, meta, &span_options(), Some(&mut sink))?;
-    Ok((vertex_id_set(doc), sink.spans.unwrap_or_default()))
+    Ok((
+        vertex_id_set(doc),
+        sink.spans.unwrap_or_default(),
+        sink.inputs,
+    ))
 }
 
 /// 정점 범위를 쓰는 수확의 옵션 — 심볼 레벨, 외부 크레이트 정점 없음, semantic 없음.
@@ -233,6 +249,8 @@ pub(crate) struct Parts {
     pub(crate) spans: Vec<harvest::OwnerSpan>,
     pub(crate) tree: ModTree,
     arena: Arena,
+    /// 이 수확이 읽은 입력 — 입력을 원한 수확([`harvest_parts`]의 `want_inputs`)만 채운다.
+    pub(crate) inputs: Option<HarvestInputs>,
 }
 
 impl Parts {
@@ -244,12 +262,18 @@ impl Parts {
 }
 
 /// 기본 옵션(심볼 레벨)으로 수확하고 트리·아레나까지 돌려준다. 라우트 추출은
-/// 간선을 읽지 않으므로 간선 해석을 건너뛴다.
-pub(crate) fn harvest_parts(dir: &Path, meta: &Metadata) -> Result<Parts, String> {
+/// 간선을 읽지 않으므로 간선 해석을 건너뛴다. `want_inputs`면 이 수확이 읽은 입력도
+/// `Parts::inputs`로 넘긴다 — `routes --out`이 입력 보호 목록을 위해 다시 파싱하지 않게 한다.
+pub(crate) fn harvest_parts(
+    dir: &Path,
+    meta: &Metadata,
+    want_inputs: bool,
+) -> Result<Parts, String> {
     let mut sink = Sink {
         spans: Some(Vec::new()),
         want_tree: true,
         want_edges: false,
+        want_inputs,
         ..Default::default()
     };
     let (doc, _) = harvest(dir, meta, &span_options(), Some(&mut sink))?;
@@ -261,6 +285,7 @@ pub(crate) fn harvest_parts(dir: &Path, meta: &Metadata) -> Result<Parts, String
         spans: sink.spans.unwrap_or_default(),
         tree,
         arena,
+        inputs: sink.inputs,
     })
 }
 
@@ -339,11 +364,12 @@ fn manifests_above<'a>(paths: impl Iterator<Item = &'a PathBuf>) -> Vec<PathBuf>
     found
 }
 
-/// 문서를 만든 수확의 입력을 넘겨받지 못한 `--out`(schema·routes, semantic 캐시 적중)이
-/// 보호 목록을 다시 만든다. 모듈 트리만 키운다 — 이름 해석·정점 수확은 보호 목록에 쓰이지
-/// 않는다. 파일 목록은 [`HarvestInputs::protected_files`]와 같다. 읽거나 파싱하지 못한
-/// 모듈 파일은 오류가 아니라 `unloaded_modules`다 — 그런 파일을 limitation으로 세고 문서를
-/// 내는 명령(`schema`)이 출력 대상에 따라 성공·실패가 갈리지 않게 한다.
+/// 문서를 만든 수확의 입력을 넘겨받지 못한 `--out`(수확하지 않은 `routes --role server`, 정점
+/// 수확이 실패한 `schema`, semantic 캐시 적중)이 보호 목록을 다시 만든다. 모듈 트리만
+/// 키운다 — 이름 해석·정점 수확은 보호 목록에 쓰이지 않는다. 파일 목록은
+/// [`HarvestInputs::protected_files`]와 같다. 읽거나 파싱하지 못한 모듈 파일은 오류가 아니라
+/// `unloaded_modules`다 — 그런 파일을 limitation으로 세고 문서를 내는 명령(`schema`)이 출력
+/// 대상에 따라 성공·실패가 갈리지 않게 한다.
 pub(crate) fn input_files(dir: &Path) -> Result<ProtectedInputs, String> {
     let metadata = cargo_meta::load(dir)?;
     let found = input_tree(&metadata, true)?;
@@ -2032,7 +2058,7 @@ mod tests {
             let full_ids: BTreeSet<String> = full.vertices.iter().map(|v| v.id.clone()).collect();
             let full_spans = span_keys(sink.spans.as_deref().unwrap());
             let (tree, arena) = (sink.tree.unwrap(), sink.arena.unwrap());
-            let (ids, spans) = vertex_spans(&dir, &meta).unwrap();
+            let (ids, spans, _) = vertex_spans(&dir, &meta, false).unwrap();
             assert_eq!(ids, full_ids, "{name}");
             assert_eq!(span_keys(&spans), full_spans, "{name}");
             // 공개 owner_spans는 그대로 간선까지 만든 완전한 문서다.
@@ -2040,7 +2066,7 @@ mod tests {
             let json = |d: &Document| serde_json::to_string(d).unwrap();
             assert_eq!(json(&doc), json(&full), "{name}");
             assert_eq!(span_keys(&owners), full_spans, "{name}");
-            let parts = harvest_parts(&dir, &meta).unwrap();
+            let parts = harvest_parts(&dir, &meta, false).unwrap();
             assert_eq!(parts.vertex_ids, full_ids, "{name}");
             assert_eq!(span_keys(&parts.spans), full_spans, "{name}");
             assert!(parts.tree.modules.keys().eq(tree.modules.keys()), "{name}");
@@ -2053,7 +2079,7 @@ mod tests {
     /// 전부의 매니페스트 확인이다. 새 경로가 같은 파일 집합을 내는지 비교하는 오라클이다.
     fn protected_files_by_full_harvest(dir: &Path) -> (Vec<PathBuf>, bool) {
         let metadata = cargo_meta::load(dir).unwrap();
-        let parts = harvest_parts(dir, &metadata).unwrap();
+        let parts = harvest_parts(dir, &metadata, false).unwrap();
         let mut files: BTreeSet<PathBuf> = parts.arena.keys().cloned().collect();
         let unresolved_includes = include_inputs(&parts.arena, &mut files);
         files.extend(parts.tree.orphan_files);
@@ -2080,9 +2106,10 @@ mod tests {
         (files.into_iter().collect(), unresolved_includes)
     }
 
-    /// `--out` 보호 목록은 문서를 만든 수확의 입력으로 만들든(graph·rules) 모듈 트리만 다시
-    /// 키워 만들든(schema·routes) 옛 구현과 같은 파일 집합·include 미해석 표시다. 조상
-    /// 디렉터리는 한 번씩만 본다 — 파일마다 조상 전부를 stat하면 깊은 트리에서 수만 번이었다.
+    /// `--out` 보호 목록은 문서를 만든 수확의 입력으로 만들든(graph·rules·schema·routes) 모듈
+    /// 트리만 다시 키워 만들든(수확 입력이 없을 때) 옛 구현과 같은 파일 집합·include 미해석
+    /// 표시다. 조상 디렉터리는 한 번씩만 본다 — 파일마다 조상 전부를 stat하면 깊은 트리에서
+    /// 수만 번이었다.
     #[test]
     fn output_protection_matches_the_full_harvest_and_probes_each_directory_once() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -2103,16 +2130,23 @@ mod tests {
                 expected,
                 "{name}"
             );
-            let (_, inputs) = load_with_inputs(&dir, &span_options()).unwrap();
-            let reused = inputs
-                .expect("a harvest hands over what it read")
-                .protected_files();
-            assert!(reused.unloaded_modules.is_empty(), "{name}");
-            assert_eq!(
-                (reused.files, reused.unresolved_includes),
-                expected,
-                "{name}"
-            );
+            // graph·rules는 문서 수확이, schema는 정점 귀속 수확이, routes는 트리까지 받는
+            // 수확이 읽은 입력을 넘긴다 — 셋 다 같은 목록이어야 한다.
+            let (_, from_document) = load_with_inputs(&dir, &span_options()).unwrap();
+            let metadata = cargo_meta::load(&dir).unwrap();
+            let (_, _, from_spans) = vertex_spans(&dir, &metadata, true).unwrap();
+            let from_parts = harvest_parts(&dir, &metadata, true).unwrap().inputs;
+            for handed in [from_document, from_spans, from_parts] {
+                let reused = handed
+                    .expect("a harvest hands over what it read")
+                    .protected_files();
+                assert!(reused.unloaded_modules.is_empty(), "{name}");
+                assert_eq!(
+                    (reused.files, reused.unresolved_includes),
+                    expected,
+                    "{name}"
+                );
+            }
             let directories: BTreeSet<&Path> = expected
                 .0
                 .iter()

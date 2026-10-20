@@ -774,7 +774,7 @@ mod tests {
         }
         let dir = temp_app("lookup", &src);
         let meta = crate::cargo_meta::load(&dir).unwrap();
-        let parts = crate::source::harvest_parts(&dir, &meta).unwrap();
+        let parts = crate::source::harvest_parts(&dir, &meta, false).unwrap();
         let ctx = Ctx::new(&parts, dir.canonicalize().unwrap());
         let before = examined_ids();
         let found = ctx.resolve_vertex("app", &owned_segments(&["T", "f"]));

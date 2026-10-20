@@ -155,11 +155,11 @@ fn cmd_schema(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
         ));
     }
     let dir = PathBuf::from(a.get("dir").unwrap_or("."));
-    let doc = source::schema::facts(&dir, VERSION)?;
+    let (doc, inputs) = source::schema::facts_with_inputs(&dir, VERSION, a.get("out").is_some())?;
     let text = export::to_json(&doc);
     match a.get("out") {
         Some(p) => {
-            write_output(a, Path::new(p), &text, &[], None)?;
+            write_output(a, Path::new(p), &text, &[], inputs.as_ref())?;
             writeln!(out, "wrote {p}").ok();
         }
         None => {
@@ -173,7 +173,7 @@ fn cmd_schema(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
 /// actix-web `route-decl`, 클라이언트는 reqwest·ureq·선언된 래퍼의 `route-call`이다.
 /// `--role`은 필수다 — 생략을 한쪽으로 읽으면 명령의 뜻이 역할에 따라 흔들린다.
 fn cmd_routes(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
-    let text = match a.get("role") {
+    let (text, inputs) = match a.get("role") {
         Some("server") => routes_server(a)?,
         Some("client") => routes_client(a)?,
         Some(other) => {
@@ -185,7 +185,7 @@ fn cmd_routes(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     };
     match a.get("out") {
         Some(p) => {
-            write_output(a, Path::new(p), &text, &[], None)?;
+            write_output(a, Path::new(p), &text, &[], inputs.as_ref())?;
             writeln!(out, "wrote {p}").ok();
         }
         None => {
@@ -195,8 +195,8 @@ fn cmd_routes(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     Ok(0)
 }
 
-/// 서버 route-decl 문서(JSON 텍스트).
-fn routes_server(a: &Args) -> Result<String, String> {
+/// 서버 route-decl 문서(JSON 텍스트)와, `--out`이면 그 문서를 만든 수확이 읽은 입력.
+fn routes_server(a: &Args) -> Result<(String, Option<source::HarvestInputs>), String> {
     if let Some(bad) = a.unsupported(&["dir", "out", "role", "framework"]) {
         return Err(format!(
             "routes --role server takes only --dir, --out and --framework — {bad} is not supported"
@@ -211,12 +211,13 @@ fn routes_server(a: &Args) -> Result<String, String> {
     };
     let dir = PathBuf::from(a.get("dir").unwrap_or("."));
     let opts = source::routes::RouteOptions { framework };
-    let doc = source::routes::routes(&dir, VERSION, &opts)?;
-    Ok(export::to_json(&doc))
+    let (doc, inputs) =
+        source::routes::routes_with_inputs(&dir, VERSION, &opts, a.get("out").is_some())?;
+    Ok((export::to_json(&doc), inputs))
 }
 
-/// 클라이언트 route-call 문서(JSON 텍스트).
-fn routes_client(a: &Args) -> Result<String, String> {
+/// 클라이언트 route-call 문서(JSON 텍스트)와, `--out`이면 그 문서를 만든 수확이 읽은 입력.
+fn routes_client(a: &Args) -> Result<(String, Option<source::HarvestInputs>), String> {
     if let Some(bad) = a.unsupported(&["dir", "out", "role", "wrappers", "service"]) {
         return Err(format!(
             "routes --role client takes only --dir, --out, --wrappers and --service — {bad} is not supported"
@@ -238,13 +239,18 @@ fn routes_client(a: &Args) -> Result<String, String> {
     };
     let dir = PathBuf::from(a.get("dir").unwrap_or("."));
     let opts = source::routes::client::ClientOptions { wrappers, service };
-    let doc = source::routes::client::client_routes(&dir, VERSION, &opts)?;
-    Ok(export::to_json(&doc))
+    let (doc, inputs) = source::routes::client::client_routes_with_inputs(
+        &dir,
+        VERSION,
+        &opts,
+        a.get("out").is_some(),
+    )?;
+    Ok((export::to_json(&doc), inputs))
 }
 
 /// 출력 형식과 무관하게 그래프 입력과 수확 원본을 보호한다. `harvested`는 결과 문서를 만든
-/// 수확이 읽은 입력이다 — 없으면(schema·routes, semantic 캐시 적중) 보호 목록을 위해
-/// 모듈 트리를 다시 찾는다.
+/// 수확이 읽은 입력이다 — 없으면(수확하지 않은 `routes --role server`, 정점 수확이 실패한
+/// `schema`, semantic 캐시 적중) 보호 목록을 위해 모듈 트리를 다시 찾는다.
 fn write_output(
     a: &Args,
     path: &Path,
@@ -889,6 +895,47 @@ mod tests {
             baseline,
         ]);
         assert_eq!((to_file, to_baseline), (stdout, stdout));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// `schema`·`routes --out`도 문서를 만든 수확이 읽은 입력으로 보호 목록을 만든다 — 보호
+    /// 목록을 위해 cargo metadata와 모듈 트리 읽기·파싱을 한 번 더 하면 합성 8만 줄
+    /// 워크스페이스에서 `--out`이 표준 출력보다 시간 1.4~1.8배, 최대 메모리 1.3~1.4배였다(먼저
+    /// 파싱한 AST는 누수 아레나라 함께 산다). 새 경로에 쓰든 방금 쓴 출력을 바꾸든 표준 출력
+    /// 실행과 같은 수의 파일만 파싱해야 한다.
+    #[test]
+    fn bridge_outputs_reuse_their_harvest() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let tmp =
+            std::env::temp_dir().join(format!("rustograph-cli-bridge-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let facts_out = tmp.join("facts.json");
+        let facts_out = facts_out.to_str().unwrap();
+        let parsed_by = |args: &[&str]| {
+            let before = source::parsed_files();
+            let (code, _, err) = run_cli(args);
+            assert_eq!(code, 0, "{args:?}: {err}");
+            source::parsed_files() - before
+        };
+        let commands: [(&str, &[&str]); 3] = [
+            ("tests/fixture-schema", &["schema"]),
+            (
+                "tests/fixture-routes/axum08",
+                &["routes", "--role", "server"],
+            ),
+            ("tests/fixture-client/app", &["routes", "--role", "client"]),
+        ];
+        for (fixture, command) in commands {
+            let fixture_dir = repo.join(fixture);
+            let fixture_dir = fixture_dir.to_str().unwrap();
+            let stdout = parsed_by(&[command, &["--dir", fixture_dir]].concat());
+            assert!(stdout > 0, "{fixture}: the harvest must parse the fixture");
+            std::fs::remove_file(facts_out).ok();
+            let to_file = [command, &["--dir", fixture_dir, "--out", facts_out]].concat();
+            let (fresh, replacing) = (parsed_by(&to_file), parsed_by(&to_file));
+            assert_eq!((fresh, replacing), (stdout, stdout), "{fixture}");
+        }
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 }
