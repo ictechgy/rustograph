@@ -24,8 +24,11 @@
   rustup 프록시면 임시 디렉터리 아래 새 빈 디렉터리에서 rustup에 물은 툴체인으로 `RUSTUP_TOOLCHAIN`도 고정한다.
   사용자가 준 `RUSTUP_TOOLCHAIN`·`RUSTC`는 그대로 쓴다. 이전에는 체크아웃 안에서 띄우면 그 설정이 고른 래퍼·컴파일러·
   툴체인이 실행됐고, `PATH`에 빈 항목이나 `.` 같은 상대 항목이 있으면 체크아웃에 든 `cargo`도 실행됐다. 작업 디렉터리는
-  그대로라 source replacement·`[patch]`·레지스트리 설정과 체크아웃의 `[env]`는 지금처럼 적용되고, 자격 증명 공급자와
-  `--semantic`의 rust-analyzer가 띄우는 cargo는 이 보호 밖이다 — README의 Security 절.
+  그대로라 source replacement·`[patch]`·레지스트리 설정은 지금처럼 적용된다. 이 보호는 실행할 프로그램의 선택만
+  막는다: 체크아웃의 `[env]`도 지금처럼 `cargo metadata`가 띄우는 rustc에 적용되므로, 체크아웃(이나 그 하위
+  디렉터리) 안에서 실행하면 그 체크아웃이 `LD_PRELOAD`·`DYLD_INSERT_LIBRARIES` 같은 변수로 자기 라이브러리를 rustc에
+  실어 코드를 실행할 수 있다. 신뢰하지 않는 체크아웃은 지금처럼 체크아웃 밖의 작업 디렉터리에서 `--dir`로
+  분석한다. 자격 증명 공급자와 `--semantic`의 rust-analyzer가 띄우는 cargo도 이 보호 밖이다 — README의 Security 절.
 - `mcp`: 서버가 1 MiB(1,048,576바이트, 줄 끝 제외)를 넘는 요청 줄을 버퍼에 쌓지 않는다. 그런 줄에는 `id`가 `null`인
   JSON-RPC `-32600` 오류로 답하고 그 줄의 나머지를 버린 뒤 다음 요청을 계속 읽는다. 이전에는 줄 길이 상한이 없어
   개행 없는 입력 하나가 서버 메모리를 끝없이 쌓았다.

@@ -549,7 +549,8 @@ for the `--dir` workspace on its first call; the `--semantic` cache key runs
 `.cargo/config.toml` (from that directory and its parents) and rustup proxies
 look for a `rust-toolchain.toml` (or `rust-toolchain`) file the same way.
 rustograph keeps a checkout from choosing the programs they run, even when you
-run it inside that checkout:
+run it inside that checkout — but not from running its own code inside them
+through `[env]` (below), so run it inside a checkout only if you trust it:
 
 - `cargo`, `rustc`, and `rustup` come from absolute `PATH` entries only
   (`/bin:/usr/bin` when `PATH` is unset) and run by that absolute path. Empty
@@ -581,13 +582,21 @@ run it inside that checkout:
 
 The current directory does not change, so the rest of the checkout's Cargo
 configuration — source replacement, `[patch]`, registries — still applies, as
-it does for `cargo build`. That includes settings rustograph leaves alone:
-the checkout's `[env]` table still sets environment variables for the `rustc`
-that `cargo metadata` runs, and credential providers
-(`registry.global-credential-providers`,
-`registries.<name>.credential-provider`), which Cargo runs to authenticate to
-registries that need it, are not overridden, because that would also turn off
-your own provider for private registries.
+it does for `cargo build`. That includes two settings rustograph leaves alone:
+
+- The checkout's `[env]` table still sets environment variables for the
+  `rustc` that `cargo metadata` runs to learn the host and target, and with
+  `force = true` it overrides your own values. That is enough to run the
+  checkout's code: `LD_PRELOAD` on Linux or `DYLD_INSERT_LIBRARIES` on macOS
+  can load a library from the checkout into that `rustc`. rustograph does not
+  override `[env]`, so it applies whenever the current directory is the
+  checkout or one of its subdirectories. Running rustograph inside a checkout
+  is therefore not safe for code you do not trust; analyze such a checkout
+  from outside, as described below.
+- Credential providers (`registry.global-credential-providers`,
+  `registries.<name>.credential-provider`), which Cargo runs to authenticate
+  to registries that need it, are not overridden, because that would also
+  turn off your own provider for private registries.
 
 `--semantic` executes the analyzed code. rust-analyzer runs `cargo check` in
 the analyzed workspace root, which builds and runs its build scripts
@@ -599,15 +608,15 @@ starts. Use `--semantic` only on code you would build yourself.
 For untrusted repositories and pull requests from forks, run rustograph on an
 isolated runner or sandbox that holds no secrets, without `--semantic`, from a
 working directory outside the checkout (neither the checkout nor one of its
-subdirectories), and pass the checkout with `--dir`. The checkout's
-`.cargo/config.toml` and `rust-toolchain.toml` then do not apply to the
-toolchain commands rustograph runs at all; configuration in the working
-directory, its parents, and your Cargo home still does. `cargo metadata`
-resolves the checkout's dependencies wherever it runs. It can write
-`Cargo.lock` into the checkout, and the analysis fails if that write fails; it
-can also fetch registry and git dependencies named in the checkout's
-manifests, so limit the sandbox's network access if that matters. rustograph
-does not sandbox these commands itself.
+subdirectories, where its `[env]` table applies), and pass the checkout with
+`--dir`. The checkout's `.cargo/config.toml` — `[env]` included — and
+`rust-toolchain.toml` then do not apply to the toolchain commands rustograph
+runs at all; configuration in the working directory, its parents, and your
+Cargo home still does. `cargo metadata` resolves the checkout's dependencies
+wherever it runs. It can write `Cargo.lock` into the checkout, and the
+analysis fails if that write fails; it can also fetch registry and git
+dependencies named in the checkout's manifests, so limit the sandbox's network
+access if that matters. rustograph does not sandbox these commands itself.
 
 `reach` and `impact --format language-traversal` without `--revision` or
 `--graph`, and `graph --out` when it writes a harvested graph as JSON, also run

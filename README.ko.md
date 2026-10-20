@@ -356,7 +356,9 @@ MCP `rustograph_deps` 도구는 첫 호출 때 `--dir` 워크스페이스를 대
 실행합니다. 이 명령들은 현재 디렉터리에서 돌고, Cargo는 그 디렉터리와 부모의
 `.cargo/config.toml`을, rustup 프록시는 같은 방식으로 `rust-toolchain.toml`(또는
 `rust-toolchain`) 파일을 찾습니다. rustograph는 체크아웃 안에서 실행해도 그
-체크아웃이 이 명령들이 실행할 프로그램을 고르지 못하게 합니다.
+체크아웃이 이 명령들이 실행할 프로그램을 고르지 못하게 합니다. 다만 그 프로그램
+안에서 체크아웃의 코드가 `[env]`로 실행되는 것은 막지 못하므로(아래), 체크아웃
+안에서는 신뢰하는 체크아웃만 분석하세요.
 
 - `cargo`·`rustc`·`rustup`은 `PATH`의 절대 경로 항목(`PATH`가 없으면
   `/bin:/usr/bin`)에서만 찾아 그 절대 경로로 실행합니다. 빈 항목과 `.`·`bin` 같은
@@ -381,11 +383,19 @@ MCP `rustograph_deps` 도구는 첫 호출 때 `--dir` 워크스페이스를 대
 
 현재 디렉터리는 바꾸지 않으므로 체크아웃의 나머지 Cargo 설정(source
 replacement, `[patch]`, 레지스트리)은 `cargo build`처럼 그대로 적용됩니다.
-rustograph가 덮지 않는 설정도 마찬가지입니다. 체크아웃의 `[env]` 표는
-`cargo metadata`가 실행하는 `rustc`의 환경 변수를 여전히 정합니다. Cargo가 인증이
-필요한 레지스트리에 쓰는 자격 증명 공급자(`registry.global-credential-providers`,
-`registries.<name>.credential-provider`)는 덮지 않습니다. 덮으면 사설 레지스트리에
-쓰는 사용자 자신의 공급자도 꺼지기 때문입니다.
+rustograph가 덮지 않는 두 설정도 마찬가지입니다.
+
+- 체크아웃의 `[env]` 표는 `cargo metadata`가 호스트·타깃 정보를 얻으려고 실행하는
+  `rustc`의 환경 변수를 여전히 정하고, `force = true`면 사용자가 준 값도 덮습니다.
+  그것만으로 체크아웃의 코드를 실행할 수 있습니다. Linux의 `LD_PRELOAD`나 macOS의
+  `DYLD_INSERT_LIBRARIES`로 체크아웃 안의 라이브러리를 그 `rustc`에 실을 수 있습니다.
+  rustograph는 `[env]`를 덮지 않으므로 현재 디렉터리가 체크아웃이나 그 하위
+  디렉터리이면 늘 적용됩니다. 그래서 신뢰하지 않는 코드를 체크아웃 안에서 분석하는
+  것은 안전하지 않습니다. 그런 체크아웃은 아래처럼 체크아웃 밖에서 분석하세요.
+- Cargo가 인증이 필요한 레지스트리에 쓰는 자격 증명 공급자
+  (`registry.global-credential-providers`, `registries.<name>.credential-provider`)는
+  덮지 않습니다. 덮으면 사설 레지스트리에 쓰는 사용자 자신의 공급자도 꺼지기
+  때문입니다.
 
 `--semantic`은 분석 대상 코드를 실행합니다. rust-analyzer가 분석 대상
 워크스페이스 루트에서 `cargo check`를 실행해, 그 워크스페이스의 Cargo 설정
@@ -395,11 +405,12 @@ rustograph가 덮지 않는 설정도 마찬가지입니다. 체크아웃의 `[e
 `--semantic`은 직접 빌드해도 되는 코드에만 쓰세요.
 
 신뢰할 수 없는 저장소나 포크 PR은 비밀이 없는 격리 러너나 샌드박스에서
-`--semantic` 없이, 체크아웃 밖(체크아웃 자신도 그 하위 디렉터리도 아닌 곳)의
-작업 디렉터리에서 `--dir`로 체크아웃을 넘겨 분석하세요. 그러면 rustograph가
-실행하는 툴체인 명령에 체크아웃의 `.cargo/config.toml`과 `rust-toolchain.toml`이
-전혀 적용되지 않습니다. 작업 디렉터리와 그 부모, Cargo 홈의 설정은 여전히
-적용됩니다. `cargo metadata`는 어디서 실행하든 체크아웃의 의존성을 해석합니다.
+`--semantic` 없이, 체크아웃 밖(체크아웃 자신도 그 하위 디렉터리도 아닌 곳 —
+그 안에서는 체크아웃의 `[env]`가 적용됩니다)의 작업 디렉터리에서 `--dir`로
+체크아웃을 넘겨 분석하세요. 그러면 rustograph가 실행하는 툴체인 명령에 체크아웃의
+`.cargo/config.toml`(`[env]` 포함)과 `rust-toolchain.toml`이 전혀 적용되지 않습니다.
+작업 디렉터리와 그 부모, Cargo 홈의 설정은 여전히 적용됩니다. `cargo metadata`는
+어디서 실행하든 체크아웃의 의존성을 해석합니다.
 체크아웃에 `Cargo.lock`을 쓸 수 있고, 그 쓰기가 실패하면 분석도 실패합니다.
 체크아웃의 매니페스트에 적힌 레지스트리·git 의존을 네트워크로 가져올 수도
 있으니, 필요하면 샌드박스의 네트워크 접근을 제한하세요. rustograph가 이
