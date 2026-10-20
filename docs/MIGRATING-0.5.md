@@ -118,7 +118,9 @@ configuration errors: `rules` exits 2 and `rustograph_rules` answers with an
 error. Earlier releases ignored them, so a misspelled `components:` key left
 every module unmapped while `rules --strict` still exited 0, and a misspelled
 `deny` or `signature` key dropped that rule. Correct the key or define the
-component; a placeholder file needs at least one component.
+component; a placeholder file needs at least one component. Library callers
+get the same checks from `rustograph::config::load_file` and `config::load`,
+and deserializing `rustograph::config::Config` directly now rejects unknown keys.
 
 A `baseline:` in a rules file has to stay inside the `--dir` directory. It is
 still relative to the rules file, and `..` may climb within the `--dir`
