@@ -858,7 +858,7 @@ fn harvest(
 
     // 1패스: 모듈·아이템 선언 — 정점과 contains/uses/implements 간선.
     let mut bodies: Vec<BodyItem<'_>> = Vec::new();
-    let mut impls: Vec<harvest::ImplBlock> = Vec::new();
+    let mut impls: Vec<harvest::ImplBlock<'_>> = Vec::new();
     let mut attr_refs: Vec<harvest::AttrRef> = Vec::new();
     let mut test_roots: Vec<String> = Vec::new();
     // 지역명이 fn owner_spans와 같으면 이름 해석이 함수 정점으로 읽어 거짓 순환이 된다.
@@ -1071,7 +1071,7 @@ fn harvest(
 /// 해석된 impl 블록(메서드 밖 연관 아이템을 self 타입에 귀속)이다.
 fn collect_owner_spans(
     tree: &ModTree,
-    impls: &[harvest::ImplBlock],
+    impls: &[harvest::ImplBlock<'_>],
     bodies: &[BodyItem<'_>],
     mut spans: Vec<harvest::OwnerSpan>,
     out: &mut Vec<harvest::OwnerSpan>,

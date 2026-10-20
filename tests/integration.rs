@@ -1688,6 +1688,118 @@ pub fn nested_fn() { let _ = { fn go(helper: u32) -> u32 { helper } go(1) }; }
         .any(|e| e.from == "locals::S::me" && e.to == "locals"));
 }
 
+/// 함수 본문의 최상위 문장은 중첩 블록의 문장과 방문 규칙이 다르다. 수확이 본문을 복제하지 않고
+/// 아레나의 문장을 직접 돌아도 이 규칙이 그대로여야 그래프가 바뀌지 않는다.
+/// - `let .. else`의 else 블록은 묶음보다 먼저 본다 — 그 안의 같은 이름은 아이템이다.
+/// - `;`로 끝난 문장 위치 매크로는 표현식 매크로처럼 인자를 파싱해 호출을 잡는다.
+/// - 최상위 아이템(`fn` 본문 바로 안의 `fn`)은 방문하지 않는다.
+/// - 중첩 블록은 syn 기본 순회를 따른다: 블록 안 아이템은 방문하고, `;`로 끝난 문장 매크로의
+///   인자는 파싱하지 않는다. 의도한 의미라기보다 지금의 출력이다 — 바꾸면 간선이 달라지므로
+///   본문 순회를 고칠 때 함께 바뀌지 않게 여기서 고정한다.
+/// - 정점의 unsafe 표시도 같은 범위를 본다(최상위 아이템·매크로 토큰 안은 보지 않는다).
+#[test]
+fn top_level_body_statements_keep_their_visit_rules() {
+    let tmp = std::env::temp_dir().join(format!("rg-top-stmts-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("src")).unwrap();
+    std::fs::write(
+        tmp.join("Cargo.toml"),
+        "[package]\nname = \"topstmt\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.join("src/lib.rs"),
+        r#"
+pub fn helper() -> u32 { 2 }
+pub fn item() -> u32 { 3 }
+pub fn other() -> u32 { 4 }
+macro_rules! mac { ($e:expr) => { $e } }
+
+pub fn let_else(o: Option<u32>) -> u32 { let Some(helper) = o else { return helper(); }; helper }
+pub fn top_macro() { println!("{}", helper()); }
+pub fn crate_macro() { mac!(item()); }
+pub fn nested_macro(c: bool) { if c { println!("{}", item()); } }
+pub fn top_item() { fn inner() -> u32 { helper() } }
+pub fn block_item() { { fn inner() -> u32 { other() } } }
+pub struct Q;
+impl Q {
+    pub fn method(&self, o: Option<u32>) -> u32 {
+        let Some(helper) = o else { return helper(); };
+        println!("{}", item());
+        helper
+    }
+    pub fn unsafe_method(&self) { unsafe {} }
+}
+pub trait T { fn provided(&self) { mac!(other()); } }
+
+pub fn unsafe_top() { unsafe {} }
+pub fn unsafe_let() { let _x = unsafe { 1 }; }
+pub fn unsafe_else(o: Option<u32>) { let Some(_y) = o else { unsafe { return } }; }
+pub fn unsafe_block_item() { { fn g() { unsafe {} } } }
+pub fn unsafe_top_item() { fn g() { unsafe {} } }
+pub fn unsafe_in_macro() { mac!(unsafe { 1 }); }
+pub const C: u32 = unsafe { 1 };
+pub static S: u32 = unsafe { 2 };
+pub trait U { fn provided(&self) { unsafe {} } fn required(&self); }
+"#,
+    )
+    .unwrap();
+    let d = source::load(
+        &tmp,
+        &source::Options {
+            symbol_level: true,
+            ..Default::default()
+        },
+    )
+    .expect("temp crate harvest failed");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let has = |from: &str, to: &str| {
+        let (from, to) = (format!("topstmt::{from}"), format!("topstmt::{to}"));
+        d.edges.iter().any(|e| e.from == from && e.to == to)
+    };
+    // let-else의 else 블록은 묶음 전에 본다 — 자유 함수와 impl 메서드 모두.
+    assert!(has("let_else", "helper"), "let-else diverge in a fn");
+    assert!(has("Q::method", "helper"), "let-else diverge in a method");
+    // 최상위 문장 매크로는 인자를 파싱한다 — std 매크로, 크레이트 매크로, 트레이트 기본 메서드.
+    assert!(has("top_macro", "helper"));
+    assert!(has("crate_macro", "mac") && has("crate_macro", "item"));
+    assert!(has("Q::method", "item"));
+    assert!(has("T::provided", "mac") && has("T::provided", "other"));
+    // 중첩 블록: 아이템은 방문하고, `;`로 끝난 문장 매크로 인자는 파싱하지 않는다.
+    assert!(has("block_item", "other"));
+    assert!(!has("nested_macro", "item"), "nested statement macro");
+    // 최상위 아이템은 방문하지 않는다.
+    assert!(!has("top_item", "helper"), "top-level item");
+    let is_unsafe = |id: &str| {
+        let id = format!("topstmt::{id}");
+        d.vertices
+            .iter()
+            .find(|v| v.id == id)
+            .unwrap_or_else(|| panic!("missing vertex {id}"))
+            .unsafe_
+    };
+    for id in [
+        "unsafe_top",
+        "unsafe_let",
+        "unsafe_else",
+        "unsafe_block_item",
+        "C",
+        "S",
+        "U::provided",
+        "Q::unsafe_method",
+    ] {
+        assert!(is_unsafe(id), "{id} should be unsafe");
+    }
+    for id in [
+        "unsafe_top_item",
+        "unsafe_in_macro",
+        "U::required",
+        "let_else",
+    ] {
+        assert!(!is_unsafe(id), "{id} should not be unsafe");
+    }
+}
+
 /// src 아래 파일들로 임시 크레이트(`pathcycle` 패키지)를 만든다 — 공유 fixture의 계수를
 /// 건드리지 않고 모듈 트리 모양 하나만 검증할 때 쓴다. 파일 이름의 디렉터리도 만든다.
 fn temp_crate(tag: &str, files: &[(String, String)]) -> PathBuf {

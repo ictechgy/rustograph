@@ -44,7 +44,7 @@ pub struct Harvest {
 /// 반환값: (이 모듈이 만든 정점들, 이 모듈의 impl 블록들).
 pub struct ModuleDecls<'a> {
     pub vertices: Vec<Vertex>,
-    pub impls: Vec<ImplBlock>,
+    pub impls: Vec<ImplBlock<'a>>,
     /// fn/method/const/static/macro 본문을 담은 항목(2패스용).
     pub bodies: Vec<BodyItem<'a>>,
     /// 아이템 속성의 경로 참조 — `#[dep::attr]`, `#[derive(dep::X)]`.
@@ -93,10 +93,12 @@ pub struct AttrRef {
 
 /// impl 블록 — self 타입·트레이트·메서드 목록.
 #[derive(Clone)]
-pub struct ImplBlock {
+pub struct ImplBlock<'a> {
     pub self_ty: Vec<String>,
     pub trait_path: Option<Vec<String>>,
-    pub methods: Vec<syn::ImplItemFn>,
+    /// impl 안의 메서드 — 파싱한 AST 아레나의 노드를 빌린다. 예전에는 메서드를 통째로 복제해
+    /// [`impls`]가 그 본문을 또 복제했다(impl 메서드 본문이 수확 내내 세 벌이었다).
+    pub methods: Vec<&'a syn::ImplItemFn>,
     pub items_module: String,
     /// `#[cfg]`가 붙은 impl — 메서드 정점과 그 본문 간선이 조건을 물려받는다.
     pub cfg: Option<String>,
@@ -111,15 +113,26 @@ pub struct ImplBlock {
     pub range: std::ops::Range<usize>,
 }
 
+/// 본문 아이템이 방문할 AST — 파싱한 아레나의 노드를 그대로 빌린다. 아레나는 수확 내내 살아
+/// 있으므로 복제할 까닭이 없다: 예전처럼 본문을 표현식 목록으로 깊은 복제하면 수확 피크가 본문
+/// AST만큼(impl 메서드는 그 두 배) 커졌다.
+#[derive(Clone, Copy)]
+pub enum Body<'a> {
+    /// fn·impl 메서드·트레이트 기본 메서드 본문 블록의 문장들. 최상위 문장은 중첩 블록과 방문
+    /// 규칙이 다르다 — [`body_edges`]가 따르는 규칙은 그쪽 문서에 있다.
+    Stmts(&'a [syn::Stmt]),
+    /// const·static 초기식.
+    Expr(&'a syn::Expr),
+}
+
 /// 본문을 나중에 방문할 항목.
 pub struct BodyItem<'a> {
     pub id: String,
     pub module: String,
     /// Self가 가리키는 타입(impl 안이면 Some).
     pub self_ty: Option<Vec<String>>,
-    /// 블록의 표현식들 — 문 위치 매크로는 ExprMacro로 감싸져 있다.
-    /// `let` 문은 패턴을 잃지 않도록 `Expr::Let`으로 담는다(지역 가림).
-    pub exprs: Vec<syn::Expr>,
+    /// 방문할 본문 — 아레나의 문장·초기식을 빌린다.
+    pub body: Body<'a>,
     /// 매개변수가 묶는 이름 — 본문 전체에서 같은 이름의 아이템을 가린다.
     pub params: Vec<String>,
     pub signature_surface: Vec<&'a syn::Type>,
@@ -130,49 +143,6 @@ pub struct BodyItem<'a> {
     /// 소유 아이템의 바이트 범위 — cfg 변형·블록 지역 정의 같은
     /// 정규 ID 충돌을 소스 위치로 걸러내는 데 쓴다.
     pub range: std::ops::Range<usize>,
-}
-
-/// 블록 `{ ... }`의 구문들을 표현식 목록으로 펼친다.
-/// `println!(..)` 같은 문 위치 매크로는 syn이 Stmt::Macro로 파싱한다 —
-/// ExprMacro로 감싸지 않으면 토큰 속 호출이 통째로 사라진다.
-fn block_exprs(b: &syn::Block) -> Vec<syn::Expr> {
-    let mut out = Vec::new();
-    for s in &b.stmts {
-        match s {
-            syn::Stmt::Expr(e, _) => out.push(e.clone()),
-            // `let` 문은 패턴과 함께 `Expr::Let`으로 담는다 — 방문자가
-            // 초기식을 본 뒤 패턴의 이름을 지역으로 묶어, 뒤따르는 표현식의
-            // 같은 이름이 아이템(모듈·함수)으로 해석되지 않게 한다.
-            // `let .. else { }`의 else 블록은 묶음이 보이지 않으므로 먼저 둔다.
-            syn::Stmt::Local(l) => {
-                if let Some((_, diverge)) = l.init.as_ref().and_then(|i| i.diverge.as_ref()) {
-                    out.push((**diverge).clone());
-                }
-                let init = match &l.init {
-                    Some(i) => (*i.expr).clone(),
-                    None => syn::Expr::Verbatim(proc_macro2::TokenStream::new()),
-                };
-                out.push(syn::Expr::Let(syn::ExprLet {
-                    attrs: l.attrs.clone(),
-                    let_token: l.let_token,
-                    pat: Box::new(l.pat.clone()),
-                    eq_token: Default::default(),
-                    expr: Box::new(init),
-                }));
-            }
-            syn::Stmt::Macro(m) => out.push(syn::Expr::Macro(syn::ExprMacro {
-                attrs: m.attrs.clone(),
-                mac: m.mac.clone(),
-            })),
-            _ => {}
-        }
-    }
-    out
-}
-
-/// Option<&Block>의 map에 바로 쓰기 위한 참조 어댑터 — 클로저 감쌈을 피한다.
-fn block_exprs_ref(b: &syn::Block) -> Vec<syn::Expr> {
-    block_exprs(b)
 }
 
 /// 모듈의 파일 AST를 1패스로 돌려 선언 정점을 수확한다.
@@ -236,9 +206,9 @@ pub(crate) fn decls_with_markers<'a>(
             match item {
                 syn::Item::Fn(f) => {
                     let id = format!("{module_path}::{}", f.sig.ident);
-                    let exprs = block_exprs(&f.block);
+                    let body = Body::Stmts(&f.block.stmts);
                     // unsafe fn이거나 본문에 unsafe 블록이 있으면 경계의 안쪽이다.
-                    let unsafe_ = f.sig.unsafety.is_some() || exprs_have_unsafe(&exprs);
+                    let unsafe_ = f.sig.unsafety.is_some() || body_has_unsafe(body);
                     out.vertices
                         .push(v(id.clone(), Kind::Fn, is_pub(&f.vis), unsafe_));
                     if is_extern_entry(&f.attrs) {
@@ -250,7 +220,7 @@ pub(crate) fn decls_with_markers<'a>(
                         id,
                         module: module_path.to_string(),
                         self_ty: None,
-                        exprs,
+                        body,
                         params: locals::param_bindings(&f.sig),
                         signature_surface: fn_signature_types(&f.sig),
                         cfg: cfg.clone(),
@@ -286,20 +256,22 @@ pub(crate) fn decls_with_markers<'a>(
                     for ti in &t.items {
                         if let syn::TraitItem::Fn(m) = ti {
                             let mid = format!("{module_path}::{}::{}", t.ident, m.sig.ident);
-                            let exprs = m.default.as_ref().map(block_exprs_ref).unwrap_or_default();
-                            let unsafe_ = m.sig.unsafety.is_some() || exprs_have_unsafe(&exprs);
+                            // 기본 구현이 없는 선언은 본문이 없다 — 정점만 남는다.
+                            let body = m.default.as_ref().map(|b| Body::Stmts(&b.stmts));
+                            let unsafe_ =
+                                m.sig.unsafety.is_some() || body.is_some_and(body_has_unsafe);
                             out.vertices.push(v(
                                 mid.clone(),
                                 Kind::Method,
                                 is_pub(&t.vis),
                                 unsafe_,
                             ));
-                            if m.default.is_some() {
+                            if let Some(body) = body {
                                 out.bodies.push(BodyItem {
                                     id: mid,
                                     module: module_path.to_string(),
                                     self_ty: None,
-                                    exprs,
+                                    body,
                                     params: locals::param_bindings(&m.sig),
                                     signature_surface: fn_signature_types(&m.sig),
                                     cfg: cfg.clone(),
@@ -328,15 +300,15 @@ pub(crate) fn decls_with_markers<'a>(
                 }
                 syn::Item::Const(c) => {
                     let id = format!("{module_path}::{}", c.ident);
-                    let exprs = vec![(*c.expr).clone()];
-                    let unsafe_ = exprs_have_unsafe(&exprs);
+                    let body = Body::Expr(&c.expr);
+                    let unsafe_ = body_has_unsafe(body);
                     out.vertices
                         .push(v(id.clone(), Kind::Const, is_pub(&c.vis), unsafe_));
                     out.bodies.push(BodyItem {
                         id,
                         module: module_path.to_string(),
                         self_ty: None,
-                        exprs,
+                        body,
                         params: Vec::new(),
                         signature_surface: vec![&c.ty],
                         cfg: cfg.clone(),
@@ -346,16 +318,16 @@ pub(crate) fn decls_with_markers<'a>(
                 }
                 syn::Item::Static(s) => {
                     let id = format!("{module_path}::{}", s.ident);
-                    let exprs = vec![(*s.expr).clone()];
+                    let body = Body::Expr(&s.expr);
                     // static mut 초기화의 unsafe 블록도 경계다.
-                    let unsafe_ = exprs_have_unsafe(&exprs);
+                    let unsafe_ = body_has_unsafe(body);
                     out.vertices
                         .push(v(id.clone(), Kind::Static, is_pub(&s.vis), unsafe_));
                     out.bodies.push(BodyItem {
                         id,
                         module: module_path.to_string(),
                         self_ty: None,
-                        exprs,
+                        body,
                         params: Vec::new(),
                         signature_surface: vec![&s.ty],
                         cfg: cfg.clone(),
@@ -383,7 +355,7 @@ pub(crate) fn decls_with_markers<'a>(
                             .items
                             .iter()
                             .filter_map(|x| match x {
-                                syn::ImplItem::Fn(f) => Some(f.clone()),
+                                syn::ImplItem::Fn(f) => Some(f),
                                 _ => None,
                             })
                             .collect(),
@@ -456,9 +428,10 @@ pub(crate) fn decls_with_markers<'a>(
 }
 
 /// impl 블록들을 정점·간선으로 변환한다(1패스 후속).
-/// 반환: (정점, 간선, 속성 경로 참조, 2패스용 본문 목록).
+/// 반환: (정점, 간선, 속성 경로 참조, 2패스용 본문 목록). 본문은 블록 목록이 아니라 블록이
+/// 빌린 AST 아레나를 빌린다 — 블록 목록을 먼저 버려도 된다.
 pub fn impls<'a>(
-    blocks: &'a [ImplBlock],
+    blocks: &[ImplBlock<'a>],
     krate: &str,
     tree: &ModTree,
     harvest: &mut Harvest,
@@ -484,7 +457,7 @@ pub fn impls<'a>(
                 harvest.unresolved_paths += 1;
             }
         }
-        for m in &b.methods {
+        for &m in &b.methods {
             // 트레이트 impl 메서드는 `Type::<Trait>::m` — 고유 선언과 충돌 안 함.
             let mid = match &b.trait_path {
                 Some(tp) => {
@@ -493,9 +466,9 @@ pub fn impls<'a>(
                 }
                 None => format!("{self_id}::{}", m.sig.ident),
             };
-            let exprs = block_exprs(&m.block);
+            let body = Body::Stmts(&m.block.stmts);
             // unsafe impl의 메서드, unsafe fn 메서드, unsafe 본문 모두 경계다.
-            let unsafe_ = b.unsafe_ || m.sig.unsafety.is_some() || exprs_have_unsafe(&exprs);
+            let unsafe_ = b.unsafe_ || m.sig.unsafety.is_some() || body_has_unsafe(body);
             vertices.push(Vertex {
                 id: mid.clone(),
                 kind: Kind::Method,
@@ -530,7 +503,7 @@ pub fn impls<'a>(
                 id: mid,
                 module: b.items_module.clone(),
                 self_ty: Some(b.self_ty.clone()),
-                exprs,
+                body,
                 params: locals::param_bindings(&m.sig),
                 signature_surface: fn_signature_types(&m.sig),
                 cfg: b.cfg.clone(),
@@ -638,6 +611,13 @@ pub(crate) fn bodies_within(
 /// 본문 하나의 syn 방문 — 표현식 안의 호출·참조·매크로 간선.
 /// semantic 엔진이 못 보는 본문(cfg 비활성·매크로 생성 정의)의 폴백이기도 하다.
 /// 이름 팬아웃은 [`bodies`]와 같이 좁히지 않는다.
+///
+/// 본문 블록의 최상위 문장은 중첩 블록의 문장과 규칙이 다르다. 최상위에서는 지역 겹을 새로 열지
+/// 않고(`let` 묶음은 매개변수 겹에 들어간다), `let .. else`의 else 블록을 초기식보다 먼저 보며,
+/// 문장 매크로(`;`로 끝나거나 중괄호로 감싼 문장 위치 매크로 호출)는 표현식 매크로처럼 인자를
+/// 파싱하고, 아이템(`fn` 안의 `fn`)은 보지 않는다. 중첩 블록은 syn 기본 순회를 따른다 — 블록 안
+/// 아이템은 보고, 문장 매크로의 인자는 파싱하지 않는다. 본문을 표현식 목록으로 복제해 방문하던
+/// 때의 규칙 그대로다.
 pub fn body_edges(
     b: &BodyItem,
     tree: &ModTree,
@@ -677,9 +657,7 @@ fn body_edges_within(
         capped_names: BTreeSet::new(),
         ext_macros: 0,
     };
-    for e in &b.exprs {
-        vis.visit_expr(e);
-    }
+    vis.visit_body(b.body);
     harvest.unresolved_paths += vis.unresolved;
     harvest.fanned_method_calls += vis.fanned;
     harvest.out_of_reach_method_calls += vis.out_of_reach;
@@ -825,6 +803,77 @@ impl BodyVisitor<'_> {
             .get(parent)
             .is_some_and(|m| m.value_items.contains(name))
     }
+
+    /// 본문을 아레나에서 바로 방문한다 — 최상위 문장 규칙은 [`body_edges`] 문서에 있다.
+    /// 최상위를 [`Visit::visit_block`]으로 돌리면 겹이 하나 더 열리고 최상위 아이템을 방문하며
+    /// 문장 매크로 인자를 파싱하지 않아 간선이 달라진다.
+    fn visit_body(&mut self, body: Body<'_>) {
+        let stmts = match body {
+            Body::Expr(e) => return self.visit_expr(e),
+            Body::Stmts(stmts) => stmts,
+        };
+        for stmt in stmts {
+            match stmt {
+                syn::Stmt::Expr(e, _) => self.visit_expr(e),
+                syn::Stmt::Local(l) => self.visit_top_local(l),
+                // `println!(..);`·`name! { .. }` 같은 문장 매크로 — 표현식 매크로와 같은 처리다.
+                syn::Stmt::Macro(m) => {
+                    self.visit_macro_call(&m.mac);
+                    syn::visit::visit_stmt_macro(self, m);
+                }
+                // 최상위 아이템은 보지 않는다(중첩 블록 안의 아이템은 visit_item이 본다).
+                syn::Stmt::Item(_) => {}
+            }
+        }
+    }
+
+    /// 최상위 `let` — else 블록, 초기식, 패턴 순으로 보고 이름을 매개변수 겹에 묶는다. else
+    /// 블록은 새 묶음이 보이지 않는 곳이라 묶기 전에 보고, 초기식도 새 묶음을 못 본다
+    /// (`let x = x + 1`의 오른쪽은 바깥 x). 속성은 보지 않는다.
+    fn visit_top_local(&mut self, l: &syn::Local) {
+        if let Some(init) = &l.init {
+            if let Some((_, diverge)) = &init.diverge {
+                self.visit_expr(diverge);
+            }
+            self.visit_expr(&init.expr);
+        }
+        syn::visit::visit_pat(self, &l.pat);
+        self.scopes.bind(&l.pat);
+    }
+
+    /// 매크로 호출 하나 — 크레이트 안 매크로면 call 간선, std/외부면 실측 생략으로 센다.
+    /// 매크로 인자는 토큰 스트림이라 방문자가 못 내린다 — write!·format!·assert_eq! 같은 흔한
+    /// 형태는 쉼표로 나뉜 표현식 목록이라 직접 파싱을 시도한다. 파싱이 안 되면 매크로 문법이
+    /// 독자적이라는 뜻이고, 그 안의 호출은 구문 수준에서 영원히 보이지 않는다(ext_macros가 그
+    /// 수를 잰다).
+    fn visit_macro_call(&mut self, mac: &syn::Macro) {
+        let segs = path_segments(&mac.path);
+        match self.resolve(&segs) {
+            Some(id) => self.push(id, EdgeKind::Call),
+            None => self.ext_macros += 1,
+        }
+        if let Ok(exprs) =
+            syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
+                .parse2(mac.tokens.clone())
+        {
+            for ex in &exprs {
+                self.visit_expr(ex);
+                // 포맷 문자열의 `{name}` 캡처 — 토큰이 아니라 문자열 안에 있어
+                // AST에 나타나지 않지만 실제 참조다.
+                if let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(s),
+                    ..
+                }) = ex
+                {
+                    for name in format_captures(&s.value()) {
+                        if let ValueRes::Item(id) = self.resolve_value(&[name]) {
+                            self.push(id, EdgeKind::References);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -929,37 +978,8 @@ impl Visit<'_> for BodyVisitor<'_> {
     }
 
     fn visit_expr_macro(&mut self, e: &syn::ExprMacro) {
-        // name!() — 크레이트 안 매크로면 간선, std/외부면 실측 생략.
-        let segs = path_segments(&e.mac.path);
-        match self.resolve(&segs) {
-            Some(id) => self.push(id, EdgeKind::Call),
-            None => self.ext_macros += 1,
-        }
-        // 매크로 인자는 토큰 스트림이라 방문자가 못 내린다 — write!·format!·
-        // assert_eq! 같은 흔한 형태는 쉼표로 나뉜 표현식 목록이라 직접 파싱을
-        // 시도한다. 파싱이 안 되면 매크로 문법이 독자적이라는 뜻이고, 그 안의
-        // 호출은 구문 수준에서 영원히 보이지 않는다(ext_macros가 그 수를 잰다).
-        if let Ok(exprs) =
-            syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
-                .parse2(e.mac.tokens.clone())
-        {
-            for ex in &exprs {
-                self.visit_expr(ex);
-                // 포맷 문자열의 `{name}` 캡처 — 토큰이 아니라 문자열 안에 있어
-                // AST에 나타나지 않지만 실제 참조다.
-                if let syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Str(s),
-                    ..
-                }) = ex
-                {
-                    for name in format_captures(&s.value()) {
-                        if let ValueRes::Item(id) = self.resolve_value(&[name]) {
-                            self.push(id, EdgeKind::References);
-                        }
-                    }
-                }
-            }
-        }
+        // name!() — 표현식 위치 매크로(최상위 문장 매크로도 같은 처리를 탄다).
+        self.visit_macro_call(&e.mac);
         syn::visit::visit_expr_macro(self, e);
     }
 
@@ -1390,8 +1410,9 @@ pub(crate) fn text_has_generated_marker(src: &str) -> bool {
     })
 }
 
-/// 표현식 목록 안에 `unsafe {}` 블록이 있는지 본다 — 재귀 방문.
-fn exprs_have_unsafe(exprs: &[syn::Expr]) -> bool {
+/// 본문 안에 `unsafe {}` 블록이 있는지 본다 — 재귀 방문. 본문 방문([`body_edges`])처럼 최상위
+/// 아이템은 보지 않는다. 매크로 토큰 안도 보지 않는다(syn 기본 순회는 토큰을 내리지 않는다).
+fn body_has_unsafe(body: Body<'_>) -> bool {
     struct Finder(bool);
     impl Visit<'_> for Finder {
         fn visit_expr_unsafe(&mut self, _e: &syn::ExprUnsafe) {
@@ -1399,11 +1420,20 @@ fn exprs_have_unsafe(exprs: &[syn::Expr]) -> bool {
         }
     }
     let mut f = Finder(false);
-    for e in exprs {
-        if f.0 {
-            break;
+    match body {
+        Body::Expr(e) => f.visit_expr(e),
+        Body::Stmts(stmts) => {
+            for stmt in stmts {
+                if f.0 {
+                    break;
+                }
+                match stmt {
+                    syn::Stmt::Item(_) => {}
+                    // let은 속성·패턴·초기식·else 블록, 문장 매크로는 속성·경로를 본다.
+                    other => f.visit_stmt(other),
+                }
+            }
         }
-        f.visit_expr(e);
     }
     f.0
 }

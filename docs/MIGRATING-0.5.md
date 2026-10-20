@@ -21,7 +21,7 @@ errors with `?` or handle them explicitly.
 This source compatibility change is the reason for the 0.5 minor version rather
 than a 0.4 patch. The serialized graph document remains version 1.
 
-Six library changes after 0.5.0 are source-incompatible for some callers:
+Seven library changes after 0.5.0 are source-incompatible for some callers:
 
 - `rustograph::modtree::ModTree` has a new public field, `skipped_mods`.
   `collect_submodules` no longer loads a `mod` declaration whose file re-enters
@@ -60,6 +60,18 @@ Six library changes after 0.5.0 are source-incompatible for some callers:
   its signature and, like `harvest::bodies`, does not narrow. Code that builds
   a `Stats` with a struct literal must add the fields or use
   `..Default::default()`.
+- `rustograph::harvest` borrows function bodies from the parsed syntax tree
+  instead of copying them. `ImplBlock` is now `ImplBlock<'a>`, and its
+  `methods` field is `Vec<&'a syn::ImplItemFn>`. `BodyItem` replaces
+  `exprs: Vec<syn::Expr>` with `body: harvest::Body<'a>`, which is
+  `Body::Stmts` for a function, method, or provided trait method body and
+  `Body::Expr` for a `const` or `static` initializer. `ModuleDecls::impls`
+  holds `ImplBlock<'a>`, and `harvest::impls` takes `&[ImplBlock<'a>]` and
+  returns bodies that borrow the syntax tree rather than the block slice.
+  `harvest::bodies` and `harvest::body_edges` keep their signatures and
+  produce the same edges. Code that reads `exprs`, builds an `ImplBlock` or a
+  `BodyItem` with a struct literal, or stores an `ImplBlock` in its own type
+  must use the new field and lifetime.
 
 ## Saved snapshots and MCP
 
