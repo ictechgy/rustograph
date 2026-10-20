@@ -125,3 +125,10 @@ The path expansion budget also limits queued partial-path copies. Completed
 paths use separate bounded slots, so a known direct path remains available even
 when partial paths have exhausted the budget. Dropped search states set
 `truncated`; a partial search is never reported as complete.
+
+`paths` now accepts `--max` up to 1,024 and `--budget` up to 1,000,000, and MCP
+`rustograph_paths` the same `max` and `budget`. A larger value is a usage error
+(exit 2) or an `isError` result instead of a search whose memory grows with the
+budget. `query`, `impact` and `search` have matching limits: `--max` (MCP `max`)
+up to 10,000 and `--depth` (MCP `depth`) up to 64, where `0` still means no
+depth limit.

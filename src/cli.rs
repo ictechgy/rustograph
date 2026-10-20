@@ -54,6 +54,10 @@ command does not use is a usage error (exit 2) instead of being ignored.
 query / impact --depth 0 walks without a depth limit (the whole closure, still
 bounded by --max); the report keeps \"depth\": 0.
 
+query / impact / search take --max up to 10000 and query / impact --depth up
+to 64; paths takes --max up to 1024 and --budget up to 1000000. A larger value
+is a usage error (exit 2) instead of being clipped.
+
 reach / impact --format language-traversal emit an isthmus language-traversal
 v1 document (dependencies / dependents) for many roots in one pass; ids that
 are not graph vertices are listed without symbol and the command exits 64.
@@ -588,6 +592,7 @@ fn cmd_paths(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     };
     let max = cli_args::usize_arg(a, "max", 10)?;
     let budget = cli_args::usize_arg(a, "budget", 50_000)?;
+    cli_args::check_paths_limits(cli_args::ArgSpelling::Flag, max, budget)?;
     let doc = cli_args::document_for(a, true)?;
     let from = require_id(&doc, from)?;
     let to = require_id(&doc, to)?;
@@ -602,6 +607,7 @@ fn cmd_search(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
         return Err("usage: search QUERY".to_string());
     };
     let max = cli_args::usize_arg(a, "max", 20)?;
+    cli_args::check_search_limit(cli_args::ArgSpelling::Flag, max)?;
     let doc = cli_args::document_for(a, true)?;
     write!(out, "{}", export::to_json(&analysis::search(&doc, q, max))).ok();
     Ok(0)
@@ -694,6 +700,7 @@ fn cmd_query(a: &Args, out: &mut dyn Write, reverse: bool) -> Result<i32, String
     };
     let depth = cli_args::usize_arg(a, "depth", 1)?;
     let max = cli_args::usize_arg(a, "max", 200)?;
+    cli_args::check_neighbor_limits(cli_args::ArgSpelling::Flag, depth, max)?;
     let doc = cli_args::document_for(a, true)?;
     let id = require_id(&doc, id)?;
     // 0은 깊이 제한 없음이다(MCP와 같은 해석 함수) — 보고에는 요청한 깊이를 싣는다.

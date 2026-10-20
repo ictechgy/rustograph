@@ -123,6 +123,11 @@ rustograph impact --format language-traversal --roots-from schema-facts.json  # 
 `--semantic`·`--no-cache`·`--focus`·`--target`·`--exclude-tests`)를 받습니다.
 명령별 플래그는 `rustograph help`로 봅니다.
 
+숫자 인자에는 상한이 있습니다: `query`·`impact`·`search`의 `--max`는 10,000,
+`query`·`impact`의 `--depth`는 64(`0`은 깊이 제한 없음), `paths`의 `--max`는 1,024·
+`--budget`은 1,000,000까지입니다. 넘는 값은 조용히 깎지 않고 사용법 오류(`2`)입니다.
+MCP 도구 인자도 같은 상한을 넘으면 isError로 답하고, 응답은 자르지 않습니다.
+
 ## persistence 사실 — `schema`
 
 `rustograph schema`는 코드가 SQL 관계를 어떻게 참조하는지 담은 isthmus

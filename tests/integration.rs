@@ -401,6 +401,71 @@ mod cli_tests {
         assert!(out.contains("\"found\": true"));
     }
 
+    /// 질의 인자에는 문서화된 상한이 있다 — query·impact·search `--max` 10,000, query·impact `--depth`
+    /// 64(0은 깊이 제한 없음), paths `--max` 1,024·`--budget` 1,000,000. 상한까지는 그대로 받고, 1만 넘어도
+    /// 조용히 깎지 않고 사용법 오류(2)다. 예전에는 상한이 없어 `paths --budget`·`--max` 하나로 메모리를
+    /// 수 GB까지 쓸 수 있었다. 순회 형식의 자체 상한(`--depth`/`--max-depth` 1~128)은 그대로다.
+    #[test]
+    fn query_arguments_past_their_limits_are_usage_errors() {
+        let (from, to) = ("fixture_app::main", "fixture_core::entry");
+        for (args, flag, limit) in [
+            (&["query", to, "--max", "10001"][..], "--max 10001", "10000"),
+            (&["query", to, "--depth", "65"][..], "--depth 65", "64"),
+            (
+                &["impact", to, "--max", "10001"][..],
+                "--max 10001",
+                "10000",
+            ),
+            (&["impact", to, "--depth", "65"][..], "--depth 65", "64"),
+            (
+                &["search", "entry", "--max", "10001"][..],
+                "--max 10001",
+                "10000",
+            ),
+            (
+                &["paths", from, to, "--max", "1025"][..],
+                "--max 1025",
+                "1024",
+            ),
+            (
+                &["paths", from, to, "--budget", "1000001"][..],
+                "--budget 1000001",
+                "1000000",
+            ),
+            (
+                &["paths", from, to, "--budget", "1000000000000"][..],
+                "--budget 1000000000000",
+                "1000000",
+            ),
+        ] {
+            let (code, out, err) = run(args);
+            assert_eq!(code, 2, "{args:?}: {err}");
+            assert!(out.is_empty(), "{args:?}: {out}");
+            assert!(
+                err.contains(flag) && err.contains(&format!("limit of {limit}")),
+                "{args:?}: {err}"
+            );
+        }
+        for args in [
+            &["query", to, "--depth", "64", "--max", "10000"][..],
+            &["query", to, "--depth", "0", "--max", "10000"][..],
+            &["impact", to, "--depth", "64", "--max", "10000"][..],
+            &["search", "entry", "--max", "10000"][..],
+            &["paths", from, to, "--max", "1024", "--budget", "1000000"][..],
+            &[
+                "impact",
+                "--format",
+                "language-traversal",
+                to,
+                "--depth",
+                "128",
+            ][..],
+        ] {
+            let (code, _, err) = run(args);
+            assert_eq!(code, 0, "{args:?}: {err}");
+        }
+    }
+
     #[test]
     fn deps_rejects_document_filters() {
         // deps는 자체 수확을 쓴다 — 필터·저장 그래프·semantic은

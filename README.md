@@ -104,6 +104,7 @@ rustograph query mycrate::module::f --depth 2
 rustograph impact mycrate::Type --depth 3  # reverse transitive closure
 rustograph impact mycrate::Type --depth 0  # no depth limit (still bounded by --max)
 rustograph paths mycrate::a mycrate::b    # bounded paths between two ids
+rustograph paths mycrate::a mycrate::b --max 50 --budget 200000  # at most 1024 / 1000000
 rustograph search entry                   # exact > suffix > substring
 #   partial ids are refused with candidates — retry with an exact id
 
@@ -150,6 +151,12 @@ of being silently ignored — for example `cycles --out`, `query --format` or
 `--graph` and the shared flags `--deps`, `--tests`, `--retain-public`,
 `--semantic`, `--no-cache`, `--focus`, `--target` and `--exclude-tests`;
 `rustograph help` lists each command's own flags.
+
+Numeric limits are part of the contract: `query`, `impact` and `search` take
+`--max` up to 10,000, `query` and `impact` take `--depth` up to 64 (`0` means
+no depth limit), and `paths` takes `--max` up to 1,024 and `--budget` up to
+1,000,000. A larger value is a usage error (`2`) instead of being clipped; the
+MCP tools apply the same limits.
 
 ## Graph model
 
@@ -200,7 +207,12 @@ list — call `rustograph_search` or retry with an exact id.
 Each request is one line of at most 1 MiB (1,048,576 bytes, not counting the
 line ending). A longer line is never buffered: the server answers it with a
 JSON-RPC `-32600` error whose `id` is `null`, discards the rest of that line,
-and keeps reading the next request.
+and keeps reading the next request. Tool arguments have the CLI limits —
+`max` up to 10,000 (`rustograph_paths`: 1,024), `depth` up to 64 and `budget`
+up to 1,000,000 — and `tools/list` publishes them as JSON Schema `maximum`. A
+larger value returns an `isError` result instead of being clipped. Responses
+are never cut short: a tool answers with the complete report for the
+arguments it accepted.
 
 Semantic-mode documents are cached under `.rustograph/semantic-cache.json`,
 keyed by a fingerprint of workspace sources and manifests — a stale or
@@ -421,11 +433,12 @@ no value are omitted — an absent `tentative` means confirmed, an absent
 another symbol does not make that symbol impacted. `query` walks both directions;
 each neighbor/direction is reported once at its shortest discovered depth, with
 all dependency edge kinds for that direction and depth. The starting symbol is
-not repeated as its own neighbor. `--max` bounds the number of result records,
-including zero; `truncated` becomes true only when a record is actually omitted.
-`--depth 0` (MCP `depth: 0`) means no depth limit: the report covers the whole
-closure, still bounded by `--max`, and keeps `depth: 0`. The default depth is 1,
-except for MCP `rustograph_impact`, whose default is 0.
+not repeated as its own neighbor. `--max` bounds the number of result records
+(at most 10,000), including zero; `truncated` becomes true only when a record is
+actually omitted. `--depth` is at most 64. `--depth 0` (MCP `depth: 0`) means no
+depth limit: the report covers the whole closure, still bounded by `--max`, and
+keeps `depth: 0`. The default depth is 1, except for MCP `rustograph_impact`,
+whose default is 0.
 
 ## Development
 

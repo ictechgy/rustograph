@@ -85,6 +85,14 @@ check 2 "paths missing to"  paths fixture_app::main fixture_core::nope
 check 2 "paths one arg"     paths fixture_app::main
 check 2 "paths ambiguous"   paths nest fixture_core::entry
 check 0 "search"            search entry
+# 숫자 인자 상한 — 상한까지는 0, 넘는 값은 조용히 깎지 않고 사용법 오류(2)다(MCP 도구는 isError).
+check 0 "paths at caps"     paths fixture_app::main fixture_core::entry --max 1024 --budget 1000000
+check 2 "paths budget cap"  paths fixture_app::main fixture_core::entry --budget 1000001
+check 2 "paths max cap"     paths fixture_app::main fixture_core::entry --max 1025
+check 0 "query at caps"     query fixture_core::entry --depth 64 --max 10000
+check 2 "query max cap"     query fixture_core::entry --max 10001
+check 2 "impact depth cap"  impact fixture_core::Used --depth 65
+check 2 "search max cap"    search entry --max 10001
 check 0 "deps"              deps
 check 0 "deps json"         deps --format json
 check 1 "deps strict"       deps --strict

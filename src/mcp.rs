@@ -370,6 +370,7 @@ impl<'d> Server<'d> {
                 // depth 0은 CLI `--depth 0`과 같은 해석 함수로 "깊이 제한 없음"이다 — 보고에는 요청값을 싣는다.
                 let depth = arg_usize(args, "depth")?.unwrap_or(1);
                 let max = arg_usize(args, "max")?.unwrap_or(200);
+                cli_args::check_neighbor_limits(cli_args::ArgSpelling::ToolArgument, depth, max)?;
                 let mut r = self.index.query(&id, cli_args::walk_depth(depth), max);
                 r.depth = depth;
                 Ok(export::to_json(&r))
@@ -380,6 +381,7 @@ impl<'d> Server<'d> {
                 // 기본 깊이는 0(깊이 제한 없음)이다 — query와 같은 해석 함수를 지나고 보고에는 요청값을 싣는다.
                 let depth = arg_usize(args, "depth")?.unwrap_or(0);
                 let max = arg_usize(args, "max")?.unwrap_or(200);
+                cli_args::check_neighbor_limits(cli_args::ArgSpelling::ToolArgument, depth, max)?;
                 let mut r = self.index.impact(&id, cli_args::walk_depth(depth), max);
                 r.depth = depth;
                 Ok(export::to_json(&r))
@@ -391,11 +393,13 @@ impl<'d> Server<'d> {
                 let to = self.require_id(to)?;
                 let max = arg_usize(args, "max")?.unwrap_or(10);
                 let budget = arg_usize(args, "budget")?.unwrap_or(50_000);
+                cli_args::check_paths_limits(cli_args::ArgSpelling::ToolArgument, max, budget)?;
                 Ok(export::to_json(&self.index.paths(&from, &to, max, budget)))
             }
             "rustograph_search" => {
                 let q = arg_str(args, "q").ok_or("search needs a \"q\" argument")?;
                 let max = arg_usize(args, "max")?.unwrap_or(20);
+                cli_args::check_search_limit(cli_args::ArgSpelling::ToolArgument, max)?;
                 Ok(export::to_json(&analysis::search(self.doc, q, max)))
             }
             // 첫 호출에 한 번 만들어 메모한다(오류도 세션 내내 같다).
@@ -529,8 +533,11 @@ impl<'d> Server<'d> {
     }
 }
 
-/// 도구 목록과 입력 스키마 — 계열의 이름 규칙(`<tool>_<query>`)을 따른다.
+/// 도구 목록과 입력 스키마 — 계열의 이름 규칙(`<tool>_<query>`)을 따른다. 정수 인자의 상한은 서버가
+/// 거부하는 값과 같은 상수로 JSON Schema `maximum`과 설명에 싣는다 — 클라이언트가 보내기 전에 안다.
 fn tool_list() -> serde_json::Value {
+    let (max_results, max_depth) = (cli_args::MAX_RESULTS, cli_args::MAX_DEPTH);
+    let (max_paths, max_budget) = (cli_args::MAX_PATHS, cli_args::MAX_PATH_BUDGET);
     serde_json::json!([
         {
             "name": "rustograph_summary",
@@ -544,8 +551,8 @@ fn tool_list() -> serde_json::Value {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "vertex ID, e.g. mycrate::mod::func"},
-                    "depth": {"type": "integer", "description": "neighbor depth (default 1); 0 = no depth limit, bounded by max"},
-                    "max": {"type": "integer", "description": "max neighbors (default 200)"},
+                    "depth": {"type": "integer", "minimum": 0, "maximum": max_depth, "description": format!("neighbor depth (default 1, at most {max_depth}); 0 = no depth limit, bounded by max")},
+                    "max": {"type": "integer", "minimum": 0, "maximum": max_results, "description": format!("max neighbors (default 200, at most {max_results})")},
                 },
                 "required": ["id"],
             },
@@ -557,8 +564,8 @@ fn tool_list() -> serde_json::Value {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "vertex ID"},
-                    "depth": {"type": "integer", "description": "max depth (default 0); 0 = no depth limit, the full closure bounded by max"},
-                    "max": {"type": "integer", "description": "max dependers (default 200)"},
+                    "depth": {"type": "integer", "minimum": 0, "maximum": max_depth, "description": format!("max depth (default 0, at most {max_depth}); 0 = no depth limit, the full closure bounded by max")},
+                    "max": {"type": "integer", "minimum": 0, "maximum": max_results, "description": format!("max dependers (default 200, at most {max_results})")},
                 },
                 "required": ["id"],
             },
@@ -592,8 +599,8 @@ fn tool_list() -> serde_json::Value {
                 "properties": {
                     "from": {"type": "string", "description": "start vertex ID"},
                     "to": {"type": "string", "description": "goal vertex ID"},
-                    "max": {"type": "integer", "description": "max paths (default 10)"},
-                    "budget": {"type": "integer", "description": "max vertex expansions (default 50000)"},
+                    "max": {"type": "integer", "minimum": 0, "maximum": max_paths, "description": format!("max paths (default 10, at most {max_paths})")},
+                    "budget": {"type": "integer", "minimum": 0, "maximum": max_budget, "description": format!("max vertex expansions (default 50000, at most {max_budget})")},
                 },
                 "required": ["from", "to"],
             },
@@ -605,7 +612,7 @@ fn tool_list() -> serde_json::Value {
                 "type": "object",
                 "properties": {
                     "q": {"type": "string", "description": "query string"},
-                    "max": {"type": "integer", "description": "max hits (default 20)"},
+                    "max": {"type": "integer", "minimum": 0, "maximum": max_results, "description": format!("max hits (default 20, at most {max_results})")},
                 },
                 "required": ["q"],
             },
@@ -1140,6 +1147,157 @@ mod tests {
         }
         // 같은 줄을 한 번 더 보내도 같은 답이다.
         assert_eq!(session(&srv, &lines), res);
+    }
+
+    /// 도구 호출 하나의 결과 — (isError인가, 본문).
+    fn tool_result(srv: &Server<'_>, name: &str, arguments: serde_json::Value) -> (bool, String) {
+        let res = session(srv, &[&call_line(1, name, arguments)]);
+        let result = &res[0]["result"];
+        (
+            result["isError"] == true,
+            result["content"][0]["text"].as_str().unwrap().to_string(),
+        )
+    }
+
+    /// 도구 인자도 CLI와 같은 상한을 지난다 — query·impact·search `max` 10,000, query·impact `depth` 64,
+    /// paths `max` 1,024·`budget` 1,000,000. 상한까지는 답하고, 넘으면 조용히 깎지 않고 isError로 답한다.
+    /// 예전에는 `budget` 하나로 단일 스레드 서버의 메모리를 수 GB까지 쓰게 할 수 있었다.
+    #[test]
+    fn tool_arguments_past_their_limits_are_errors() {
+        let doc = branching_doc();
+        let srv = server_for(&doc);
+        let (from, to) = ("c::f00", "c::f13");
+        for (name, arguments, shown, limit) in [
+            (
+                "rustograph_query",
+                serde_json::json!({"id": to, "max": 10001}),
+                "max 10001",
+                "10000",
+            ),
+            (
+                "rustograph_query",
+                serde_json::json!({"id": to, "depth": 65}),
+                "depth 65",
+                "64",
+            ),
+            (
+                "rustograph_impact",
+                serde_json::json!({"id": to, "max": 10001}),
+                "max 10001",
+                "10000",
+            ),
+            (
+                "rustograph_impact",
+                serde_json::json!({"id": to, "depth": 65}),
+                "depth 65",
+                "64",
+            ),
+            (
+                "rustograph_search",
+                serde_json::json!({"q": "f1", "max": 10001}),
+                "max 10001",
+                "10000",
+            ),
+            (
+                "rustograph_paths",
+                serde_json::json!({"from": from, "to": to, "max": 1025}),
+                "max 1025",
+                "1024",
+            ),
+            (
+                "rustograph_paths",
+                serde_json::json!({"from": from, "to": to, "budget": 1_000_000_000_000u64}),
+                "budget 1000000000000",
+                "1000000",
+            ),
+        ] {
+            let (is_error, text) = tool_result(&srv, name, arguments.clone());
+            assert!(is_error, "{name} {arguments}: {text}");
+            assert!(
+                text.starts_with(shown) && text.contains(&format!("limit of {limit}")),
+                "{name} {arguments}: {text}"
+            );
+        }
+        for (name, arguments) in [
+            (
+                "rustograph_query",
+                serde_json::json!({"id": to, "depth": 64, "max": 10000}),
+            ),
+            (
+                "rustograph_impact",
+                serde_json::json!({"id": to, "depth": 64, "max": 10000}),
+            ),
+            (
+                "rustograph_impact",
+                serde_json::json!({"id": to, "depth": 0, "max": 10000}),
+            ),
+            (
+                "rustograph_search",
+                serde_json::json!({"q": "f1", "max": 10000}),
+            ),
+            (
+                "rustograph_paths",
+                serde_json::json!({"from": from, "to": to, "max": 1024, "budget": 1_000_000}),
+            ),
+        ] {
+            let (is_error, text) = tool_result(&srv, name, arguments.clone());
+            assert!(!is_error, "{name} {arguments}: {text}");
+        }
+    }
+
+    /// `depth: 0`(깊이 제한 없음)의 방문 수는 `max` 상한이 묶는다 — 의존자 10,001개 사슬에서 최대
+    /// `max`(10,000)인 impact는 정확히 10,000개를 싣고 truncated다. 이웃 걷기는 보고 수가 `max`에
+    /// 닿으면 멈춘다.
+    #[test]
+    fn unlimited_depth_is_bounded_by_the_result_limit() {
+        let id = |i: usize| format!("c::f{i:05}");
+        let vertices = (0..10_002).map(|i| v(&id(i), Kind::Fn, false)).collect();
+        let edges = (0..10_001)
+            .map(|i| Edge::new(id(i + 1), id(i), EdgeKind::Call))
+            .collect();
+        let doc = document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec![id(10_001)],
+            vertices,
+            edges,
+            vec![],
+        );
+        let srv = server_for(&doc);
+        let arguments = serde_json::json!({"id": id(0), "depth": 0, "max": 10000});
+        let (is_error, text) = tool_result(&srv, "rustograph_impact", arguments);
+        assert!(!is_error, "{text}");
+        let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(report["impacted"].as_array().unwrap().len(), 10_000);
+        assert_eq!(report["truncated"], true);
+        assert_eq!(report["depth"], 0);
+    }
+
+    /// tools/list의 입력 스키마가 상한을 JSON Schema `maximum`으로 싣는다 — 클라이언트가 보내기 전에
+    /// 알 수 있고, 서버가 거부하는 값과 같다.
+    #[test]
+    fn tool_schemas_publish_the_argument_limits() {
+        let res = session(
+            &server_for(&test_doc()),
+            &[r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#],
+        );
+        let tools = res[0]["result"]["tools"].as_array().unwrap();
+        let maximum = |tool: &str, field: &str| {
+            let t = tools.iter().find(|t| t["name"] == tool).unwrap();
+            t["inputSchema"]["properties"][field]["maximum"].clone()
+        };
+        for (tool, field, limit) in [
+            ("rustograph_query", "max", 10_000),
+            ("rustograph_query", "depth", 64),
+            ("rustograph_impact", "max", 10_000),
+            ("rustograph_impact", "depth", 64),
+            ("rustograph_search", "max", 10_000),
+            ("rustograph_paths", "max", 1_024),
+            ("rustograph_paths", "budget", 1_000_000),
+        ] {
+            assert_eq!(maximum(tool, field), limit, "{tool}.{field}");
+        }
     }
 
     /// `rustograph mcp`도 쓰지 않는 플래그·위치 인자를 수확 전에 거부한다(CLI와 같은 공용 검사) —
