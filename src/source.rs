@@ -517,6 +517,13 @@ fn fingerprint(dir: &Path, meta: &Metadata, opts: &Options) -> Option<u64> {
     // RUSTFLAGS가 바뀌면 cfg 평가·의미 해석이 달라진다. 프로브
     // 실패는 지문 불가 — 캐시 없는 경로로 돌아간다.
     feed(cargo_meta::rustc_version()?.as_bytes());
+    // 메타데이터 단계의 limitation(resolve 없음, 쓰지 않은 rust-toolchain 파일)은 문서에 실린다 —
+    // 키에 넣어 다른 실행(다른 작업 디렉터리)의 캐시 문서가 그 사실을 잘못 싣거나 빠뜨리지 않게
+    // 한다. 없으면 아무것도 넣지 않아 기존 키가 그대로다.
+    for note in &meta.limitations {
+        feed(note.as_bytes());
+        feed(&[0]);
+    }
     for var in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"] {
         feed(var.as_bytes());
         feed(std::env::var(var).unwrap_or_default().as_bytes());
@@ -1700,6 +1707,16 @@ mod tests {
         // 캐시 파일이 워크스페이스 안에 있어도 지문을 바꾸지 않는다 —
         // .rustograph는 숨김 디렉터리라 지문 걷기에서 빠진다.
         assert_eq!(k2, fingerprint(&tmp, &meta, &opts).unwrap());
+        // 메타데이터 limitation은 문서에 실리므로 키에 들어간다 — 쓰지 않은 rust-toolchain 파일을
+        // 알린 실행의 캐시 문서가 그 파일이 없는 실행에 재사용되지 않는다.
+        let noted = Metadata {
+            packages: vec![],
+            by_id: BTreeMap::new(),
+            dep_edges: vec![],
+            workspace_root: tmp.clone(),
+            limitations: vec!["toolchain-file-ignored: example".to_string()],
+        };
+        assert_ne!(k2, fingerprint(&tmp, &noted, &opts).unwrap());
         std::fs::remove_dir_all(&tmp).ok();
     }
 

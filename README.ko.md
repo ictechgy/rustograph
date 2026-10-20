@@ -284,27 +284,50 @@ rustograph는 소스를 syn으로 파싱하지만 Rust 툴체인도 실행합니
 수확(`--graph`로 저장 그래프를 읽지 않는 모든 분석)은 `cargo metadata`를
 실행합니다. `--graph`를 써도 `--target`이면 `rustc --print cfg`를 실행하고,
 MCP `rustograph_deps` 도구는 첫 호출 때 `--dir` 워크스페이스를 대상으로
-`cargo metadata`를 실행합니다. 신뢰할 수 없는 체크아웃을 분석하면 그
-체크아웃이 고른 프로그램이 실행될 수 있습니다.
+`cargo metadata`를 실행합니다. `--semantic` 캐시 키를 만들 때는 `rustc -vV`를
+실행합니다. 이 명령들은 현재 디렉터리에서 돌고, Cargo는 그 디렉터리와 부모의
+`.cargo/config.toml`을, rustup 프록시는 같은 방식으로 `rust-toolchain.toml`(또는
+`rust-toolchain`) 파일을 찾습니다. rustograph는 체크아웃 안에서 실행해도 그
+체크아웃이 이 명령들이 실행할 프로그램을 고르지 못하게 합니다.
 
-- rustograph는 이 명령들을 현재 디렉터리에서 실행합니다. Cargo는 `--dir`
-  워크스페이스가 아니라 현재 디렉터리와 그 부모의 `.cargo/config.toml`을
-  읽으므로, 체크아웃 안에서 실행하면 그 체크아웃의 설정(예:
-  `build.rustc-wrapper`, `build.rustc`)이 고른 프로그램이 실행됩니다.
-  `cargo`와 `rustc`가 rustup 프록시이면 rustup도 현재 디렉터리에서 위로
-  올라가며 찾은 `rust-toolchain.toml`(또는 `rust-toolchain`) 파일로 툴체인을
-  고르고, 이 파일은 사용자 지정 툴체인 디렉터리를 가리킬 수 있습니다.
-- `--semantic`은 분석 대상 코드를 실행합니다. rust-analyzer가 분석 대상
-  워크스페이스 루트에서 `cargo check`를 실행해, 그 워크스페이스의 Cargo 설정
-  아래에서 빌드 스크립트(`build.rs`)를 빌드·실행하고, 매크로를 펼치려고 proc
-  매크로를 실행합니다. rustograph를 어느 디렉터리에서 실행하든 같습니다.
-  `--semantic`은 직접 빌드해도 되는 코드에만 쓰세요.
+- `cargo`·`rustc`·`rustup`은 `PATH`의 절대 경로 항목(`PATH`가 없으면
+  `/bin:/usr/bin`)에서만 찾아 그 절대 경로로 실행합니다. 빈 항목과 `.`·`bin` 같은
+  상대 항목은 현재 디렉터리 기준으로 풀리므로 건너뜁니다.
+- 모든 툴체인 명령에 `RUSTC_WRAPPER`·`RUSTC_WORKSPACE_WRAPPER`를 빈 값으로 줘
+  `build.rustc-wrapper`·`build.rustc-workspace-wrapper`를 끄고, `build.rustc`보다
+  앞서는 `RUSTC`를 줍니다. 줄 `rustc`가 없으면 `cargo`를 실행하지 않습니다.
+- 툴체인은 실행마다 한 번, 체크아웃 밖에서 정합니다. `RUSTC`는 `PATH`에서 찾은
+  `rustc`이고, 그것이 rustup 프록시면 `rustup which rustc`가 알려 준 경로입니다.
+  `PATH`의 `cargo`나 `rustc`가 rustup 프록시면 `rustup show active-toolchain`이
+  알려 준 툴체인을 `RUSTUP_TOOLCHAIN`으로도 줍니다. rustup에는 임시 디렉터리
+  아래 새 빈 디렉터리에서 묻기 때문에 `rust-toolchain` 파일을 읽지 않습니다.
+  직접 설정한 `RUSTUP_TOOLCHAIN`·`RUSTC`는 그대로 씁니다. 프로젝트 툴체인으로
+  분석하려면 `RUSTUP_TOOLCHAIN=<channel>`을 주세요.
+- 그 때문에 현재 디렉터리나 부모의 `rust-toolchain` 파일을 쓰지 않았으면 문서에
+  `toolchain-file-ignored:` limitation이 붙습니다. 임시 디렉터리 자체가 그런 파일
+  아래에 있거나 rustup이 툴체인을 알려 주지 못하면, `RUSTUP_TOOLCHAIN`과 `RUSTC`를
+  직접 주라는 오류로 분석이 실패합니다.
+
+현재 디렉터리는 바꾸지 않으므로 체크아웃의 나머지 Cargo 설정(source
+replacement, `[patch]`, 레지스트리)은 `cargo build`처럼 그대로 적용됩니다.
+rustograph가 덮지 않는 설정도 마찬가지입니다. 체크아웃의 `[env]` 표는
+`cargo metadata`가 실행하는 `rustc`의 환경 변수를 여전히 정합니다. Cargo가 인증이
+필요한 레지스트리에 쓰는 자격 증명 공급자(`registry.global-credential-providers`,
+`registries.<name>.credential-provider`)는 덮지 않습니다. 덮으면 사설 레지스트리에
+쓰는 사용자 자신의 공급자도 꺼지기 때문입니다.
+
+`--semantic`은 분석 대상 코드를 실행합니다. rust-analyzer가 분석 대상
+워크스페이스 루트에서 `cargo check`를 실행해, 그 워크스페이스의 Cargo 설정
+아래에서 빌드 스크립트(`build.rs`)를 빌드·실행하고, 매크로를 펼치려고 proc
+매크로를 실행합니다. rustograph를 어느 디렉터리에서 실행하든 같습니다. 위의
+보호는 rust-analyzer가 띄우는 `cargo`·`rustc`에는 적용되지 않습니다.
+`--semantic`은 직접 빌드해도 되는 코드에만 쓰세요.
 
 신뢰할 수 없는 저장소나 포크 PR은 비밀이 없는 격리 러너나 샌드박스에서
 `--semantic` 없이, 체크아웃 밖(체크아웃 자신도 그 하위 디렉터리도 아닌 곳)의
 작업 디렉터리에서 `--dir`로 체크아웃을 넘겨 분석하세요. 그러면 rustograph가
 실행하는 툴체인 명령에 체크아웃의 `.cargo/config.toml`과 `rust-toolchain.toml`이
-적용되지 않습니다. 작업 디렉터리와 그 부모, Cargo 홈의 설정은 여전히
+전혀 적용되지 않습니다. 작업 디렉터리와 그 부모, Cargo 홈의 설정은 여전히
 적용됩니다. `cargo metadata`는 어디서 실행하든 체크아웃의 의존성을 해석합니다.
 체크아웃에 `Cargo.lock`을 쓸 수 있고, 그 쓰기가 실패하면 분석도 실패합니다.
 체크아웃의 매니페스트에 적힌 레지스트리·git 의존을 네트워크로 가져올 수도
