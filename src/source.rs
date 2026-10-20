@@ -7,6 +7,7 @@ pub mod routes;
 pub mod schema;
 
 use crate::cargo_meta::{self, Metadata};
+use crate::fanout;
 use crate::graph::{self, Document, Edge, EdgeKind, Kind, Level, Vertex};
 use crate::harvest::{self, BodyItem, Harvest};
 use crate::modtree::{self, ModTree};
@@ -858,7 +859,8 @@ fn harvest(
         #[cfg(test)]
         LINKED_ITEMS.with(|c| c.set(c.get() + bodies.len() + attr_refs.len()));
         // 메서드 이름 → ID 인덱스 — 이름 팬아웃 폴백에 쓴다(semantic에서는
-        // ra가 해석하지 못한 호출에만 쓰인다).
+        // ra가 해석하지 못한 호출에만 쓰인다). 후보는 본문 크레이트의 의존 폐포로 좁힌다.
+        let fan_out_scope = fan_out_reach(meta);
         let mut method_index: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for v in &vertices {
             if v.kind == Kind::Method {
@@ -906,7 +908,8 @@ fn harvest(
                     krate: b.module.split("::").next().unwrap_or_default(),
                     module: &b.module,
                 };
-                match eng.body_edges(&site, &ids, &method_index, &mut st) {
+                let visible = fan_out_scope.get(site.krate);
+                match eng.body_edges_within(&site, &ids, &method_index, visible, &mut st) {
                     Some(es) => {
                         // 시그니처 간선은 엔진과 무관하게 syn이 권위다.
                         edges.extend(harvest::signature_edges(b, &tree, &dep_crates));
@@ -914,11 +917,12 @@ fn harvest(
                     }
                     None => {
                         st.unmapped += 1;
-                        edges.extend(harvest::bodies(
+                        edges.extend(harvest::bodies_within(
                             std::slice::from_ref(b),
                             &tree,
                             &dep_crates,
                             &method_index,
+                            &fan_out_scope,
                             &mut harvest,
                         ));
                     }
@@ -926,20 +930,22 @@ fn harvest(
             }
             push_sem_stats(&st, eng.has_proc_macros(), &mut limitations, &mut harvest);
         } else {
-            edges.extend(harvest::bodies(
+            edges.extend(harvest::bodies_within(
                 &bodies,
                 &tree,
                 &dep_crates,
                 &method_index,
+                &fan_out_scope,
                 &mut harvest,
             ));
         }
         #[cfg(not(feature = "semantic"))]
-        edges.extend(harvest::bodies(
+        edges.extend(harvest::bodies_within(
             &bodies,
             &tree,
             &dep_crates,
             &method_index,
+            &fan_out_scope,
             &mut harvest,
         ));
 
@@ -1046,6 +1052,93 @@ fn collect_owner_spans(
         range: b.range.clone(),
     }));
     *out = spans;
+}
+
+/// 이름 팬아웃이 크레이트마다 고유·트레이트 선언 메서드를 고를 수 있는 크레이트 — 타깃 루트 이름 →
+/// (자기, 같은 패키지의 lib, 전이 의존 폐포 안 멤버 패키지의 lib).
+///
+/// 의존은 종류 전부(normal·dev·build)를 따른다 — 수확이 `#[cfg(test)]` 모듈까지 담아 dev 의존을 빼면
+/// 테스트 코드의 실제 호출을 잃는다. cargo의 resolve 그래프는 기본 feature가 켜지 않은 optional 의존을
+/// 빼지만 수확은 `#[cfg(feature)]` 뒤 코드도 담으므로, 멤버가 선언한 optional 멤버 의존도 따른다.
+/// 정확한 해석보다 넓게(살아 있는 쪽으로) 잡는다 — 의존 크레이트의 dev 의존까지 따라가도 후보가 늘 뿐
+/// 사라지지 않는다. resolve 그래프가 없으면(의존을 모르면) 빈 맵을 돌려 좁히지 않는다.
+fn fan_out_reach(meta: &Metadata) -> fanout::Reach {
+    let mut scope = fanout::Reach::new();
+    if meta
+        .limitations
+        .iter()
+        .any(|l| l == cargo_meta::NO_RESOLVE_GRAPH)
+    {
+        return scope;
+    }
+    let direct = package_dependencies(meta);
+    for (i, p) in meta.packages.iter().enumerate() {
+        if !p.workspace_member {
+            continue;
+        }
+        let libs = closure_libs(meta, &direct, i);
+        for t in p
+            .targets
+            .iter()
+            .filter(|t| matches!(t.kind.as_str(), "lib" | "bin"))
+        {
+            // 같은 이름의 lib/bin은 루트를 공유한다 — 두 타깃의 폐포를 합친다.
+            let visible = scope.entry(t.name.clone()).or_default();
+            visible.extend(libs.iter().cloned());
+            visible.insert(t.name.clone());
+        }
+    }
+    scope
+}
+
+/// 패키지 인덱스마다 직접 의존하는 패키지 인덱스 — resolve 간선(종류 전부)에, 멤버가 선언한
+/// optional 의존 중 워크스페이스 멤버인 것을 더한다(resolve에는 켜진 optional 의존만 있다).
+fn package_dependencies(meta: &Metadata) -> Vec<BTreeSet<usize>> {
+    let mut direct = vec![BTreeSet::new(); meta.packages.len()];
+    for d in &meta.dep_edges {
+        if let (Some(&from), Some(&to)) = (meta.by_id.get(&d.from), meta.by_id.get(&d.to)) {
+            direct[from].insert(to);
+        }
+    }
+    let member_index: BTreeMap<&str, usize> = meta
+        .packages
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.workspace_member)
+        .map(|(i, p)| (p.name.as_str(), i))
+        .collect();
+    for (i, p) in meta.packages.iter().enumerate() {
+        if !p.workspace_member {
+            continue;
+        }
+        for dep_name in &p.optional_deps {
+            if let Some(&to) = member_index.get(dep_name.as_str()) {
+                direct[i].insert(to);
+            }
+        }
+    }
+    direct
+}
+
+/// 패키지 `start`와 그 전이 의존 폐포 안 멤버 패키지들의 lib 타깃 이름이다. 작업 목록으로 걷는다 —
+/// 재귀 함수는 자기 분석에서 symbol 순환이 된다. 의존 순환(dev 의존)은 방문 집합이 끊는다. 외부
+/// 패키지는 메서드 정점이 없어 이름을 싣지 않지만 그 뒤의 멤버(`[patch]`로 바꾼 의존)까지는 걷는다.
+fn closure_libs(meta: &Metadata, direct: &[BTreeSet<usize>], start: usize) -> BTreeSet<String> {
+    let mut seen = BTreeSet::from([start]);
+    let mut pending = vec![start];
+    while let Some(k) = pending.pop() {
+        for &dep_index in &direct[k] {
+            if seen.insert(dep_index) {
+                pending.push(dep_index);
+            }
+        }
+    }
+    seen.into_iter()
+        .map(|k| &meta.packages[k])
+        .filter(|p| p.workspace_member)
+        .filter_map(|p| p.targets.iter().find(|t| t.kind == "lib"))
+        .map(|t| t.name.clone())
+        .collect()
 }
 
 /// 크레이트 정점과 `depends` 간선을 만든다.
@@ -1571,6 +1664,13 @@ fn push_limitations(h: &Harvest, limitations: &mut Vec<String>) {
             h.fanned_method_calls
         ));
     }
+    if h.out_of_reach_method_calls > 0 {
+        limitations.push(format!(
+            "{} method calls name only inherent or trait-declared methods of crates the calling \
+             crate does not depend on; no fan-out edges were added",
+            h.out_of_reach_method_calls
+        ));
+    }
     if h.external_macros > 0 {
         limitations.push(format!(
             "{} macro invocations resolve to std/external macros and were omitted; \
@@ -1600,6 +1700,7 @@ fn push_sem_stats(
     out: &mut Harvest,
 ) {
     out.fanned_method_calls += st.fanned;
+    out.out_of_reach_method_calls += st.out_of_reach;
     out.unresolved_paths += st.unresolved;
     limitations.push(format!(
         "semantic analysis: {} call/reference edges resolved via types; \
@@ -2181,6 +2282,112 @@ mod tests {
             [("owner_prefix::T10::get", true)]
         );
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 이름 팬아웃 폐포 시험용 패키지 — 타깃은 (이름, 종류) 목록, optional은 선언된 optional 의존이다.
+    fn reach_package(
+        name: &str,
+        member: bool,
+        targets: &[(&str, &str)],
+        optional: &[&str],
+    ) -> cargo_meta::Package {
+        cargo_meta::Package {
+            name: name.to_string(),
+            version: "0.1.0".to_string(),
+            targets: targets
+                .iter()
+                .map(|(target, kind)| cargo_meta::Target {
+                    name: target.to_string(),
+                    kind: kind.to_string(),
+                    src: PathBuf::from("src/lib.rs"),
+                })
+                .collect(),
+            workspace_member: member,
+            proc_macro: false,
+            optional_deps: optional.iter().map(|o| o.to_string()).collect(),
+        }
+    }
+
+    /// 패키지 ID(여기서는 이름) 사이의 resolve 간선.
+    fn reach_edge(from: &str, to: &str, kind: &str) -> cargo_meta::DepEdge {
+        cargo_meta::DepEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: kind.to_string(),
+            lib_name: to.to_string(),
+        }
+    }
+
+    /// 의존 폐포 시험 메타데이터 — app은 dep(→ base, lib 이름이 다르다)·외부 ext(→ `[patch]`로 바꾼
+    /// 멤버 patched)·proc-macro 멤버 macros에 의존하고, testdep에 dev 의존(testdep은 app에 dev 의존 —
+    /// 순환), opt에 optional 의존(resolve 간선 없음)이다. tool은 lib과 bin 둘이고, other는 아무와도
+    /// 잇지 않는다.
+    fn reach_metadata() -> Metadata {
+        let packages = vec![
+            reach_package("app", true, &[("app", "lib")], &["opt", "not_a_member"]),
+            reach_package("dep", true, &[("dep", "lib")], &[]),
+            reach_package("base", true, &[("base_lib", "lib")], &[]),
+            reach_package("testdep", true, &[("testdep", "lib")], &[]),
+            reach_package("opt", true, &[("opt", "lib")], &[]),
+            reach_package("ext", false, &[("ext", "lib")], &[]),
+            reach_package("patched", true, &[("patched", "lib")], &[]),
+            reach_package("tool", true, &[("tool", "lib"), ("tool_cli", "bin")], &[]),
+            reach_package("other", true, &[("other", "lib")], &[]),
+            reach_package("macros", true, &[], &[]),
+        ];
+        let by_id = packages
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.name.clone(), i))
+            .collect();
+        Metadata {
+            packages,
+            by_id,
+            dep_edges: vec![
+                reach_edge("app", "dep", ""),
+                reach_edge("dep", "base", ""),
+                reach_edge("app", "ext", ""),
+                reach_edge("ext", "patched", ""),
+                reach_edge("app", "macros", ""),
+                reach_edge("app", "testdep", "dev"),
+                reach_edge("testdep", "app", "dev"),
+            ],
+            workspace_root: PathBuf::from("/w"),
+            limitations: vec![],
+        }
+    }
+
+    /// 크레이트 이름 집합 — 기대값을 짧게 쓰기 위한 도우미.
+    fn crate_names(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// 이름 팬아웃 폐포는 타깃 루트 이름마다 자기와 같은 패키지의 lib, 그리고 의존 종류 전부(dev 포함,
+    /// 순환은 끊는다)와 선언된 optional 멤버 의존을 따라 닿는 멤버 lib이다. 외부 패키지는 이름을 싣지
+    /// 않지만 그 뒤의 멤버까지 걷는다. lib이 없는 멤버(proc-macro)는 이름이 없다. resolve 그래프가
+    /// 없으면 의존을 모르니 맵이 비어 좁히지 않는다.
+    #[test]
+    fn fan_out_reach_follows_every_dependency_kind_and_optional_members() {
+        let scope = fan_out_reach(&reach_metadata());
+        let everything_app_sees =
+            crate_names(&["app", "base_lib", "dep", "opt", "patched", "testdep"]);
+        assert_eq!(scope["app"], everything_app_sees);
+        assert_eq!(scope["testdep"], everything_app_sees);
+        assert_eq!(scope["dep"], crate_names(&["base_lib", "dep"]));
+        assert_eq!(scope["base_lib"], crate_names(&["base_lib"]));
+        assert_eq!(scope["tool"], crate_names(&["tool"]));
+        assert_eq!(scope["tool_cli"], crate_names(&["tool", "tool_cli"]));
+        assert_eq!(scope["other"], crate_names(&["other"]));
+        assert!(
+            !scope.contains_key("ext"),
+            "external packages have no entry"
+        );
+        let mut unresolved = reach_metadata();
+        unresolved.dep_edges.clear();
+        unresolved
+            .limitations
+            .push(cargo_meta::NO_RESOLVE_GRAPH.to_string());
+        assert!(fan_out_reach(&unresolved).is_empty());
     }
 
     /// 정점 ID의 generated 플래그 — 정점이 없으면 None이다.

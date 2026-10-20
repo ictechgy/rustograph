@@ -26,9 +26,10 @@ over it, with a deterministic JSON contract meant for coding agents:
 
 - **Tentative edges are labeled, not hidden.** A method call `x.m()` has no
   type information in syntax — rustograph emits speculative fan-out edges
-  marked `tentative: true`, uses them for reachability (erring toward
-  "alive"), and excludes them from cycle and rule evidence with a counted
-  report.
+  marked `tentative: true` to the same-name methods the call could reach
+  (see [Graph model](#graph-model)), uses them for reachability (erring
+  toward "alive"), and excludes them from cycle and rule evidence with a
+  counted report.
 - **Limitations are measured, not boilerplate.** Unresolved paths, macro
   bodies, `#[cfg]` items, and orphan files are counted per project and travel
   with every answer.
@@ -165,6 +166,18 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
 `contains`, `call`, `references`, `implements`, `signature`.
 
 - `contains` is ownership, not a dependency — it never feeds cycles or rules.
+- Name fan-out: a method call `x.m()` whose receiver type is unknown gets
+  `tentative` call edges to the same-name workspace methods it could reach.
+  Inherent (`T::m`) and trait-declared (`Tr::m`) methods come only
+  from the calling crate, its package's library, and the crates it depends
+  on — transitively and of every kind, including dev, build, and optional
+  dependencies that the default features leave off — because a crate cannot
+  name another crate's types or traits without depending on it. Trait impl
+  methods (`T::<Tr>::m`) come from the whole workspace: `dyn` and generic
+  dispatch reach impls in crates that depend on the caller. Calls whose only
+  same-name methods are out of reach get no edges and are counted in
+  `limitations`. Without a resolve graph from `cargo metadata`, fan-out is
+  not narrowed.
 - Levels are projections: the symbol graph is the source of truth; shallower
   levels fold edges onto owning modules/crates.
 - `signature` edges record types leaked through a function's public
@@ -485,7 +498,8 @@ walked, and `dyn`/generic trait calls expand to workspace impl candidates
 (still tentative — the real impl is a runtime fact). The graph contract —
 vertices, edge kinds, `tentative`, `limitations` — is unchanged; only
 accuracy improves. Bodies the semantic engine cannot see (cfg-disabled,
-macro-generated) fall back to the syntactic path with measured counters.
+macro-generated) fall back to the syntactic path with measured counters, and
+calls it cannot resolve fall back to the same narrowed name fan-out.
 
 ## Security: trust boundary
 

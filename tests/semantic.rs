@@ -946,3 +946,56 @@ fn inner_cfg_attr_fails_closed() {
         "forged impl must fall back to its owner type vertex"
     );
 }
+
+#[path = "support/fan_out.rs"]
+mod fan_out;
+
+/// `from` 본문이 단 추정(tentative) call 간선의 대상 — 정렬한 목록이다.
+fn tentative_calls(d: &Document, from: &str) -> Vec<String> {
+    let mut found: Vec<String> = d
+        .edges
+        .iter()
+        .filter(|e| e.from == from && e.kind == EdgeKind::Call && e.tentative)
+        .map(|e| e.to.clone())
+        .collect();
+    found.sort();
+    found
+}
+
+/// 의미 해석 모드도 syn 수확과 같은 의존 폐포로 이름 팬아웃을 좁힌다 — ra가 수신자 타입을 모르는
+/// 호출의 팬아웃(엔진)과 엔진이 못 보는 본문(기본 feature가 끈 `#[cfg(feature)]` 함수)의 syn 폴백이
+/// 같은 규칙이다. 모드에 따라 같은 호출이 무관한 크레이트로 간선을 내면 정확도를 올린다는 계약이
+/// 거꾸로 된다. 제네릭 수신자의 트레이트 호출은 impl 행렬이 펼친다(다른 크레이트의 impl 포함).
+#[test]
+fn name_fan_out_stays_within_the_calling_crates_dependencies() {
+    let dir = fan_out::write_workspace("sem");
+    let d = source::load(
+        &dir,
+        &Options {
+            symbol_level: true,
+            semantic: true,
+            ..Default::default()
+        },
+    )
+    .expect("semantic fan-out workspace load failed");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(tentative_calls(&d, "app::calls"), ["dep::D::get"]);
+    assert_eq!(
+        tentative_calls(&d, "app::hooks"),
+        ["app::Hook::fire", "other::O::<Hook>::fire"]
+    );
+    assert_eq!(
+        tentative_calls(&d, "app::tuned"),
+        ["dep::D::get", "opt::P::tune"]
+    );
+    assert_eq!(
+        tentative_calls(&d, "app::tests::probed"),
+        ["testdep::T::probe"]
+    );
+    assert_eq!(tentative_calls(&d, "tool_cli::turn"), ["tool::K::knob"]);
+    assert!(
+        d.limitations.iter().any(|l| l == fan_out::OUT_OF_REACH),
+        "{:?}",
+        d.limitations
+    );
+}

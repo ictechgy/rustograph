@@ -31,6 +31,10 @@ pub struct Package {
     /// 그래프에 안 잡힐 수 있어 deps 보고서가 약한 증거로 표시한다.
     /// targets에서 proc-macro 타깃을 걸러내기 전에 따로 잡아야 한다.
     pub proc_macro: bool,
+    /// 선언된 optional 의존의 패키지 이름(정규화, 선언 순서). resolve 그래프(`dep_edges`)는 기본
+    /// feature가 켜지 않은 optional 의존을 빼지만 수확은 `#[cfg(feature)]` 뒤 코드도 담으므로, 이름
+    /// 팬아웃의 의존 폐포가 이 목록으로 그 의존까지 따른다.
+    pub optional_deps: Vec<String>,
 }
 
 impl Package {
@@ -98,6 +102,17 @@ struct RawPackage {
     name: String,
     version: String,
     targets: Vec<RawTarget>,
+    /// 선언된 의존(Cargo.toml 그대로) — optional 의존만 쓴다.
+    #[serde(default)]
+    dependencies: Vec<RawDeclaredDep>,
+}
+
+/// 패키지가 선언한 의존 하나 — `name`은 rename 전 패키지 이름이다.
+#[derive(Deserialize)]
+struct RawDeclaredDep {
+    name: String,
+    #[serde(default)]
+    optional: bool,
 }
 
 #[derive(Deserialize)]
@@ -220,6 +235,11 @@ pub fn load(dir: &Path) -> Result<Metadata, String> {
     }
     Ok(metadata)
 }
+
+/// `cargo metadata`가 resolve 그래프를 주지 않았다는 limitation — 의존 간선을 모른다는 뜻이라, 의존
+/// 폐포로 후보를 좁히는 이름 팬아웃이 이 문장으로 좁히기를 끈다(모르는 의존을 없다고 보지 않는다).
+pub(crate) const NO_RESOLVE_GRAPH: &str =
+    "cargo metadata returned no resolve graph; dependency edges unavailable";
 
 /// 작업 디렉터리(와 그 조상)의 rust-toolchain 파일을 쓰지 않았다는 limitation — 경로는 싣지 않는다
 /// (문서가 다른 머신으로 옮겨진다). 해결 방향은 툴체인을 직접 고르는 것이다.
@@ -659,11 +679,18 @@ fn parse(bytes: &[u8]) -> Result<Metadata, String> {
             .targets
             .iter()
             .any(|t| t.kind.iter().any(|k| k == "proc-macro"));
+        let optional_deps = p
+            .dependencies
+            .iter()
+            .filter(|d| d.optional)
+            .map(|d| normalize_name(&d.name))
+            .collect();
         packages.push(Package {
             workspace_member: members.contains(p.id.as_str()),
             name: normalize_name(&p.name),
             version: p.version,
             proc_macro,
+            optional_deps,
             targets: p
                 .targets
                 .into_iter()
@@ -703,9 +730,7 @@ fn parse(bytes: &[u8]) -> Result<Metadata, String> {
                 }
             }
         }
-        None => limitations.push(
-            "cargo metadata returned no resolve graph; dependency edges unavailable".to_string(),
-        ),
+        None => limitations.push(NO_RESOLVE_GRAPH.to_string()),
     }
     Ok(Metadata {
         packages,
@@ -1181,5 +1206,39 @@ mod tests {
             Ok(Some(root.join("a/rust-toolchain")))
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 선언된 optional 의존은 resolve 그래프에 없어도(기본 feature가 켜지 않음) 패키지의
+    /// `optional_deps`로 남는다 — 이름 팬아웃의 의존 폐포가 `#[cfg(feature)]` 뒤 코드의 호출을 잃지
+    /// 않게 한다. 이름은 모듈 경로처럼 정규화하고, optional이 아닌 선언은 싣지 않는다. 선언 목록이 없는
+    /// 옛 출력도 읽힌다.
+    #[test]
+    fn parse_keeps_declared_optional_dependencies() {
+        let json = r#"{
+            "packages": [
+                {"id": "app 0.1.0", "name": "app", "version": "0.1.0",
+                 "targets": [{"name": "app", "kind": ["lib"], "src_path": "/w/app/src/lib.rs"}],
+                 "dependencies": [
+                    {"name": "dep", "optional": false},
+                    {"name": "opt-in", "optional": true},
+                    {"name": "testdep", "kind": "dev"}
+                 ]},
+                {"id": "dep 0.1.0", "name": "dep", "version": "0.1.0",
+                 "targets": [{"name": "dep", "kind": ["lib"], "src_path": "/w/dep/src/lib.rs"}]}
+            ],
+            "resolve": {"nodes": [
+                {"id": "app 0.1.0", "deps": [
+                    {"pkg": "dep 0.1.0", "name": "dep", "dep_kinds": [{"kind": null}]}
+                ]},
+                {"id": "dep 0.1.0", "deps": []}
+            ]},
+            "workspace_members": ["app 0.1.0", "dep 0.1.0"],
+            "workspace_root": "/w"
+        }"#;
+        let meta = parse(json.as_bytes()).unwrap();
+        assert_eq!(meta.packages[0].optional_deps, ["opt_in"]);
+        assert!(meta.packages[1].optional_deps.is_empty());
+        assert_eq!(meta.dep_edges.len(), 1);
+        assert!(meta.limitations.is_empty());
     }
 }

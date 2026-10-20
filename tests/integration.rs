@@ -1841,3 +1841,67 @@ fn path_attribute_fixture_modules_are_kept() {
     }
     assert_eq!(skipped_mod_lines(&d.limitations), Vec::<&str>::new());
 }
+
+#[path = "support/fan_out.rs"]
+mod fan_out;
+
+/// `from` 본문이 단 추정(tentative) call 간선의 대상 — 정렬한 목록이다.
+fn tentative_calls(d: &rustograph::graph::Document, from: &str) -> Vec<String> {
+    let mut found: Vec<String> = d
+        .edges
+        .iter()
+        .filter(|e| e.from == from && e.kind == EdgeKind::Call && e.tentative)
+        .map(|e| e.to.clone())
+        .collect();
+    found.sort();
+    found
+}
+
+/// 이름 팬아웃(수신자 타입을 모르는 `x.m()`)은 고유 메서드와 트레이트 선언 메서드를 호출 크레이트와
+/// 그 전이 의존 폐포에서만 고른다. 폐포는 의존 종류 전부(dev 의존 — 수확이 `#[cfg(test)]` 모듈까지
+/// 담는다), 기본 feature가 켜지 않아 cargo의 resolve 그래프에 없는 optional 의존(수확이
+/// `#[cfg(feature)]` 뒤 코드도 담는다), 같은 패키지의 lib(bin이 자기 lib을 부른다)을 따른다. 그 밖의
+/// 크레이트 타입·트레이트는 호출 크레이트가 이름 붙이거나 값으로 얻을 수 없어 정적으로 호출할 수
+/// 없다 — 워크스페이스 전체를 후보로 삼던 예전 색인은 의존 관계가 없는 크레이트로도 간선을 퍼뜨렸다.
+/// 트레이트 impl 메서드는 dyn·제네릭 디스패치로 의존 없이 닿으니(역방향 의존 크레이트의 impl)
+/// 그대로 전체에서 고르고, 후보가 전부 걸러진 호출은 limitation으로 센다.
+#[test]
+fn name_fan_out_stays_within_the_calling_crates_dependencies() {
+    let dir = fan_out::write_workspace("syn");
+    let d = source::load(
+        &dir,
+        &source::Options {
+            symbol_level: true,
+            ..Default::default()
+        },
+    )
+    .expect("fan-out workspace harvest failed");
+    let _ = std::fs::remove_dir_all(&dir);
+    // other::O::get(고유)과 other::Spin::spin(트레이트 선언)은 app이 의존하지 않는 크레이트 것이다.
+    assert_eq!(tentative_calls(&d, "app::calls"), ["dep::D::get"]);
+    assert_eq!(
+        tentative_calls(&d, "app::hooks"),
+        ["app::Hook::fire", "other::O::<Hook>::fire"]
+    );
+    assert_eq!(
+        tentative_calls(&d, "app::tuned"),
+        ["dep::D::get", "opt::P::tune"]
+    );
+    assert_eq!(
+        tentative_calls(&d, "app::tests::probed"),
+        ["testdep::T::probe"]
+    );
+    // bin은 같은 패키지 lib의 메서드를 고르고, 의존하지 않는 dep·other의 get은 고르지 않는다.
+    assert_eq!(tentative_calls(&d, "tool_cli::turn"), ["tool::K::knob"]);
+    assert!(
+        d.limitations.iter().any(|l| l == fan_out::OUT_OF_REACH),
+        "{:?}",
+        d.limitations
+    );
+    assert!(
+        d.limitations.iter().any(|l| l
+            == "6 method calls resolved by name fan-out (no type information; errs toward alive)"),
+        "{:?}",
+        d.limitations
+    );
+}

@@ -367,6 +367,7 @@ mod tests {
                 version: ver.to_string(),
                 workspace_member: *member,
                 proc_macro: *name == "tool",
+                optional_deps: vec![],
                 targets: kinds
                     .iter()
                     .map(|k| crate::cargo_meta::Target {
@@ -508,6 +509,7 @@ mod tests {
             version: "0.1.0".into(),
             workspace_member: true,
             proc_macro: false,
+            optional_deps: vec![],
             targets: vec![crate::cargo_meta::Target {
                 name: "app".into(),
                 kind: "bin".into(),
@@ -520,6 +522,7 @@ mod tests {
             version: "0.1.0".into(),
             workspace_member: true,
             proc_macro: false,
+            optional_deps: vec![],
             targets: vec![crate::cargo_meta::Target {
                 name: "real_lib".into(), // [lib] name ≠ package name
                 kind: "lib".into(),
@@ -574,6 +577,7 @@ mod tests {
             version: "1.0.0".into(),
             workspace_member,
             proc_macro: false,
+            optional_deps: vec![],
             targets: vec![crate::cargo_meta::Target {
                 name: name.into(),
                 kind: "lib".into(),

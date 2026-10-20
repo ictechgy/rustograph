@@ -2,11 +2,13 @@
 //!
 //! 구문 수준 수확이라 할 수 있는 것과 없는 것을 구분한다: 경로 호출·use·impl은
 //! 정확히 해석되고, 메서드 호출(`x.m()`)은 타입이 없어 이름 팬아웃으로
-//! 과대 근사한다 — 오탐은 "살아 있다" 쪽으로만 기울게 하는 계약이다.
+//! 과대 근사한다 — 오탐은 "살아 있다" 쪽으로만 기울게 하는 계약이다. 후보 규칙은
+//! [`crate::fanout`]에 있다.
 
+use crate::fanout::{self, Fanned};
 use crate::graph::{Edge, EdgeKind, Kind, Vertex};
-use crate::modtree::{cfg_of, DepCrates, ModTree};
-use std::collections::BTreeMap;
+use crate::modtree::{cfg_of, crate_of, DepCrates, ModTree};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use syn::parse::Parser;
 use syn::spanned::Spanned;
@@ -21,6 +23,9 @@ pub struct Harvest {
     pub unresolved_paths: usize,
     /// 이름 팬아웃으로 해석한 메서드 호출 수.
     pub fanned_method_calls: usize,
+    /// 같은 이름 메서드가 전부 호출 크레이트의 의존 폐포 밖 크레이트의 고유·트레이트 선언 메서드라
+    /// 팬아웃 간선을 달지 않은 메서드 호출 수 — 그런 메서드는 정적으로 호출할 수 없다.
+    pub out_of_reach_method_calls: usize,
     /// 외부/std 매크로 호출 수(유령 정점 없이 생략).
     pub external_macros: usize,
     /// cfg 조건부로 포함한 아이템 수.
@@ -579,6 +584,8 @@ pub fn attr_edges(
 }
 
 /// 본문을 방문해 call/references/매크로 간선을 만든다(2패스).
+/// 이름 팬아웃은 `method_index`의 같은 이름 메서드 전부를 후보로 삼는다(크레이트로 좁히지 않는다 —
+/// 의존 그래프를 모른다). 워크스페이스 수확은 의존 폐포로 좁히는 변형을 쓴다.
 pub fn bodies(
     items: &[BodyItem],
     tree: &ModTree,
@@ -586,9 +593,37 @@ pub fn bodies(
     method_index: &BTreeMap<String, Vec<String>>,
     harvest: &mut Harvest,
 ) -> Vec<Edge> {
+    bodies_within(
+        items,
+        tree,
+        dep_crates,
+        method_index,
+        &fanout::Reach::new(),
+        harvest,
+    )
+}
+
+/// [`bodies`]와 같되 이름 팬아웃의 고유·트레이트 선언 메서드 후보를 본문 크레이트의 의존 폐포
+/// (`reach`)로 좁힌다 — 의존 관계가 없는 크레이트의 같은 이름 메서드로 간선이 퍼지지 않게 한다.
+pub(crate) fn bodies_within(
+    items: &[BodyItem],
+    tree: &ModTree,
+    dep_crates: &DepCrates,
+    method_index: &BTreeMap<String, Vec<String>>,
+    reach: &fanout::Reach,
+    harvest: &mut Harvest,
+) -> Vec<Edge> {
     let mut edges = Vec::new();
     for b in items {
-        edges.extend(body_edges(b, tree, dep_crates, method_index, harvest));
+        let visible = reach.get(&crate_of(&b.module));
+        edges.extend(body_edges_within(
+            b,
+            tree,
+            dep_crates,
+            method_index,
+            visible,
+            harvest,
+        ));
         edges.extend(signature_edges(b, tree, dep_crates));
     }
     edges
@@ -596,11 +631,25 @@ pub fn bodies(
 
 /// 본문 하나의 syn 방문 — 표현식 안의 호출·참조·매크로 간선.
 /// semantic 엔진이 못 보는 본문(cfg 비활성·매크로 생성 정의)의 폴백이기도 하다.
+/// 이름 팬아웃은 [`bodies`]와 같이 좁히지 않는다.
 pub fn body_edges(
     b: &BodyItem,
     tree: &ModTree,
     dep_crates: &DepCrates,
     method_index: &BTreeMap<String, Vec<String>>,
+    harvest: &mut Harvest,
+) -> Vec<Edge> {
+    body_edges_within(b, tree, dep_crates, method_index, None, harvest)
+}
+
+/// [`body_edges`]의 본체 — `visible`(본문 크레이트의 의존 폐포, None이면 좁히지 않음)로 이름
+/// 팬아웃의 고유·트레이트 선언 메서드 후보를 좁힌다.
+fn body_edges_within(
+    b: &BodyItem,
+    tree: &ModTree,
+    dep_crates: &DepCrates,
+    method_index: &BTreeMap<String, Vec<String>>,
+    visible: Option<&BTreeSet<String>>,
     harvest: &mut Harvest,
 ) -> Vec<Edge> {
     let mut vis = BodyVisitor {
@@ -610,12 +659,14 @@ pub fn body_edges(
         tree,
         dep_crates,
         method_index,
+        visible,
         edge_cfg: &b.cfg,
         in_unsafe: 0,
         scopes: locals::Scopes::with_params(&b.params),
         edges: Vec::new(),
         unresolved: 0,
         fanned: 0,
+        out_of_reach: 0,
         ext_macros: 0,
     };
     for e in &b.exprs {
@@ -623,6 +674,7 @@ pub fn body_edges(
     }
     harvest.unresolved_paths += vis.unresolved;
     harvest.fanned_method_calls += vis.fanned;
+    harvest.out_of_reach_method_calls += vis.out_of_reach;
     harvest.external_macros += vis.ext_macros;
     vis.edges
 }
@@ -658,6 +710,9 @@ struct BodyVisitor<'a> {
     tree: &'a ModTree,
     dep_crates: &'a DepCrates,
     method_index: &'a BTreeMap<String, Vec<String>>,
+    /// 본문 크레이트의 의존 폐포 — 이름 팬아웃의 고유·트레이트 선언 메서드 후보를 좁힌다(None이면
+    /// 좁히지 않는다).
+    visible: Option<&'a BTreeSet<String>>,
     /// 소유 아이템의 cfg — 이 본문의 간선은 전부 그 조건 아래 있다.
     edge_cfg: &'a Option<String>,
     /// 현재 unsafe 블록 깊이 — 0보다 크면 간선에 unsafe를 찍는다.
@@ -667,6 +722,7 @@ struct BodyVisitor<'a> {
     edges: Vec<Edge>,
     unresolved: usize,
     fanned: usize,
+    out_of_reach: usize,
     ext_macros: usize,
 }
 
@@ -695,6 +751,23 @@ impl BodyVisitor<'_> {
             e.cfg = self.edge_cfg.clone();
             e.unsafe_ = self.in_unsafe > 0;
             self.edges.push(e);
+        }
+    }
+
+    /// 수신자를 모르는 `x.m()` — 같은 이름 메서드 중 이 본문 크레이트가 닿을 수 있는 후보에 추정
+    /// 간선을 단다([`fanout::select`]). 같은 이름 메서드가 워크스페이스에 없으면 세지 않는다.
+    fn fan_out(&mut self, name: String) {
+        let Some(ids) = self.method_index.get(&name) else {
+            return;
+        };
+        match fanout::select(ids, self.visible) {
+            Fanned::Candidates(picked) => {
+                for mid in picked {
+                    self.push_maybe(mid.to_string(), EdgeKind::Call);
+                }
+                self.fanned += 1;
+            }
+            Fanned::OutOfReach => self.out_of_reach += 1,
         }
     }
 
@@ -834,12 +907,7 @@ impl Visit<'_> for BodyVisitor<'_> {
             }
         }
         if !scoped {
-            if let Some(ids) = self.method_index.get(&name) {
-                for mid in ids {
-                    self.push_maybe(mid.clone(), EdgeKind::Call);
-                }
-                self.fanned += 1;
-            }
+            self.fan_out(name);
         }
         syn::visit::visit_expr_method_call(self, e);
     }

@@ -1,6 +1,6 @@
 # rustograph 자기 분석 규칙 — 계층을 한 방향으로 유지한다.
 #
-#   graph · cfgeval (순수 도메인)
+#   graph · cfgeval · fanout (순수 도메인·정책)
 #     ↑ modtree · cargo_meta · harvest (수확 경계 — syn/cargo는 여기만)
 #     ↑ source (오케스트레이터)
 #     ↑ analysis · rules · export · sarif · config · deps_report (질의/출력)
@@ -25,16 +25,17 @@ components:
   mcp: ["rustograph::mcp/**"]
   sem: ["rustograph::sem/**"]
   cfgeval: ["rustograph::cfgeval/**"]
+  fanout: ["rustograph::fanout/**"]
   deps_report: ["rustograph::deps/**"]
 deps:
   app: [cli]
   cli: [source, analysis, traversal, rules, export, sarif, config, graph, mcp, cli_args, deps_report]
   mcp: [cli_args, analysis, rules, export, config, graph, deps_report]
   cli_args: [source, export, graph]
-  source: [graph, harvest, modtree, cargo_meta, sem, cfgeval]
+  source: [graph, harvest, modtree, cargo_meta, sem, cfgeval, fanout]
   # sem은 ra_ap 경계 — source만 호출하고, syn 경계·도메인 위층은 모른다.
-  sem: [graph, cargo_meta]
-  harvest: [graph, modtree]
+  sem: [graph, cargo_meta, fanout]
+  harvest: [graph, modtree, fanout]
   analysis: [graph]
   # 다중 root 순회는 문서만 소비한다 — 수확·입출력을 모른다.
   traversal: [graph]
@@ -45,6 +46,8 @@ deps:
   modtree: []
   # cfgeval은 순수 평가기 — graph의 타깃 필터가 쓰는 유일한 소비자다.
   cfgeval: []
+  # fanout은 이름 팬아웃 정책(후보 규칙) — syn 수확과 의미 해석 폴백이 같은 규칙을 쓴다.
+  fanout: []
   graph: [cfgeval]
   # deps 보고서는 cargo 메타데이터와 수확 그래프를 맞대조한다 —
   # 호출자 문서를 받지 않고 자체 syn 수확을 쓰니 source를 거른다.
