@@ -21,7 +21,7 @@ errors with `?` or handle them explicitly.
 This source compatibility change is the reason for the 0.5 minor version rather
 than a 0.4 patch. The serialized graph document remains version 1.
 
-Five library changes after 0.5.0 are source-incompatible for some callers:
+Six library changes after 0.5.0 are source-incompatible for some callers:
 
 - `rustograph::modtree::ModTree` has a new public field, `skipped_mods`.
   `collect_submodules` no longer loads a `mod` declaration whose file re-enters
@@ -40,23 +40,26 @@ Five library changes after 0.5.0 are source-incompatible for some callers:
   code that destructures every field must add it or `..`. The serialized
   document stays version 1: the key is omitted when empty, and readers that
   ignore unknown fields still load snapshots that have it.
-- `rustograph::harvest::Harvest` has a new public field,
-  `out_of_reach_method_calls`. `harvest::bodies` and `harvest::body_edges`
-  keep their signatures and still fan out over the given method index without
-  narrowing it to the calling crate's dependencies (they have no dependency
-  graph); `source::load` narrows the fan-out (see the README's Graph model).
-  Code that builds a `Harvest` with a struct literal must add the field or use
-  `..Default::default()`.
+- `rustograph::harvest::Harvest` has new public fields,
+  `out_of_reach_method_calls`, `capped_method_calls`, and
+  `capped_method_names`. `harvest::bodies` and `harvest::body_edges` keep their
+  signatures and still fan out over the given method index without narrowing
+  it to the calling crate's dependencies (they have no dependency graph), but
+  a call with more than 4,096 same-name candidates now gets no edges and is
+  counted in the new fields instead. `source::load` narrows the fan-out (see
+  the README's Graph model). Code that builds a `Harvest` with a struct
+  literal must add the fields or use `..Default::default()`.
 - `rustograph::cargo_meta::Package` has a new public field, `optional_deps`:
   the declared optional dependencies, which the resolve graph omits when
   default features leave them off. Code that builds a `Package` with a struct
   literal must add the field, and code that destructures every field must add
   it or `..`.
-- `rustograph::sem::Stats` (the `semantic` feature) has a new public field,
-  `out_of_reach`, with the same meaning for calls the semantic engine cannot
-  resolve. `sem::Engine::body_edges` keeps its signature and, like
-  `harvest::bodies`, does not narrow. Code that builds a `Stats` with a struct
-  literal must add the field or use `..Default::default()`.
+- `rustograph::sem::Stats` (the `semantic` feature) has new public fields,
+  `out_of_reach`, `capped`, and `capped_names`, with the same meaning for
+  calls the semantic engine cannot resolve. `sem::Engine::body_edges` keeps
+  its signature and, like `harvest::bodies`, does not narrow. Code that builds
+  a `Stats` with a struct literal must add the fields or use
+  `..Default::default()`.
 
 ## Saved snapshots and MCP
 

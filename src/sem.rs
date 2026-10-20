@@ -65,6 +65,11 @@ pub struct Stats {
     /// 그 팬아웃의 같은 이름 메서드가 전부 본문 크레이트의 의존 폐포 밖 크레이트의 고유·트레이트
     /// 선언 메서드라 간선을 달지 않은 호출 수 — syn의 out_of_reach_method_calls와 같은 버킷.
     pub out_of_reach: usize,
+    /// 좁힌 후보가 팬아웃 폭 상한을 넘어 간선을 달지 않은 호출 수 — syn의 capped_method_calls와
+    /// 같은 버킷.
+    pub capped: usize,
+    /// 그 호출들의 메서드 이름(중복 없음).
+    pub capped_names: BTreeSet<String>,
     /// 그래프 밖(의존 크레이트·std·derive 생성 정의)으로 해석된 타깃 수.
     pub external: usize,
     /// 해석된 외부·std 매크로 호출 수 — syn의 external_macros와 같은 버킷.
@@ -1568,6 +1573,10 @@ impl<'a, 'b> Walker<'a, 'b> {
                 self.st.fanned += 1;
             }
             Fanned::OutOfReach => self.st.out_of_reach += 1,
+            Fanned::Capped => {
+                self.st.capped += 1;
+                self.st.capped_names.insert(name.to_string());
+            }
         }
     }
 

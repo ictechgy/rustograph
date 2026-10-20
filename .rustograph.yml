@@ -46,7 +46,7 @@ deps:
   modtree: []
   # cfgeval은 순수 평가기 — graph의 타깃 필터가 쓰는 유일한 소비자다.
   cfgeval: []
-  # fanout은 이름 팬아웃 정책(후보 규칙) — syn 수확과 의미 해석 폴백이 같은 규칙을 쓴다.
+  # fanout은 이름 팬아웃 정책(후보 규칙·폭 상한) — syn 수확과 의미 해석 폴백이 같은 규칙을 쓴다.
   fanout: []
   graph: [cfgeval]
   # deps 보고서는 cargo 메타데이터와 수확 그래프를 맞대조한다 —

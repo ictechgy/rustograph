@@ -2,8 +2,8 @@
 //!
 //! 구문 수준 수확이라 할 수 있는 것과 없는 것을 구분한다: 경로 호출·use·impl은
 //! 정확히 해석되고, 메서드 호출(`x.m()`)은 타입이 없어 이름 팬아웃으로
-//! 과대 근사한다 — 오탐은 "살아 있다" 쪽으로만 기울게 하는 계약이다. 후보 규칙은
-//! [`crate::fanout`]에 있다.
+//! 과대 근사한다 — 오탐은 "살아 있다" 쪽으로만 기울게 하는 계약이다. 후보 규칙과
+//! 그 예외(폭 상한을 넘는 호출은 간선 없이 센다)는 [`crate::fanout`]에 있다.
 
 use crate::fanout::{self, Fanned};
 use crate::graph::{Edge, EdgeKind, Kind, Vertex};
@@ -26,6 +26,11 @@ pub struct Harvest {
     /// 같은 이름 메서드가 전부 호출 크레이트의 의존 폐포 밖 크레이트의 고유·트레이트 선언 메서드라
     /// 팬아웃 간선을 달지 않은 메서드 호출 수 — 그런 메서드는 정적으로 호출할 수 없다.
     pub out_of_reach_method_calls: usize,
+    /// 좁힌 후보가 팬아웃 폭 상한을 넘어 간선을 달지 않은 메서드 호출 수 — 그 이름의 메서드를
+    /// 살려 두지 못하므로 limitation이 dead·도달성에 닿는 영향을 알린다.
+    pub capped_method_calls: usize,
+    /// 그 호출들의 메서드 이름(중복 없음).
+    pub capped_method_names: BTreeSet<String>,
     /// 외부/std 매크로 호출 수(유령 정점 없이 생략).
     pub external_macros: usize,
     /// cfg 조건부로 포함한 아이템 수.
@@ -585,7 +590,8 @@ pub fn attr_edges(
 
 /// 본문을 방문해 call/references/매크로 간선을 만든다(2패스).
 /// 이름 팬아웃은 `method_index`의 같은 이름 메서드 전부를 후보로 삼는다(크레이트로 좁히지 않는다 —
-/// 의존 그래프를 모른다). 워크스페이스 수확은 의존 폐포로 좁히는 변형을 쓴다.
+/// 의존 그래프를 모른다). 후보가 팬아웃 폭 상한을 넘는 호출은 간선 없이 [`Harvest`]에 센다.
+/// 워크스페이스 수확은 의존 폐포로 좁히는 변형을 쓴다.
 pub fn bodies(
     items: &[BodyItem],
     tree: &ModTree,
@@ -667,6 +673,8 @@ fn body_edges_within(
         unresolved: 0,
         fanned: 0,
         out_of_reach: 0,
+        capped: 0,
+        capped_names: BTreeSet::new(),
         ext_macros: 0,
     };
     for e in &b.exprs {
@@ -675,6 +683,8 @@ fn body_edges_within(
     harvest.unresolved_paths += vis.unresolved;
     harvest.fanned_method_calls += vis.fanned;
     harvest.out_of_reach_method_calls += vis.out_of_reach;
+    harvest.capped_method_calls += vis.capped;
+    harvest.capped_method_names.append(&mut vis.capped_names);
     harvest.external_macros += vis.ext_macros;
     vis.edges
 }
@@ -723,6 +733,8 @@ struct BodyVisitor<'a> {
     unresolved: usize,
     fanned: usize,
     out_of_reach: usize,
+    capped: usize,
+    capped_names: BTreeSet<String>,
     ext_macros: usize,
 }
 
@@ -768,6 +780,10 @@ impl BodyVisitor<'_> {
                 self.fanned += 1;
             }
             Fanned::OutOfReach => self.out_of_reach += 1,
+            Fanned::Capped => {
+                self.capped += 1;
+                self.capped_names.insert(name);
+            }
         }
     }
 

@@ -1671,6 +1671,16 @@ fn push_limitations(h: &Harvest, limitations: &mut Vec<String>) {
             h.out_of_reach_method_calls
         ));
     }
+    if h.capped_method_calls > 0 {
+        limitations.push(format!(
+            "{} method calls ({} names) match more than {} candidate methods and were not fanned \
+             out; methods reached only through them are reported unreachable by dead, and their \
+             callers are missing from query, impact, and reach",
+            h.capped_method_calls,
+            h.capped_method_names.len(),
+            fanout::MAX_CANDIDATES
+        ));
+    }
     if h.external_macros > 0 {
         limitations.push(format!(
             "{} macro invocations resolve to std/external macros and were omitted; \
@@ -1701,6 +1711,9 @@ fn push_sem_stats(
 ) {
     out.fanned_method_calls += st.fanned;
     out.out_of_reach_method_calls += st.out_of_reach;
+    out.capped_method_calls += st.capped;
+    out.capped_method_names
+        .extend(st.capped_names.iter().cloned());
     out.unresolved_paths += st.unresolved;
     limitations.push(format!(
         "semantic analysis: {} call/reference edges resolved via types; \
@@ -2281,6 +2294,44 @@ mod tests {
             call_targets(&doc, "owner_prefix::T10::run"),
             [("owner_prefix::T10::get", true)]
         );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 의존 폐포로 좁힌 뒤에도 같은 이름 후보가 팬아웃 폭 상한을 넘는 호출은 간선을 달지 않고 센다 —
+    /// 상한이 없으면 같은 이름 정의가 워크스페이스 크기에 비례해 는 입력에서 추정 간선이 코드 크기의
+    /// 제곱으로 늘었다. 정확히 상한인 호출은 그대로 펼친다. 같은 이름의 호출이 두 번이면 두 번 센다.
+    #[test]
+    fn fan_out_beyond_the_width_cap_is_counted_without_edges() {
+        let tmp = std::env::temp_dir().join(format!("rustograph-fan-cap-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let max = fanout::MAX_CANDIDATES;
+        let mut lib = String::new();
+        for i in 0..=max {
+            lib.push_str(&format!(
+                "pub struct T{i};\nimpl T{i} {{\n    pub fn get(&self) {{}}\n}}\n"
+            ));
+        }
+        for i in 0..max {
+            lib.push_str(&format!("impl T{i} {{\n    pub fn put(&self) {{}}\n}}\n"));
+        }
+        lib.push_str("pub fn call(x: Unknown) {\n    x.get();\n    x.put();\n    x.get();\n}\n");
+        let dir = write_crate(&tmp, "wide", None, &[("src/lib.rs", lib.as_bytes())]);
+        let doc = load(&dir, &span_options()).unwrap();
+        let targets = call_targets(&doc, "wide::call");
+        assert_eq!(targets.len(), max, "only `put` is fanned out");
+        assert!(targets
+            .iter()
+            .all(|(to, tentative)| to.ends_with("::put") && *tentative));
+        let capped = format!(
+            "2 method calls (1 names) match more than {max} candidate methods and were not fanned \
+             out; methods reached only through them are reported unreachable by dead, and their \
+             callers are missing from query, impact, and reach"
+        );
+        assert!(doc.limitations.contains(&capped), "{:?}", doc.limitations);
+        assert!(doc.limitations.contains(
+            &"1 method calls resolved by name fan-out (no type information; errs toward alive)"
+                .to_string()
+        ));
         std::fs::remove_dir_all(&tmp).ok();
     }
 
