@@ -4,11 +4,12 @@
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 /// 규칙 파일. `components`는 경로 패턴 → 컴포넌트, `deps`는 허용 목록,
 /// `deny`는 무조건 금지(deps를 이긴다), `signature`는 공개 API 타입 누출 제한.
-/// `baseline`은 기존 위반을 얼린 파일의 경로 — 설정 파일 기준 상대 경로다.
+/// `baseline`은 기존 위반을 얼린 파일의 경로 — 설정 파일 기준 상대 경로이고 `--dir` 안이어야
+/// 한다([`resolve_baseline`]).
 /// 모르는 키는 거부한다 — 필드가 전부 선택이라, 받아 주면 `components:`를 `component:`로
 /// 잘못 쓴 설정 하나로 규칙이 통째로 꺼진 채 `rules --strict`가 0으로 통과한다.
 /// [`load_file`]은 규칙 키가 정의된 컴포넌트를 가리키는지도 본다.
@@ -24,7 +25,8 @@ pub struct Config {
     #[serde(default)]
     pub signature: BTreeMap<String, Vec<String>>,
     /// 기준선 파일 경로 — 레거시 도입 시 기존 위반을 얼려 새 위반만
-    /// 실패하게 하는 장치. 파일이 없으면 조용히 무시한다.
+    /// 실패하게 하는 장치. 파일이 없으면 조용히 무시한다. 분석 대상 저장소가 고른 값이라
+    /// 읽고 쓰기 전에 [`resolve_baseline`]으로 `--dir` 안에 가둔다.
     #[serde(default)]
     pub baseline: Option<String>,
 }
@@ -101,6 +103,114 @@ fn escape_control_chars(message: &str) -> String {
         }
     }
     escaped
+}
+
+/// 설정의 `baseline:` 값을 읽고 쓸 경로로 푼다 — `cfg_dir`(설정 파일의 디렉터리) 기준 상대 경로이고,
+/// 푼 결과는 `root`(`--dir` 디렉터리) 안이어야 한다. 값은 분석 대상 저장소가 고른다:
+/// `rules --write-baseline`이 이 경로에 중간 디렉터리까지 만들어 쓰므로, 가두지 않으면 기여자 PR이
+/// 바꾼 설정 한 줄이 메인테이너의 저장소 밖 파일을 기준선 텍스트로 덮어쓴다. 명시 `--baseline FILE`은
+/// 실행한 사람이 고른 입력이라 이 함수를 거치지 않는다(호출자 몫).
+///
+/// 거부하는 것: 절대 경로와 루트 접두(Windows 드라이브·`\` 시작 포함), `.`·`..`를 어휘적으로 푼 결과가
+/// `root` 밖인 경로, 존재하는 가장 가까운 조상이 심볼릭 링크를 따라 `root` 밖으로 나가는 경로(풀리지
+/// 않는 링크 포함). 루트 안의 `..`는 받는다 — 모노레포 하위 설정 `sub/.rustograph.yml`의 `../base.txt`.
+/// 기준은 cargo 워크스페이스 루트가 아니라 `--dir`이다: `--graph`에서는 cargo를 돌리지 않고, 스냅샷이
+/// 적은 워크스페이스는 신뢰할 수 없는 값이다.
+///
+/// 돌려주는 경로: `..`가 없으면 `cfg_dir`에 그대로 이은 경로다(이전과 같은 표기 — 이때는 OS가 푸는
+/// 경로가 검사한 경로와 같다). `..`가 있으면 어휘적으로 푼 정규 경로다 — OS는 `link/..`를 링크 대상의
+/// 부모로 풀어 어휘 검사와 어긋나므로, 검사한 경로 그대로 읽고 쓰게 한다. 오류는 원인과 해결 방향을
+/// 싣고, 설정에서 온 값은 `{:?}`로 실어 제어 문자가 터미널에 닿지 않게 한다.
+pub fn resolve_baseline(cfg_dir: &Path, root: &Path, raw: &str) -> Result<PathBuf, String> {
+    let relative = Path::new(raw);
+    let refuse = |cause: String| {
+        format!(
+            "baseline {raw:?} from the rules file {cause}; write it relative to the rules file \
+             and keep it inside the --dir directory"
+        )
+    };
+    let (target, climbs) = lexical_target(cfg_dir, relative).map_err(refuse)?;
+    let real_root = root.canonicalize().map_err(|e| {
+        refuse(format!(
+            "cannot be checked: the --dir directory {} cannot be resolved ({e})",
+            root.display()
+        ))
+    })?;
+    if !target.starts_with(&real_root) {
+        return Err(refuse(format!(
+            "resolves to {target:?}, outside the --dir directory {}",
+            real_root.display()
+        )));
+    }
+    linked_ancestor_within(&target, &real_root).map_err(refuse)?;
+    Ok(if climbs {
+        target
+    } else {
+        cfg_dir.join(relative)
+    })
+}
+
+/// `cfg_dir`의 정규 경로에 `relative`의 구성 요소를 어휘적으로 잇는다 — `.`는 건너뛰고 `..`는 한 단계
+/// 올라간다(심볼릭 링크를 따라가지 않는다). 정규 경로에서 시작하므로 결과의 앞부분에는 링크가 없다.
+/// `..`를 하나라도 만났는지 함께 돌려준다. 접두·루트 구성 요소(절대 경로, Windows 드라이브와 `\`
+/// 시작)는 거부한다. 빈 `cfg_dir`(경로 없는 `--config rules.yml`의 부모)은 현재 디렉터리다.
+fn lexical_target(cfg_dir: &Path, relative: &Path) -> Result<(PathBuf, bool), String> {
+    let start = if cfg_dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        cfg_dir
+    };
+    let mut target = start.canonicalize().map_err(|e| {
+        format!(
+            "cannot be checked: the rules file's directory {} cannot be resolved ({e})",
+            start.display()
+        )
+    })?;
+    let mut climbs = false;
+    for part in relative.components() {
+        match part {
+            Component::Normal(name) => target.push(name),
+            Component::ParentDir => {
+                climbs = true;
+                target.pop();
+            }
+            Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir => {
+                return Err("is an absolute path".to_string())
+            }
+        }
+    }
+    Ok((target, climbs))
+}
+
+/// `target`이나 그 조상 가운데 존재하는 가장 가까운 것을 끝까지 풀어 `real_root` 안인지 본다 — 어휘적으로
+/// 루트 안이어도 저장소 안의 심볼릭 링크(디렉터리나 파일)가 밖을 가리키면 읽기·쓰기가 밖에 닿는다.
+/// 링크인데 풀리지 않으면(대상 없는 링크) 나중에 무엇을 가리킬지 몰라 거부한다. 재귀 대신 반복으로
+/// 올라간다 — `target`은 `real_root`로 시작하니 늦어도 `real_root`에서 멈춘다.
+fn linked_ancestor_within(target: &Path, real_root: &Path) -> Result<(), String> {
+    let mut existing = target;
+    loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                existing = existing
+                    .parent()
+                    .ok_or_else(|| format!("has no existing directory above {target:?}"))?;
+            }
+            Err(e) => return Err(format!("cannot be inspected at {existing:?} ({e})")),
+        }
+    }
+    let resolved = existing.canonicalize().map_err(|e| {
+        format!("leads through {existing:?}, a symbolic link that cannot be resolved ({e})")
+    })?;
+    if resolved.starts_with(real_root) {
+        Ok(())
+    } else {
+        Err(format!(
+            "leads through {existing:?} to {resolved:?}, outside the --dir directory {}",
+            real_root.display()
+        ))
+    }
 }
 
 /// 설정·기준선 파일의 크기 상한(바이트). 기준선은 위반 하나가 한 줄이라 큰 레거시
@@ -408,6 +518,110 @@ signature:
             read_bounded_text(Path::new("/dev/zero"), 4096, FileKinds::AnyReadable).unwrap_err();
         assert_eq!(zero.kind(), std::io::ErrorKind::InvalidData);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 설정의 `baseline:`은 설정 파일 디렉터리 기준이고 `--dir` 안이어야 한다 — 분석 대상 저장소가
+    /// 고른 값이라, 가두지 않으면 `--write-baseline`이 저장소 밖 파일을 덮어쓰고 중간 디렉터리까지
+    /// 만든다. 루트 안의 `..`(모노레포 하위 설정의 `../base.txt`)는 받는다. `..`가 없으면 이전과 같은
+    /// 표기를, 있으면 정규화한 경로를 돌려준다. 루트 밖 설정의 상대 경로도 루트 밖이면 거부한다.
+    #[test]
+    fn resolve_baseline_keeps_config_paths_inside_the_root() {
+        let tmp = std::env::temp_dir().join(format!("rg-config-baseline-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let (root, outside) = (tmp.join("root"), tmp.join("outside"));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let real_root = root.canonicalize().unwrap();
+        assert_eq!(
+            resolve_baseline(&root, &root, ".rustograph/rules-baseline.txt").unwrap(),
+            root.join(".rustograph/rules-baseline.txt")
+        );
+        assert_eq!(
+            resolve_baseline(Path::new(""), Path::new("."), "base.txt").unwrap(),
+            PathBuf::from("base.txt")
+        );
+        assert_eq!(
+            resolve_baseline(&root.join("sub"), &root, "../base.txt").unwrap(),
+            real_root.join("base.txt")
+        );
+        assert_eq!(
+            resolve_baseline(&root, &root, "sub/./../sub/base.txt").unwrap(),
+            real_root.join("sub").join("base.txt")
+        );
+        let absolute = outside.join("absolute.txt").display().to_string();
+        for (cfg_dir, raw, cause) in [
+            (root.clone(), absolute.as_str(), "is an absolute path"),
+            (
+                root.clone(),
+                "../outside/new/deep/x.txt",
+                "outside the --dir directory",
+            ),
+            (
+                root.join("sub"),
+                "../../outside/x.txt",
+                "outside the --dir directory",
+            ),
+            (
+                root.clone(),
+                "sub/../../root-sibling.txt",
+                "outside the --dir directory",
+            ),
+            (outside.clone(), "base.txt", "outside the --dir directory"),
+        ] {
+            let err = resolve_baseline(&cfg_dir, &root, raw).unwrap_err();
+            assert!(
+                err.starts_with(&format!("baseline {raw:?} from the rules file "))
+                    && err.contains(cause)
+                    && err.contains("inside the --dir directory"),
+                "{raw}: {err}"
+            );
+        }
+        assert!(!outside.join("new").exists());
+        // 루트를 풀 수 없으면 안인지 확인할 수 없어 거부한다.
+        let err = resolve_baseline(&root, &tmp.join("gone"), "base.txt").unwrap_err();
+        assert!(err.contains("cannot be checked"), "{err}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 어휘적으로 루트 안이어도 저장소 안의 심볼릭 링크가 밖을 가리키면 쓰기가 밖에 닿는다 — 존재하는
+    /// 가장 가까운 조상을 따라가 보고, 풀리지 않는 링크는 어디를 가리킬지 몰라 거부한다. `..`는 링크를
+    /// 따라가지 않고 어휘적으로 푼 경로를 돌려준다(`escape/..`를 OS는 링크 대상의 부모로 푼다).
+    #[cfg(unix)]
+    #[test]
+    fn resolve_baseline_refuses_symbolic_links_that_leave_the_root() {
+        use std::os::unix::fs::symlink;
+        let tmp = std::env::temp_dir().join(format!("rg-config-links-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let (root, outside) = (tmp.join("root"), tmp.join("outside"));
+        std::fs::create_dir_all(root.join("inner")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("victim.txt"), "keep\n").unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+        symlink(outside.join("victim.txt"), root.join("victim-link.txt")).unwrap();
+        symlink(tmp.join("missing"), root.join("dangling")).unwrap();
+        symlink(root.join("inner"), root.join("inner-link")).unwrap();
+        for (raw, cause) in [
+            ("escape/new.txt", "outside the --dir directory"),
+            ("escape/victim.txt", "outside the --dir directory"),
+            ("victim-link.txt", "outside the --dir directory"),
+            ("dangling", "cannot be resolved"),
+            ("dangling/x.txt", "cannot be resolved"),
+        ] {
+            let err = resolve_baseline(&root, &root, raw).unwrap_err();
+            assert!(
+                err.contains(cause) && err.contains("inside the --dir directory"),
+                "{raw}: {err}"
+            );
+        }
+        assert_eq!(
+            resolve_baseline(&root, &root, "inner-link/base.txt").unwrap(),
+            root.join("inner-link/base.txt")
+        );
+        assert_eq!(
+            resolve_baseline(&root, &root, "escape/../base.txt").unwrap(),
+            root.canonicalize().unwrap().join("base.txt")
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

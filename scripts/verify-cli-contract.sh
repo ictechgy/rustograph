@@ -170,6 +170,16 @@ grep -q "allow|fixture_app" "$FIX/base.txt" || {
 	echo "FAIL baseline file: no violation key written" >&2
 	fails=$((fails+1))
 }
+# 설정의 baseline:은 설정 파일 기준이고 --dir 안이어야 한다 — 저장소가 고른 값이라 루트 밖·절대
+# 경로는 수확 전에 2이고 바깥에 파일·디렉터리를 만들지 않는다. 명시 --baseline은 위 줄처럼 어디든 된다.
+{ cat "$FIX/deny.yml"; echo 'baseline: ../escaped/new/base.txt'; } > "$FIX/fixture/escape.yml"
+{ cat "$FIX/deny.yml"; echo "baseline: $FIX/absolute.txt"; } > "$FIX/fixture/absolute.yml"
+check 2 "baseline escape"   rules --config "$FIX/fixture/escape.yml" --write-baseline
+check 2 "baseline absolute" rules --config "$FIX/fixture/absolute.yml" --write-baseline
+if [ -e "$FIX/escaped" ] || [ -e "$FIX/absolute.txt" ]; then
+	echo "FAIL baseline bound: wrote outside --dir" >&2
+	fails=$((fails+1))
+fi
 
 # --semantic — opt-in feature 계약: feature 빌드면 분석 성공(0), 아니면
 # 무엇을 빌드해야 하는지 알려주는 명확한 오류(2)여야 한다. 조용한 syn

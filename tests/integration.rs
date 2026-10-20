@@ -220,9 +220,14 @@ mod cli_tests {
     use std::io::Write;
 
     fn run(args: &[&str]) -> (i32, String, String) {
+        run_at(&fixture(), args)
+    }
+
+    /// `dir`을 `--dir`로 붙여 같은 프로세스에서 CLI를 돌린다 — (종료 코드, stdout, stderr).
+    fn run_at(dir: &std::path::Path, args: &[&str]) -> (i32, String, String) {
         let mut argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         argv.push("--dir".into());
-        argv.push(fixture().display().to_string());
+        argv.push(dir.display().to_string());
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = cli::run(&argv, &mut out, &mut err);
@@ -231,6 +236,35 @@ mod cli_tests {
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap(),
         )
+    }
+
+    /// [`layered_workspace`]에 위반 하나(app → core 호출)를 내는 규칙.
+    const LAYERED_RULES: &str =
+        "components:\n  app: [\"layers::app/**\"]\n  core: [\"layers::core/**\"]\n\
+         deps:\n  app: []\n  core: []\n";
+
+    /// app 모듈이 core 모듈을 부르는 단일 패키지 워크스페이스를 `dir`에 만든다. 설정의 `baseline:`은
+    /// `--dir` 안이어야 하니 설정·기준선을 둘 수 있는 워크스페이스가 필요하다 — tests/fixture는 저장소
+    /// 안이라 쓸 수 없다. 미해석 include가 없어 기존 출력 교체가 막히지 않는다(tests/fixture와 다르다) —
+    /// 루트 밖 기존 파일을 지키는 것이 경로 경계인지 가려낸다.
+    fn layered_workspace(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"layers\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub mod app;\npub mod core;\n").unwrap();
+        std::fs::write(
+            dir.join("src/app.rs"),
+            "pub fn run() -> u32 {\n    crate::core::value()\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/core.rs"),
+            "pub fn value() -> u32 {\n    1\n}\n",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -745,31 +779,135 @@ mod cli_tests {
         let _ = std::fs::remove_file(&base);
     }
 
-    /// README의 기준선 흐름 — 설정 옆 `.rustograph/rules-baseline.txt`가 아직 없으면 도입
-    /// 전으로 보고, `--write-baseline`이 디렉터리째 만들어 얼린 뒤 strict가 억누른다.
+    /// README의 기준선 흐름 — `--dir`에서 찾은 `.rustograph.yml`이 가리키는
+    /// `.rustograph/rules-baseline.txt`가 아직 없으면 도입 전으로 보고, `--write-baseline`이
+    /// 디렉터리째 만들어 얼린 뒤 strict가 억누른다. 설정의 baseline은 `--dir` 안이어야 하므로
+    /// 설정과 기준선을 수확하는 워크스페이스 안에 둔다.
     #[test]
     fn rules_baseline_under_dot_rustograph_round_trips() {
         let tmp = std::env::temp_dir().join(format!("rg-dot-base-{}", std::process::id()));
         std::fs::remove_dir_all(&tmp).ok();
-        std::fs::create_dir_all(&tmp).unwrap();
-        let cfg = tmp.join(".rustograph.yml");
+        layered_workspace(&tmp);
         std::fs::write(
-            &cfg,
-            "components:\n  app: [\"fixture_app/**\"]\n  core: [\"fixture_core/**\"]\n\
-             deps:\n  app: []\n  core: []\nbaseline: .rustograph/rules-baseline.txt\n",
+            tmp.join(".rustograph.yml"),
+            format!("{LAYERED_RULES}baseline: .rustograph/rules-baseline.txt\n"),
         )
         .unwrap();
-        let cfgp = cfg.to_str().unwrap();
-        let (code, _, err) = run(&["rules", "--strict", "--config", cfgp]);
+        let (code, _, err) = run_at(&tmp, &["rules", "--strict"]);
         assert_eq!(code, 1, "{err}");
-        let (code, out, err) = run(&["rules", "--config", cfgp, "--write-baseline"]);
+        let (code, out, err) = run_at(&tmp, &["rules", "--write-baseline"]);
         assert_eq!(code, 0, "{err}");
         assert!(out.contains("wrote baseline"));
         let frozen = std::fs::read_to_string(tmp.join(".rustograph/rules-baseline.txt")).unwrap();
-        assert!(frozen.contains("allow|fixture_app"), "{frozen}");
-        let (code, out, err) = run(&["rules", "--strict", "--config", cfgp]);
+        assert!(frozen.contains("allow|layers::app"), "{frozen}");
+        let (code, out, err) = run_at(&tmp, &["rules", "--strict"]);
         assert_eq!(code, 0, "{err}");
         assert!(out.contains("suppressed by baseline"));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 설정의 `baseline:`은 분석 대상 저장소가 고른다 — `--write-baseline`이 그 경로에 중간
+    /// 디렉터리까지 만들어 쓰므로, `--dir` 밖을 가리키는 값(`..`, 절대 경로, 밖을 가리키는 심볼릭
+    /// 링크 디렉터리)은 수확 전에 2로 끝나고 밖에 아무것도 쓰거나 만들지 않는다. 예전에는 저장소 밖
+    /// 기존 파일을 기준선 텍스트로 덮어썼다. 읽기(`rules --strict`)도 같고, `--dir` 밖에 둔 명시
+    /// `--config`의 상대 baseline도 같다. 명시 `--baseline`은 실행한 사람이 고른 입력이라 밖도 된다.
+    #[test]
+    fn config_baselines_stay_inside_the_dir_directory() {
+        let tmp = std::env::temp_dir().join(format!("rg-base-bound-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let (ws, outside) = (tmp.join("ws"), tmp.join("outside"));
+        layered_workspace(&ws);
+        std::fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("victim.txt");
+        std::fs::write(&victim, "keep\n").unwrap();
+        let absolute = outside.join("absolute.txt").display().to_string();
+        let cases = [
+            ("../outside/victim.txt", "outside the --dir directory"),
+            ("../outside/new/deep/x.txt", "outside the --dir directory"),
+            (absolute.as_str(), "is an absolute path"),
+        ];
+        // 저장소 안 심볼릭 링크 디렉터리가 밖을 가리키는 경우 — 링크는 unix에서만 만든다.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, ws.join("escape")).unwrap();
+        let linked: &[(&str, &str)] = if cfg!(unix) {
+            &[("escape/link.txt", "outside the --dir directory")]
+        } else {
+            &[]
+        };
+        let cfg = ws.join(".rustograph.yml");
+        for (raw, cause) in cases.iter().chain(linked) {
+            let quoted = serde_json::to_string(raw).unwrap();
+            std::fs::write(&cfg, format!("{LAYERED_RULES}baseline: {quoted}\n")).unwrap();
+            for args in [
+                &["rules", "--write-baseline"][..],
+                &["rules", "--strict"][..],
+            ] {
+                let (code, out, err) = run_at(&ws, args);
+                assert_eq!(code, 2, "{raw} {args:?}: {out}");
+                assert!(
+                    err.contains(cause) && err.contains("or pass --baseline FILE"),
+                    "{raw} {args:?}: {err}"
+                );
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
+        let entries = std::fs::read_dir(&outside).unwrap().count();
+        assert_eq!(entries, 1, "nothing may appear outside the --dir directory");
+        // `--dir` 밖에 둔 명시 --config의 상대 baseline도 루트 밖이다.
+        let outside_cfg = outside.join("rules.yml");
+        std::fs::write(
+            &outside_cfg,
+            format!("{LAYERED_RULES}baseline: rules-baseline.txt\n"),
+        )
+        .unwrap();
+        let (code, _, err) = run_at(
+            &ws,
+            &[
+                "rules",
+                "--strict",
+                "--config",
+                outside_cfg.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(code, 2, "{err}");
+        assert!(err.contains("outside the --dir directory"), "{err}");
+        // 명시 --baseline은 루트 밖도 쓴다.
+        std::fs::write(&cfg, LAYERED_RULES).unwrap();
+        let explicit = outside.join("explicit.txt");
+        let (code, _, err) = run_at(
+            &ws,
+            &[
+                "rules",
+                "--write-baseline",
+                "--baseline",
+                explicit.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(code, 0, "{err}");
+        let frozen = std::fs::read_to_string(&explicit).unwrap();
+        assert!(frozen.contains("allow|layers::app"), "{frozen}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 루트 안이면 `..`도 된다 — 모노레포 하위 설정 `sub/.rustograph.yml`의 `../base.txt`는
+    /// `--dir` 루트의 base.txt다. 쓰고, 다음 실행이 그 파일로 억누른다.
+    #[test]
+    fn config_baselines_may_climb_within_the_dir_directory() {
+        let tmp = std::env::temp_dir().join(format!("rg-base-climb-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        layered_workspace(&tmp);
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        let cfg = tmp.join("sub/.rustograph.yml");
+        std::fs::write(&cfg, format!("{LAYERED_RULES}baseline: ../base.txt\n")).unwrap();
+        let cfg = cfg.to_str().unwrap();
+        let (code, out, err) = run_at(&tmp, &["rules", "--config", cfg, "--write-baseline"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("wrote baseline"), "{out}");
+        let frozen = std::fs::read_to_string(tmp.join("base.txt")).unwrap();
+        assert!(frozen.contains("allow|layers::app"), "{frozen}");
+        let (code, out, err) = run_at(&tmp, &["rules", "--strict", "--config", cfg]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("suppressed by baseline"), "{out}");
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -782,7 +920,8 @@ mod cli_tests {
     fn rules_refuses_special_config_and_baseline_files() {
         let tmp = std::env::temp_dir().join(format!("rg-special-{}", std::process::id()));
         std::fs::remove_dir_all(&tmp).ok();
-        std::fs::create_dir_all(&tmp).unwrap();
+        // 설정의 baseline은 --dir 안이어야 열어 보므로 FIFO를 수확하는 워크스페이스 안에 둔다.
+        layered_workspace(&tmp);
         let fifo = tmp.join("pipe");
         let made = std::process::Command::new("mkfifo")
             .arg(&fifo)
@@ -790,11 +929,7 @@ mod cli_tests {
             .expect("mkfifo must run");
         assert!(made.success());
         let cfg = tmp.join("rules.yml");
-        std::fs::write(
-            &cfg,
-            "components:\n  app: [\"fixture_app/**\"]\ndeps:\n  app: []\nbaseline: pipe\n",
-        )
-        .unwrap();
+        std::fs::write(&cfg, format!("{LAYERED_RULES}baseline: pipe\n")).unwrap();
         let cfgp = cfg.to_str().unwrap();
         for (args, cause, why) in [
             // 설정의 baseline이 FIFO — 열지 않는다.
@@ -810,7 +945,7 @@ mod cli_tests {
                 "larger than",
             ),
         ] {
-            let (code, _, err) = run(&args);
+            let (code, _, err) = run_at(&tmp, &args);
             assert_eq!(code, 2, "{args:?}: {err}");
             assert!(err.contains(cause) && err.contains(why), "{args:?}: {err}");
         }

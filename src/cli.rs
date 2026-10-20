@@ -461,13 +461,19 @@ fn cmd_rules(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
             None => return Err(format!("no .rustograph.yml in {}", dir.display())),
         },
     };
+    // 기준선 경로 — --baseline이 cfg.baseline을 이긴다. 설정의 baseline:은 분석 대상 저장소가
+    // 고른 값이라 --dir 안으로 가둔다(config::resolve_baseline). 명시 --baseline은 실행한 사람이
+    // 고른 입력이라 그대로 쓴다. 수확 전에 푼다 — 거부할 설정에 수확 비용을 쓰지 않는다.
+    let baseline_path = match (a.get("baseline"), cfg.baseline.as_deref()) {
+        (Some(explicit), _) => Some(PathBuf::from(explicit)),
+        (None, Some(raw)) => Some(
+            config::resolve_baseline(&cfg_dir, &dir, raw)
+                .map_err(|e| format!("{e}, or pass --baseline FILE"))?,
+        ),
+        (None, None) => None,
+    };
     let (doc, inputs) = cli_args::document_with_inputs(a, true, a.has("write-baseline"))?;
     let mut report = rules::check(&doc, &cfg);
-    // 기준선 경로 — --baseline이 cfg.baseline을 이긴다.
-    let baseline_path = a
-        .get("baseline")
-        .map(PathBuf::from)
-        .or_else(|| cfg.baseline.as_ref().map(|b| cfg_dir.join(b)));
     // --write-baseline: 현재 위반을 기준선으로 기록하고 끝낸다 —
     // 레거시 도입의 첫 단계는 "기존 위반을 얼리는 것"이다.
     if a.has("write-baseline") {

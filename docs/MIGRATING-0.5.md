@@ -120,6 +120,20 @@ every module unmapped while `rules --strict` still exited 0, and a misspelled
 `deny` or `signature` key dropped that rule. Correct the key or define the
 component; a placeholder file needs at least one component.
 
+A `baseline:` in a rules file has to stay inside the `--dir` directory. It is
+still relative to the rules file, and `..` may climb within the `--dir`
+directory, but an absolute path, a path that climbs out of it, and a path that
+leaves it through a symbolic link are configuration errors (exit 2, or an error
+from `rustograph_rules`) before `rules` harvests, reads or writes anything.
+Earlier releases followed the path wherever it led, so a rules file from an
+untrusted branch could make `rules --write-baseline` replace a file outside the
+repository. This also applies when `--config` names a file outside `--dir`,
+including `--config /dev/stdin`, whose relative baseline resolves under `/dev`:
+move the baseline under the `--dir` directory, or pass `--baseline FILE`, which
+is not restricted. When the `baseline:` path contains `..`,
+`rules --write-baseline` reports the normalized path it wrote. Library callers
+can apply the same rule with the new `rustograph::config::resolve_baseline`.
+
 ## Mermaid output
 
 Mermaid labels write `"`, `%`, `<`, `>` and `&` as Mermaid entity codes

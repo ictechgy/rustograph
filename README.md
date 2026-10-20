@@ -249,6 +249,16 @@ key per line, `#` comments allowed), and later runs suppress matching
 violations while still reporting `baselined`/`stale_baseline` counts —
 stale entries mean the code improved and the file can be regenerated.
 
+`baseline:` is relative to the directory of the rules file and has to stay
+inside the `--dir` directory, because the rules file comes from the analyzed
+repository and `--write-baseline` creates the file and its parent directories.
+An absolute path, a path whose `..` climbs out of the `--dir` directory, and one
+that leaves it through a symbolic link are configuration errors, which `rules`
+reports before it harvests, reads or writes anything. `..` that stays inside is fine,
+so `--config sub/.rustograph.yml` can name `../base.txt`. The same holds for a
+`--config` file outside `--dir` and for the MCP server's `--dir`. An explicit
+`--baseline FILE` is your own choice and may point anywhere.
+
 ## Persistence facts — `schema`
 
 `rustograph schema` emits an isthmus `bridge-facts` v1 document

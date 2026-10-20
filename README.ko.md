@@ -134,6 +134,13 @@ MCP 도구 인자도 같은 상한을 넘으면 isError로 답하고, 응답은 
 종료 코드 `2`, MCP `rustograph_rules`는 isError로 답합니다. 키만 검사하므로 목록에는
 여전히 컴포넌트 이름이나 모듈 패턴을 쓸 수 있습니다.
 
+설정의 `baseline:`은 설정 파일 디렉터리 기준 상대 경로이고 `--dir` 디렉터리 안이어야
+합니다. 설정은 분석 대상 저장소에서 오고, `--write-baseline`은 그 경로에 파일과 상위
+디렉터리를 만들기 때문입니다. 절대 경로, `..`로 `--dir` 밖으로 나가는 경로, 심볼릭 링크를
+따라 밖으로 나가는 경로는 수확·읽기·쓰기 전에 설정 오류입니다. 안에 머무는 `..`는 됩니다
+(`--config sub/.rustograph.yml`의 `../base.txt`). `--dir` 밖에 둔 `--config`와 MCP 서버의
+`--dir`도 같고, 명시 `--baseline FILE`은 실행한 사람이 고른 경로라 어디든 됩니다.
+
 ## persistence 사실 — `schema`
 
 `rustograph schema`는 코드가 SQL 관계를 어떻게 참조하는지 담은 isthmus

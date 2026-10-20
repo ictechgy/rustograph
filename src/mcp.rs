@@ -450,13 +450,20 @@ impl<'d> Server<'d> {
                 // 설정은 호출마다 다시 읽는다(세션 중 바뀔 수 있다) — 명시 --config여도 정규
                 // 파일만 연다. 한 번만 읽히는 파이프는 두 번째 호출에서 멈추거나 빈 설정을 읽는다.
                 let cfg = config::load_file(cfg_path, config::FileKinds::RegularOnly)?;
-                let mut rep = rules::check(self.doc, &cfg);
-                // 설정에 선언된 기준선을 적용한다 — CLI rules와 같은 계약.
+                // 설정에 선언된 기준선을 적용한다 — CLI rules와 같은 계약. 경로는 서버의
+                // --dir 안으로 가둔다(config::resolve_baseline) — 설정은 분석 대상 저장소가 고른다.
                 // NotFound만 도입 전으로 본다 — 권한 오류나 깨진 파일을
                 // 조용히 넘기면 억제가 안 먹힌 채로 지나간다. 장치·FIFO는
                 // 열지 않고 상한까지만 읽는다 — 서버가 멈추면 안 된다.
-                if let Some(b) = &cfg.baseline {
-                    let path = cfg_path.parent().unwrap_or(self.dir.as_path()).join(b);
+                let baseline_path = match &cfg.baseline {
+                    Some(b) => {
+                        let cfg_dir = cfg_path.parent().unwrap_or(self.dir.as_path());
+                        Some(config::resolve_baseline(cfg_dir, &self.dir, b)?)
+                    }
+                    None => None,
+                };
+                let mut rep = rules::check(self.doc, &cfg);
+                if let Some(path) = baseline_path {
                     match config::read_bounded_text(
                         &path,
                         config::MAX_FILE_BYTES,
@@ -624,7 +631,7 @@ fn tool_list() -> serde_json::Value {
         },
         {
             "name": "rustograph_rules",
-            "description": "Check layer rules from .rustograph.yml; returns violations and unmapped vertices. A rules file with an unknown key, a rule keyed by a component that components does not define, or no component is an error",
+            "description": "Check layer rules from .rustograph.yml; returns violations and unmapped vertices. A rules file with an unknown key, a rule keyed by a component that components does not define, or no component is an error, and so is a baseline: path that leaves the --dir directory",
             "inputSchema": {"type": "object", "properties": {}},
         },
     ])
@@ -970,8 +977,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// rules 도구도 설정·기준선을 상한 읽기로 연다 — 장치를 가리키는 baseline과 FIFO
-    /// 설정 파일은 서버를 멈추거나 메모리를 다 쓰지 않고 isError로 답한다.
+    /// rules 도구도 설정·기준선을 상한 읽기로 연다 — `--dir` 안의 FIFO를 가리키는 baseline과
+    /// FIFO 설정 파일은 서버를 멈추지 않고 isError로 답한다(장치 같은 절대 경로 baseline은
+    /// 경로 경계가 먼저 거부한다 — `rules_tool_keeps_config_baselines_inside_the_dir_directory`).
     #[cfg(unix)]
     #[test]
     fn rules_tool_refuses_special_config_and_baseline_files() {
@@ -984,18 +992,18 @@ mod tests {
             .status()
             .expect("mkfifo must run");
         assert!(made.success());
-        let device_baseline = dir.join("rules.yml");
+        let fifo_baseline = dir.join("rules.yml");
         std::fs::write(
-            &device_baseline,
-            "components:\n  all: [\"c/**\"]\nbaseline: /dev/zero\n",
+            &fifo_baseline,
+            "components:\n  all: [\"c/**\"]\nbaseline: pipe.yml\n",
         )
         .unwrap();
         let doc = test_doc();
-        let mut srv = server_for(&doc);
+        let mut srv = Server::new(&doc, dir.clone(), None);
         for (cfg, cause) in [
             (
-                device_baseline,
-                "cannot read baseline /dev/zero: ".to_string(),
+                fifo_baseline,
+                format!("cannot read baseline {}: ", fifo.display()),
             ),
             (fifo.clone(), format!("cannot read {}: ", fifo.display())),
         ] {
@@ -1009,6 +1017,49 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// rules 도구도 설정의 baseline을 서버의 `--dir` 안으로 가둔다 — 루트 밖과 절대 경로(장치
+    /// 포함)는 열지 않고 isError다. 예전에는 저장소 밖 파일을 기준선으로 읽어 그 줄 수를
+    /// stale_baseline으로 답했다. MCP에는 `--baseline`이 없으니 오류가 그것을 권하지 않는다.
+    /// 루트 안 기준선은 그대로 읽는다.
+    #[test]
+    fn rules_tool_keeps_config_baselines_inside_the_dir_directory() {
+        let tmp = std::env::temp_dir().join(format!("rg-mcp-bound-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let root = tmp.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(tmp.join("outside.txt"), "allow|x|y|call\n").unwrap();
+        let doc = test_doc();
+        let mut srv = Server::new(&doc, root.clone(), None);
+        let cfg = root.join("rules.yml");
+        srv.cfg_path = Some(cfg.clone());
+        for (raw, cause) in [
+            ("../outside.txt", "outside the --dir directory"),
+            ("/dev/zero", "is an absolute path"),
+        ] {
+            std::fs::write(
+                &cfg,
+                format!("components:\n  all: [\"c/**\"]\nbaseline: {raw}\n"),
+            )
+            .unwrap();
+            let result = call_rules(&srv);
+            assert_eq!(result["isError"], true, "{raw}: {result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.starts_with(&format!("baseline {raw:?} from the rules file "))
+                    && text.contains(cause)
+                    && !text.contains("--baseline"),
+                "{text}"
+            );
+        }
+        std::fs::write(root.join("base.txt"), "allow|x|y|call\n").unwrap();
+        std::fs::write(&cfg, "components:\n  all: [\"c/**\"]\nbaseline: base.txt\n").unwrap();
+        let result = call_rules(&srv);
+        assert_eq!(result["isError"], serde_json::Value::Null, "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"stale_baseline\": 1"), "{text}");
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// 정점 30개 사슬에 갈래·순환·추정 간선·공개 정점을 섞은 문서 — 도구마다 비지 않은 답이 있다.
