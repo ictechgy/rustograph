@@ -55,6 +55,14 @@ check 2 "impact missing"    impact fixture_core::missing
 check 2 "rules no config"   rules --strict
 check 0 "rules"             rules --config "$FIX/rules.yml"
 check 0 "rules sarif"       rules --config "$FIX/rules.yml" --format sarif
+# 설정 실수는 규칙을 끈 채 통과하지 않는다 — 모르는 키(components 오타), 정의되지 않은
+# 컴포넌트를 가리키는 규칙 키, 컴포넌트 없는 설정은 설정 오류 2다(이전에는 0 위반·0).
+printf 'component:\n  app: ["fixture_app/**"]\ndeny:\n  app: [core]\n' > "$FIX/typo.yml"
+printf 'components:\n  app: ["fixture_app/**"]\ndeny:\n  nope: [app]\n' > "$FIX/undefined.yml"
+printf 'components: {}\n' > "$FIX/empty.yml"
+check 2 "rules typo key"    rules --strict --config "$FIX/typo.yml"
+check 2 "rules undefined"   rules --strict --config "$FIX/undefined.yml"
+check 2 "rules empty"       rules --strict --config "$FIX/empty.yml"
 check 0 "version"           version
 check 0 "--version"         --version
 # --version은 isthmus 설치 버전 대조가 읽는 별칭이다 — 하위 명령과 출력이 같아야 한다.

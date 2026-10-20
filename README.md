@@ -236,6 +236,13 @@ baseline: .rustograph/rules-baseline.txt  # frozen violations (optional)
 
 Unmapped modules are reported separately — a rule's blind spot is not a pass.
 
+A rules file that would silently switch rules off is a configuration error:
+an unknown key (such as `component:` for `components:`), a `deps`, `deny` or
+`signature` key that names a component `components` does not define, and a
+file that defines no component at all. `rules` exits 2 and the MCP
+`rustograph_rules` tool answers with an error, naming the cause. Only the keys
+are checked; the lists may still name components or module patterns.
+
 A baseline file freezes violations that existed when the rules were adopted:
 `rules --write-baseline` records the current set (one `rule|from|to|kind`
 key per line, `#` comments allowed), and later runs suppress matching

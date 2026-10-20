@@ -128,6 +128,12 @@ rustograph impact --format language-traversal --roots-from schema-facts.json  # 
 `--budget`은 1,000,000까지입니다. 넘는 값은 조용히 깎지 않고 사용법 오류(`2`)입니다.
 MCP 도구 인자도 같은 상한을 넘으면 isError로 답하고, 응답은 자르지 않습니다.
 
+`.rustograph.yml`이 규칙을 조용히 끄는 설정이면 설정 오류입니다: 모르는 키
+(`components:` 대신 `component:` 등), `components`에 없는 컴포넌트를 가리키는
+`deps`·`deny`·`signature` 키, 컴포넌트가 하나도 없는 파일. `rules`는 원인을 적고
+종료 코드 `2`, MCP `rustograph_rules`는 isError로 답합니다. 키만 검사하므로 목록에는
+여전히 컴포넌트 이름이나 모듈 패턴을 쓸 수 있습니다.
+
 ## persistence 사실 — `schema`
 
 `rustograph schema`는 코드가 SQL 관계를 어떻게 참조하는지 담은 isthmus

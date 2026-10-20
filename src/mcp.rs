@@ -624,7 +624,7 @@ fn tool_list() -> serde_json::Value {
         },
         {
             "name": "rustograph_rules",
-            "description": "Check layer rules from .rustograph.yml; returns violations and unmapped vertices",
+            "description": "Check layer rules from .rustograph.yml; returns violations and unmapped vertices. A rules file with an unknown key, a rule keyed by a component that components does not define, or no component is an error",
             "inputSchema": {"type": "object", "properties": {}},
         },
     ])
@@ -934,6 +934,39 @@ mod tests {
             text.starts_with(&format!("bad {}: ", bad.display())),
             "{text}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// rules 도구도 CLI와 같은 설정 검증을 쓴다 — `components:` 오타나 정의되지 않은 컴포넌트를
+    /// 가리키는 규칙은 보고서(0 위반) 대신 원인을 담은 isError다. 예전에는 규칙이 꺼진 채 답했다.
+    #[test]
+    fn rules_tool_rejects_configs_that_would_silently_disable_rules() {
+        let dir = std::env::temp_dir().join(format!("rg-mcp-strict-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = test_doc();
+        let mut srv = server_for(&doc);
+        for (text, cause) in [
+            (
+                "component:\n  all: [\"c/**\"]\n",
+                "unknown field `component`",
+            ),
+            (
+                "components:\n  all: [\"c/**\"]\ndeny:\n  nope: [all]\n",
+                "deny has rules for component \"nope\"",
+            ),
+        ] {
+            let cfg = dir.join("rules.yml");
+            std::fs::write(&cfg, text).unwrap();
+            srv.cfg_path = Some(cfg.clone());
+            let result = call_rules(&srv);
+            assert_eq!(result["isError"], true, "{text:?}: {result}");
+            let message = result["content"][0]["text"].as_str().unwrap();
+            assert!(
+                message.starts_with(&format!("bad {}: ", cfg.display())) && message.contains(cause),
+                "{message}"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

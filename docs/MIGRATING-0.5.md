@@ -111,6 +111,15 @@ substitutions such as `--config /dev/stdin` or `--baseline <(…)`. The
 `rustograph mcp --config` file must be a regular file, because the server reads
 it again on every rules call.
 
+Rules files are checked before any rule runs. An unknown key, a `deps`, `deny`
+or `signature` key that names a component missing from `components`, and a
+file with no component (including an empty file or `components: {}`) are
+configuration errors: `rules` exits 2 and `rustograph_rules` answers with an
+error. Earlier releases ignored them, so a misspelled `components:` key left
+every module unmapped while `rules --strict` still exited 0, and a misspelled
+`deny` or `signature` key dropped that rule. Correct the key or define the
+component; a placeholder file needs at least one component.
+
 ## Mermaid output
 
 Mermaid labels write `"`, `%`, `<`, `>` and `&` as Mermaid entity codes

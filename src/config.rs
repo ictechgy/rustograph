@@ -9,7 +9,11 @@ use std::path::Path;
 /// 규칙 파일. `components`는 경로 패턴 → 컴포넌트, `deps`는 허용 목록,
 /// `deny`는 무조건 금지(deps를 이긴다), `signature`는 공개 API 타입 누출 제한.
 /// `baseline`은 기존 위반을 얼린 파일의 경로 — 설정 파일 기준 상대 경로다.
+/// 모르는 키는 거부한다 — 필드가 전부 선택이라, 받아 주면 `components:`를 `component:`로
+/// 잘못 쓴 설정 하나로 규칙이 통째로 꺼진 채 `rules --strict`가 0으로 통과한다.
+/// [`load_file`]은 규칙 키가 정의된 컴포넌트를 가리키는지도 본다.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub components: BTreeMap<String, Vec<String>>,
@@ -37,14 +41,66 @@ pub fn load(dir: &Path) -> Result<Option<Config>, String> {
     Ok(None)
 }
 
-/// 설정 파일 하나를 읽어 파싱한다 — `rules --config`·MCP rules·디렉터리 탐색이 모두 쓴다.
+/// 설정 파일 하나를 읽어 파싱하고 검증한다 — `rules --config`·MCP rules·디렉터리 탐색이 모두 쓴다.
 /// `kinds`는 경로를 누가 골랐고 몇 번 읽는지에 따라 호출자가 정한다([`FileKinds`]).
 /// YAML 파서 호출을 이 함수 하나에 두는 이유: 파서가 config 밖에서도 불리면 파서
 /// 교체·보안 수정이 여러 모듈로 퍼지고, 외부 크레이트 사용은 `rules --strict`가 보지 못한다.
+/// 검증도 여기서 한다 — CLI(종료 2)와 MCP(isError)가 같은 설정을 같은 이유로 거부한다.
 pub fn load_file(path: &Path, kinds: FileKinds) -> Result<Config, String> {
     let src = read_bounded_text(path, MAX_FILE_BYTES, kinds)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    serde_norway::from_str(&src).map_err(|e| format!("bad {}: {e}", path.display()))
+    let parsed: Config = serde_norway::from_str(&src).map_err(|e| {
+        format!(
+            "bad {}: {}",
+            path.display(),
+            escape_control_chars(&e.to_string())
+        )
+    })?;
+    check_components(&parsed).map_err(|e| format!("bad {}: {e}", path.display()))?;
+    Ok(parsed)
+}
+
+/// 규칙이 정의된 컴포넌트에만 걸리는지 본다. 컴포넌트가 하나도 없으면 모든 모듈이 unmapped라
+/// 어떤 규칙도 걸리지 않는다(빈 파일도 그렇다). `deps`·`deny`·`signature`의 키가 `components`에
+/// 없는 이름이면 그 규칙은 어떤 간선에도 걸리지 않는다 — 오타 하나가 `deny`·`signature` 규칙을
+/// 조용히 끈다. 값은 컴포넌트 이름이나 모듈 경로 패턴이라([`matches`]) 키만 엄격히 본다.
+/// 이름은 `{:?}`로 실어 설정이 고른 제어 문자가 터미널에 닿지 않게 한다.
+fn check_components(cfg: &Config) -> Result<(), String> {
+    if cfg.components.is_empty() {
+        return Err(
+            "components defines no component, so every module is unmapped and no rule can \
+             apply; map at least one component to module patterns under components"
+                .to_string(),
+        );
+    }
+    for (section, keyed) in [
+        ("deps", &cfg.deps),
+        ("deny", &cfg.deny),
+        ("signature", &cfg.signature),
+    ] {
+        if let Some(name) = keyed.keys().find(|n| !cfg.components.contains_key(*n)) {
+            return Err(format!(
+                "{section} has rules for component {name:?}, which components does not define; \
+                 add it under components or fix the name"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 파서 오류 문구의 제어 문자(C0·DEL·C1)와 U+2028·U+2029를 `\u{..}`로 바꾼다 — 모르는 키 오류는
+/// 설정이 고른 키 이름을 그대로 싣는데, 그 설정은 분석 대상 저장소에서 온다. 그대로 stderr에
+/// 쓰면 터미널 제어 문자가 사용자 터미널을 조작한다(저장 문서 ID에 같은 문자를 거부하는 이유와 같다).
+fn escape_control_chars(message: &str) -> String {
+    let mut escaped = String::with_capacity(message.len());
+    for c in message.chars() {
+        if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
+            escaped.extend(c.escape_unicode());
+        } else {
+            escaped.push(c);
+        }
+    }
+    escaped
 }
 
 /// 설정·기준선 파일의 크기 상한(바이트). 기준선은 위반 하나가 한 줄이라 큰 레거시
@@ -183,6 +239,109 @@ signature:
         std::fs::copy(&good, dir.join(".rustograph.yml")).unwrap();
         let found = load(&dir).unwrap().unwrap();
         assert_eq!(found.baseline.as_deref(), Some("base.txt"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 설정 실수가 규칙을 조용히 끄지 못한다 — 모든 필드가 선택이라 예전에는 `components:`를
+    /// `component:`로 잘못 쓴 설정 하나로 모든 모듈이 unmapped가 되고 `rules --strict`가 0 위반·
+    /// 종료 0으로 통과했다. `signature`·`deny` 키 오타나 정의되지 않은 컴포넌트의 규칙은 그 규칙만
+    /// 사라졌다. 모르는 키, 정의되지 않은 컴포넌트를 가리키는 규칙 키, 컴포넌트가 하나도 없는
+    /// 설정(빈 파일 포함)은 경로·원인·해결 방향을 담은 오류다 — 디렉터리에서 찾은 설정도 같다.
+    #[test]
+    fn load_file_rejects_configs_that_would_silently_disable_rules() {
+        let dir = std::env::temp_dir().join(format!("rg-config-strict-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = "components:\n  app: [\"c::app/**\"]\n";
+        for (text, cause, direction) in [
+            (
+                "component:\n  app: [\"c::app/**\"]\ndeny:\n  app: [core]\n".to_string(),
+                "unknown field `component`",
+                "expected one of `components`",
+            ),
+            (
+                format!("{app}signatures:\n  app: [app]\n"),
+                "unknown field `signatures`",
+                "expected one of",
+            ),
+            (
+                format!("{app}deny:\n  nope: [app]\n"),
+                "deny has rules for component \"nope\", which components does not define",
+                "add it under components or fix the name",
+            ),
+            (
+                format!("{app}deps:\n  ap: []\n"),
+                "deps has rules for component \"ap\"",
+                "add it under components or fix the name",
+            ),
+            (
+                format!("{app}signature:\n  core: [app]\n"),
+                "signature has rules for component \"core\"",
+                "add it under components or fix the name",
+            ),
+            (
+                "components: {}\ndeps: {}\n".to_string(),
+                "components defines no component",
+                "map at least one component",
+            ),
+            (
+                String::new(),
+                "components defines no component",
+                "map at least one component",
+            ),
+        ] {
+            let path = dir.join("rules.yml");
+            std::fs::write(&path, &text).unwrap();
+            let err = load_file(&path, FileKinds::RegularOnly).unwrap_err();
+            assert!(
+                err.starts_with(&format!("bad {}: ", path.display())),
+                "{text:?}: {err}"
+            );
+            assert!(
+                err.contains(cause) && err.contains(direction),
+                "{text:?}: {err}"
+            );
+            std::fs::rename(&path, dir.join(".rustograph.yml")).unwrap();
+            let found = load(&dir).unwrap_err();
+            assert!(found.contains(cause), "{text:?}: {found}");
+            std::fs::remove_file(dir.join(".rustograph.yml")).unwrap();
+        }
+        // 모든 규칙이 정의된 컴포넌트를 가리키면 그대로 읽는다(값은 컴포넌트 이름이나 패턴이라 보지 않는다).
+        let good = dir.join("good.yml");
+        std::fs::write(
+            &good,
+            format!("{app}  core: [\"c::core/**\"]\ndeps:\n  app: [core, \"c::util/**\"]\ndeny:\n  core: [app]\nsignature:\n  app: [app, core]\n"),
+        )
+        .unwrap();
+        let cfg = load_file(&good, FileKinds::RegularOnly).unwrap();
+        assert_eq!(cfg.deps["app"], vec!["core", "c::util/**"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 설정 오류 문구에 실리는 키 이름은 분석 대상 저장소가 고른 문자열이다 — 제어 문자를 그대로
+    /// 실으면 `rules`의 stderr가 사용자 터미널을 조작한다. 이스케이프해서 싣는다.
+    #[test]
+    fn config_errors_escape_control_characters_from_the_file() {
+        let dir = std::env::temp_dir().join(format!("rg-config-escape-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        for text in [
+            "\"\\e[2Jcomponents\":\n  app: [\"c::app/**\"]\n",
+            "components:\n  app: [\"c::app/**\"]\ndeny:\n  \"\\e[2Japp\": [app]\n",
+            "components:\n  app: [\"c::app/**\"]\n\"\\L\": 1\n",
+        ] {
+            let path = dir.join("rules.yml");
+            std::fs::write(&path, text).unwrap();
+            let err = load_file(&path, FileKinds::RegularOnly).unwrap_err();
+            assert!(
+                !err.contains('\u{1b}') && !err.contains('\u{2028}'),
+                "{text:?}: {err:?}"
+            );
+            assert!(
+                err.contains("\\u{1b}[2J") || err.contains("\\u{2028}"),
+                "{text:?}: {err:?}"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

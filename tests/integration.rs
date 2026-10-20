@@ -309,6 +309,53 @@ mod cli_tests {
         assert_eq!(code, 2);
     }
 
+    /// 설정 실수는 규칙을 끈 채 통과하지 않고 설정 오류(2)다 — 예전에는 `components:`를
+    /// `component:`로 잘못 쓴 설정으로 `rules --strict`가 "0 violations"·종료 0이었고, `deny`·
+    /// `signature` 키 오타나 정의되지 않은 컴포넌트의 규칙은 그 규칙만 조용히 사라졌다.
+    /// `--config`로 준 설정과 `--dir`에서 찾은 설정이 같다(수확 전에 끝난다).
+    #[test]
+    fn rules_rejects_configs_that_would_silently_disable_rules() {
+        let tmp = std::env::temp_dir().join(format!("rg-rules-strict-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mapped = "components:\n  app: [\"fixture_app/**\"]\n  core: [\"fixture_core/**\"]\n";
+        for (text, cause) in [
+            (
+                "component:\n  app: [\"fixture_app/**\"]\ndeny:\n  app: [core]\n".to_string(),
+                "unknown field `component`",
+            ),
+            (
+                format!("{mapped}deps:\n  app: []\n  core: []\nsignatures:\n  app: [app]\n"),
+                "unknown field `signatures`",
+            ),
+            (
+                format!("{mapped}deps:\n  app: []\n  core: []\ndeny:\n  nope: [core]\n"),
+                "deny has rules for component \"nope\"",
+            ),
+            (
+                "components: {}\ndeps: {}\n".to_string(),
+                "components defines no component",
+            ),
+        ] {
+            let cfg = tmp.join("rules.yml");
+            std::fs::write(&cfg, &text).unwrap();
+            let (code, out, err) = run(&["rules", "--strict", "--config", cfg.to_str().unwrap()]);
+            assert_eq!(code, 2, "{text:?}: {out}");
+            assert!(err.contains(cause), "{text:?}: {err}");
+            std::fs::rename(&cfg, tmp.join(".rustograph.yml")).unwrap();
+            let argv: Vec<String> = ["rules", "--strict", "--dir", tmp.to_str().unwrap()]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = cli::run(&argv, &mut out, &mut err);
+            let err = String::from_utf8(err).unwrap();
+            assert_eq!(code, 2, "{text:?}: {err}");
+            assert!(err.contains(cause), "{text:?}: {err}");
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     #[test]
     fn query_and_impact() {
         let (code, out, _) = run(&["query", "fixture_core::entry"]);

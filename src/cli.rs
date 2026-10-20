@@ -803,7 +803,8 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::create_dir_all(&tmp).unwrap();
         let rules_config = tmp.join("rules.yml");
-        std::fs::write(&rules_config, "components: {}\ndeps: {}\n").unwrap();
+        // 컴포넌트 하나짜리 최소 유효 설정 — 컴포넌트가 없는 설정은 설정 오류다(config::load_file).
+        std::fs::write(&rules_config, "components:\n  app: [\"fixture_app/**\"]\n").unwrap();
         let parsed_by = |args: &[&str]| {
             let before = source::parsed_files();
             let (code, _, err) = run_cli(args);
