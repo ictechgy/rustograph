@@ -15,6 +15,11 @@ pub const DOCUMENT_VERSION: u32 = 1;
 /// 시작해 `--`로 시작하는 이 머리와 겹치지 않는다.
 const FOCUS_LIMITATION_PREFIX: &str = "--focus dropped ";
 
+/// 이름 팬아웃 폭 상한을 넘어 간선을 달지 않은 호출을 세는 수확 limitation의 가운데 구절 — 쓰는
+/// 쪽(source의 수확 limitation)과 찾는 쪽([`Document::capped_fan_out_limitations`])이 같은 값을 쓴다.
+/// 그 문장은 다른 수확 limitation처럼 호출 수로 시작해 머리로는 가릴 수 없어, 수 뒤의 고정 구절로 찾는다.
+pub(crate) const CAPPED_FAN_OUT_MARK: &str = " candidate methods and were not fanned out; ";
+
 /// serde skip 조건 — 0인 카운터는 키를 뺀다("없는 것"과 "0"을 구분하는 계약).
 pub fn is_zero(n: &usize) -> bool {
     *n == 0
@@ -509,11 +514,21 @@ impl Document {
     /// 이 문서가 싣고 있는 `--focus` 경계 limitation — [`Document::focus`]가 쓴 문장이다. 저장
     /// 스냅샷에도 남으므로 그 스냅샷을 다시 읽은 실행도 찾는다. dead 보고서는 문서 limitation과
     /// 따로 판정 한계를 싣는데, 포커스는 도달성의 두 입력(보존 루트·들어오는 간선)을 지우므로
-    /// 이 문장만 판정 한계로 옮긴다.
+    /// 이 문장을 판정 한계로 옮긴다(이름 팬아웃 폭 상한 문장 —
+    /// [`Document::capped_fan_out_limitations`] — 과 함께).
     pub(crate) fn focus_limitations(&self) -> impl Iterator<Item = &String> {
         self.limitations
             .iter()
             .filter(|l| l.starts_with(FOCUS_LIMITATION_PREFIX))
+    }
+
+    /// 이 문서가 싣고 있는 이름 팬아웃 폭 상한 limitation — 상한을 넘은 호출에는 간선을 달지 않았으므로
+    /// 그 호출로만 닿는 메서드는 dead 판정에서 unreachable로 나온다. 포커스 문장처럼 도달성의 입력(들어오는
+    /// 간선)을 지운 사실이라 dead 보고서가 판정 한계로 옮긴다. 저장 스냅샷에도 남아 다시 읽은 실행도 찾는다.
+    pub(crate) fn capped_fan_out_limitations(&self) -> impl Iterator<Item = &String> {
+        self.limitations
+            .iter()
+            .filter(|l| l.contains(CAPPED_FAN_OUT_MARK))
     }
 
     /// `--exclude-tests` — `cfg(test)` 없이는 성립하지 않는 코드를 지운다.

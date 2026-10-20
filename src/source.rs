@@ -1706,13 +1706,15 @@ fn push_limitations(h: &Harvest, limitations: &mut Vec<String>) {
         ));
     }
     if h.capped_method_calls > 0 {
+        // 가운데 구절은 dead 보고서가 이 문장을 찾는 표지다(`Document::capped_fan_out_limitations`).
         limitations.push(format!(
-            "{} method calls ({} names) match more than {} candidate methods and were not fanned \
-             out; methods reached only through them are reported unreachable by dead, and their \
-             callers are missing from query, impact, and reach",
+            "{} method calls ({} names) match more than {}{}methods reached only through them are \
+             reported unreachable by dead, and their callers are missing from query, impact, and \
+             reach",
             h.capped_method_calls,
             h.capped_method_names.len(),
-            fanout::MAX_CANDIDATES
+            fanout::MAX_CANDIDATES,
+            graph::CAPPED_FAN_OUT_MARK
         ));
     }
     if h.external_macros > 0 {

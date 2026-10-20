@@ -935,8 +935,11 @@ fn dead_with(doc: &Document, out: &ReachMap<'_>, roots: &[String]) -> DeadReport
             "{method_findings} unreachable methods may be invoked via trait objects, generics, or external crates — dispatch not visible to syntactic analysis"
         ));
     }
-    // `--focus`가 지운 보존 루트·들어오는 간선은 이 판정의 입력이라, 그 문서 limitation은 판정
-    // 한계로도 싣는다 — JSON 보고서만 읽는 소비자가 거짓 unreachable을 완전한 답으로 받지 않게.
+    // 이름 팬아웃 폭 상한을 넘은 호출에는 간선이 없고, `--focus`는 보존 루트·들어오는 간선을 지운다.
+    // 둘 다 이 판정의 입력을 줄이므로 그 문서 limitation은 판정 한계로도 싣는다 — JSON 보고서만 읽는
+    // 소비자가 거짓 unreachable을 완전한 답으로 받지 않게. 수확 문장(폭 상한)을 포커스 문장보다 먼저
+    // 싣는다 — rustograph가 만든 문서에 실린 순서와 같다.
+    limitations.extend(doc.capped_fan_out_limitations().cloned());
     limitations.extend(doc.focus_limitations().cloned());
     DeadReport {
         roots: roots.to_vec(),
@@ -1279,6 +1282,35 @@ mod tests {
             .unwrap();
         assert!(rooted.findings.is_empty());
         assert_eq!(rooted.limitations, note);
+    }
+
+    /// 이름 팬아웃 폭 상한을 넘은 호출은 간선이 없어, 그 호출로만 닿는 메서드가 unreachable로 나온다 —
+    /// 보고서가 그 수확 limitation을 판정 한계로 싣는다(호출자가 루트를 바꿔 묻는 MCP 경로도 같다).
+    /// 포커스 문장과 함께면 수확 문장이 먼저다. 팬아웃 계수 같은 다른 수확 limitation은 옮기지 않는다.
+    #[test]
+    fn dead_carries_the_fan_out_cap_limitation() {
+        let mut d = doc();
+        let capped = format!(
+            "2 method calls (1 names) match more than 4096{}methods reached only through them are \
+             reported unreachable by dead, and their callers are missing from query, impact, and \
+             reach",
+            crate::graph::CAPPED_FAN_OUT_MARK
+        );
+        d.limitations.push(
+            "1 method calls resolved by name fan-out (no type information; errs toward alive)"
+                .into(),
+        );
+        d.limitations.push(capped.clone());
+        assert_eq!(dead(&d).unwrap().limitations, std::slice::from_ref(&capped));
+        let rooted = QueryIndex::new(&d).dead(&["c::b".to_string()]).unwrap();
+        assert_eq!(rooted.limitations, std::slice::from_ref(&capped));
+        let focused = d.focus(&["c::b".to_string()]);
+        let note: Vec<String> = focused.focus_limitations().cloned().collect();
+        assert_eq!(note.len(), 1);
+        assert_eq!(
+            dead(&focused).unwrap().limitations,
+            [capped, note[0].clone()]
+        );
     }
 
     #[test]

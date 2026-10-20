@@ -895,6 +895,70 @@ mod cli_tests {
         assert!(focus_notes(&out).is_empty(), "{out}");
     }
 
+    /// 의존 폐포로 좁힌 뒤에도 같은 이름 후보가 4,096개를 넘는 호출은 간선 없이 센다 — 그 호출로만 닿는
+    /// 메서드(여기서는 실제로 불리는 것을 포함한 `get` 4,097개)를 dead가 unreachable로 낸다. 그 수확
+    /// limitation은 그래프 문서뿐 아니라 dead JSON 보고서의 `limitations`에도 실린다(MCP rustograph_dead도
+    /// 같은 보고서다) — JSON만 읽는 소비자가 거짓 unreachable을 완전한 답으로 받지 않게. 텍스트에는 한 번만
+    /// 나온다.
+    #[test]
+    fn dead_reports_carry_the_fan_out_width_cap() {
+        let dir = std::env::temp_dir().join(format!("rg-fan-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"wide\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        let mut main = String::from("fn main() {\n    let x = make();\n    x.get();\n}\n");
+        for i in 0..=4096 {
+            main.push_str(&format!(
+                "struct T{i};\nimpl T{i} {{\n    fn get(&self) {{}}\n}}\n"
+            ));
+        }
+        std::fs::write(dir.join("src/main.rs"), main).unwrap();
+        let capped =
+            "1 method calls (1 names) match more than 4096 candidate methods and were not \
+                      fanned out; methods reached only through them are reported unreachable by \
+                      dead, and their callers are missing from query, impact, and reach";
+        let limitations = |out: &str| -> Vec<String> {
+            let value: serde_json::Value = serde_json::from_str(out).expect("output must be JSON");
+            value["limitations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|l| l.as_str().map(str::to_string))
+                .collect()
+        };
+        let (code, graph, err) = run_at(&dir, &["graph", "--level", "symbol"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(limitations(&graph).iter().any(|l| l == capped));
+        let (code, report, err) = run_at(&dir, &["dead", "--format", "json"]);
+        assert_eq!(code, 0, "{err}");
+        let carried = limitations(&report);
+        assert_eq!(
+            carried.iter().filter(|l| *l == capped).count(),
+            1,
+            "{carried:?}"
+        );
+        let report: serde_json::Value = serde_json::from_str(&report).unwrap();
+        let unreachable_gets = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["id"].as_str().is_some_and(|id| id.ends_with("::get")))
+            .count();
+        assert_eq!(unreachable_gets, 4097);
+        let (code, text, err) = run_at(&dir, &["dead"]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(
+            text.matches(capped).count(),
+            1,
+            "dead text must print the cap limitation once"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn rules_baseline_freezes_existing_violations() {
         let tmp = std::env::temp_dir().join(format!("rg-base-{}", std::process::id()));

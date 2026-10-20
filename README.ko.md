@@ -331,8 +331,9 @@ dev·build, 기본 feature가 켜지 않는 optional 의존 포함)에서만 고
 resolve 그래프를 주지 않으면 좁히지 않습니다.
 
 좁힌 뒤에도 후보가 4,096개를 넘는 호출(폭 상한)도 간선 없이 `limitations`에
-셉니다. 그런 호출로만 닿는 메서드는 `dead`가 unreachable로 보고하고, 그 호출자는
-`query`·`impact`·`reach`에 나오지 않습니다. 상한은 실제 워크스페이스보다 훨씬
+셉니다. 그런 호출로만 닿는 메서드는 `dead`가 unreachable로 보고하고(그래서
+`dead --format json`과 MCP `rustograph_dead` 보고서의 `limitations`에도 같은 문장이
+실립니다), 그 호출자는 `query`·`impact`·`reach`에 나오지 않습니다. 상한은 실제 워크스페이스보다 훨씬
 큽니다(rust-analyzer 크레이트 27개에서 가장 넓은 호출의 후보가 544개) — 같은
 이름 정의가 워크스페이스 크기에 비례해 느는 입력만 묶습니다.
 

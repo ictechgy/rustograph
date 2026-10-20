@@ -107,8 +107,10 @@
   살아 있다고 보고했다 — 이제 추정 간선과 fan-out 계수가 줄고, `dead`가 그런 메서드를 unreachable로 보고할 수 있다.
   `--semantic`이 타입으로 풀지 못한 호출도 같다. `cargo metadata`가 resolve 그래프를 주지 않으면 좁히지 않는다.
 - 같은 명령: 좁힌 뒤에도 같은 이름 후보가 4,096개를 넘는 호출은 간선 없이 limitation으로 센다 — 그런 호출로만 닿는
-  메서드는 `dead`가 unreachable로 보고하고, 그 호출자는 `query`·`impact`·`reach`에 나오지 않는다. 실제 저장소에서는
-  걸리지 않는 안전 상한이다(rust-analyzer 27크레이트에서 가장 넓은 호출이 후보 544개).
+  메서드는 `dead`가 unreachable로 보고하고, 그 호출자는 `query`·`impact`·`reach`에 나오지 않는다. 그 limitation은
+  그래프 문서와 함께 `dead --format json`과 MCP `rustograph_dead` 보고서의 `limitations`에도 실린다(`dead` 텍스트에는
+  한 번 나온다). 실제 저장소에서는 걸리지 않는 안전 상한이다(rust-analyzer 27크레이트에서 가장 넓은 호출이 후보
+  544개).
 - `schema`·`routes`의 `--out`: 입력 보호 목록을 만들 때 워크스페이스를 다시 읽고 파싱하는 대신 문서를 만든 수확의
   입력을 쓴다(8만 줄 합성 워크스페이스에서 시간 −26~−41%, 최대 RSS −25~−30%, 출력 같음). `graph --out`·
   `rules --write-baseline`의 보호 목록은 같은 소스 파일을 정점마다 싣지 않아, 기존 출력을 덮어쓸 때 경로 확인이 정점

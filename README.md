@@ -179,8 +179,9 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
   same-name methods are out of reach get no edges and are counted in
   `limitations`. A call left with more than 4,096 candidates gets no edges
   either and is counted: methods reached only through such calls are
-  reported unreachable by `dead`, and their callers are missing from
-  `query`, `impact`, and `reach`. The cap sits far above real workspaces (the
+  reported unreachable by `dead` — whose JSON report and MCP
+  `rustograph_dead` answer carry the same limitation — and their callers are
+  missing from `query`, `impact`, and `reach`. The cap sits far above real workspaces (the
   widest call across 27 rust-analyzer crates has 544 candidates); it bounds
   inputs where same-name definitions grow with the workspace. Without a
   resolve graph from `cargo metadata`, fan-out is not narrowed.
