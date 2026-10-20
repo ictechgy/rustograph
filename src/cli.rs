@@ -18,9 +18,10 @@ rustograph — queryable dependency graph for Rust codebases
 
 usage:
   rustograph graph [--level crate|module|type|symbol] [--format json|mermaid]
-                   [--dir DIR] [--deps] [--tests] [--out FILE]
+                   [--dir DIR] [--deps] [--tests] [--root ID] [--out FILE]
   rustograph cycles [--level L] [--strict] [--format text|json]
   rustograph dead [--strict] [--explain ID] [--root ID] [--retain-public] [--tests]
+                  [--format text|json]
   rustograph rules [--strict] [--format text|json|sarif] [--config FILE]
                    [--baseline FILE] [--write-baseline]
   rustograph deps [--strict] [--format text|json]
@@ -31,7 +32,8 @@ usage:
   rustograph impact --format language-traversal ID... (same options as reach)
   rustograph paths FROM TO [--max N] [--budget N]
   rustograph search QUERY [--max N]
-  rustograph mcp [--dir DIR] [--graph FILE] [--config FILE] [--deps] [--tests]
+  rustograph mcp [--dir DIR] [--graph FILE] [--config FILE] [--root ID] [--deps]
+                 [--tests]
   rustograph schema [--dir DIR] [--out FILE]
   rustograph routes --role server [--dir DIR] [--out FILE] [--framework axum|actix]
   rustograph routes --role client [--dir DIR] [--out FILE] [--wrappers FILE]
@@ -43,6 +45,11 @@ shared flags: --deps --tests --retain-public --semantic --no-cache
   --semantic resolves method calls and macro expansions with rust-analyzer
   semantics (requires a build with `--features semantic`; results cached
   in .rustograph/semantic-cache.json unless --no-cache)
+
+graph, cycles, dead, rules, query, impact, paths, search and mcp read the graph
+from --dir DIR (default .) or --graph FILE and take the shared flags; deps
+takes only --dir, --deps, --strict and --format. A flag or argument that a
+command does not use is a usage error (exit 2) instead of being ignored.
 
 query / impact --depth 0 walks without a depth limit (the whole closure, still
 bounded by --max); the report keeps \"depth\": 0.
@@ -284,6 +291,14 @@ fn replacement_refusal(listed: &source::ProtectedInputs) -> Option<String> {
 }
 
 fn cmd_graph(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    cli_args::reject_unused(
+        a,
+        &[
+            cli_args::DOCUMENT_FLAGS,
+            &["level", "format", "out", "root"],
+        ],
+        0,
+    )?;
     let level = cli_args::level_of(a)?;
     let format = a.get("format").unwrap_or("json");
     // 수확은 항상 최대 깊이로 — 얕은 레벨은 투영이다.
@@ -329,6 +344,11 @@ fn recorded_revision(a: &Args, format: &str) -> Option<String> {
 }
 
 fn cmd_cycles(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    cli_args::reject_unused(
+        a,
+        &[cli_args::DOCUMENT_FLAGS, &["level", "format", "strict"]],
+        0,
+    )?;
     let level = cli_args::level_of(a)?;
     let doc = cli_args::document_for(a, true)?.view(level)?;
     let rep = analysis::cycles(&doc);
@@ -362,6 +382,14 @@ fn cmd_cycles(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
 }
 
 fn cmd_dead(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    cli_args::reject_unused(
+        a,
+        &[
+            cli_args::DOCUMENT_FLAGS,
+            &["strict", "explain", "root", "format"],
+        ],
+        0,
+    )?;
     // dead는 항상 심볼 레벨 — 도달성은 심볼에서만 의미 있다.
     let doc = cli_args::document_for(a, true)?;
     if let Some(target) = a.get("explain") {
@@ -407,6 +435,14 @@ fn cmd_dead(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
 }
 
 fn cmd_rules(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    cli_args::reject_unused(
+        a,
+        &[
+            cli_args::DOCUMENT_FLAGS,
+            &["strict", "format", "config", "baseline", "write-baseline"],
+        ],
+        0,
+    )?;
     let dir = PathBuf::from(a.get("dir").unwrap_or("."));
     // --config이 주어지면 기준선 상대 경로의 기준은 그 파일의 디렉터리다.
     let cfg_dir = a
@@ -543,6 +579,7 @@ fn require_id(doc: &crate::graph::Document, id: &str) -> Result<String, String> 
 }
 
 fn cmd_paths(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    cli_args::reject_unused(a, &[cli_args::DOCUMENT_FLAGS, &["max", "budget"]], 2)?;
     let Some(from) = a.positional.first() else {
         return Err("usage: paths FROM TO".to_string());
     };
@@ -560,6 +597,7 @@ fn cmd_paths(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
 }
 
 fn cmd_search(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    cli_args::reject_unused(a, &[cli_args::DOCUMENT_FLAGS, &["max"]], 1)?;
     let Some(q) = a.positional.first() else {
         return Err("usage: search QUERY".to_string());
     };
@@ -571,7 +609,8 @@ fn cmd_search(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
 
 fn cmd_deps(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     // deps는 자체 syn 수확으로 문서를 만든다 — 문서 필터나 저장
-    // 그래프를 받으면 사용 증거가 지워져 거짓 미사용이 나온다.
+    // 그래프를 받으면 사용 증거가 지워져 거짓 미사용이 나온다. 그런 플래그는
+    // 이유를 붙여 거부하고, 그 밖에 쓰지 않는 플래그는 공용 검사가 거부한다.
     for flag in [
         "graph",
         "focus",
@@ -591,6 +630,8 @@ fn cmd_deps(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
             ));
         }
     }
+    // `--deps`는 공유 플래그다 — deps 보고서는 늘 외부 크레이트까지 수확하니 뜻이 어긋나지 않는다.
+    cli_args::reject_unused(a, &[&["dir", "deps", "format", "strict"]], 0)?;
     let dir = PathBuf::from(a.get("dir").unwrap_or("."));
     let report = deps::report(&dir)?;
     match a.get("format").unwrap_or("text") {
@@ -639,6 +680,15 @@ fn cmd_deps(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
 }
 
 fn cmd_query(a: &Args, out: &mut dyn Write, reverse: bool) -> Result<i32, String> {
+    // impact의 --format은 순회 문서(language-traversal)를 고르는 값 하나뿐이다 — 그 값은 run_inner가
+    // 순회 명령으로 보냈으니, 여기 온 --format은 보고서에 적용되지 않는다.
+    if let (true, Some(f)) = (reverse, a.get("format")) {
+        return Err(format!(
+            "impact --format {f} is not supported; impact prints its JSON report without --format, \
+             or a traversal document with --format language-traversal"
+        ));
+    }
+    cli_args::reject_unused(a, &[cli_args::DOCUMENT_FLAGS, &["depth", "max"]], 1)?;
     let Some(id) = a.positional.first() else {
         return Err("query/impact needs a vertex ID".to_string());
     };

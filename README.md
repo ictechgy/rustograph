@@ -143,6 +143,14 @@ language-traversal`) follow the isthmus family contract instead: `64` for a
 usage error (stdout stays empty) or when some roots are not graph vertices
 (the document is still written).
 
+A flag or argument that a command does not use is a usage error (`2`) instead
+of being silently ignored — for example `cycles --out`, `query --format` or
+`paths --role`. Every command that reads the graph (`graph`, `cycles`, `dead`,
+`rules`, `query`, `impact`, `paths`, `search`, `mcp`) takes `--dir` or
+`--graph` and the shared flags `--deps`, `--tests`, `--retain-public`,
+`--semantic`, `--no-cache`, `--focus`, `--target` and `--exclude-tests`;
+`rustograph help` lists each command's own flags.
+
 ## Graph model
 
 Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,

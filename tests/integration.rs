@@ -417,6 +417,127 @@ mod cli_tests {
         }
     }
 
+    /// 명령이 쓰지 않는 플래그·위치 인자는 조용히 무시하지 않고 사용법 오류(2)다. `cycles --out`은
+    /// 파일을 쓰지 않은 채 0으로 끝나 CI의 다음 단계가 이전 실행의 파일을 읽었고, `query --format
+    /// mermaid`는 JSON을 냈다. 오류는 명령과 그 플래그(인자)를 대고, 수확 전에 끝나 표준 출력이 비어 있다.
+    #[test]
+    fn commands_reject_flags_and_arguments_they_do_not_use() {
+        let tmp = std::env::temp_dir().join(format!("rg-unused-{}", std::process::id()));
+        let out = tmp.join("written.json");
+        let out = out.to_str().unwrap();
+        for (args, unused) in [
+            (&["cycles", "--format", "json", "--out", out][..], "--out"),
+            (
+                &["query", "fixture_core::entry", "--format", "mermaid"][..],
+                "--format",
+            ),
+            (
+                &["impact", "fixture_core::Used", "--format", "json"][..],
+                "--format",
+            ),
+            (
+                &["impact", "fixture_core::Used", "--max-depth", "3"][..],
+                "--max-depth",
+            ),
+            (
+                &[
+                    "paths",
+                    "fixture_app::main",
+                    "fixture_core::entry",
+                    "--role",
+                    "server",
+                ][..],
+                "--role",
+            ),
+            (&["search", "entry", "--budget", "5"][..], "--budget"),
+            (&["dead", "--level", "module"][..], "--level"),
+            (&["graph", "--strict"][..], "--strict"),
+            (&["rules", "--depth", "3"][..], "--depth"),
+            (&["cycles", "--root", "fixture_app::main"][..], "--root"),
+            (&["deps", "--out", out][..], "--out"),
+            (&["cycles", "stray"][..], "\"stray\""),
+            (
+                &["query", "fixture_core::entry", "fixture_core::Used"][..],
+                "\"fixture_core::Used\"",
+            ),
+            (
+                &["paths", "fixture_app::main", "fixture_core::entry", "x"][..],
+                "\"x\"",
+            ),
+            (&["search", "entry", "more"][..], "\"more\""),
+        ] {
+            let (code, stdout, err) = run(args);
+            assert_eq!(code, 2, "{args:?}: {err}");
+            assert!(stdout.is_empty(), "{args:?}: {stdout}");
+            assert!(
+                err.contains(args[0]) && err.contains(unused),
+                "{args:?}: {err}"
+            );
+        }
+        assert!(!std::path::Path::new(out).exists());
+    }
+
+    /// 거부는 명령이 쓰지 않는 조합만이다 — USAGE의 공유 플래그와 `--dir`·`--graph`는 문서를 얻는 모든
+    /// 명령이 계속 받고, 명령 고유 플래그(`graph --root`·`dead --root`, `deps --deps`)도 그대로다.
+    #[test]
+    fn commands_keep_accepting_documented_shared_flags() {
+        let shared = [
+            "--deps",
+            "--tests",
+            "--retain-public",
+            "--no-cache",
+            "--focus",
+            "fixture_core",
+            "--target",
+            "x86_64-pc-windows-msvc",
+        ];
+        let cfg = std::env::temp_dir().join(format!("rg-shared-{}.yml", std::process::id()));
+        std::fs::write(
+            &cfg,
+            "components:\n  core: [\"fixture_core/**\"]\ndeps:\n  core: []\n",
+        )
+        .unwrap();
+        let cfg = cfg.to_str().unwrap().to_string();
+        for command in [
+            &[
+                "graph",
+                "--level",
+                "symbol",
+                "--root",
+                "fixture_core::entry",
+            ][..],
+            &[
+                "cycles", "--level", "module", "--format", "json", "--strict",
+            ][..],
+            &["dead", "--root", "fixture_core::entry", "--format", "json"][..],
+            &["query", "fixture_core::entry", "--depth", "2", "--max", "5"][..],
+            &["impact", "fixture_core::Used", "--depth", "0"][..],
+            &[
+                "paths",
+                "fixture_core::entry",
+                "fixture_core::Used",
+                "--budget",
+                "9",
+            ][..],
+            &["search", "entry", "--max", "3"][..],
+            &["rules", "--config", &cfg, "--format", "json"][..],
+        ] {
+            let args: Vec<&str> = command.iter().chain(&shared).copied().collect();
+            let (code, _, err) = run(&args);
+            assert_eq!(code, 0, "{args:?}: {err}");
+            let args: Vec<&str> = command
+                .iter()
+                .chain(&["--exclude-tests"])
+                .copied()
+                .collect();
+            let (code, _, err) = run(&args);
+            assert_eq!(code, 0, "{args:?}: {err}");
+        }
+        let (code, _, err) = run(&["deps", "--deps", "--format", "json"]);
+        assert_eq!(code, 0, "{err}");
+        std::fs::remove_file(&cfg).unwrap();
+    }
+
     #[test]
     fn deps_reports_unused_declared_dep() {
         // fixture_unused는 선언만 됐다 — 미사용 판정이 잡혀야 한다.

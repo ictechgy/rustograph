@@ -114,6 +114,13 @@ rustograph impact --format language-traversal --roots-from schema-facts.json  # 
 계약을 따릅니다 — 사용법 오류는 표준 출력을 비운 채 `64`, 그래프 정점이
 아닌 root가 섞이면 문서를 쓴 뒤 `64`입니다.
 
+명령이 쓰지 않는 플래그·위치 인자는 조용히 무시하지 않고 사용법 오류(`2`)입니다
+(예: `cycles --out`, `query --format`, `paths --role`). 그래프를 읽는 명령
+(`graph`·`cycles`·`dead`·`rules`·`query`·`impact`·`paths`·`search`·`mcp`)은
+모두 `--dir`이나 `--graph`와 공유 플래그(`--deps`·`--tests`·`--retain-public`·
+`--semantic`·`--no-cache`·`--focus`·`--target`·`--exclude-tests`)를 받습니다.
+명령별 플래그는 `rustograph help`로 봅니다.
+
 ## persistence 사실 — `schema`
 
 `rustograph schema`는 코드가 SQL 관계를 어떻게 참조하는지 담은 isthmus

@@ -65,6 +65,19 @@ fi
 check 2 "unknown command"   frobnicate
 check 2 "bad level"         graph --level bogus
 check 2 "bad format"        graph --format xml
+# 명령이 쓰지 않는 플래그·위치 인자는 조용히 무시하지 않고 사용법 오류(2)다 — `cycles --out`은
+# 파일 없이 0으로 끝났었다. 문서화된 공유 플래그는 그래프를 읽는 모든 명령이 계속 받는다(0).
+check 2 "cycles out"        cycles --format json --out "$FIX/cycles.json"
+check 2 "query format"      query fixture_core::entry --format mermaid
+check 2 "paths role"        paths fixture_app::main fixture_core::entry --role server
+check 2 "dead level"        dead --level module
+check 2 "query extra arg"   query fixture_core::entry fixture_core::Used
+check 2 "deps out"          deps --out "$FIX/deps.txt"
+check 0 "cycles shared"     cycles --deps --retain-public --no-cache --exclude-tests --focus fixture_core --target x86_64-pc-windows-msvc
+if [ -e "$FIX/cycles.json" ] || [ -e "$FIX/deps.txt" ]; then
+	echo "FAIL unused --out: a file was written" >&2
+	fails=$((fails+1))
+fi
 
 # 신규 질의 — paths/search/deps와 문서 필터의 종료 코드 계약.
 check 0 "paths"             paths fixture_app::main fixture_core::entry

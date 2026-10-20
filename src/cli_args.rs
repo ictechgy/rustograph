@@ -138,6 +138,48 @@ pub(crate) fn parse(args: &[String]) -> Result<Args, String> {
     Ok(a)
 }
 
+/// 그래프 문서를 얻는 명령이 모두 받는 플래그 — 문서 출처(`--dir`·`--graph`)와 USAGE의 공유 플래그.
+/// 공유 플래그는 문서화된 계약이라, 명령이 그 효과를 쓰지 않아도(`cycles --tests`) 기존 호출을 깨지
+/// 않도록 계속 받는다.
+pub(crate) const DOCUMENT_FLAGS: &[&str] = &[
+    "dir",
+    "graph",
+    "deps",
+    "tests",
+    "retain-public",
+    "semantic",
+    "no-cache",
+    "focus",
+    "target",
+    "exclude-tests",
+];
+
+/// 명령이 쓰지 않는 플래그나 남는 위치 인자를 사용법 오류로 거부한다 — 순회 형식을 뺀 명령이 이
+/// 검사 하나를 쓴다. `accepted`는 이 명령이 읽는 플래그 목록들(대개 [`DOCUMENT_FLAGS`]와 명령 고유
+/// 플래그), `positionals`는 받는 위치 인자의 최대 개수다. 조용히 무시하면 사용자는 플래그가 적용됐다고
+/// 믿는다 — `cycles --out`은 파일 없이 0으로 끝났고 `query --format mermaid`는 JSON을 냈다. 허용
+/// 목록이라 나중에 추가되는 플래그도 그 명령이 읽기 전까지는 거부된다. 빠진 위치 인자는 명령마다
+/// 고유한 안내가 있어 여기서 보지 않는다.
+pub(crate) fn reject_unused(
+    a: &Args,
+    accepted: &[&[&str]],
+    positionals: usize,
+) -> Result<(), String> {
+    if let Some(flag) = a.unsupported_flag(&accepted.concat()) {
+        return Err(format!(
+            "{} does not support {flag}; remove it (`rustograph help` lists the flags each command takes)",
+            a.cmd
+        ));
+    }
+    if let Some(extra) = a.positional.get(positionals) {
+        return Err(format!(
+            "{} does not take the argument {extra:?}; remove it (`rustograph help` lists the arguments each command takes)",
+            a.cmd
+        ));
+    }
+    Ok(())
+}
+
 /// 수확 또는 저장 문서 로드 — 모든 명령이 같은 경로로 문서를 얻는다.
 /// --focus/--target/--exclude-tests 필터는 저장 문서에도 같은 순서로
 /// 적용된다 — 필터는 문서 변환이라 수확 방식과 무관하다.

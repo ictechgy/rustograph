@@ -74,6 +74,8 @@ pub(crate) fn cmd(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<i32, String> {
+    // `--root`는 서빙하는 문서의 보존 루트를 바꾼다(summary·dead 도구가 쓴다).
+    cli_args::reject_unused(a, &[cli_args::DOCUMENT_FLAGS, &["config", "root"]], 0)?;
     let doc = cli_args::document_for(a, true)?;
     let dir = PathBuf::from(a.get("dir").unwrap_or("."));
     let cfg_path = match a.get("config") {
@@ -900,6 +902,31 @@ mod tests {
         }
         // 같은 줄을 한 번 더 보내도 같은 답이다.
         assert_eq!(session(&srv, &lines), res);
+    }
+
+    /// `rustograph mcp`도 쓰지 않는 플래그·위치 인자를 수확 전에 거부한다(CLI와 같은 공용 검사) —
+    /// `--root`(서빙하는 문서의 보존 루트)와 공유 플래그는 받는다.
+    #[test]
+    fn mcp_command_rejects_flags_it_does_not_use() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture");
+        let dir = fixture.to_str().unwrap();
+        let start = |argv: &[&str]| {
+            let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            let parsed = cli_args::parse(&argv).unwrap();
+            let mut stdin: &[u8] = b"";
+            cmd(&parsed, &mut stdin, &mut Vec::new(), &mut Vec::new())
+        };
+        for (argv, unused) in [
+            (&["mcp", "--out", "x.json", "--dir", dir][..], "--out"),
+            (&["mcp", "--level", "module", "--dir", dir][..], "--level"),
+            (&["mcp", "--strict", "--dir", dir][..], "--strict"),
+            (&["mcp", "stray", "--dir", dir][..], "\"stray\""),
+        ] {
+            let e = start(argv).unwrap_err();
+            assert!(e.starts_with("mcp does not") && e.contains(unused), "{e}");
+        }
+        let kept = ["mcp", "--root", "fixture_core::entry", "--retain-public"];
+        assert_eq!(start(&[&kept[..], &["--dir", dir]].concat()), Ok(0));
     }
 
     #[test]
