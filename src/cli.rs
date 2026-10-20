@@ -798,6 +798,58 @@ mod tests {
         assert!(err.contains("vertex ID"));
     }
 
+    /// 기존 출력을 바꾸는 `graph --out`이 보호 입력을 canonicalize하는 횟수는 정점 수와 무관하다 —
+    /// 정점 위치마다 경로를 넣던 보호 목록은 덮어쓸 때마다 정점 수의 두 배를 풀었다(실제 수확
+    /// 9,394정점 스냅샷에서 덮어쓰기 0.27초 대 새 경로 0.07초). 수확한 그래프(문서 정점과 수확
+    /// 입력이 같은 파일을 겹쳐 싣는다)와 저장 스냅샷(`--graph`) 둘 다 본다.
+    #[test]
+    fn replacing_outputs_resolves_inputs_per_file_not_per_vertex() {
+        let tmp =
+            std::env::temp_dir().join(format!("rustograph-cli-probes-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(
+            tmp.join("Cargo.toml"),
+            "[package]\nname = \"probes\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let (snapshot, out) = (tmp.join("snapshot.json"), tmp.join("graph.json"));
+        let (dir, snapshot, out) = (
+            tmp.to_str().unwrap(),
+            snapshot.to_str().unwrap(),
+            out.to_str().unwrap(),
+        );
+        let probes_replacing = |args: &[&str]| {
+            std::fs::write(out, "previous").unwrap();
+            let before = export::input_probes();
+            let (code, _, err) = run_cli(args);
+            assert_eq!(code, 0, "{args:?}: {err}");
+            export::input_probes() - before
+        };
+        let mut counted = Vec::new();
+        for functions in [20, 40] {
+            let body: String = (0..functions)
+                .map(|i| format!("pub fn f{i}() {{}}\n"))
+                .collect();
+            std::fs::write(tmp.join("src/lib.rs"), format!("pub mod m;\n{body}")).unwrap();
+            std::fs::write(tmp.join("src/m.rs"), &body).unwrap();
+            std::fs::remove_file(snapshot).ok();
+            let (code, _, err) = run_cli(&[
+                "graph", "--level", "symbol", "--dir", dir, "--out", snapshot,
+            ]);
+            assert_eq!(code, 0, "{err}");
+            counted.push((
+                probes_replacing(&["graph", "--level", "symbol", "--dir", dir, "--out", out]),
+                probes_replacing(&[
+                    "graph", "--level", "symbol", "--graph", snapshot, "--out", out,
+                ]),
+            ));
+        }
+        assert!(counted[0].0 > 0 && counted[0].1 > 0, "{counted:?}");
+        assert_eq!(counted[0], counted[1]);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
     /// `graph --out`·`rules --write-baseline`은 문서를 만든 수확이 읽은 입력으로 보호 목록을
     /// 만든다 — 보호 목록 때문에 워크스페이스를 다시 수확하면 대형 저장소에서 시간과 누수 AST
     /// 메모리가 두 배였다. 표준 출력 실행과 같은 수의 파일만 파싱해야 한다.

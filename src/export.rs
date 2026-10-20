@@ -4,6 +4,7 @@
 //! 같은 입력이 같은 바이트가 되는 계약은 struct 필드 순서와 정렬된 Vec에 있다.
 
 use crate::graph::Document;
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -91,13 +92,17 @@ pub fn save_file(doc: &Document, path: &Path) -> Result<(), String> {
     write_file(path, to_json(doc).as_bytes(), &protected)
 }
 
-/// 스냅샷이 가리키는 원본 소스를 산출물로 바꾸지 않도록 보호한다.
+/// 스냅샷이 가리키는 원본 소스를 산출물로 바꾸지 않도록 보호한다. 소스 파일은 처음 나온
+/// 순서대로 한 번씩만 싣는다 — 정점 대부분이 몇 안 되는 파일을 공유해(실제 수확 9,394정점이
+/// 파일 271개), 정점마다 넣으면 출력을 덮어쓸 때 같은 경로를 정점 수만큼 canonicalize한다.
 pub(crate) fn document_inputs(doc: &Document) -> Vec<PathBuf> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
     let mut inputs: Vec<PathBuf> = doc
         .vertices
         .iter()
-        .filter_map(|vertex| vertex.position.as_ref())
+        .filter_map(|vertex| vertex.position.as_deref())
         .filter_map(|position| position.rsplit_once(':'))
+        .filter(|(file, _)| seen.insert(*file))
         .map(|(file, _)| Path::new(&doc.root).join(file))
         .collect();
     inputs.extend(
@@ -118,7 +123,32 @@ pub fn write_file(path: &Path, contents: &[u8], protected: &[PathBuf]) -> Result
     write_file_with(path, protected, |file| file.write_all(contents))
 }
 
-fn validate_output(path: &Path, protected: &[PathBuf]) -> Result<(), String> {
+#[cfg(test)]
+thread_local! {
+    /// 출력 검사가 보호 입력을 canonicalize한 횟수 — 같은 입력을 정점 수만큼 거듭 풀지 않는지
+    /// 단위 테스트가 센다(테스트 스레드마다 따로).
+    static INPUT_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 테스트용 — 이 스레드에서 지금까지 출력 검사가 보호 입력을 canonicalize한 횟수.
+#[cfg(test)]
+pub(crate) fn input_probes() -> usize {
+    INPUT_PROBES.with(std::cell::Cell::get)
+}
+
+/// 보호 경로를 처음 나온 순서대로 한 번씩만 남긴다. 호출자가 합친 목록(문서 정점 위치·수확
+/// 입력·설정)은 같은 파일을 겹쳐 싣는데, 겹친 경로는 같은 판정을 되풀이할 뿐이다. 순서는 지킨다 —
+/// 살피지 못한 입력 중 처음 것이 오류에 실린다.
+fn distinct_paths(paths: &[PathBuf]) -> Vec<&Path> {
+    let mut seen: BTreeSet<&Path> = BTreeSet::new();
+    paths
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|input| seen.insert(*input))
+        .collect()
+}
+
+fn validate_output(path: &Path, protected: &[&Path]) -> Result<(), String> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -141,6 +171,8 @@ fn validate_output(path: &Path, protected: &[PathBuf]) -> Result<(), String> {
         .canonicalize()
         .map_err(|error| format!("cannot resolve {}: {error}", path.display()))?;
     for input in protected {
+        #[cfg(test)]
+        INPUT_PROBES.with(|c| c.set(c.get() + 1));
         match input.canonicalize() {
             Ok(input) if input == resolved => {
                 return Err(format!(
@@ -161,7 +193,8 @@ fn write_file_with(
     protected: &[PathBuf],
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> Result<(), String> {
-    validate_output(path, protected)?;
+    let protected = distinct_paths(protected);
+    validate_output(path, &protected)?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -194,7 +227,7 @@ fn write_file_with(
         file.sync_all()
             .map_err(|error| format!("cannot sync {}: {error}", path.display()))?;
         // 준비 중 교체된 입력 별칭도 공개 직전에 다시 확인한다.
-        validate_output(&destination, protected)?;
+        validate_output(&destination, &protected)?;
         std::fs::rename(&temporary, &destination)
             .map_err(|error| format!("cannot publish {}: {error}", path.display()))
     })();
@@ -323,6 +356,99 @@ mod tests {
         let loaded = load_file(&p).unwrap();
         assert_eq!(to_json(&loaded), to_json(&doc()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 보호 목록은 소스 파일을 정점마다가 아니라 한 번씩만 싣는다 — 정점 위치를 그대로 넣으면
+    /// 실제 수확(9,394정점이 파일 271개)에서 같은 경로가 정점 수만큼 겹쳐, 출력을 덮어쓸 때마다
+    /// 그 수의 두 배를 canonicalize했다. 처음 나온 순서와 경로 집합은 그대로다.
+    #[test]
+    fn document_inputs_list_each_source_file_once() {
+        let fn_at = |id: &str, position: &str| Vertex {
+            id: id.into(),
+            kind: Kind::Fn,
+            krate: "c".into(),
+            module: "c::m".into(),
+            position: Some(position.into()),
+            exported: false,
+            generated: false,
+            cfg: None,
+            unsafe_: false,
+        };
+        let mut vertices = doc().vertices;
+        vertices.extend([
+            fn_at("c::m::a", "src/m.rs:3"),
+            fn_at("c::m::b", "src/m.rs:9"),
+            fn_at("c::n", "src/n.rs:1"),
+            fn_at("c::n::f", "src/n.rs:4"),
+        ]);
+        let d = document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec![],
+            vertices,
+            vec![],
+            vec![],
+        );
+        let expected: Vec<PathBuf> = [
+            "src/m.rs",
+            "src/n.rs",
+            "Cargo.toml",
+            "Cargo.lock",
+            ".rustograph.yml",
+            ".rustograph.yaml",
+        ]
+        .into_iter()
+        .map(|file| Path::new(".").join(file))
+        .collect();
+        assert_eq!(document_inputs(&d), expected);
+    }
+
+    /// 기존 출력을 바꿀 때 보호 입력은 검사마다 서로 다른 경로당 한 번만 canonicalize한다 —
+    /// 겹친 경로는 같은 결과를 다시 계산할 뿐이다. 새 경로는 입력의 별칭일 수 없어 입력을 풀지
+    /// 않는다. 별칭 거부와, 살피지 못한 입력 중 처음 나온 것을 오류에 싣는 순서는 그대로다.
+    #[test]
+    fn replacing_an_output_resolves_each_protected_input_once_per_check() {
+        let dir = std::env::temp_dir().join(format!("rg-input-probes-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.rs"), dir.join("b.rs"));
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        let out = dir.join("out.json");
+        std::fs::write(&out, "previous").unwrap();
+        let probed = |path: &Path, protected: &[PathBuf]| {
+            let before = input_probes();
+            let result = write_file(path, b"replacement", protected);
+            (result, input_probes() - before)
+        };
+        let overlapping = [
+            a.clone(),
+            a.clone(),
+            b.clone(),
+            a.clone(),
+            dir.join("missing.rs"),
+        ];
+        let (result, replacing) = probed(&out, &overlapping);
+        result.unwrap();
+        // 공개 전 검사와 rename 직전 재검사 × 서로 다른 입력 셋.
+        assert_eq!(replacing, 2 * 3);
+        let (result, fresh) = probed(&dir.join("fresh.json"), &overlapping);
+        result.unwrap();
+        assert_eq!(fresh, 0);
+        let (result, _) = probed(&out, &[a.clone(), a.clone(), out.clone()]);
+        assert!(result.unwrap_err().contains("aliases an input"));
+        assert_eq!(std::fs::read(&out).unwrap(), b"replacement");
+        #[cfg(unix)]
+        {
+            // 파일을 디렉터리처럼 지나는 경로는 NotFound가 아닌 오류다 — 처음 나온 입력을 싣는다.
+            let (first, second) = (b.join("x"), a.join("y"));
+            let (result, _) = probed(&out, &[first.clone(), second, first.clone()]);
+            let error = result.unwrap_err();
+            let named = format!("cannot inspect input {}:", first.display());
+            assert!(error.starts_with(&named), "{error}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
