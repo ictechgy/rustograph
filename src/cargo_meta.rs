@@ -212,6 +212,12 @@ pub fn load(dir: &Path) -> Result<Metadata, String> {
     LOADS.with(|c| c.set(c.get() + 1));
     let toolchain =
         process_toolchain().map_err(|e| format!("failed to run cargo metadata: {e}"))?;
+    load_with(dir, toolchain)
+}
+
+/// [`load`]의 본체 — 정한 툴체인으로 `cargo metadata`를 돌린다. 툴체인을 인자로 받는 것은 단위 테스트가
+/// 가짜 rustup·cargo로 정한 툴체인을 줄 수 있게 하려는 것이다(프로세스 툴체인은 한 번만 정한다).
+fn load_with(dir: &Path, toolchain: &Toolchain) -> Result<Metadata, String> {
     let out = toolchain
         .command_for(Tool::Cargo)
         .map_err(|e| format!("failed to run cargo metadata: {e}"))?
@@ -220,12 +226,7 @@ pub fn load(dir: &Path) -> Result<Metadata, String> {
         .output()
         .map_err(|e| format!("failed to run cargo metadata: {e}"))?;
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!(
-            "cargo metadata failed in {}: {}",
-            dir.display(),
-            stderr.trim()
-        ));
+        return Err(metadata_failure(dir, &out.stderr, toolchain));
     }
     let mut metadata = parse(&out.stdout)?;
     if toolchain.ignored_toolchain_file {
@@ -234,6 +235,31 @@ pub fn load(dir: &Path) -> Result<Metadata, String> {
             .push(TOOLCHAIN_FILE_IGNORED.to_string());
     }
     Ok(metadata)
+}
+
+/// `cargo metadata`가 실패한 오류 — cargo가 알린 원인을 싣고, 작업 디렉터리(와 그 조상)의 rust-toolchain
+/// 파일을 쓰지 않은 실행이면 그 사실과 해결 방향을 덧붙인다. 성공한 문서는 `toolchain-file-ignored:`
+/// limitation으로 알지만 실패하면 문서가 없다. 그 파일이 고르던 툴체인이 있어야 읽히는 매니페스트(nightly
+/// 전용 `cargo-features` 등)는 고정한 툴체인에서 실패하는데, 같은 디렉터리에서 직접 돌린 `cargo metadata`는
+/// 성공하니 cargo의 오류만으로는 원인을 알 수 없다. 실패가 툴체인 탓인지는 모르므로 "필요하면"으로 쓴다.
+fn metadata_failure(dir: &Path, stderr: &[u8], toolchain: &Toolchain) -> String {
+    let failure = format!(
+        "cargo metadata failed in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(stderr).trim()
+    );
+    match (
+        &toolchain.pinned_toolchain,
+        toolchain.ignored_toolchain_file,
+    ) {
+        (Some(pinned), true) => format!(
+            "{failure}\na rust-toolchain file in the working directory or one of its parents was \
+             not used: cargo metadata ran with {pinned}, the toolchain rustup picks where no such \
+             file exists; if the project needs the toolchain that file selects, set \
+             RUSTUP_TOOLCHAIN=<channel>"
+        ),
+        _ => failure,
+    }
 }
 
 /// `cargo metadata`가 resolve 그래프를 주지 않았다는 limitation — 의존 간선을 모른다는 뜻이라, 의존
@@ -894,13 +920,18 @@ mod tests {
     }
 
     /// 가짜 rustup과 그 프록시가 든 bin 디렉터리 — rustup은 호출마다 `작업 디렉터리|RUSTUP_TOOLCHAIN|인자`를
-    /// 기록하고 `show active-toolchain`에 `active`, `which rustc`에 `which`를 답한다.
+    /// 기록하고 `show active-toolchain`에 `active`, `which rustc`에 `which`를 답한다. 프록시 `cargo`로 부른
+    /// `metadata`는 매니페스트를 읽지 못한 cargo처럼 [`FAKE_METADATA_ERROR`]를 쓰고 실패한다.
     #[cfg(unix)]
     struct FakeRustup {
         root: PathBuf,
         bin: PathBuf,
         log: PathBuf,
     }
+
+    /// [`FakeRustup`]의 프록시 `cargo metadata`가 표준 오류에 쓰는 줄.
+    #[cfg(unix)]
+    const FAKE_METADATA_ERROR: &str = "error: the manifest needs a nightly version of Cargo";
 
     #[cfg(unix)]
     impl FakeRustup {
@@ -915,6 +946,7 @@ mod tests {
                  case \"$1 $2\" in\n\
                  \"show active-toolchain\") printf '%s\\n' '{active}' ;;\n\
                  \"which rustc\") printf '%s\\n' '{which}' ;;\n\
+                 \"metadata --format-version\") printf '%s\\n' '{FAKE_METADATA_ERROR}' >&2; exit 101 ;;\n\
                  *) exit 2 ;;\nesac\n",
                 log.display()
             );
@@ -1004,6 +1036,48 @@ mod tests {
             );
         }
         assert!(fake.scratch_is_empty());
+    }
+
+    /// 작업 디렉터리의 rust-toolchain 파일을 쓰지 않은 실행에서 `cargo metadata`가 실패하면, 오류가 cargo의
+    /// 원인 뒤에 그 사실과 해결 방향(`RUSTUP_TOOLCHAIN=<channel>`)을 싣는다 — 그 파일의 툴체인이 있어야
+    /// 읽히는 매니페스트는 고정한 툴체인에서 실패하는데, 같은 디렉터리에서 직접 돌린 cargo는 성공해 cargo의
+    /// 오류만으로는 원인을 알 수 없다. 무시한 파일이 없으면 지금처럼 cargo의 오류만 싣는다.
+    #[cfg(unix)]
+    #[test]
+    fn metadata_failures_say_when_a_toolchain_file_was_not_used() {
+        let fake = FakeRustup::new(
+            "ignored-fail",
+            "fake-stable (default)",
+            "/toolchains/fake/bin/rustc",
+        );
+        let checkout = fake.root.join("checkout");
+        let file = checkout.join("rust-toolchain.toml");
+        std::fs::write(&file, "[toolchain]\nchannel = \"nightly\"\n").unwrap();
+        let ignoring = resolve_toolchain(&fake.inputs()).unwrap();
+        assert!(ignoring.ignored_toolchain_file);
+        let cargo_failure = format!(
+            "cargo metadata failed in {}: {FAKE_METADATA_ERROR}",
+            checkout.display()
+        );
+        assert_eq!(
+            load_with(&checkout, &ignoring).unwrap_err(),
+            format!(
+                "{cargo_failure}\na rust-toolchain file in the working directory or one of its \
+                 parents was not used: cargo metadata ran with fake-stable, the toolchain rustup \
+                 picks where no such file exists; if the project needs the toolchain that file \
+                 selects, set RUSTUP_TOOLCHAIN=<channel>"
+            )
+        );
+        std::fs::remove_file(&file).unwrap();
+        let plain = resolve_toolchain(&fake.inputs()).unwrap();
+        assert!(!plain.ignored_toolchain_file);
+        assert_eq!(load_with(&checkout, &plain).unwrap_err(), cargo_failure);
+        let metadata_calls = fake
+            .rustup_calls()
+            .into_iter()
+            .filter(|call| call.contains("|metadata --format-version 1 --manifest-path "))
+            .count();
+        assert_eq!(metadata_calls, 2, "{:?}", fake.rustup_calls());
     }
 
     #[cfg(unix)]

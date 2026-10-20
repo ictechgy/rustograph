@@ -65,7 +65,10 @@
 - **Breaking**: 수확하는 모든 명령: `PATH`의 `cargo`·`rustc`가 rustup 프록시이고 `RUSTUP_TOOLCHAIN`을 주지 않았는데
   rustup이 빈 임시 디렉터리에서 툴체인을 답하지 못하거나(기본 툴체인 없이 체크아웃의 rust-toolchain 파일에만 기대던
   환경 등) 임시 디렉터리의 조상에 rust-toolchain 파일이 있으면, 분석이 `RUSTUP_TOOLCHAIN`·`RUSTC`를 직접 주라는 오류로
-  끝난다. 이전에는 체크아웃 안에서 띄우면 그 툴체인 파일을 따라 돌았다.
+  끝난다. 체크아웃의 rust-toolchain 파일이 고르던 툴체인이어야 매니페스트를 읽을 수 있는 프로젝트(nightly 전용
+  `cargo-features` 등)는 고정한 툴체인의 `cargo metadata`가 실패해 분석도 실패한다 — 그 오류 끝에 툴체인 파일을 쓰지
+  않았다는 사실, `cargo metadata`를 돌린 툴체인 이름, `RUSTUP_TOOLCHAIN=<channel>` 안내가 붙는다. 이전에는 체크아웃
+  안에서 띄우면 그 툴체인 파일을 따라 돌았다.
 - `query`·`impact`, MCP `rustograph_query`: `--depth 0`(`depth: 0`)이 MCP `rustograph_impact`와 같이 깊이 제한 없는
   전체 폐포(`--max`까지)를 뜻한다. 이전에 CLI `query`·`impact`와 MCP `rustograph_query`는 같은 `depth: 0`,
   `truncated: false`로 빈 결과를 내 의존자가 없는 것처럼 보였다. 보고 `depth`는 0 그대로이고 기본 깊이도 그대로다(1,

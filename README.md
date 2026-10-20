@@ -567,9 +567,13 @@ run it inside that checkout:
   given: set `RUSTUP_TOOLCHAIN=<channel>` to analyze with a project's own
   toolchain.
 - When this leaves a `rust-toolchain` file in the current directory or its
-  parents unused, the document gets a `toolchain-file-ignored:` limitation. If
-  the temporary directory itself sits below such a file, or rustup cannot
-  report a toolchain, the analysis fails with an error that asks you to set
+  parents unused, the document gets a `toolchain-file-ignored:` limitation.
+  When `cargo metadata` fails instead — for example on a manifest that only
+  the file's toolchain can read, such as nightly-only `cargo-features` — the
+  error ends by saying that the file was not used and which toolchain ran; set
+  `RUSTUP_TOOLCHAIN=<channel>` to analyze with the file's toolchain. If the
+  temporary directory itself sits below such a file, or rustup cannot report a
+  toolchain, the analysis fails with an error that asks you to set
   `RUSTUP_TOOLCHAIN` and `RUSTC`.
 
 The current directory does not change, so the rest of the checkout's Cargo

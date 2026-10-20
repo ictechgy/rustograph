@@ -370,9 +370,12 @@ MCP `rustograph_deps` 도구는 첫 호출 때 `--dir` 워크스페이스를 대
   직접 설정한 `RUSTUP_TOOLCHAIN`·`RUSTC`는 그대로 씁니다. 프로젝트 툴체인으로
   분석하려면 `RUSTUP_TOOLCHAIN=<channel>`을 주세요.
 - 그 때문에 현재 디렉터리나 부모의 `rust-toolchain` 파일을 쓰지 않았으면 문서에
-  `toolchain-file-ignored:` limitation이 붙습니다. 임시 디렉터리 자체가 그런 파일
-  아래에 있거나 rustup이 툴체인을 알려 주지 못하면, `RUSTUP_TOOLCHAIN`과 `RUSTC`를
-  직접 주라는 오류로 분석이 실패합니다.
+  `toolchain-file-ignored:` limitation이 붙습니다. 그 대신 `cargo metadata`가
+  실패하면(그 파일의 툴체인이어야 읽히는 매니페스트 — nightly 전용 `cargo-features`
+  등) 오류 끝에 그 파일을 쓰지 않았다는 사실과 실행한 툴체인을 알립니다. 그
+  파일의 툴체인으로 분석하려면 `RUSTUP_TOOLCHAIN=<channel>`을 주세요. 임시 디렉터리
+  자체가 그런 파일 아래에 있거나 rustup이 툴체인을 알려 주지 못하면,
+  `RUSTUP_TOOLCHAIN`과 `RUSTC`를 직접 주라는 오류로 분석이 실패합니다.
 
 현재 디렉터리는 바꾸지 않으므로 체크아웃의 나머지 Cargo 설정(source
 replacement, `[patch]`, 레지스트리)은 `cargo build`처럼 그대로 적용됩니다.
