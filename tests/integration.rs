@@ -1160,6 +1160,67 @@ mod cli_tests {
         }
         std::fs::remove_dir_all(&tmp).unwrap();
     }
+
+    /// 64 MiB를 넘는 모듈 파일은 읽지 않는다 — `graph`는 그 파일의 아이템 없이 limitation을 달고
+    /// 종료 0으로 끝난다(이전에는 파일을 통째로 읽고 파싱 오류로 2였다). 그 파일이 선언할 하위
+    /// 모듈·include 입력을 모르므로 `--out`은 기존 출력을 교체하지 않고 새 경로에는 쓴다.
+    #[test]
+    fn module_files_over_64_mib_are_left_out_of_the_graph() {
+        let tmp = std::env::temp_dir().join(format!("rg-oversized-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        layered_workspace(&tmp);
+        std::fs::write(
+            tmp.join("src/lib.rs"),
+            "pub mod app;\npub mod core;\npub mod big;\n",
+        )
+        .unwrap();
+        std::fs::File::create(tmp.join("src/big.rs"))
+            .unwrap()
+            .set_len(64 * 1024 * 1024 + 1)
+            .unwrap();
+        let (code, out, err) = run_at(&tmp, &["graph", "--level", "symbol"]);
+        assert_eq!(code, 0, "{err}");
+        let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let vertex_ids: Vec<&str> = doc["vertices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect();
+        assert!(vertex_ids.contains(&"layers::big"), "{vertex_ids:?}");
+        assert!(vertex_ids.contains(&"layers::app::run"), "{vertex_ids:?}");
+        assert!(!vertex_ids.iter().any(|id| id.starts_with("layers::big::")));
+        let notes: Vec<&str> = doc["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|l| l.as_str())
+            .filter(|l| l.contains("larger than 64 MiB"))
+            .collect();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("1 module files larger than 64 MiB were not read"));
+
+        let existing = tmp.join("graph.json");
+        std::fs::write(&existing, "previous complete output").unwrap();
+        let (code, _, err) = run_at(&tmp, &["graph", "--out", existing.to_str().unwrap()]);
+        assert_eq!(code, 2);
+        assert!(
+            err.contains("cannot safely replace an existing output: 1 module file(s) could not be read or parsed"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "previous complete output"
+        );
+        let fresh = tmp.join("fresh.json");
+        let (code, out, err) = run_at(&tmp, &["graph", "--out", fresh.to_str().unwrap()]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("wrote"), "{out}");
+        assert!(std::fs::read_to_string(&fresh)
+            .unwrap()
+            .contains("larger than 64 MiB"));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
 }
 
 /// 실제 바이너리로 `mcp <args>`를 띄워 도구 하나를 부른다 — (isError 여부, 답 텍스트).

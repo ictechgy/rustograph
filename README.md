@@ -518,6 +518,15 @@ accuracy improves. Bodies the semantic engine cannot see (cfg-disabled,
 macro-generated) fall back to the syntactic path with measured counters, and
 calls it cannot resolve fall back to the same bounded name fan-out.
 
+The syntactic harvest does not read a module file — a `mod` file or a crate
+root — larger than 64 MiB. Its module or crate vertex stays, but the items and
+submodules it declares are missing, and `limitations` counts such files, so
+`dead` can report code used only from them as unreachable. `schema` counts
+them under `unparsed-sources`; `routes` and `deps` do not see them. While such
+a file is in the workspace, `--out` does not replace an existing output — write
+to a new path or to stdout. The limit sits far above real sources: the largest
+of 18,080 `.rs` files in 610 crates.io packages is 2.5 MiB.
+
 ## Security: trust boundary
 
 rustograph parses source with syn, but it also runs the Rust toolchain.

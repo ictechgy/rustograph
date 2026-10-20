@@ -41,27 +41,38 @@ pub struct Options {
 /// 'static으로 누수시킨다. CLI는 짧게 살다 종료하므로 해제 비용이 없다.
 type Arena = BTreeMap<PathBuf, &'static [syn::Item]>;
 
-/// 분석 대상이 경로를 고르는 소스를 읽을 때의 크기 상한이다. 생성 코드(수 MB)는 넉넉히
-/// 덮되, 상한 없는 읽기가 거대한 sparse 파일을 통째로 메모리에 올리지 않게 한다.
-/// 판단값이다(rustc의 문서화된 한도가 아니다).
+/// 분석 대상이 경로를 고르는 소스를 읽을 때의 크기 상한이다 — 모듈 파일([`parse_into`]),
+/// include 입력, `schema`가 훑는 .rs가 같은 값을 쓴다. 생성 코드(수 MB)는 넉넉히 덮되, 상한 없는
+/// 읽기가 거대한 sparse 파일을 통째로 메모리에 올리지 않게 한다(1 GiB 모듈 파일에 최대 RSS 약
+/// 2 GB였다). 판단값이다(rustc의 문서화된 한도가 아니다) — 로컬 cargo 레지스트리 .rs 18,080개
+/// 가운데 가장 큰 파일(encoding_rs data.rs)이 2.5 MiB다.
 pub(crate) const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// 분석 대상 소스를 `max_bytes`까지만 읽는다 — 정규 파일만 연다([`require_regular_file`]).
-/// 정규 파일이 아니면 `InvalidInput`, 상한을 넘으면 `InvalidData` 오류다.
+/// 정규 파일이 아니면 `InvalidInput`, 상한을 넘으면 `FileTooLarge`, 상한 안이지만 UTF-8이
+/// 아니면 `InvalidData` 오류다. 크기를 UTF-8보다 먼저 본다: 상한+1 바이트에서 끊은 읽기가 다중
+/// 바이트 문자를 가르면 상한을 넘는 정상 파일이 깨진 UTF-8로 보였다. 상한 초과를 따로 알려야
+/// 수확이 그 파일을 읽기 오류가 아니라 limitation으로 다룬다([`parse_into`]).
 pub(crate) fn read_source_bounded(path: &Path, max_bytes: u64) -> std::io::Result<String> {
     use std::io::Read;
     require_regular_file(path)?;
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     std::fs::File::open(path)?
         .take(max_bytes.saturating_add(1))
-        .read_to_string(&mut text)?;
-    if text.len() as u64 > max_bytes {
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::FileTooLarge,
             format!("{} is larger than {max_bytes} bytes", path.display()),
         ));
     }
-    Ok(text)
+    // 문구는 std `read_to_string`과 같다 — 깨진 UTF-8 파일의 "cannot read" 오류가 바뀌지 않게 한다.
+    String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+    })
 }
 
 /// 분석 대상이 경로를 고른 소스가 정규 파일인지 연기 전에 본다 — `metadata`는 stat이라
@@ -295,8 +306,9 @@ pub(crate) fn harvest_parts(
 pub(crate) struct HarvestInputs {
     arena: Arena,
     orphan_files: Vec<PathBuf>,
-    /// 읽거나 파싱하지 못한 모듈 파일 — 끝까지 간 수확에는 없다(수확은 그런 파일에서
-    /// 실패한다). 관대 모드로 트리만 다시 찾은 [`input_files`]만 채운다.
+    /// 하위 모듈·include 입력을 모르는 모듈 파일(경로순) — 크기 상한을 넘어 읽지 않은 파일과,
+    /// 관대 모드로 트리만 다시 찾은 [`input_files`]에서는 읽거나 파싱하지 못한 파일도 있다
+    /// (끝까지 간 수확은 그런 파일에서 실패한다).
     unloaded: Vec<PathBuf>,
     workspace_root: PathBuf,
 }
@@ -308,8 +320,8 @@ pub(crate) struct ProtectedInputs {
     pub(crate) files: Vec<PathBuf>,
     /// 리터럴로 풀지 못한 include 경로가 있다 — 그 대상은 목록에 없다.
     pub(crate) unresolved_includes: bool,
-    /// 읽거나 파싱하지 못한 모듈 파일(경로순) — 파일은 목록에 있지만 그 파일이 선언한
-    /// 하위 모듈·include 입력은 없다.
+    /// 읽거나 파싱하지 못한 모듈 파일과 크기 상한을 넘어 읽지 않은 모듈 파일(경로순) — 파일은
+    /// 목록에 있지만 그 파일이 선언한 하위 모듈·include 입력은 없다.
     pub(crate) unloaded_modules: Vec<PathBuf>,
 }
 
@@ -373,10 +385,13 @@ fn manifests_above<'a>(paths: impl Iterator<Item = &'a PathBuf>) -> Vec<PathBuf>
 pub(crate) fn input_files(dir: &Path) -> Result<ProtectedInputs, String> {
     let metadata = cargo_meta::load(dir)?;
     let found = input_tree(&metadata, true)?;
+    // 크기 상한을 넘어 읽지 않은 파일도 그 파일이 선언할 하위 모듈·include 입력을 모른다.
+    let mut unloaded = found.unloaded.unwrap_or_default();
+    unloaded.extend(found.oversized);
     let inputs = HarvestInputs {
         arena: found.arena,
         orphan_files: found.tree.orphan_files,
-        unloaded: found.unloaded.into_iter().flatten().collect(),
+        unloaded: unloaded.into_iter().collect(),
         workspace_root: metadata.workspace_root,
     };
     Ok(inputs.protected_files())
@@ -799,6 +814,7 @@ fn harvest(
         markers,
         conditional_mods,
         uses_include,
+        oversized,
         ..
     } = input_tree(meta, false)?;
     for t in source_targets(meta).filter(|t| t.kind == "bin") {
@@ -816,6 +832,14 @@ fn harvest(
         ));
     }
     push_skipped_mods(&tree.skipped_mods, &mut limitations);
+    if !oversized.is_empty() {
+        limitations.push(format!(
+            "{} module files larger than {} MiB were not read; the items and submodules they \
+             declare are missing, so dead can report code used only from them as unreachable",
+            oversized.len(),
+            MAX_SOURCE_BYTES >> 20
+        ));
+    }
 
     // 스코프 2단계: 전 모듈의 아이템 표를 먼저 채우고(1단계), 그 다음
     // `use`를 해석한다(2단계). 임포트 해석이 다른 모듈의 아이템 표를 필요로
@@ -1019,7 +1043,7 @@ fn harvest(
             k.inputs = Some(HarvestInputs {
                 arena: arena.clone(),
                 orphan_files: tree.orphan_files.clone(),
-                unloaded: Vec::new(),
+                unloaded: oversized.iter().cloned().collect(),
                 workspace_root: meta.workspace_root.clone(),
             });
         }
@@ -1265,8 +1289,13 @@ struct InputTree {
     /// 읽거나 파싱하지 못한 모듈 파일 — Some이면 관대 모드다. 수확(None)은 그런 파일에서
     /// 오류로 끝나지만, `--out` 입력 보호는 파일을 적고 나머지 트리를 계속 찾는다. `schema`는
     /// 그런 파일을 unparsed-sources로 세고 문서를 내는데, 보호 목록 수집이 실패하면 `--out`일
-    /// 때만 종료 2가 됐다.
+    /// 때만 종료 2가 됐다. 크기 상한을 넘은 파일은 여기가 아니라 `oversized`에 적는다.
     unloaded: Option<BTreeSet<PathBuf>>,
+    /// 크기 상한([`MAX_SOURCE_BYTES`])을 넘어 읽지 않은 모듈 파일 — 두 모드 모두 오류가 아니다.
+    /// 수확은 limitation으로 세고 그 파일의 아이템·하위 모듈 없이 계속한다. 그 파일이 선언할 하위
+    /// 모듈·include 입력을 모르므로 `--out` 입력 보호는 싣지 못한 모듈 파일처럼 다룬다(기존 출력
+    /// 교체 거부).
+    oversized: BTreeSet<PathBuf>,
 }
 
 impl InputTree {
@@ -1418,17 +1447,24 @@ fn scan_orphans(dir: &Path, known: &BTreeSet<PathBuf>, tree: &mut ModTree) {
 /// 실전에서는 조건부 생성 파일이 깨진 문법을 가질 수 있어 빈 목록으로 둔다.
 /// 정규 파일이 아니면 열지 않고 "cannot read" 오류다 — `mod` 대상은 collect_submodules가,
 /// 타깃 루트는 grow_tree가 미리 거르지만, stat이 실패해 걸러지지 않은 대상과 검사 뒤에 바뀐
-/// 파일도 여기서 막는다. 크기 상한은 두지 않는다(정상인 거대 생성 파일을 오류로 할지
-/// limitation으로 할지 정하지 않았다 — 정규 파일은 끝이 있다).
+/// 파일도 여기서 막는다. [`MAX_SOURCE_BYTES`]를 넘는 파일은 넘는지 알 만큼(상한+1 바이트)만
+/// 읽고 오류 대신 `oversized`에 적는다 — 상한 없는 읽기는 거대한 sparse 파일을 통째로 메모리에
+/// 올렸고, 정상인 거대 생성 파일일 수도 있다. 그 파일은 아레나에 없어 아이템·하위 모듈이 그래프에
+/// 없고, 수확이 그 수를 limitation으로 센다.
 fn parse_into(found: &mut InputTree, file: &Path) -> Result<(), String> {
-    if found.arena.contains_key(file) {
+    if found.arena.contains_key(file) || found.oversized.contains(file) {
         return Ok(());
     }
     #[cfg(test)]
     PARSED_FILES.with(|c| c.set(c.get() + 1));
-    let src = require_regular_file(file)
-        .and_then(|()| std::fs::read_to_string(file))
-        .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+    let src = match read_source_bounded(file, MAX_SOURCE_BYTES) {
+        Ok(src) => src,
+        Err(e) if e.kind() == std::io::ErrorKind::FileTooLarge => {
+            found.oversized.insert(file.to_path_buf());
+            return Ok(());
+        }
+        Err(e) => return Err(format!("cannot read {}: {e}", file.display())),
+    };
     // include! 계열은 파일 경로 인자를 받아 별도 입력을 읽는다 —
     // 그 입력 파일은 정점 위치에 안 나타나 지문 밖이다.
     if !found.uses_include
@@ -1517,8 +1553,8 @@ struct ModuleHarvest<'a> {
 
 /// 한 모듈의 선언을 수확한다 — 모듈 정점, contains/uses 간선, 본문 보관.
 /// 생성 코드 마커는 파싱할 때 파일마다 판정해 둔 `markers`에서 찾는다 — 모듈 정점과 그 아이템
-/// 정점이 같은 판정을 쓴다. 모듈 파일과 그룹 파일은 모두 아레나에 있다(엄격 수확은 싣지 못한
-/// 파일에서 오류로 끝난다).
+/// 정점이 같은 판정을 쓴다. 크기 상한을 넘어 읽지 않은 파일은 아레나에 없어 그 모듈은 아이템 없이
+/// 정점만 남는다(generated는 거짓). 그 밖에 싣지 못한 파일에서는 엄격 수확이 오류로 끝난다.
 fn harvest_module<'a>(
     tree: &mut ModTree,
     arena: &'a Arena,
@@ -2209,7 +2245,7 @@ mod tests {
         std::fs::write(&fits, "fn a() {}").unwrap();
         assert_eq!(read_source_bounded(&fits, 9).unwrap(), "fn a() {}");
         let over = read_source_bounded(&fits, 8).unwrap_err();
-        assert_eq!(over.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(over.kind(), std::io::ErrorKind::FileTooLarge);
         let fifo = tmp.join("pipe.rs");
         let made = std::process::Command::new("mkfifo")
             .arg(&fifo)
@@ -2227,6 +2263,107 @@ mod tests {
         }
         let missing = read_source_bounded(&tmp.join("missing.rs"), MAX_SOURCE_BYTES).unwrap_err();
         assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 상한은 UTF-8 검사보다 먼저 본다 — 상한+1 바이트에서 끊은 읽기가 다중 바이트 문자를 가르면
+    /// 상한을 넘는 정상 UTF-8 파일이 깨진 UTF-8로 보고됐다(수확이 그 파일을 limitation 대신 읽기
+    /// 오류로 다룬다). 상한 초과는 `FileTooLarge`, 상한 안의 깨진 UTF-8은 그대로 `InvalidData`다.
+    #[test]
+    fn bounded_source_judges_the_size_before_utf8() {
+        let tmp =
+            std::env::temp_dir().join(format!("rustograph-bounded-utf8-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file = tmp.join("text.rs");
+        // 'a'(1바이트) 뒤 3바이트 문자 — 상한 1·2의 읽기(2·3바이트)는 문자 한가운데서 끊긴다.
+        std::fs::write(&file, "a한").unwrap();
+        assert_eq!(read_source_bounded(&file, 4).unwrap(), "a한");
+        for max_bytes in [1, 2, 3] {
+            let err = read_source_bounded(&file, max_bytes).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge, "{max_bytes}");
+            assert!(
+                err.to_string()
+                    .ends_with(&format!("is larger than {max_bytes} bytes")),
+                "{max_bytes}: {err}"
+            );
+        }
+        std::fs::write(&file, b"fn a() {}\n// \xff\n").unwrap();
+        let err = read_source_bounded(&file, 64).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "stream did not contain valid UTF-8");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// `len` 바이트의 sparse 파일 — 내용이 0바이트라 Rust로 파싱되지 않고 디스크도 거의 쓰지 않는다.
+    fn sparse_source(path: &Path, len: u64) {
+        std::fs::File::create(path).unwrap().set_len(len).unwrap();
+    }
+
+    /// 크기 상한([`MAX_SOURCE_BYTES`])을 넘는 모듈 파일은 읽지 않고 limitation으로 센다 — 상한 없는
+    /// 읽기는 거대한 sparse 파일을 통째로 메모리에 올렸다(1 GiB 파일에 최대 RSS 약 2 GB). 그 파일의
+    /// 모듈 정점은 상위 `mod` 선언이 만들어 남고, 아이템과 그 파일이 선언할 하위 모듈은 없다. 타깃
+    /// 루트 파일이면 크레이트 정점만 남는다. 하위 모듈·include 입력을 모르므로 `--out` 입력 보호는
+    /// 수확이 넘긴 입력과 관대 모드 재수집 모두 그 파일을 싣지 못한 모듈 파일로 다룬다(기존 출력 교체
+    /// 거부). 상한과 같은 크기는 읽는다 — 0바이트로 찬 파일이라 파싱 오류가 읽었다는 증거다.
+    #[test]
+    fn module_files_over_the_size_limit_are_left_out_with_a_limitation() {
+        let tmp = std::env::temp_dir().join(format!("rustograph-oversized-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let unread_note = "1 module files larger than 64 MiB were not read; the items and \
+                           submodules they declare are missing, so dead can report code used \
+                           only from them as unreachable"
+            .to_string();
+        let files: [(&str, &[u8]); 2] = [
+            (
+                "src/lib.rs",
+                b"pub mod big;\npub mod small;\npub fn top() {}\n",
+            ),
+            ("src/small.rs", b"pub fn f() {}\n"),
+        ];
+        let dir = write_crate(&tmp, "oversized", None, &files);
+        let big = dir.join("src/big.rs");
+        sparse_source(&big, MAX_SOURCE_BYTES + 1);
+        let root_dir = write_crate(&tmp, "oversized_root", None, &[]);
+        sparse_source(&root_dir.join("src/lib.rs"), MAX_SOURCE_BYTES + 1);
+        for (crate_dir, unread_file, kept) in [
+            (
+                &dir,
+                &big,
+                &[
+                    "oversized",
+                    "oversized::big",
+                    "oversized::small",
+                    "oversized::small::f",
+                    "oversized::top",
+                ][..],
+            ),
+            (
+                &root_dir,
+                &root_dir.join("src/lib.rs"),
+                &["oversized_root"][..],
+            ),
+        ] {
+            let doc = load(crate_dir, &span_options()).unwrap();
+            let mut vertex_ids: Vec<&str> = doc.vertices.iter().map(|v| v.id.as_str()).collect();
+            vertex_ids.sort_unstable();
+            assert_eq!(vertex_ids, kept);
+            let notes: Vec<&String> = doc
+                .limitations
+                .iter()
+                .filter(|l| l.contains("64 MiB"))
+                .collect();
+            assert_eq!(notes, [&unread_note], "{}", crate_dir.display());
+            let (_, inputs) = load_with_inputs(crate_dir, &span_options()).unwrap();
+            let harvested = inputs.expect("a fresh harvest hands over its inputs");
+            for listed in [harvested.protected_files(), input_files(crate_dir).unwrap()] {
+                assert_eq!(listed.unloaded_modules, std::slice::from_ref(unread_file));
+                assert!(listed.files.contains(unread_file));
+            }
+        }
+        sparse_source(&big, MAX_SOURCE_BYTES);
+        let err = load(&dir, &span_options()).unwrap_err();
+        assert!(err.starts_with("parse error in"), "{err}");
         std::fs::remove_dir_all(&tmp).ok();
     }
 

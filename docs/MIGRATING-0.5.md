@@ -113,7 +113,11 @@ the file under `unparsed-sources` and writes the same document to a fresh output
 path. The unreadable file is protected, but the modules and include inputs it
 declares are unknown, so replacing an existing output is rejected conservatively
 with an error that names the file. Commands that need the symbol graph, such as
-`graph` and `rules`, still exit 2 on such a file.
+`graph` and `rules`, still exit 2 on such a file. A module file larger than
+64 MiB is the exception: it is not read at all, and the harvest goes on without
+its items and submodules and counts it in `limitations`, so `graph` and `rules`
+no longer exit 2 on it — but replacing an existing output is still rejected the
+same way.
 
 The rename is a single-file publication, not a multi-file transaction or a
 power-loss durability guarantee. On systems that reject replacing an open or
