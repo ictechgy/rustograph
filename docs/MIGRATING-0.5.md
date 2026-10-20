@@ -121,7 +121,7 @@ HTML tag. Lines without those characters are unchanged.
 
 ## Path budgets
 
-The path expansion budget also limits queued partial-path copies. Completed
+The path expansion budget also limits queued partial paths. Completed
 paths use separate bounded slots, so a known direct path remains available even
 when partial paths have exhausted the budget. Dropped search states set
 `truncated`; a partial search is never reported as complete.
