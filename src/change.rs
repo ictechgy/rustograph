@@ -127,7 +127,7 @@ impl Checkout {
         ));
         std::fs::create_dir(&dir).map_err(|e| format!("create isolated snapshot: {e}"))?;
         let owned = Self(dir);
-        let result = git_command()
+        let result = guarded_git(repo)?
             .args([
                 "clone",
                 "--local",
@@ -513,9 +513,7 @@ fn git_path(path: &Path) -> String {
     }
 }
 fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let result = git_command()
-        .arg("-C")
-        .arg(root)
+    let result = guarded_git(root)?
         .args(args)
         .output()
         .map_err(|e| format!("start git: {e}"))?;
@@ -527,19 +525,101 @@ fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     }
     Ok(result.stdout)
 }
-fn git_command() -> Command {
+fn git_command() -> Result<Command, String> {
     // 체크아웃이 사용자의 필터·hook·fsmonitor 명령을 선택하지 않게 raw Git 내용을 쓴다.
-    let mut command = Command::new("git");
+    let search = std::env::var_os("PATH")
+        .or_else(|| {
+            if cfg!(unix) {
+                Some("/bin:/usr/bin".into())
+            } else {
+                None
+            }
+        })
+        .ok_or("Git requires an absolute PATH entry")?;
+    let file = format!("git{}", std::env::consts::EXE_SUFFIX);
+    let program = std::env::split_paths(&search)
+        .filter(|p| p.is_absolute())
+        .map(|p| p.join(&file))
+        .find(|p| {
+            let Ok(meta) = std::fs::metadata(p) else {
+                return false;
+            };
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                meta.is_file() && meta.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(not(unix))]
+            {
+                meta.is_file()
+            }
+        })
+        .ok_or("Git executable was not found in absolute PATH entries")?;
+    let mut command = Command::new(program);
     command
-        .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath="])
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "log.showSignature=false",
+        ])
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env(
             "GIT_CONFIG_GLOBAL",
             if cfg!(windows) { "NUL" } else { "/dev/null" },
         )
+        .env_remove("GIT_CONFIG")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_TERMINAL_PROMPT", "0");
-    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null());
+    Ok(command)
+}
+fn guarded_git(root: &Path) -> Result<Command, String> {
+    // 작업 트리를 읽지 않는 설정 조회부터 하고, diff/checkout 직전에 로컬 필터도 끈다.
+    let keys = git_command()?
+        .arg("-C")
+        .arg(root)
+        .args(["config", "-z", "--includes", "--name-only", "--list"])
+        .output()
+        .map_err(|e| format!("read Git filter configuration: {e}"))?;
+    if !keys.status.success() {
+        return Err("cannot inspect Git filter configuration".into());
+    }
+    let mut command = git_command()?;
+    command.arg("-C").arg(root);
+    for key in keys.stdout.split(|b| *b == 0) {
+        if key.len() < 7 || !key[..7].eq_ignore_ascii_case(b"filter.") {
+            continue;
+        }
+        let rest = &key[7..];
+        let Some(dot) = rest.iter().rposition(|b| *b == b'.') else {
+            continue;
+        };
+        if ![b"clean".as_slice(), b"smudge", b"process"]
+            .iter()
+            .any(|kind| rest[dot + 1..].eq_ignore_ascii_case(kind))
+        {
+            continue;
+        }
+        let name = std::str::from_utf8(&rest[..dot])
+            .map_err(|_| "unsupported Git filter driver name; use a raw source checkout")?;
+        if name.contains('=')
+            || name
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        {
+            return Err("unsupported Git filter driver name; use a raw source checkout".into());
+        }
+        for setting in ["clean=", "smudge=", "process=", "required=false"] {
+            command.arg("-c").arg(format!("filter.{name}.{setting}"));
+        }
+    }
+    Ok(command)
 }
 fn git_text(root: &Path, args: &[&str]) -> Result<String, String> {
     String::from_utf8(git(root, args)?)

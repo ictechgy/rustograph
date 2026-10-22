@@ -3,7 +3,7 @@
 This is bounded evidence for review usefulness, not an application-wide recall,
 precision, productivity or failure-prediction claim.
 
-The eight new Git-flow regressions exercise real source capture: deleted
+The nine new Git-flow regressions exercise real source capture: deleted
 declarations retain old callers; a before-only call and after-only call cannot
 form a hybrid path; rename retains independent old/new identities; body-only
 edits change content identity; untracked configuration remains visible; CLI
@@ -11,7 +11,9 @@ and MCP agree on bounded captures; trait/callback source compiles and its
 connected test root remains a review candidate; invalid/conflicting input
 fails instead of returning empty success. Staged deletion and rename remove
 the old HEAD files from working captures, including when their old module
-declarations remain; unresolved references remain limitations. The trait/callback fixture is run by
+declarations remain; unresolved references remain limitations. A harmless marker
+also reproduced repository clean-filter execution during working diff; the
+corrected capture suppresses those commands. The trait/callback fixture is run by
 Cargo, but these tests do not establish that all dynamic callbacks are resolved.
 
 Ordinary impact regression preserves harvested unresolved-path limitations,

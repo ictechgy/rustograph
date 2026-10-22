@@ -328,3 +328,29 @@ fn invalid_revision_and_conflicting_inputs_fail_instead_of_empty_success() {
         assert!(result.stdout.is_empty());
     }
 }
+
+#[test]
+fn working_diff_does_not_execute_repository_clean_filters() {
+    let repo = Repo::new();
+    let base = repo.base();
+    git(
+        &repo.0,
+        &[
+            "config",
+            "filter.fixture.clean",
+            "echo ran >> .git/filter-ran; cat",
+        ],
+    );
+    std::fs::write(repo.0.join(".gitattributes"), "*.rs filter=fixture\n").unwrap();
+    std::fs::write(
+        repo.0.join("src/target.rs"),
+        "pub fn removed() { let _x = 9; }\n",
+    )
+    .unwrap();
+    let report = repo.report(&base, &["--working-tree"]);
+    assert!(!repo.0.join(".git/filter-ran").exists());
+    assert!(has(
+        &report["after"]["seeds"],
+        "patch_fixture::target::removed"
+    ));
+}

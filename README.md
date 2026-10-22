@@ -41,11 +41,11 @@ over it, with a deterministic JSON contract meant for coding agents:
 ```bash
 brew install ictechgy/tap/rustograph
 # or
-cargo install --locked --git https://github.com/ictechgy/rustograph --tag v0.5.0
+cargo install --locked --git https://github.com/ictechgy/rustograph --tag v0.6.0
 ```
 
-The source-install command is pinned to the published
-[v0.5.0 release](https://github.com/ictechgy/rustograph/releases/tag/v0.5.0)
+The source-install command is pinned to the
+[v0.6.0 release](https://github.com/ictechgy/rustograph/releases/tag/v0.6.0)
 and its committed dependency lockfile. Homebrew availability follows the tap
 formula separately; this GitHub release does not establish crates.io publication.
 
@@ -675,6 +675,14 @@ points into the checkout), apply as usual.
 
 MIT — see [LICENSE](LICENSE).
 
+
+## 0.6.0 compatibility notes
+
+Use [the Git change workflow](docs/CHANGE-IMPACT.md) for independent before/after
+source capture. Ordinary impact now includes harvested limitations, provenance,
+witness evidence and explicit bounds. Existing current-only command defaults,
+graph document v1 and traversal v1 remain compatible. Public Rust result fields
+are additive but struct literals need updating; see [0.6 migration](docs/MIGRATING-0.6.md).
 
 ## 0.5.0 compatibility notes
 

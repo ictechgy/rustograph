@@ -16,6 +16,9 @@ checkout. Old and new paths are retained for renames. A deleted declaration can
 therefore retain its historical callers. A path never combines a before edge
 with an after edge. Git and Cargo must be available, and both captured projects
 must support Cargo metadata. Capture failures are errors, not empty reports.
+Git filters/hooks/fsmonitor are suppressed, and Git is resolved only from
+absolute PATH entries. The capture uses raw file bytes; projects that require
+filter-generated source must prepare that source explicitly before analysis.
 
 `before` and `after` contain their own seeds, impact reports, witness hops,
 connected `review_roots`, unmapped files and limitations. `review_roots` are
@@ -47,6 +50,10 @@ to 200 and caps total impacted rows per revision; at most 256 seeds per revision
 are selected, deterministically. `truncation_reasons` records depth, result and
 seed limits. `preparation_ms` includes local snapshot preparation, metadata,
 hashing and both source harvests; it does not imply compilation or test time.
+The row/depth/seed limits do not bound preparation. Fingerprinting rejects each
+file above 64 MiB, but there is no total file-count, wall-clock or memory budget
+for cloning, hashing, Cargo metadata or harvesting. Large repositories can take
+substantial time and memory before the bounded report is produced.
 
 ## MCP
 
