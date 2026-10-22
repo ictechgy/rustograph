@@ -104,6 +104,9 @@ rustograph rules --baseline base.txt      # only *new* violations fail
 rustograph query mycrate::module::f --depth 2
 rustograph impact mycrate::Type --depth 3  # reverse transitive closure
 rustograph impact mycrate::Type --depth 0  # no depth limit (still bounded by --max)
+# Analyze an actual patch using independent before/after source snapshots
+rustograph change-impact --base main --head HEAD --depth 2
+rustograph change-impact --base HEAD --working-tree
 rustograph paths mycrate::a mycrate::b    # bounded paths between two ids
 rustograph paths mycrate::a mycrate::b --max 50 --budget 200000  # at most 1024 / 1000000
 rustograph search entry                   # exact > suffix > substring
@@ -424,6 +427,16 @@ reqwest/ureq/url crates and records every request at a local server: 41
 scenarios, 0 mismatches, checked offline by `cargo test`. All 48
 `producer`/`producer:rustograph` cases of the isthmus `url-compose` vectors
 pass.
+
+## Git change review — `change-impact`
+
+Use [the change-impact workflow](docs/CHANGE-IMPACT.md) to map a Git base/head
+or working-tree patch to old/new file declarations, historical/current callers
+and connected test/entry roots. Results preserve source content freshness,
+harvested limitations, witness hops and depth/output restrictions. File-wide
+static candidates support review; empty results are not a safety guarantee or
+permission to skip tests. MCP exposes the same workflow as
+`rustograph_change_impact`.
 
 ## Traversal documents — `reach` / `impact --format language-traversal`
 

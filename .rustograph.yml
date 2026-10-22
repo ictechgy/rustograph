@@ -17,6 +17,7 @@ components:
   harvest: ["rustograph::harvest/**"]
   graph: ["rustograph::graph/**"]
   analysis: ["rustograph::analysis/**"]
+  change: ["rustograph::change/**"]
   traversal: ["rustograph::traversal/**"]
   rules: ["rustograph::rules/**"]
   export: ["rustograph::export/**"]
@@ -29,8 +30,9 @@ components:
   deps_report: ["rustograph::deps/**"]
 deps:
   app: [cli]
-  cli: [source, analysis, traversal, rules, export, sarif, config, graph, mcp, cli_args, deps_report]
-  mcp: [cli_args, analysis, rules, export, config, graph, deps_report]
+  cli: [source, analysis, traversal, change, rules, export, sarif, config, graph, mcp, cli_args, deps_report]
+  mcp: [cli_args, analysis, change, rules, export, config, graph, deps_report]
+  change: [analysis, graph, source, traversal]
   cli_args: [source, export, graph]
   source: [graph, harvest, modtree, cargo_meta, sem, cfgeval, fanout]
   # sem은 ra_ap 경계 — source만 호출하고, syn 경계·도메인 위층은 모른다.

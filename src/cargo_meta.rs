@@ -786,20 +786,27 @@ mod tests {
 
     #[test]
     fn find_program_skips_empty_and_relative_path_entries() {
+        let first = if cfg!(windows) { "C:/first" } else { "/first" };
+        let second = if cfg!(windows) {
+            "C:/second"
+        } else {
+            "/second"
+        };
+        let executable = Path::new(second).join("cargo");
         let present = |candidate: &Path| {
             [
                 Path::new("cargo"),
                 Path::new("./cargo"),
                 Path::new("bin/cargo"),
-                Path::new("/second/cargo"),
+                executable.as_path(),
             ]
             .iter()
             .any(|known| candidate == known.with_extension(std::env::consts::EXE_EXTENSION))
         };
-        let path = std::env::join_paths(["", ".", "bin", "/first", "/second"]).unwrap();
+        let path = std::env::join_paths(["", ".", "bin", first, second]).unwrap();
         assert_eq!(
             find_program(Some(&path), "cargo", present),
-            Some(PathBuf::from("/second/cargo").with_extension(std::env::consts::EXE_EXTENSION))
+            Some(executable.with_extension(std::env::consts::EXE_EXTENSION))
         );
         let relative_only = std::env::join_paths(["", ".", "bin"]).unwrap();
         assert_eq!(find_program(Some(&relative_only), "cargo", present), None);

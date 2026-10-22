@@ -6,7 +6,7 @@
 mod reach;
 
 use crate::cli_args::{self, Args};
-use crate::{analysis, config, deps, export, mcp, rules, sarif, source, traversal};
+use crate::{analysis, change, config, deps, export, mcp, rules, sarif, source, traversal};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -27,6 +27,8 @@ usage:
   rustograph deps [--strict] [--format text|json]
   rustograph query ID [--depth N] [--max N]
   rustograph impact ID [--depth N] [--max N]
+  rustograph change-impact --base REV [--head REV | --working-tree] [--dir DIR]
+                           [--depth N] [--max N]
   rustograph reach ID... [--roots-from FILE|-] [--max-depth N] [--max-reached N]
                    [--revision REV] [--generated-at TIMESTAMP]
   rustograph impact --format language-traversal ID... (same options as reach)
@@ -104,6 +106,7 @@ fn run_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Resul
             cmd_traversal(&a, traversal::Direction::Dependents, out, err)
         }
         "impact" => cmd_query(&a, out, true),
+        "change-impact" => cmd_change(&a, out),
         "reach" => cmd_traversal(&a, traversal::Direction::Dependencies, out, err),
         "paths" => cmd_paths(&a, out),
         "search" => cmd_search(&a, out),
@@ -701,6 +704,25 @@ fn cmd_deps(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
             0
         },
     )
+}
+
+fn cmd_change(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
+    cli_args::reject_unused(
+        a,
+        &[&["dir", "base", "head", "working-tree", "depth", "max"]],
+        0,
+    )?;
+    let base = a.get("base").ok_or("change-impact needs --base REV")?;
+    let report = change::analyze(&change::Request {
+        dir: Path::new(a.get("dir").unwrap_or(".")),
+        base,
+        head: a.get("head"),
+        working_tree: a.has("working-tree"),
+        depth: cli_args::usize_arg(a, "depth", 2)?,
+        max: cli_args::usize_arg(a, "max", 200)?,
+    })?;
+    write!(out, "{}", export::to_json(&report)).map_err(|e| e.to_string())?;
+    Ok(0)
 }
 
 fn cmd_query(a: &Args, out: &mut dyn Write, reverse: bool) -> Result<i32, String> {

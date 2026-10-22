@@ -7,6 +7,7 @@
 pub mod analysis;
 pub mod cargo_meta;
 pub mod cfgeval;
+pub mod change;
 pub mod cli;
 pub(crate) mod cli_args;
 pub mod config;
