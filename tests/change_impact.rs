@@ -190,6 +190,66 @@ fn untracked_and_configuration_changes_are_explicit_candidates() {
 }
 
 #[test]
+fn staged_deletion_does_not_restore_head_source_in_captured_working_tree() {
+    let repo = Repo::new();
+    let base = repo.base();
+    git(&repo.0, &["rm", "src/target.rs"]);
+    // Cargo 변경으로 전체 선언을 드러내되 사라진 모듈 선언은 그대로 남긴다.
+    let manifest = repo.0.join("Cargo.toml");
+    let mut text = std::fs::read_to_string(&manifest).unwrap();
+    text.push_str("description='staged deletion regression'\n");
+    std::fs::write(manifest, text).unwrap();
+    let report = repo.report(&base, &["--working-tree"]);
+    assert!(!has(
+        &report["after"]["seeds"],
+        "patch_fixture::target::removed"
+    ));
+    assert_eq!(report["after"]["provenance"]["freshness"], "captured");
+    assert_eq!(report["state"], "incomplete");
+    assert!(report["after"]["limitations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s.as_str().unwrap().contains("could not be resolved")));
+    let old = report["before"]["impacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "patch_fixture::target::removed")
+        .unwrap();
+    assert!(has(&old["impacted"], "patch_fixture::caller::caller"));
+    assert!(!repo.0.join("src/target.rs").exists());
+}
+
+#[test]
+fn staged_rename_removes_old_path_even_when_the_old_module_is_still_declared() {
+    let repo = Repo::new();
+    let base = repo.base();
+    git(&repo.0, &["mv", "src/target.rs", "src/renamed.rs"]);
+    std::fs::write(
+        repo.0.join("src/lib.rs"),
+        "pub mod target; pub mod renamed; pub mod caller; pub mod entry;\n",
+    )
+    .unwrap();
+    let manifest = repo.0.join("Cargo.toml");
+    let mut text = std::fs::read_to_string(&manifest).unwrap();
+    text.push_str("description='staged rename regression'\n");
+    std::fs::write(manifest, text).unwrap();
+    let report = repo.report(&base, &["--working-tree"]);
+    assert!(!has(
+        &report["after"]["seeds"],
+        "patch_fixture::target::removed"
+    ));
+    assert!(has(
+        &report["after"]["seeds"],
+        "patch_fixture::renamed::removed"
+    ));
+    assert_eq!(report["after"]["provenance"]["freshness"], "captured");
+    assert_eq!(report["state"], "incomplete");
+    assert!(!repo.0.join("src/target.rs").exists());
+}
+
+#[test]
 fn native_mcp_and_cli_use_the_same_patch_contract() {
     let repo = Repo::new();
     let base = repo.base();

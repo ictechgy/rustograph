@@ -199,7 +199,7 @@ impl<'a> QueryIndex<'a> {
             truncation_reasons,
             limitations: self.doc.limitations.clone(),
             provenance: ImpactProvenance { origin: "graph-document", revision: self.doc.revision.clone(),
-                content_freshness: "unverified" },
+                content_freshness: "unverified", project: self.doc.root.clone(), workspace: self.doc.workspace.clone() },
             witnesses,
             interpretation: "Static review candidates; empty results do not prove safety and do not authorize skipping tests.",
         }
@@ -383,6 +383,8 @@ pub struct ImpactProvenance {
     pub origin: &'static str,
     pub revision: Option<String>,
     pub content_freshness: &'static str,
+    pub project: String,
+    pub workspace: Option<String>,
 }
 
 /// 같은 문서 안의 최단 경로 한 홉 — via를 따라가면 seed에 닿는다.

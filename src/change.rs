@@ -127,7 +127,7 @@ impl Checkout {
         ));
         std::fs::create_dir(&dir).map_err(|e| format!("create isolated snapshot: {e}"))?;
         let owned = Self(dir);
-        let result = Command::new("git")
+        let result = git_command()
             .args([
                 "clone",
                 "--local",
@@ -161,7 +161,14 @@ impl Checkout {
     }
     fn working(repo: &Path, revision: &str) -> Result<Self, String> {
         let checkout = Self::new(repo, revision)?;
-        for file in paths(&git(
+        // index에서 사라진 staged 삭제/rename의 이전 경로도 HEAD 복사본에서 제거한다.
+        let mut files: BTreeSet<String> = paths(&git(
+            repo,
+            &["ls-tree", "-r", "--name-only", "-z", revision, "--"],
+        )?)?
+        .into_iter()
+        .collect();
+        files.extend(paths(&git(
             repo,
             &[
                 "ls-files",
@@ -170,7 +177,8 @@ impl Checkout {
                 "--exclude-standard",
                 "-z",
             ],
-        )?)? {
+        )?)?);
+        for file in files {
             let relative = Path::new(&file);
             if relative
                 .components()
@@ -182,6 +190,9 @@ impl Checkout {
             let to = checkout.0.join(relative);
             match std::fs::symlink_metadata(&from) {
                 Ok(meta) if meta.is_file() => {
+                    if std::fs::symlink_metadata(&to).is_ok_and(|m| m.file_type().is_symlink()) {
+                        return Err(format!("snapshot source {file} changes a symlink; commit the regular input before analysis"));
+                    }
                     if let Some(parent) = to.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
                     std::fs::copy(&from, &to).map_err(|e| format!("copy working source {file}: {e}"))?;
                 }
@@ -230,6 +241,8 @@ pub fn analyze(request: &Request<'_>) -> Result<Report, String> {
     };
     let mut args = vec![
         "diff",
+        "--no-ext-diff",
+        "--no-textconv",
         "--name-status",
         "-z",
         "--find-renames",
@@ -422,6 +435,19 @@ fn capture(
             remaining,
         );
         result.depth = request.depth;
+        result.mode = if before {
+            "historical-snapshot"
+        } else {
+            "current-snapshot"
+        };
+        result.provenance.project = relative.to_string_lossy().replace('\\', "/");
+        result.provenance.workspace = doc.workspace.as_deref().map(|workspace| {
+            let path = Path::new(workspace);
+            path.strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        });
         result.provenance.origin = if working {
             "fresh-working-tree"
         } else {
@@ -487,7 +513,7 @@ fn git_path(path: &Path) -> String {
     }
 }
 fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let result = Command::new("git")
+    let result = git_command()
         .arg("-C")
         .arg(root)
         .args(args)
@@ -500,6 +526,20 @@ fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         ));
     }
     Ok(result.stdout)
+}
+fn git_command() -> Command {
+    // 체크아웃이 사용자의 필터·hook·fsmonitor 명령을 선택하지 않게 raw Git 내용을 쓴다.
+    let mut command = Command::new("git");
+    command
+        .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath="])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command
 }
 fn git_text(root: &Path, args: &[&str]) -> Result<String, String> {
     String::from_utf8(git(root, args)?)
