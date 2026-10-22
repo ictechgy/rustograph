@@ -2,6 +2,16 @@
 
 세션을 이어받는 에이전트가 먼저 읽는 문서입니다.
 
+## 릴리스 준비 — v0.6.0 (2026-10-22)
+
+PR #40은 실제 Git 변경의 독립적인 이전/이후 수확과 CLI/MCP 영향 분석을 추가한다.
+staged 삭제·rename과 로컬 Git clean filter 실행 회귀를 실제 fixture에서 재현하고 수정했다.
+공개 Rust 결과 필드는 docs/MIGRATING-0.6.md, 분석 한계·준비 비용은 docs/CHANGE-IMPACT.md 및
+docs/CHANGE-IMPACT-EVALUATION.md에 있다. Cargo.lock은 자기 버전만 바꾸고 의존 핀은 유지했다.
+8cace4a 커밋 CI는 coverage 94.71%와 CLI 계약·자기 분석·Windows 출력 검사를 통과했다.
+최종 버전 커밋의 독립 리뷰·CI·머지 확인 뒤 기존 태그 workflow를 사용한다. 이 기록 자체는
+태그·Release·바이너리 배포 완료를 뜻하지 않는다. 공개 자산 다운로드·깨끗한 설치 검증이 필요하다.
+
 ## 릴리스 준비 — v0.4.2 (2026-10-11)
 
 PR #28의 실제 머지 커밋 `d7fc6b45f2a94634cc8deec2cdc1627e9adf4302`에서 준비했다.

@@ -2,7 +2,19 @@
 
 이 프로젝트의 주요 변경 사항을 기록한다.
 
-## [Unreleased]
+## [0.6.0]
+
+### Change analysis
+
+- `change-impact --base REV [--head REV | --working-tree]`와 MCP `rustograph_change_impact`가 실제 변경을
+  독립적인 이전/이후 소스 그래프로 연결한다. 삭제·rename의 과거 호출자를 보존하며 staged 삭제 경로를
+  현재 캡처에 되살리지 않는다. 파일 전체 seed의 정밀도, 연결된 테스트/진입점 후보, 내용 신선도,
+  미해결 경로와 깊이·출력·seed 제한을 결과에 남긴다. 서로 다른 revision의 간선을 섞지 않는다.
+- 기존 ordinary impact에도 수확한 한계·provenance·실제 경로의 간선 근거를 보존한다. CLI depth=1과
+  MCP depth=0 기본값 및 기존 `truncated`의 출력 개수 의미는 유지한다. 새 공개 Rust 필드의 이행은
+  [0.6 migration](docs/MIGRATING-0.6.md)을 따른다. 빈 결과는 안전 판정이나 테스트 생략 허가가 아니다.
+- 새 Git 흐름도 로컬 clean/smudge/process 필터·hook·fsmonitor를 실행하지 않는다. 절대 PATH의 Git을
+  사용하고 원본 checkout은 수정하지 않는다. 준비 비용과 미검증 범위는 [평가 기록](docs/CHANGE-IMPACT-EVALUATION.md)에 남긴다.
 
 ### Security
 

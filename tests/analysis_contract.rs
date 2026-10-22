@@ -141,8 +141,12 @@ fn mcp_and_cli_share_directional_results_and_caps() {
 fn cli_and_mcp_depth_zero_walk_the_whole_closure() {
     let snapshot = Snapshot::new("depth-zero");
     let impact = snapshot.cli(&["impact", "shared", "--depth", "0"]);
+    let original_fields = json!({
+        "id": impact["id"], "found": impact["found"], "depth": impact["depth"],
+        "truncated": impact["truncated"], "impacted": impact["impacted"]
+    });
     assert_eq!(
-        impact,
+        original_fields,
         json!({
             "id": "shared", "found": true, "depth": 0, "truncated": false,
             "impacted": [
@@ -173,6 +177,25 @@ fn cli_and_mcp_depth_zero_walk_the_whole_closure() {
         ],
     );
     assert_eq!(mcp, [impact.clone(), impact, query, capped]);
+}
+
+#[test]
+fn ordinary_impact_preserves_scope_and_depth_evidence() {
+    let snapshot = Snapshot::new("impact-evidence");
+    let mut doc: Value = serde_json::from_slice(&std::fs::read(&snapshot.0).unwrap()).unwrap();
+    doc["limitations"] = json!(["3 unresolved_paths; callbacks not resolved"]);
+    doc["revision"] = json!("captured-source-label");
+    std::fs::write(&snapshot.0, serde_json::to_vec(&doc).unwrap()).unwrap();
+    let report = snapshot.cli(&["impact", "shared", "--depth", "1"]);
+    assert_eq!(report["limitations"], doc["limitations"]);
+    assert_eq!(report["provenance"]["revision"], doc["revision"]);
+    assert_eq!(report["provenance"]["content_freshness"], "unverified");
+    assert_eq!(report["depth_limited"], true);
+    assert_eq!(report["truncated"], false); // legacy row-cap field remains compatible
+    assert_eq!(report["truncation_reasons"], json!(["depth"]));
+    assert_eq!(report["witnesses"][0]["via"], "shared");
+    assert_eq!(report["witnesses"][0]["evidence"], "direct");
+    assert_eq!(report["state"], "incomplete");
 }
 
 /// 스냅샷을 서빙하는 MCP 서버 한 세션에 도구 호출을 차례로 보내고, 각 답의 보고서 JSON을 돌려준다.

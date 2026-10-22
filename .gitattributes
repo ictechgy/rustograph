@@ -1,0 +1,2 @@
+# Vendored conformance vectors are checked against byte-level upstream digests.
+conformance/** -text

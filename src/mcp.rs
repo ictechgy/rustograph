@@ -7,7 +7,7 @@
 
 use crate::cli_args::{self, Args};
 use crate::graph::{Document, Level};
-use crate::{analysis, config, deps, export, rules};
+use crate::{analysis, change, config, deps, export, rules};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -375,6 +375,30 @@ impl<'d> Server<'d> {
                 r.depth = depth;
                 Ok(export::to_json(&r))
             }
+            "rustograph_change_impact" => {
+                if self.snapshot {
+                    return Err(
+                        "change impact needs a source session; restart MCP without --graph".into(),
+                    );
+                }
+                let base = arg_str(args, "base").ok_or("change impact needs a base revision")?;
+                let working_tree = match args.get("working_tree") {
+                    None => false,
+                    Some(value) => value.as_bool().ok_or("working_tree must be a boolean")?,
+                };
+                let head = match args.get("head") {
+                    None => None,
+                    Some(value) => Some(value.as_str().ok_or("head must be a string")?),
+                };
+                change::isolated_json(&change::Request {
+                    dir: &self.dir,
+                    base,
+                    head,
+                    working_tree,
+                    depth: arg_usize(args, "depth")?.unwrap_or(2),
+                    max: arg_usize(args, "max")?.unwrap_or(200),
+                })
+            }
             "rustograph_impact" => {
                 let id = arg_str(args, "id").ok_or("impact needs an \"id\" argument")?;
                 let id = self.require_id(id)?;
@@ -566,7 +590,7 @@ fn tool_list() -> serde_json::Value {
         },
         {
             "name": "rustograph_impact",
-            "description": "Reverse transitive closure: what breaks if this vertex changes",
+            "description": "Current-snapshot reverse dependencies for review; static candidates do not predict failures. Use rustograph_change_impact for Git patches.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -611,6 +635,21 @@ fn tool_list() -> serde_json::Value {
                 },
                 "required": ["from", "to"],
             },
+        },
+        {
+            "name": "rustograph_change_impact",
+            "description": "Fresh independent before/after Git source captures; retains deleted callers, file-wide seed precision, content freshness and bounded review paths. This explicitly refreshes source instead of using the session snapshot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "base": {"type": "string"},
+                    "head": {"type": "string", "description": "default HEAD; mutually exclusive with working_tree"},
+                    "working_tree": {"type": "boolean", "default": false},
+                    "depth": {"type": "integer", "minimum": 0, "maximum": 64, "default": 2},
+                    "max": {"type": "integer", "minimum": 0, "maximum": 10000, "default": 200}
+                },
+                "required": ["base"]
+            }
         },
         {
             "name": "rustograph_search",
@@ -864,7 +903,7 @@ mod tests {
         // 알림은 응답을 만들지 않는다.
         assert_eq!(res.len(), 2);
         assert_eq!(res[0]["result"]["protocolVersion"], "2025-06-18");
-        assert_eq!(res[1]["result"]["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(res[1]["result"]["tools"].as_array().unwrap().len(), 10);
     }
 
     #[test]

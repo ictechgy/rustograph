@@ -38,12 +38,14 @@ Rust에는 `cargo-modules`, `cargo deps`, 그리고 syn/tree-sitter 기반 콜�
 ```bash
 brew install ictechgy/tap/rustograph
 # 또는
-cargo install --locked --git https://github.com/ictechgy/rustograph --tag v0.4.1
+cargo install --locked --git https://github.com/ictechgy/rustograph --tag v0.6.0
 ```
 
-소스 설치 명령은 공개된
-[v0.4.1 릴리스](https://github.com/ictechgy/rustograph/releases/tag/v0.4.1)와
-해당 태그의 의존성 잠금 파일을 사용합니다. main 브랜치의 0.5.0은 아직 개발 중인 버전입니다.
+소스 설치 명령은
+[v0.6.0 릴리스](https://github.com/ictechgy/rustograph/releases/tag/v0.6.0)와
+해당 태그의 의존성 잠금 파일을 사용합니다. Homebrew 배포는 tap formula를 따로 확인합니다.
+실제 Git 변경은 [변경 영향 분석](docs/CHANGE-IMPACT.md), 공개 Rust API의 추가 필드는
+[0.6 이행 안내](docs/MIGRATING-0.6.md)를 참고합니다. 정적 후보는 테스트 실패 예측이나 생략 허가가 아닙니다.
 
 타입 해석 분석은 opt-in `semantic` feature 빌드가 필요합니다
 (rust-analyzer `ra_ap_*` — 의존이 커서 기본이 아닙니다):

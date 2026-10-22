@@ -85,6 +85,8 @@ const VALUE_FLAGS: &[&str] = &[
     "framework",
     "wrappers",
     "service",
+    "base",
+    "head",
 ];
 const BOOL_FLAGS: &[&str] = &[
     "deps",
@@ -95,6 +97,7 @@ const BOOL_FLAGS: &[&str] = &[
     "exclude-tests",
     "no-cache",
     "write-baseline",
+    "working-tree",
 ];
 
 pub(crate) fn parse(args: &[String]) -> Result<Args, String> {

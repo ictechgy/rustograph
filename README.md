@@ -41,11 +41,11 @@ over it, with a deterministic JSON contract meant for coding agents:
 ```bash
 brew install ictechgy/tap/rustograph
 # or
-cargo install --locked --git https://github.com/ictechgy/rustograph --tag v0.5.0
+cargo install --locked --git https://github.com/ictechgy/rustograph --tag v0.6.0
 ```
 
-The source-install command is pinned to the published
-[v0.5.0 release](https://github.com/ictechgy/rustograph/releases/tag/v0.5.0)
+The source-install command is pinned to the
+[v0.6.0 release](https://github.com/ictechgy/rustograph/releases/tag/v0.6.0)
 and its committed dependency lockfile. Homebrew availability follows the tap
 formula separately; this GitHub release does not establish crates.io publication.
 
@@ -104,6 +104,9 @@ rustograph rules --baseline base.txt      # only *new* violations fail
 rustograph query mycrate::module::f --depth 2
 rustograph impact mycrate::Type --depth 3  # reverse transitive closure
 rustograph impact mycrate::Type --depth 0  # no depth limit (still bounded by --max)
+# Analyze an actual patch using independent before/after source snapshots
+rustograph change-impact --base main --head HEAD --depth 2
+rustograph change-impact --base HEAD --working-tree
 rustograph paths mycrate::a mycrate::b    # bounded paths between two ids
 rustograph paths mycrate::a mycrate::b --max 50 --budget 200000  # at most 1024 / 1000000
 rustograph search entry                   # exact > suffix > substring
@@ -425,6 +428,16 @@ scenarios, 0 mismatches, checked offline by `cargo test`. All 48
 `producer`/`producer:rustograph` cases of the isthmus `url-compose` vectors
 pass.
 
+## Git change review — `change-impact`
+
+Use [the change-impact workflow](docs/CHANGE-IMPACT.md) to map a Git base/head
+or working-tree patch to old/new file declarations, historical/current callers
+and connected test/entry roots. Results preserve source content freshness,
+harvested limitations, witness hops and depth/output restrictions. File-wide
+static candidates support review; empty results are not a safety guarantee or
+permission to skip tests. MCP exposes the same workflow as
+`rustograph_change_impact`.
+
 ## Traversal documents — `reach` / `impact --format language-traversal`
 
 ```bash
@@ -662,6 +675,14 @@ points into the checkout), apply as usual.
 
 MIT — see [LICENSE](LICENSE).
 
+
+## 0.6.0 compatibility notes
+
+Use [the Git change workflow](docs/CHANGE-IMPACT.md) for independent before/after
+source capture. Ordinary impact now includes harvested limitations, provenance,
+witness evidence and explicit bounds. Existing current-only command defaults,
+graph document v1 and traversal v1 remain compatible. Public Rust result fields
+are additive but struct literals need updating; see [0.6 migration](docs/MIGRATING-0.6.md).
 
 ## 0.5.0 compatibility notes
 

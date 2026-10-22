@@ -92,6 +92,7 @@ pub struct QueryIndex<'a> {
     dependers: OnceLock<NeighborIndex<'a>>,
     adjacency: OnceLock<PathAdjacency<'a>>,
     reach: OnceLock<ReachMap<'a>>,
+    impact_edges: OnceLock<BTreeMap<&'a str, Vec<&'a Edge>>>,
 }
 
 impl<'a> QueryIndex<'a> {
@@ -104,6 +105,7 @@ impl<'a> QueryIndex<'a> {
             dependers: OnceLock::new(),
             adjacency: OnceLock::new(),
             reach: OnceLock::new(),
+            impact_edges: OnceLock::new(),
         }
     }
 
@@ -120,12 +122,86 @@ impl<'a> QueryIndex<'a> {
     /// [`impact`]와 같은 역방향 전이 — 처음부터 incoming만 따라간다.
     pub fn impact(&self, id: &str, depth: usize, max: usize) -> ImpactResult {
         let q = walk_neighbors(self, id, depth, max, true);
+        let distances: BTreeMap<&str, usize> = std::iter::once((id, 0))
+            .chain(q.neighbors.iter().map(|n| (n.id.as_str(), n.depth)))
+            .collect();
+        let depth_limited = distances.iter().any(|(node, distance)| {
+            *distance == depth
+                && self
+                    .neighbor_map(true)
+                    .get(node)
+                    .into_iter()
+                    .flatten()
+                    .any(|((next, _), _)| !distances.contains_key(next))
+        });
+        let mut witnesses = Vec::new();
+        let mut evidence: BTreeMap<&str, bool> = BTreeMap::from([(id, false)]);
+        for row in &q.neighbors {
+            let edge = self
+                .impact_edges
+                .get_or_init(|| {
+                    let mut edges: BTreeMap<&str, Vec<&Edge>> = BTreeMap::new();
+                    for edge in &self.doc.edges {
+                        if edge.kind.is_dependency() {
+                            edges.entry(&edge.from).or_default().push(edge);
+                        }
+                    }
+                    edges
+                })
+                .get(row.id.as_str())
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|e| {
+                    e.kind.is_dependency()
+                        && distances
+                            .get(e.to.as_str())
+                            .is_some_and(|d| *d + 1 == row.depth)
+                })
+                .min_by_key(|e| {
+                    (
+                        e.tentative || evidence.get(e.to.as_str()).copied().unwrap_or(true),
+                        &e.to,
+                        e.kind,
+                    )
+                });
+            if let Some(edge) = edge {
+                let candidate =
+                    edge.tentative || evidence.get(edge.to.as_str()).copied().unwrap_or(true);
+                evidence.insert(&row.id, candidate);
+                witnesses.push(ImpactWitness {
+                    id: row.id.clone(),
+                    via: edge.to.clone(),
+                    relationship: edge.kind,
+                    evidence: if candidate { "candidate" } else { "direct" },
+                    cfg: edge.cfg.clone(),
+                });
+            }
+        }
+        let mut truncation_reasons = Vec::new();
+        if q.truncated {
+            truncation_reasons.push("max-results");
+        }
+        if depth_limited {
+            truncation_reasons.push("depth");
+        }
         ImpactResult {
             id: q.id,
             found: q.found,
             depth: q.depth,
             truncated: q.truncated,
             impacted: q.neighbors,
+            mode: "current-snapshot",
+            state: "incomplete",
+            level: self.doc.level,
+            max_results: max,
+            depth_limited,
+            truncation_reasons,
+            limitations: self.doc.limitations.clone(),
+            provenance: ImpactProvenance { origin: "graph-document", revision: self.doc.revision.clone(),
+                content_freshness: "unverified", project: self.doc.root.clone(), workspace: self.doc.workspace.clone() },
+            witnesses,
+            interpretation: "Static review candidates; empty results do not prove safety and do not authorize skipping tests.",
         }
     }
 
@@ -286,6 +362,39 @@ pub struct ImpactResult {
     pub truncated: bool,
     /// 깊이별 영향받는 정점.
     pub impacted: Vec<Neighbor>,
+    /// 기존 한쪽 그래프 탐색과 Git 변경 분석을 구분한다.
+    pub mode: &'static str,
+    /// 정적 그래프는 실행 결과나 모든 동적 경로를 보증하지 않는다.
+    pub state: &'static str,
+    pub level: crate::graph::Level,
+    pub max_results: usize,
+    /// `truncated`의 기존 출력 개수 의미를 유지하며 깊이 중단을 따로 보고한다.
+    pub depth_limited: bool,
+    pub truncation_reasons: Vec<&'static str>,
+    pub limitations: Vec<String>,
+    pub provenance: ImpactProvenance,
+    pub witnesses: Vec<ImpactWitness>,
+    pub interpretation: &'static str,
+}
+
+/// 문서 revision 라벨은 현재 소스 내용과 일치한다는 증명이 아니다.
+#[derive(Debug, Serialize)]
+pub struct ImpactProvenance {
+    pub origin: &'static str,
+    pub revision: Option<String>,
+    pub content_freshness: &'static str,
+    pub project: String,
+    pub workspace: Option<String>,
+}
+
+/// 같은 문서 안의 최단 경로 한 홉 — via를 따라가면 seed에 닿는다.
+#[derive(Debug, Serialize)]
+pub struct ImpactWitness {
+    pub id: String,
+    pub via: String,
+    pub relationship: EdgeKind,
+    pub evidence: &'static str,
+    pub cfg: Option<String>,
 }
 
 /// impact 질의 — 처음부터 incoming만 따라가야 공유 의존의 다른 사용자가 섞이지 않는다.
