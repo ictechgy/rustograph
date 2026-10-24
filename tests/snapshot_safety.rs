@@ -181,6 +181,116 @@ fn every_output_command_preserves_source_and_manifest() {
     }
 }
 
+/// 스키마가 실제 읽은 패키지 소스는 모듈 트리에 속하지 않아도 출력으로 바꾸지 않는다.
+fn assert_schema_source_preserved(relative: &str, label: &str, source: &str) {
+    let fixture = Fixture::new(label);
+    let input = fixture.0.join(relative);
+    std::fs::create_dir_all(input.parent().unwrap()).unwrap();
+    std::fs::write(&input, source).unwrap();
+    let before = std::fs::read(&input).unwrap();
+
+    // 같은 입력은 정상 교환 문서를 내고 새 JSON 경로·기존 JSON 교체도 허용한다.
+    let stdout = Command::new(env!("CARGO_BIN_EXE_rustograph"))
+        .args(["schema", "--dir"])
+        .arg(&fixture.0)
+        .output()
+        .unwrap();
+    assert!(stdout.status.success());
+    let document: Value = serde_json::from_slice(&stdout.stdout).unwrap();
+    if source.contains("SELECT") {
+        assert!(document["facts"].as_array().unwrap().iter().any(|fact| {
+            fact["channel"] == "schema_only_input" && fact["location"]["path"] == relative
+        }));
+    } else {
+        assert!(document["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| { value.as_str().unwrap().starts_with("unparsed-sources: 1 ") }));
+    }
+    let report = fixture.0.join("facts.json");
+    for replacing in [false, true] {
+        if replacing {
+            std::fs::write(&report, "previous report").unwrap();
+        }
+        let written = fixture.run(&["schema"], &report);
+        assert_eq!(written.status.code(), Some(0));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(&report).unwrap()).unwrap()["format"],
+            "bridge-facts"
+        );
+    }
+
+    let output = fixture.run(&["schema"], &input);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("aliases an input"));
+    assert_eq!(std::fs::read(&input).unwrap(), before);
+}
+
+#[test]
+fn schema_outputs_preserve_package_test_sources() {
+    assert_schema_source_preserved(
+        "tests/manual.rs",
+        "schema-test-source",
+        "pub fn query() { let _sql = \"SELECT id FROM schema_only_input\"; }\n",
+    );
+}
+
+#[test]
+fn schema_outputs_preserve_package_example_sources() {
+    assert_schema_source_preserved(
+        "examples/manual.rs",
+        "schema-example-source",
+        "pub fn query() { let _sql = \"SELECT id FROM schema_only_input\"; }\n",
+    );
+}
+
+#[test]
+fn schema_outputs_preserve_unparsed_scanned_sources() {
+    assert_schema_source_preserved(
+        "tests/broken.rs",
+        "schema-unparsed-source",
+        "pub fn broken( {\n",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn schema_outputs_preserve_scanned_source_aliases() {
+    let fixture = Fixture::new("schema-source-aliases");
+    let directory = fixture.0.join("tests");
+    std::fs::create_dir(&directory).unwrap();
+    let input = directory.join("manual.rs");
+    let before = b"pub fn query() { let _sql = \"SELECT id FROM schema_only_input\"; }\n";
+    std::fs::write(&input, before).unwrap();
+    let hardlink = fixture.0.join("hard.json");
+    std::fs::hard_link(&input, &hardlink).unwrap();
+    let symlink = fixture.0.join("symbolic.json");
+    std::os::unix::fs::symlink(&input, &symlink).unwrap();
+    for alias in [&hardlink, &symlink] {
+        let output = fixture.run(&["schema"], alias);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert_eq!(std::fs::read(&input).unwrap(), before);
+    }
+    std::fs::remove_file(hardlink).unwrap();
+
+    // 끝 파일이 정규 파일이어도 부모 링크를 풀면 같은 스캔 입력이다.
+    let parent_alias = fixture.0.join("test-alias");
+    std::os::unix::fs::symlink(&directory, &parent_alias).unwrap();
+    let output = fixture.run(&["schema"], &parent_alias.join("manual.rs"));
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("aliases an input"));
+    assert_eq!(std::fs::read(&input).unwrap(), before);
+}
+
 #[cfg(unix)]
 #[test]
 fn graph_outputs_reject_hardlinks_and_symbolic_links() {

@@ -125,7 +125,7 @@ impl Checkout {
                 .as_nanos(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir(&dir).map_err(|e| format!("create isolated snapshot: {e}"))?;
+        create_private_checkout(&dir).map_err(|e| format!("create isolated snapshot: {e}"))?;
         let owned = Self(dir);
         let result = guarded_git(repo)?
             .args([
@@ -180,27 +180,21 @@ impl Checkout {
         )?)?);
         for file in files {
             let relative = Path::new(&file);
-            if relative
-                .components()
-                .any(|c| !matches!(c, std::path::Component::Normal(_)))
-            {
-                return Err("Git returned an unsafe snapshot path".into());
-            }
             let from = repo.join(relative);
             let to = checkout.0.join(relative);
-            match std::fs::symlink_metadata(&from) {
-                Ok(meta) if meta.is_file() => {
-                    if std::fs::symlink_metadata(&to).is_ok_and(|m| m.file_type().is_symlink()) {
+            let destination = snapshot_metadata(&checkout.0, relative)?;
+            match snapshot_metadata(repo, relative)? {
+                Some(meta) if meta.is_file() => {
+                    if destination.is_some_and(|m| m.file_type().is_symlink()) {
                         return Err(format!("snapshot source {file} changes a symlink; commit the regular input before analysis"));
                     }
                     if let Some(parent) = to.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
                     std::fs::copy(&from, &to).map_err(|e| format!("copy working source {file}: {e}"))?;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    if to.is_file() { std::fs::remove_file(&to).map_err(|e| e.to_string())?; }
+                None => {
+                    if destination.is_some_and(|m| m.is_file() || m.file_type().is_symlink()) { std::fs::remove_file(&to).map_err(|e| e.to_string())?; }
                 }
-                Err(e) => return Err(format!("read working source {file}: {e}")),
-                Ok(_) => return Err(format!("working source {file} is a symlink/submodule/non-regular input; capture it explicitly before analysis")),
+                Some(_) => return Err(format!("working source {file} is a symlink/submodule/non-regular input; capture it explicitly before analysis")),
             }
         }
         Ok(checkout)
@@ -211,6 +205,54 @@ impl Drop for Checkout {
         // 생성에 성공한 고유 임시 디렉터리만 소유한다. 원본 checkout에는 쓰지 않는다.
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// 복사 시작 전부터 소유자 외에는 소스를 공개하지 않는다. 기존 디렉터리 권한은 바꾸지 않는다.
+#[cfg(unix)]
+fn create_private_checkout(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(dir)
+}
+
+#[cfg(not(unix))]
+fn create_private_checkout(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(dir)
+}
+
+/// 정규화된 root 아래의 각 조상을 먼저 확인한다. 변경이 없는 트리의 경계 검사이며 원자적 snapshot은 아니다.
+fn snapshot_metadata(root: &Path, relative: &Path) -> Result<Option<std::fs::Metadata>, String> {
+    let components: Vec<_> = relative.components().collect();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err("Git returned an unsafe snapshot path".into());
+    }
+    let mut path = root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        path.push(component.as_os_str());
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "inspect snapshot input {}: {error}",
+                    relative.display()
+                ))
+            }
+        };
+        if index + 1 == components.len() {
+            return Ok(Some(metadata));
+        }
+        if metadata.file_type().is_symlink() {
+            return Err(format!("snapshot input {} has a symlink ancestor; use regular in-repository inputs before analysis", relative.display()));
+        }
+        if !metadata.is_dir() {
+            return Err(format!("snapshot input {} has a non-directory ancestor; restore the regular input before analysis", relative.display()));
+        }
+    }
+    Ok(None)
 }
 
 /// base/head 또는 base/working-tree의 실제 변경을 수확한다. 실패를 빈 성공으로 바꾸지 않는다.
@@ -340,7 +382,8 @@ fn capture(
         cache: false,
         ..Default::default()
     };
-    let (mut doc, inputs) = source::load_with_inputs(&project, &options)?;
+    let context = source::CapturedRevision::new(root, &project)?;
+    let (mut doc, inputs) = context.load_with_inputs(&options)?;
     doc.revision = Some(revision.to_owned());
     let second = content_digest(root)?;
     let mut limitations = doc.limitations.clone();
@@ -671,13 +714,13 @@ fn content_digest(root: &Path) -> Result<String, String> {
     files.dedup();
     let mut digest = Sha256::new();
     for file in files {
-        let path = root.join(&file);
+        let relative = Path::new(&file);
+        let path = root.join(relative);
         digest.update(&(file.len() as u64).to_be_bytes());
         digest.update(file.as_bytes());
-        match std::fs::symlink_metadata(&path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => digest.update(b"missing"),
-            Err(e) => return Err(format!("fingerprint {file}: {e}")),
-            Ok(meta) if meta.is_file() => {
+        match snapshot_metadata(root, relative)? {
+            None => digest.update(b"missing"),
+            Some(meta) if meta.is_file() => {
                 use std::io::Read;
                 let mut bytes = Vec::new();
                 std::fs::File::open(&path)
@@ -689,8 +732,166 @@ fn content_digest(root: &Path) -> Result<String, String> {
                 digest.update(&(bytes.len() as u64).to_be_bytes());
                 digest.update(&bytes);
             }
-            Ok(_) => digest.update(b"non-regular-input-not-captured"),
+            Some(_) => digest.update(b"non-regular-input-not-captured"),
         }
     }
     Ok(digest.finalize_hex())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fixture {
+        root: PathBuf,
+        repo: PathBuf,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "rustograph-change-unit-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let repo = root.join("repo");
+            std::fs::create_dir_all(repo.join("src")).unwrap();
+            std::fs::write(repo.join("src/lib.rs"), "pub fn original() {}\n").unwrap();
+            std::fs::write(repo.join(".gitignore"), "/target/\n").unwrap();
+            let fixture = Self { root, repo };
+            fixture.git(&["init", "-q"]);
+            fixture.git(&["add", "."]);
+            fixture.git(&["commit", "-qm", "public fixture"]);
+            fixture
+        }
+        fn git(&self, arguments: &[&str]) -> String {
+            let output = Command::new("git")
+                .args([
+                    "-c",
+                    "core.hooksPath=",
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-C",
+                ])
+                .arg(&self.repo)
+                .args(arguments)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        }
+        #[cfg(unix)]
+        fn ignored_ancestor_link(&self) {
+            let outside = self.root.join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("lib.rs"), "pub fn outside_only() {}\n").unwrap();
+            std::fs::write(self.repo.join(".gitignore"), "/target/\n/src\n").unwrap();
+            std::fs::remove_dir_all(self.repo.join("src")).unwrap();
+            std::os::unix::fs::symlink(outside, self.repo.join("src")).unwrap();
+            assert!(!self
+                .git(&["ls-files", "--others", "--exclude-standard", "-z"])
+                .split('\0')
+                .any(|p| p == "src"));
+            assert!(self
+                .git(&["ls-files", "--cached", "-z"])
+                .split('\0')
+                .any(|p| p == "src/lib.rs"));
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn working_copy_rejects_an_ignored_symlink_ancestor() {
+        let fixture = Fixture::new();
+        let revision = fixture.git(&["rev-parse", "HEAD"]);
+        fixture.ignored_ancestor_link();
+        let result = Checkout::working(&fixture.repo, revision.trim());
+        assert!(
+            result.is_err(),
+            "an ignored ancestor link must not copy outside source bytes"
+        );
+        assert!(result.err().unwrap().contains("symlink"));
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("outside/lib.rs")).unwrap(),
+            "pub fn outside_only() {}\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn digest_rejects_an_ignored_symlink_ancestor() {
+        let fixture = Fixture::new();
+        fixture.ignored_ancestor_link();
+        let result = content_digest(&fixture.repo);
+        assert!(
+            result.is_err(),
+            "an ignored ancestor link must not fingerprint outside source bytes"
+        );
+        assert!(result.err().unwrap().contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_creation_is_private_and_cleans_success_and_failure_under_public_umask() {
+        const CHILD: &str = "RUSTOGRAPH_CHANGE_PRIVATE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let fixture = Fixture::new();
+            // umask는 이 테스트가 소유한 단일 자식에서만 바꾸며 부모 테스트·다른 프로세스에는 적용하지 않는다.
+            let output = Command::new("/bin/sh")
+                .args(["-c", "umask 022; exec \"$@\"", "rustograph-private-fixture"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "change::tests::checkout_creation_is_private_and_cleans_success_and_failure_under_public_umask", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("TMPDIR", &fixture.root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let revision = fixture.git(&["rev-parse", "HEAD"]);
+        let checkout = Checkout::new(&fixture.repo, revision.trim()).unwrap();
+        let path = checkout.0.clone();
+        assert_eq!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("src/lib.rs")).unwrap(),
+            "pub fn original() {}\n"
+        );
+        drop(checkout);
+        assert!(!path.exists());
+        let prefix = format!("rustograph-change-{}-", std::process::id());
+        assert!(Checkout::new(&fixture.repo, "not-a-revision").is_err());
+        assert!(!std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&prefix)));
+    }
 }

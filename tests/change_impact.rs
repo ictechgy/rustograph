@@ -354,3 +354,61 @@ fn working_diff_does_not_execute_repository_clean_filters() {
         "patch_fixture::target::removed"
     ));
 }
+
+#[cfg(unix)]
+#[test]
+fn working_tree_rejects_ignored_ancestor_links_without_an_external_capture() {
+    let repo = Repo::new();
+    let outside = Repo::new();
+    let base = repo.base();
+    std::fs::write(
+        outside.0.join("src/target.rs"),
+        "pub fn outside_only() {}\n",
+    )
+    .unwrap();
+    std::fs::write(repo.0.join(".gitignore"), "/target/\n/src\n").unwrap();
+    std::fs::remove_dir_all(repo.0.join("src")).unwrap();
+    std::os::unix::fs::symlink(outside.0.join("src"), repo.0.join("src")).unwrap();
+    assert!(!git(
+        &repo.0,
+        &["ls-files", "--others", "--exclude-standard", "-z"]
+    )
+    .split('\0')
+    .any(|path| path == "src"));
+    let output = Command::new(env!("CARGO_BIN_EXE_rustograph"))
+        .args(["change-impact", "--dir"])
+        .arg(&repo.0)
+        .args(["--base", &base, "--working-tree"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "must not report outside source bytes as an in-repository capture"
+    );
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("symlink"), "{error}");
+    assert!(!error.contains(outside.0.to_str().unwrap()), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(outside.0.join("src/target.rs")).unwrap(),
+        "pub fn outside_only() {}\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_untracked_leaf_symlinks_remain_explicitly_refused() {
+    let repo = Repo::new();
+    let outside = Repo::new();
+    let base = repo.base();
+    std::os::unix::fs::symlink(outside.0.join("src/target.rs"), repo.0.join("new.rs")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rustograph"))
+        .args(["change-impact", "--dir"])
+        .arg(&repo.0)
+        .args(["--base", &base, "--working-tree"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("symlink"));
+}

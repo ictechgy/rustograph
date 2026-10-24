@@ -1383,6 +1383,7 @@ dependencies = [
  "serde_json",
  "serde_norway",
  "syn 2.0.119",
+ "toml",
 ]
 
 [[package]]
