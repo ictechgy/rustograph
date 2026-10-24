@@ -113,18 +113,19 @@ pub struct BridgeFactsDocument {
 /// bridge-facts 문서를 만든다.
 /// 워크스페이스를 못 읽으면 오류다 — 빈 문서로 성공한 척하지 않는다.
 pub fn facts(dir: &Path, tool_version: &str) -> Result<BridgeFactsDocument, String> {
-    facts_with_inputs(dir, tool_version, false).map(|(doc, _)| doc)
+    facts_with_inputs(dir, tool_version, false).map(|(doc, _, _)| doc)
 }
 
-/// [`facts`]와 같은 문서와, `want_inputs`면 정점 귀속 수확이 읽은 입력을 돌려준다 —
+/// [`facts`]와 같은 문서와, `want_inputs`면 정점 귀속 수확 및 스키마 스캔의 입력을 돌려준다 —
 /// `schema --out`이 입력 보호 목록을 위해 cargo metadata와 모듈 트리 파싱을 한 번 더 하지
 /// 않게 한다. 정점 귀속 수확이 실패하면(사실은 usr 없이 낸다) 입력은 None이다 — 호출자가
-/// 싣지 못한 모듈 파일까지 적는 관대 모드로 다시 찾는다.
+/// 싣지 못한 모듈 파일까지 적는 관대 모드로 다시 찾는다. 별도 스캔 목록은 이 경우에도
+/// 남겨, 모듈 밖 tests/examples 및 읽거나 파싱하지 못한 .rs도 출력으로 바꾸지 않는다.
 pub(crate) fn facts_with_inputs(
     dir: &Path,
     tool_version: &str,
     want_inputs: bool,
-) -> Result<(BridgeFactsDocument, Option<HarvestInputs>), String> {
+) -> Result<(BridgeFactsDocument, Option<HarvestInputs>, Vec<PathBuf>), String> {
     let root = dir
         .canonicalize()
         .map_err(|e| format!("cannot resolve {}: {e}", dir.display()))?;
@@ -134,8 +135,14 @@ pub(crate) fn facts_with_inputs(
         ..Default::default()
     };
     scan.limitations.extend(meta.limitations.iter().cloned());
+    let schema_files = workspace_rs_files(&meta);
+    let protected_schema_files = if want_inputs {
+        schema_files.clone()
+    } else {
+        Vec::new()
+    };
     let mut files: Vec<(PathBuf, String, syn::File)> = Vec::new();
-    for file in workspace_rs_files(&meta) {
+    for file in schema_files {
         // 순회가 정규 파일만 모으지만 읽기도 상한을 둔다 — 못 읽거나 너무 큰 파일은
         // 지금처럼 unparsed로 센다.
         let Ok(src) = crate::source::read_source_bounded(&file, crate::source::MAX_SOURCE_BYTES)
@@ -201,7 +208,7 @@ pub(crate) fn facts_with_inputs(
         facts,
         limitations,
     };
-    Ok((doc, inputs))
+    Ok((doc, inputs, protected_schema_files))
 }
 
 /// 파일별 정점 범위 색인 — 그래프에 실제로 있는 정점 ID만 담는다.

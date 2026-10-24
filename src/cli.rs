@@ -158,11 +158,12 @@ fn cmd_schema(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
         ));
     }
     let dir = PathBuf::from(a.get("dir").unwrap_or("."));
-    let (doc, inputs) = source::schema::facts_with_inputs(&dir, VERSION, a.get("out").is_some())?;
+    let (doc, inputs, schema_files) =
+        source::schema::facts_with_inputs(&dir, VERSION, a.get("out").is_some())?;
     let text = export::to_json(&doc);
     match a.get("out") {
         Some(p) => {
-            write_output(a, Path::new(p), &text, &[], inputs.as_ref())?;
+            write_output(a, Path::new(p), &text, &schema_files, inputs.as_ref())?;
             writeln!(out, "wrote {p}").ok();
         }
         None => {
