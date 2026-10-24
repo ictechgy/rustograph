@@ -131,6 +131,24 @@ pub(crate) fn load_with_inputs(
     load_inner(dir, &meta, opts, true)
 }
 
+/// Git 변경 캡처만 검증한 revision 설정으로 수확한다. 기존 호출자의 Cargo 작업 디렉터리 계약은 바꾸지 않는다.
+pub(crate) struct CapturedRevision(cargo_meta::CaptureContext);
+
+impl CapturedRevision {
+    pub(crate) fn new(root: &Path, project: &Path) -> Result<Self, String> {
+        cargo_meta::CaptureContext::new(root, project).map(Self)
+    }
+
+    pub(crate) fn load_with_inputs(
+        &self,
+        opts: &Options,
+    ) -> Result<(Document, Option<HarvestInputs>), String> {
+        require_semantic_build(opts)?;
+        let metadata = self.0.load()?;
+        load_inner(self.0.project(), &metadata, opts, true)
+    }
+}
+
 /// 캐시를 거친 수확 — `want_inputs`면 수확이 읽은 입력도 함께 돌려준다.
 fn load_inner(
     dir: &Path,

@@ -6,11 +6,12 @@
 //! 툴체인 실행(`cargo metadata`, `rustc` 프로브)은 전부 [`toolchain_command`]를 지난다. cargo는
 //! 작업 디렉터리와 그 조상의 `.cargo/config.toml`을, rustup 프록시는 rust-toolchain 파일을 읽으므로
 //! 분석 대상 체크아웃 안에서 띄우면 그 체크아웃이 실행할 프로그램(래퍼, `build.rustc`, 툴체인
-//! 디렉터리)을 고를 수 있었다. 작업 디렉터리는 바꾸지 않는다 — 저장소의 정당한 source
+//! 디렉터리)을 고를 수 있었다. 일반 load의 작업 디렉터리는 바꾸지 않는다 — 저장소의 정당한 source
 //! replacement·`[patch]`·레지스트리 설정이 그대로 적용돼야 cargo가 빌드하는 그래프와 같다.
 //! 그 대가로 체크아웃의 `[env]`는 막지 못한다. cargo가 띄우는 rustc의 환경(`LD_PRELOAD`·
 //! `DYLD_INSERT_LIBRARIES` 등)을 정해 체크아웃의 코드를 실을 수 있으므로, 신뢰하지 않는 체크아웃은 그 밖의
 //! 작업 디렉터리에서 `--dir`로 분석해야 한다(README Security 절).
+//! Git 변경 캡처는 별도 [`CaptureContext`]에서 검증한 revision 내부 데이터 설정만 중립 CWD에 전달한다.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -18,6 +19,9 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+
+mod capture;
+pub(crate) use capture::CaptureContext;
 
 /// cargo 패키지 하나.
 #[derive(Debug)]

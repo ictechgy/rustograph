@@ -19,6 +19,8 @@ must support Cargo metadata. Capture failures are errors, not empty reports.
 Git filters/hooks/fsmonitor are suppressed, and Git is resolved only from
 absolute PATH entries. The capture uses raw file bytes; projects that require
 filter-generated source must prepare that source explicitly before analysis.
+On Unix, each new temporary source checkout is created with owner-only permissions
+before Git writes into it; existing checkout permissions are never changed.
 
 `before` and `after` contain their own seeds, impact reports, witness hops,
 connected `review_roots`, unmapped files and limitations. `review_roots` are
@@ -44,6 +46,55 @@ changes a missing lockfile in the isolated snapshot, capture also stays stale:
 commit a reproducible lockfile and rerun. A digest is not a claim of complete
 semantic analysis. Working-tree symlinks/submodules/non-regular inputs require
 an explicit supported capture and are rejected instead of silently copied.
+Tracked descendants do not bypass this rule when an ignored directory has become
+a symlink: copying and fingerprinting check every path component below the
+canonical repository root, and reject symlink or non-directory ancestors.
+These checks assume the repository is quiescent during capture. They do not use
+descriptor-relative atomic reads and do not prove safety against concurrent
+hostile path replacement; keep source paths unchanged until capture finishes.
+
+## Cargo configuration during Git capture
+
+Git captures use a separate metadata context; the ordinary graph/library `load`
+API keeps its existing caller-working-directory policy. For each captured
+revision, `change-impact` reads `.cargo/config` or `.cargo/config.toml` from the
+repository root through the requested project directory, parses bounded regular
+UTF-8 TOML files, and passes only supported local data to offline Cargo metadata
+in a new private neutral directory. Caller-CWD configuration is not mixed into
+that revision's configuration. Config files in an ancestor of the neutral
+directory cause an explicit error; select another `TMPDIR` instead of inheriting
+those settings silently.
+
+The supported data-only subset is `paths`, path-only `[patch.<registry>.<package>]`
+tables, and local `[source.<name>]` directory/`replace-with` chains. Directory
+paths are relative to the parent of the config file's `.cargo` directory; each
+must exist within the captured repository with no symlink component. Root and
+member config arrays accumulate in Cargo order, deeper path patches override
+the same patch leaf, and source definitions cannot change kind across levels.
+These path and merge rules follow the [Cargo configuration reference](https://doc.rust-lang.org/cargo/reference/config.html#config-relative-paths)
+and are checked with actual offline Cargo fixtures.
+Both config spellings at one level, unknown replacement targets/cycles, path
+escapes, invalid or duplicate TOML keys, and unsupported combinations are errors.
+This does not support every Cargo configuration setting or external vendor cache.
+
+Environment, include, wrapper/program, registry/authentication, network, and
+other unsupported project settings are rejected before Cargo starts. Limits are
+32 config files, 1 MiB per file, 2 MiB total, and 256 rows per path/patch/source collection.
+The exact TOML parser pin already present in `Cargo.lock` is reused; errors never
+echo TOML contents or field values during validation. Cargo failures retain the
+ordinary metadata error contract. No project build script or test is executed by
+metadata capture. Missing offline dependency data fails rather than enabling a
+network fetch or login.
+
+The user-selected Cargo home and inherited environment remain external trusted
+inputs and are not claimed as revision evidence; their secret config or
+credential files are not read by this validation layer. Relative `CARGO_HOME`,
+target paths and executable search entries are anchored to the original caller.
+Relative Rustup/home or toolchain-directory selections that cannot safely be
+preserved before isolated toolchain resolution require explicit absolute paths.
+Captured metadata retains the existing pinned compiler and disabled wrapper
+policy. These are supported local-data semantics and fail-closed boundaries,
+not a claim of general Cargo-config completeness or an atomic filesystem snapshot.
 
 `depth` defaults to 2 for both CLI and MCP; 0 means no depth limit. `max` defaults
 to 200 and caps total impacted rows per revision; at most 256 seeds per revision
