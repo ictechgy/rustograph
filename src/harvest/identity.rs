@@ -4,16 +4,20 @@
 //! 충돌한 경로에만 workspace 상대 파일·선언 바이트 위치·종류를 붙인다. 타입 추론을
 //! 흉내 내지 않으며, 소스가 확정하지 못한 대상 참조는 후보 간선으로 남긴다.
 
+use super::AttrRef;
 use crate::graph::{Edge, EdgeKind, Kind, Vertex};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 type VertexKey = (String, Kind, Option<String>, Option<String>);
 type SiteKey = (String, PathBuf, usize);
+type AttrKey = (String, bool, String, Vec<String>, Option<String>);
 
 #[derive(Default)]
 pub(crate) struct Registry {
     sites: Vec<Site>,
+    attrs: BTreeMap<AttrKey, Vec<(PathBuf, usize)>>,
+    roots: BTreeMap<(String, bool), Vec<(PathBuf, usize)>>,
 }
 
 struct Site {
@@ -33,6 +37,8 @@ struct Target {
 pub(crate) struct Identities {
     sites: BTreeMap<SiteKey, String>,
     aliases: BTreeMap<String, Vec<Target>>,
+    attrs: BTreeMap<AttrKey, Vec<String>>,
+    annotated_roots: BTreeMap<(String, bool), Vec<String>>,
     pub groups: usize,
     pub extra: usize,
 }
@@ -41,7 +47,39 @@ fn vertex_key(v: &Vertex) -> VertexKey {
     (v.id.clone(), v.kind, v.position.clone(), v.cfg.clone())
 }
 
+fn attr_key(reference: &AttrRef) -> AttrKey {
+    (
+        reference.owner.clone(),
+        reference.mod_decl,
+        reference.module.clone(),
+        reference.path.clone(),
+        reference.cfg.clone(),
+    )
+}
+
+fn type_owner(kind: Kind) -> bool {
+    matches!(
+        kind,
+        Kind::Struct | Kind::Enum | Kind::Union | Kind::Trait | Kind::TypeAlias
+    )
+}
+
 impl Registry {
+    pub fn note_attrs(&mut self, references: &[AttrRef], file: &Path, start: usize) {
+        for reference in references {
+            self.attrs
+                .entry(attr_key(reference))
+                .or_default()
+                .push((file.to_path_buf(), start));
+        }
+    }
+
+    pub fn note_root(&mut self, id: &str, test: bool, file: &Path, start: usize) {
+        self.roots
+            .entry((id.to_string(), test))
+            .or_default()
+            .push((file.to_path_buf(), start));
+    }
     pub fn note(&mut self, v: &Vertex, file: &Path, start: usize) {
         self.sites.push(Site {
             key: vertex_key(v),
@@ -52,8 +90,12 @@ impl Registry {
 
     pub fn identify(&self, vertices: &mut Vec<Vertex>, root: &Path) -> Identities {
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut anchors: BTreeMap<String, usize> = BTreeMap::new();
         for v in vertices.iter() {
             *counts.entry(v.id.clone()).or_default() += 1;
+            if type_owner(v.kind) || matches!(v.kind, Kind::Crate | Kind::Module) {
+                *anchors.entry(v.id.clone()).or_default() += 1;
+            }
         }
         let mut notes: BTreeMap<VertexKey, Vec<&Site>> = BTreeMap::new();
         for s in &self.sites {
@@ -81,7 +123,9 @@ impl Registry {
             let legacy = v.id.clone();
             // 모듈 경로는 트리 해석과 하위 정점의 기준이다. 같은 경로의 값 아이템만
             // 바꾸면 모듈 경로와 자식 경로를 모두 다시 쓰지 않아도 이름공간이 분리된다.
-            if !matches!(v.kind, Kind::Crate | Kind::Module) {
+            let anchor = matches!(v.kind, Kind::Crate | Kind::Module)
+                || (type_owner(v.kind) && anchors.get(&legacy) == Some(&1));
+            if !anchor {
                 let file = site.file.strip_prefix(root).unwrap_or(&site.file);
                 let encoded = encode_path(file);
                 let (parent, name) = legacy
@@ -111,6 +155,24 @@ impl Registry {
             .values()
             .map(|ts| ts.len().saturating_sub(1))
             .sum();
+        for (key, sites) in &self.attrs {
+            out.attrs.insert(
+                key.clone(),
+                sites
+                    .iter()
+                    .map(|(file, start)| out.owner(&key.0, file, *start))
+                    .collect(),
+            );
+        }
+        for (key, sites) in &self.roots {
+            out.annotated_roots.insert(
+                key.clone(),
+                sites
+                    .iter()
+                    .map(|(file, start)| out.owner(&key.0, file, *start))
+                    .collect(),
+            );
+        }
         // 같은 파일·범위가 공유 lib/bin 루트로 다시 들어온 경우는 같은 선언이다.
         let mut seen = BTreeSet::new();
         vertices.retain(|v| seen.insert(v.id.clone()));
@@ -132,6 +194,34 @@ fn encode_path(path: &Path) -> String {
 }
 
 impl Identities {
+    /// AttrRef의 공개 모양은 바꾸지 않고 수집 순서별 실제 선언을 되찾는다.
+    pub fn attributes(&self, references: &mut [AttrRef]) {
+        let mut used = BTreeMap::<AttrKey, usize>::new();
+        for reference in references {
+            let key = attr_key(reference);
+            let n = used.entry(key.clone()).or_default();
+            if let Some(owner) = self.attrs.get(&key).and_then(|owners| owners.get(*n)) {
+                reference.owner = owner.clone();
+            }
+            *n += 1;
+        }
+    }
+
+    pub fn annotated_roots(&self, roots: &mut [String], test: bool) {
+        let mut used = BTreeMap::<(String, bool), usize>::new();
+        for root in roots {
+            let key = (root.clone(), test);
+            let n = used.entry(key.clone()).or_default();
+            if let Some(owner) = self
+                .annotated_roots
+                .get(&key)
+                .and_then(|owners| owners.get(*n))
+            {
+                *root = owner.clone();
+            }
+            *n += 1;
+        }
+    }
     pub fn owner(&self, id: &str, file: &Path, start: usize) -> String {
         self.sites
             .get(&(id.to_string(), file.to_path_buf(), start))
@@ -172,7 +262,9 @@ impl Identities {
                     let mut e = edge.clone();
                     e.from = (*f).to_string();
                     e.to = (*t).to_string();
-                    if e.kind.is_dependency() && (fs.len() > 1 || ts.len() > 1) {
+                    if (e.kind.is_dependency() && (fs.len() > 1 || ts.len() > 1))
+                        || (e.kind == EdgeKind::Contains && fs.len() > 1)
+                    {
                         e.tentative = true;
                     }
                     out.push(e);
@@ -194,7 +286,19 @@ impl Identities {
             {
                 return matches!(t.kind, Kind::Crate | Kind::Module);
             }
+            if from
+                && edge.kind == EdgeKind::Contains
+                && candidates.iter().any(|c| type_owner(c.kind))
+            {
+                return type_owner(t.kind);
+            }
             if !from && edge.kind == EdgeKind::Call {
+                if candidates
+                    .iter()
+                    .any(|c| matches!(c.kind, Kind::Fn | Kind::Method | Kind::Macro))
+                {
+                    return matches!(t.kind, Kind::Fn | Kind::Method | Kind::Macro);
+                }
                 return !matches!(t.kind, Kind::Crate | Kind::Module);
             }
             if !from && edge.kind == EdgeKind::Signature {
@@ -216,7 +320,7 @@ impl Identities {
             true
         };
         let mut picked: Vec<_> = candidates.iter().filter(eligible).collect();
-        if !from && edge.kind == EdgeKind::Contains && picked.iter().any(|t| t.cfg == edge.cfg) {
+        if edge.kind == EdgeKind::Contains && picked.iter().any(|t| t.cfg == edge.cfg) {
             picked.retain(|t| t.cfg == edge.cfg);
         }
         // 어떤 이름공간인지 증명하지 못하면 후보를 버리는 대신 모두 보존한다.

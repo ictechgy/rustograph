@@ -25,6 +25,11 @@ pub fn is_zero(n: &usize) -> bool {
     *n == 0
 }
 
+/// 옛 snapshot의 손실된 선언 정체는 모든 출력 경로에서 같은 한계로 보고한다.
+pub(crate) fn identity_limitation(groups: usize, extra: usize) -> String {
+    format!("{groups} vertex IDs are shared by {extra} additional rows in this stored graph; source declarations cannot be separated, so related graph, query, impact and paths evidence is candidate; regenerate the graph with a source-identity-aware build")
+}
+
 /// 정점 ID·모듈·크레이트 이름에 올 수 없는 문자인가 — C0·DEL·C1(NEL 포함) 제어 문자와
 /// U+2028·U+2029. isthmus 안전 문자열 규칙과 같은 집합이다. 수확한 ID는 Rust 경로라
 /// 이 문자가 없다. 다른 도구가 만든 문서의 ID에 섞이면 텍스트 출력이 터미널을 조작하고
@@ -280,6 +285,30 @@ impl Document {
     /// 정점 ID 집합 — 존재 확인과 인덱스 구축용.
     pub fn vertex_ids(&self) -> BTreeSet<&str> {
         self.vertices.iter().map(|v| v.id.as_str()).collect()
+    }
+
+    /// 저장 파일 자체는 그대로 두고, 복원 불가한 중복 끝점의 간선을 추정으로 낮춘다.
+    /// 그래프 내보내기·cycles·rules도 옛 중복 ID를 확정 증거로 쓸 수 없다.
+    pub(crate) fn mark_ambiguous_identities(&mut self) {
+        let mut seen = BTreeSet::new();
+        let mut ambiguous = BTreeSet::new();
+        for v in &self.vertices {
+            if !seen.insert(v.id.as_str()) {
+                ambiguous.insert(v.id.as_str());
+            }
+        }
+        if ambiguous.is_empty() {
+            return;
+        }
+        let message = identity_limitation(ambiguous.len(), self.vertices.len() - seen.len());
+        if !self.limitations.contains(&message) {
+            self.limitations.push(message);
+        }
+        for e in &mut self.edges {
+            if ambiguous.contains(e.from.as_str()) || ambiguous.contains(e.to.as_str()) {
+                e.tentative = true;
+            }
+        }
     }
 
     /// outgoing 인접 목록 — 의존 간선만. contains는 소유라 제외한다.

@@ -76,4 +76,20 @@ fn legacy_snapshot_stays_readable_but_duplicate_identity_is_explicit() {
         .contains("1 vertex IDs are shared by 1 additional rows"));
     let impact = serde_json::to_value(analysis::impact(&d, "old::from", 1, 10)).unwrap();
     assert_eq!(impact["witnesses"][0]["evidence"], "candidate");
+    for (from, to) in [("caller", "old::from"), ("old::from", "old::from")] {
+        let paths = serde_json::to_value(analysis::paths(&d, from, to, 5, 50)).unwrap();
+        assert_eq!(paths["paths"][0]["tentative"], true);
+        assert!(!paths["limitations"].as_array().unwrap().is_empty());
+    }
+    assert!(rustograph::export::to_mermaid(&d).contains("|call (candidate)|"));
+    let file = std::env::temp_dir().join(format!(
+        "rustograph-legacy-identity-{}.json",
+        std::process::id()
+    ));
+    std::fs::write(&file, serde_json::to_vec(&d).unwrap()).unwrap();
+    let loaded = rustograph::export::load_file(&file).unwrap();
+    std::fs::remove_file(file).unwrap();
+    assert_eq!(loaded.vertices.len(), 3, "old ID rows remain available");
+    assert!(loaded.edges[0].tentative);
+    assert!(!loaded.limitations.is_empty());
 }

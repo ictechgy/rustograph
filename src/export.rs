@@ -19,11 +19,23 @@ pub fn to_json<T: serde::Serialize>(v: &T) -> String {
 pub fn to_mermaid(doc: &Document) -> String {
     let mut out = String::from("graph TD\n");
     let ids: std::collections::BTreeSet<&str> = doc.vertex_ids();
+    let mut seen = BTreeSet::new();
+    let ambiguous: BTreeSet<_> = doc
+        .vertices
+        .iter()
+        .filter_map(|v| (!seen.insert(v.id.as_str())).then_some(v.id.as_str()))
+        .collect();
     for e in &doc.edges {
         if !ids.contains(e.from.as_str()) || !ids.contains(e.to.as_str()) {
             continue;
         }
-        out.push_str(&mermaid_edge(e));
+        if ambiguous.contains(e.from.as_str()) || ambiguous.contains(e.to.as_str()) {
+            let mut candidate = e.clone();
+            candidate.tentative = true;
+            out.push_str(&mermaid_edge(&candidate));
+        } else {
+            out.push_str(&mermaid_edge(e));
+        }
     }
     out
 }
@@ -255,7 +267,7 @@ fn write_file_with(
 pub fn load_file(path: &Path) -> Result<Document, String> {
     let src = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let doc: Document =
+    let mut doc: Document =
         serde_json::from_str(&src).map_err(|e| format!("bad {}: {e}", path.display()))?;
     if doc.version > crate::graph::DOCUMENT_VERSION {
         return Err(format!(
@@ -271,6 +283,7 @@ pub fn load_file(path: &Path) -> Result<Document, String> {
             u32::from(c)
         ));
     }
+    doc.mark_ambiguous_identities();
     Ok(doc)
 }
 

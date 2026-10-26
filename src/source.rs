@@ -561,6 +561,58 @@ fn cache_path(meta: &Metadata) -> PathBuf {
 /// 소스 하나라도 바뀌면 키가 달라진다. 지문 재기에 실패하면 None —
 /// 캐시 없이 수확하는 것이 캐시 때문에 실패하는 것보다 항상 낫다.
 fn fingerprint(dir: &Path, meta: &Metadata, opts: &Options) -> Option<u64> {
+    fingerprint_with_producer(
+        dir,
+        meta,
+        opts,
+        b"rustograph-cache-v3-source-identities",
+        Some(producer_fingerprint()),
+    )
+}
+
+/// 같은 공개 버전의 로컬 후보라도 실제 그래프 생산 코드가 다르면 캐시를 섞지 않는다.
+/// 빌드 스크립트·Git 실행 없이 컴파일한 원문과 의존 핀을 해시하므로 checkout 경로와 무관하다.
+fn producer_fingerprint() -> u64 {
+    static KEY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *KEY.get_or_init(|| {
+        let mut h = 0xcbf29ce484222325u64;
+        for (name, bytes) in [
+            ("source", include_bytes!("source.rs").as_slice()),
+            ("harvest", include_bytes!("harvest.rs").as_slice()),
+            ("identity", include_bytes!("harvest/identity.rs").as_slice()),
+            ("locals", include_bytes!("harvest/locals.rs").as_slice()),
+            ("modtree", include_bytes!("modtree.rs").as_slice()),
+            ("cargo_meta", include_bytes!("cargo_meta.rs").as_slice()),
+            (
+                "capture",
+                include_bytes!("cargo_meta/capture.rs").as_slice(),
+            ),
+            ("sem", include_bytes!("sem.rs").as_slice()),
+            ("fanout", include_bytes!("fanout.rs").as_slice()),
+            ("graph", include_bytes!("graph.rs").as_slice()),
+            ("cfgeval", include_bytes!("cfgeval.rs").as_slice()),
+            ("lock", include_bytes!("../Cargo.lock").as_slice()),
+        ] {
+            for b in name
+                .as_bytes()
+                .iter()
+                .chain(&(bytes.len() as u64).to_le_bytes())
+                .chain(bytes)
+            {
+                h = (h ^ u64::from(*b)).wrapping_mul(0x100000001b3);
+            }
+        }
+        h
+    })
+}
+
+fn fingerprint_with_producer(
+    dir: &Path,
+    meta: &Metadata,
+    opts: &Options,
+    namespace: &[u8],
+    producer: Option<u64>,
+) -> Option<u64> {
     let mut h = 0xcbf29ce484222325u64;
     let mut feed = |bytes: &[u8]| {
         for &b in bytes {
@@ -571,7 +623,10 @@ fn fingerprint(dir: &Path, meta: &Metadata, opts: &Options) -> Option<u64> {
     // v2: 커버리지 규칙 강화(루트 밖·target/·숨김 디렉터리·include!) —
     // v1 아래 쓰인 엔트리는 새 규칙에서 불법일 수 있어 키가 다르다.
     // v3: 서로 다른 소스 선언의 ID를 분리한다. v2 문서는 충돌한 ID·간선을 품을 수 있다.
-    feed(b"rustograph-cache-v3-source-identities");
+    feed(namespace);
+    if let Some(producer) = producer {
+        feed(&producer.to_le_bytes());
+    }
     feed(env!("CARGO_PKG_VERSION").as_bytes());
     feed(&graph::DOCUMENT_VERSION.to_le_bytes());
     // 툴체인과 빌드 env도 수확 입력이다 — rustc/ra_ap 버전과
@@ -883,6 +938,7 @@ fn harvest(
     let mut impls: Vec<harvest::ImplBlock<'_>> = Vec::new();
     let mut attr_refs: Vec<harvest::AttrRef> = Vec::new();
     let mut test_roots: Vec<String> = Vec::new();
+    let mut annotated_roots: Vec<String> = Vec::new();
     // 지역명이 fn owner_spans와 같으면 이름 해석이 함수 정점으로 읽어 거짓 순환이 된다.
     let mut item_spans: Vec<harvest::OwnerSpan> = Vec::new();
     let mut identity_registry = harvest::identity::Registry::default();
@@ -899,7 +955,7 @@ fn harvest(
         vertices.push(mh.vertex);
         edges.extend(mh.edges);
         vertices.extend(mh.decls.vertices);
-        entry_roots.extend(mh.decls.entry_roots);
+        annotated_roots.extend(mh.decls.entry_roots);
         test_roots.extend(mh.decls.test_roots);
         bodies.extend(mh.decls.bodies);
         attr_refs.extend(mh.decls.attr_refs);
@@ -929,8 +985,11 @@ fn harvest(
     for span in &mut item_spans {
         span.id = identities.owner(&span.id, &span.file, span.range.start);
     }
+    identities.attributes(&mut attr_refs);
     identities.roots(&mut entry_roots);
-    identities.roots(&mut test_roots);
+    identities.annotated_roots(&mut annotated_roots, false);
+    entry_roots.extend(annotated_roots);
+    identities.annotated_roots(&mut test_roots, true);
     if identities.groups > 0 {
         limitations.push(format!(
             "{} declaration paths have {} additional distinct source instances; source-instance IDs preserve them independently, and syntactically ambiguous references remain tentative",
@@ -1054,7 +1113,7 @@ fn harvest(
         // `#[derive(dep::X)]`는 의미 해석이 더 잘 아는 것이 없다.
         edges.extend(identities.edges(
             harvest::attr_edges(&attr_refs, &tree, &dep_crates, &mut harvest),
-            true,
+            false,
         ));
     }
 
@@ -1083,10 +1142,19 @@ fn harvest(
             }
         }
     }
+    let mut missing_roots = BTreeSet::new();
     for r in &opts.extra_roots {
         if ids.contains(r.as_str()) {
             root_set.insert(r.clone());
+        } else {
+            missing_roots.insert(r.as_str());
         }
+    }
+    if !missing_roots.is_empty() {
+        limitations.push(format!(
+            "{} requested root IDs do not exist in this source graph and were not added: {}; regenerate ID-keyed inputs for this revision before interpreting reachability",
+            missing_roots.len(), missing_roots.into_iter().collect::<Vec<_>>().join(", ")
+        ));
     }
 
     let level = if opts.symbol_level {
@@ -1862,6 +1930,63 @@ mod tests {
     use super::*;
     use crate::cargo_meta::Metadata;
     use crate::graph::{document, Level};
+
+    #[test]
+    fn cache_rejects_public_and_interim_producer_entries() {
+        let tmp =
+            std::env::temp_dir().join(format!("rustograph-producer-cache-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(
+            tmp.join("Cargo.toml"),
+            "[package]\nname='producer_cache'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.join("src/lib.rs"), "pub fn first() {}\n").unwrap();
+        let meta = cargo_meta::load(&tmp).unwrap();
+        let opts = Options {
+            symbol_level: true,
+            semantic: true,
+            cache: true,
+            ..Default::default()
+        };
+        let current = fingerprint(&tmp, &meta, &opts).unwrap();
+        let syn_opts = Options {
+            symbol_level: true,
+            ..Default::default()
+        };
+        let fresh = load_with(&tmp, &meta, &syn_opts).unwrap();
+        assert!(!fresh.vertices.is_empty());
+        let mut stale = fresh.clone();
+        stale
+            .limitations
+            .push("seeded stale producer payload".to_string());
+        let path = cache_path(&meta);
+        for namespace in [
+            b"rustograph-cache-v2".as_slice(),
+            b"rustograph-cache-v3-source-identities".as_slice(),
+        ] {
+            let previous = fingerprint_with_producer(&tmp, &meta, &opts, namespace, None).unwrap();
+            write_cache(&path, previous, &stale);
+            eprintln!(
+                "previous={} key={previous:016x}, current={current:016x}",
+                String::from_utf8_lossy(namespace)
+            );
+            assert!(read_cache(&path, current, &tmp).is_none(), "a different graph producer must miss even for identical input and public package version");
+        }
+        // 실제 syn 수확을 다시 실행해 교체한다. semantic 엔진의 캐시 통합 검증은 별도다.
+        let rebuilt = load_with(&tmp, &meta, &syn_opts).unwrap();
+        write_cache(&path, current, &rebuilt);
+        let hit = read_cache(&path, current, &tmp).expect("same producer/input should hit");
+        assert_eq!(
+            serde_json::to_vec(&hit).unwrap(),
+            serde_json::to_vec(&rebuilt).unwrap()
+        );
+        assert_eq!(current, fingerprint(&tmp, &meta, &opts).unwrap());
+        assert!(!hit
+            .limitations
+            .contains(&"seeded stale producer payload".to_string()));
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
 
     /// 캐시 지문의 왕복과 무효화 — 파일 하나라도 바뀌면 키가 달라져야 한다.
     #[test]

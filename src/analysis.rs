@@ -278,10 +278,13 @@ impl<'a> QueryIndex<'a> {
     fn limitations(&self) -> Vec<String> {
         let mut limitations = self.doc.limitations.clone();
         if !self.ambiguous_set().is_empty() {
-            limitations.push(format!(
-                "{} vertex IDs are shared by {} additional rows in this stored graph; source declarations cannot be separated, so related query and impact evidence is candidate; regenerate the graph with a source-identity-aware build",
-                self.ambiguous_set().len(), self.doc.vertices.len() - self.vertex_set().len()
-            ));
+            let message = crate::graph::identity_limitation(
+                self.ambiguous_set().len(),
+                self.doc.vertices.len() - self.vertex_set().len(),
+            );
+            if !limitations.contains(&message) {
+                limitations.push(message);
+            }
         }
         limitations
     }
@@ -306,7 +309,7 @@ impl<'a> QueryIndex<'a> {
     /// 경로 탐색 인접 목록.
     fn path_adjacency(&self) -> &PathAdjacency<'a> {
         self.adjacency
-            .get_or_init(|| adjacency_of(self.doc, self.vertex_set()))
+            .get_or_init(|| adjacency_of(self.doc, self.vertex_set(), self.ambiguous_set()))
     }
 
     /// 보존 루트 BFS가 따라가는 도달성 인접 목록.
@@ -516,6 +519,8 @@ pub struct PathsReport {
     /// 탐색이 펼친 정점 수 — 예산 소비량 측정.
     pub expanded: usize,
     pub paths: Vec<Path>,
+    /// 중복 ID의 모호성과 원래 수확 한계를 경로 결과에서도 보존한다.
+    pub limitations: Vec<String>,
 }
 
 /// A→B 경로 탐색 — 의존 간선만 따라가는 bounded BFS.
@@ -531,15 +536,23 @@ pub fn paths(doc: &Document, from: &str, to: &str, max_paths: usize, budget: usi
 /// 종류만큼 중복 보고하지 않기 위함이다. 끝점이 없는 간선은 건너뛴다
 /// — 비형식 문서의 dangling 간선이 경로에 없는 정점을 끼워 넣는
 /// 것을 막는다.
-fn adjacency_of<'a>(doc: &'a Document, ids: &BTreeSet<&str>) -> PathAdjacency<'a> {
+fn adjacency_of<'a>(
+    doc: &'a Document,
+    ids: &BTreeSet<&str>,
+    ambiguous: &BTreeSet<&str>,
+) -> PathAdjacency<'a> {
     let mut adj: PathAdjacency<'a> = BTreeMap::new();
     for e in &doc.edges {
         #[cfg(test)]
         note_indexed(1);
         if e.kind.is_dependency() && ids.contains(e.from.as_str()) && ids.contains(e.to.as_str()) {
-            adj.entry(e.from.as_str())
-                .or_default()
-                .push((e.to.as_str(), e.kind, e.tentative));
+            adj.entry(e.from.as_str()).or_default().push((
+                e.to.as_str(),
+                e.kind,
+                e.tentative
+                    || ambiguous.contains(e.from.as_str())
+                    || ambiguous.contains(e.to.as_str()),
+            ));
         }
     }
     for outs in adj.values_mut() {
@@ -564,6 +577,7 @@ fn paths_bounded(
         truncated: false,
         expanded: 0,
         paths: Vec::new(),
+        limitations: index.limitations(),
     };
     if !index.has_vertex(from) || !index.has_vertex(to) {
         return report; // 끝점이 없으면 경로도 없다 — 호출자가 404를 처리한다.
@@ -577,7 +591,7 @@ fn paths_bounded(
             report.paths.push(Path {
                 vertices: vec![from.to_string()],
                 edges: Vec::new(),
-                tentative: false,
+                tentative: index.ambiguous_set().contains(from),
             });
         }
         return report;
@@ -587,7 +601,7 @@ fn paths_bounded(
     let mut steps = vec![PathStep {
         vertex: from,
         via: None,
-        tentative: false,
+        tentative: index.ambiguous_set().contains(from),
     }];
     let mut queue: VecDeque<usize> = VecDeque::from([0]);
     let mut pending_states = 1usize;
@@ -1211,6 +1225,7 @@ mod tests {
             truncated: false,
             expanded: 0,
             paths: Vec::new(),
+            limitations: index.limitations(),
         };
         if !index.has_vertex(from) || !index.has_vertex(to) {
             return report; // 끝점이 없으면 경로도 없다 — 호출자가 404를 처리한다.

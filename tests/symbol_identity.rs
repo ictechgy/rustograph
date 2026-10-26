@@ -48,6 +48,24 @@ pub trait ConditionalTrait {
     #[cfg(unix)] fn platform();
     #[cfg(not(unix))] fn platform();
 }
+mod marks { pub fn first() {} pub fn second() {} }
+pub struct AttrValue;
+impl From<String> for AttrValue {
+    #[cfg_attr(any(), marks::first)]
+    fn from(_: String) -> Self { string_body(); Self }
+}
+impl From<&str> for AttrValue {
+    #[cfg_attr(any(), marks::second)]
+    fn from(_: &str) -> Self { str_body(); Self }
+}
+#[cfg(unix)] #[no_mangle] pub extern "C" fn cfg_entry() {}
+#[cfg(not(unix))] pub extern "C" fn cfg_entry() {}
+#[cfg(unix)] #[test] fn cfg_test() {}
+#[cfg(not(unix))] fn cfg_test() {}
+pub struct Same { x: i32 }
+#[allow(non_snake_case)] pub fn Same() {}
+impl Same { pub fn method() { string_body() } }
+pub fn use_same() { Same() }
 "#,
     )
     .unwrap();
@@ -55,6 +73,8 @@ pub trait ConditionalTrait {
         &root,
         &source::Options {
             symbol_level: true,
+            tests: true,
+            extra_roots: vec!["identity_case::Value::<From>::from".to_string()],
             ..Default::default()
         },
     )
@@ -66,10 +86,20 @@ pub trait ConditionalTrait {
         d.vertices.len(),
         "distinct source declarations must never share a vertex ID"
     );
+    assert!(
+        d.limitations
+            .iter()
+            .any(|l| l.contains("1 requested root IDs do not exist")),
+        "a stale ID must not be silently accepted as a root"
+    );
     let from: Vec<_> = d
         .vertices
         .iter()
-        .filter(|v| v.kind == Kind::Method && v.id.ends_with("::from"))
+        .filter(|v| {
+            v.kind == Kind::Method
+                && v.id.starts_with("identity_case::Value::<From>::")
+                && v.id.ends_with("::from")
+        })
         .collect();
     assert_eq!(from.len(), 2);
     for vertex in from {
@@ -175,4 +205,68 @@ pub trait ConditionalTrait {
             .count(),
         1
     );
+    let attr_methods: Vec<_> = d
+        .vertices
+        .iter()
+        .filter(|v| {
+            v.id.starts_with("identity_case::AttrValue::<From>::") && v.id.ends_with("::from")
+        })
+        .collect();
+    assert_eq!(attr_methods.len(), 2);
+    for method in attr_methods {
+        let first = d.edges.iter().any(|e| {
+            e.from == method.id && e.kind == EdgeKind::Call && e.to == "identity_case::string_body"
+        });
+        let (expected, other) = if first {
+            ("first", "second")
+        } else {
+            ("second", "first")
+        };
+        assert!(d.edges.iter().any(|e| e.from == method.id
+            && e.to == format!("identity_case::marks::{expected}")
+            && !e.tentative));
+        assert!(
+            !d.edges
+                .iter()
+                .any(|e| e.from == method.id && e.to == format!("identity_case::marks::{other}")),
+            "a known attribute owner must never fan to another declaration"
+        );
+    }
+    for name in ["cfg_entry", "cfg_test"] {
+        let roots: Vec<_> = d
+            .roots
+            .iter()
+            .filter(|id| id.ends_with(&format!("::{name}")))
+            .collect();
+        assert_eq!(
+            roots.len(),
+            1,
+            "only the annotated source instance is a root"
+        );
+        let root_vertex = d.vertices.iter().find(|v| &v.id == roots[0]).unwrap();
+        assert!(!root_vertex.cfg.as_ref().unwrap().contains("not"));
+    }
+    let same_fn = d
+        .vertices
+        .iter()
+        .find(|v| v.kind == Kind::Fn && v.id.ends_with("::Same"))
+        .unwrap();
+    assert!(d.edges.iter().any(|e| e.from == "identity_case::Same"
+        && e.to == "identity_case::Same::method"
+        && e.kind == EdgeKind::Contains));
+    assert!(!d.edges.iter().any(|e| e.from == same_fn.id
+        && e.to == "identity_case::Same::method"
+        && e.kind == EdgeKind::Contains));
+    assert!(d.edges.iter().any(|e| e.from == "identity_case::use_same"
+        && e.to == same_fn.id
+        && e.kind == EdgeKind::Call
+        && !e.tentative));
+    let types = d.view(rustograph::graph::Level::Type).unwrap();
+    assert!(types
+        .vertices
+        .iter()
+        .any(|v| v.id == "identity_case::Same" && v.kind == Kind::Struct));
+    assert!(types.edges.iter().any(|e| e.from == "identity_case::Same"
+        && e.to == "identity_case"
+        && e.kind == EdgeKind::Call));
 }

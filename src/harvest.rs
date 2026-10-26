@@ -217,8 +217,10 @@ pub(crate) fn decls_with_markers<'a>(
                         .push(v(id.clone(), Kind::Fn, is_pub(&f.vis), unsafe_));
                     if is_extern_entry(&f.attrs) {
                         out.entry_roots.push(id.clone());
+                        identities.note_root(&id, false, file, f.span().byte_range().start);
                     } else if is_test_entry(&f.attrs) {
                         out.test_roots.push(id.clone());
+                        identities.note_root(&id, true, file, f.span().byte_range().start);
                     }
                     out.bodies.push(BodyItem {
                         id,
@@ -416,6 +418,7 @@ pub(crate) fn decls_with_markers<'a>(
                 .map(|i| format!("{module_path}::{i}"))
                 .unwrap_or_else(|| module_path.to_string());
             let mod_decl = matches!(item, syn::Item::Mod(m) if m.content.is_none());
+            let first_attr = out.attr_refs.len();
             harvest.unparsed_attrs += collect_attr_refs(
                 attrs_of(item),
                 &owner,
@@ -437,6 +440,11 @@ pub(crate) fn decls_with_markers<'a>(
                     });
                 }
             }
+            identities.note_attrs(
+                &out.attr_refs[first_attr..],
+                file,
+                item.span().byte_range().start,
+            );
         }
     }
     out
@@ -530,6 +538,7 @@ pub(crate) fn impls_with_identities<'a>(
             // 메서드 속성의 경로 참조 — #[dep::attr] fn m()도 사용 증거다.
             // impl과 메서드 자신의 cfg를 둘 다 물린다 — 둘 다 성립해야
             // 이 참조가 존재한다.
+            let first_attr = attr_refs.len();
             harvest.unparsed_attrs += collect_attr_refs(
                 &m.attrs,
                 &mid,
@@ -537,6 +546,11 @@ pub(crate) fn impls_with_identities<'a>(
                 false,
                 &mcfg,
                 &mut attr_refs,
+            );
+            identities.note_attrs(
+                &attr_refs[first_attr..],
+                &b.file,
+                m.span().byte_range().start,
             );
             bodies.push(BodyItem {
                 id: mid,
