@@ -44,6 +44,10 @@ impl Value {
     #[cfg(unix)] pub fn conditional() { string_body() }
     #[cfg(not(unix))] pub fn conditional() { str_body() }
 }
+pub trait ConditionalTrait {
+    #[cfg(unix)] fn platform();
+    #[cfg(not(unix))] fn platform();
+}
 "#,
     )
     .unwrap();
@@ -149,6 +153,25 @@ impl Value {
         unix.vertices
             .iter()
             .filter(|v| v.id.ends_with("::conditional"))
+            .count(),
+        1
+    );
+    let trait_methods: Vec<_> = d
+        .vertices
+        .iter()
+        .filter(|v| v.id.ends_with("::platform"))
+        .collect();
+    assert_eq!(
+        trait_methods.len(),
+        2,
+        "cfg trait declarations need their own spans even without bodies"
+    );
+    assert_ne!(trait_methods[0].id, trait_methods[1].id);
+    assert!(trait_methods.iter().all(|v| v.cfg.is_some()));
+    assert_eq!(
+        unix.vertices
+            .iter()
+            .filter(|v| v.id.ends_with("::platform"))
             .count(),
         1
     );

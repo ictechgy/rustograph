@@ -272,6 +272,7 @@ pub(crate) fn decls_with_markers<'a>(
                                 m.sig.unsafety.is_some() || body.is_some_and(body_has_unsafe);
                             let mut vertex = v(mid.clone(), Kind::Method, is_pub(&t.vis), unsafe_);
                             vertex.cfg = mcfg.clone();
+                            identities.note(&vertex, file, m.span().byte_range().start);
                             out.vertices.push(vertex);
                             if let Some(body) = body {
                                 out.bodies.push(BodyItem {
@@ -377,23 +378,11 @@ pub(crate) fn decls_with_markers<'a>(
                 _ => {}
             }
             for vertex in &out.vertices[first_vertex..] {
-                let start = if let syn::Item::Trait(t) = item {
-                    t.items
-                        .iter()
-                        .find_map(|ti| match ti {
-                            syn::TraitItem::Fn(m)
-                                if vertex.kind == Kind::Method
-                                    && vertex.id.ends_with(&format!("::{}", m.sig.ident)) =>
-                            {
-                                Some(m.span().byte_range().start)
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| item.span().byte_range().start)
-                } else {
-                    item.span().byte_range().start
-                };
-                identities.note(vertex, file, start);
+                // 기본 구현 없는 같은 이름의 cfg 메서드도 각자의 실제 범위를 쓴다.
+                // 위에서 등록한 메서드를 이름으로 다시 찾으면 첫 선언으로 합쳐진다.
+                if !(matches!(item, syn::Item::Trait(_)) && vertex.kind == Kind::Method) {
+                    identities.note(vertex, file, item.span().byte_range().start);
+                }
             }
             // 본문 없는 소유 아이템의 범위 — 필드 어트리뷰트 같은 선언 수준
             // 사실은 그 타입 정점이 감싼다.
