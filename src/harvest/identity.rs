@@ -9,15 +9,16 @@ use crate::graph::{Edge, EdgeKind, Kind, Vertex};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-type VertexKey = (String, Kind, Option<String>, Option<String>);
-type SiteKey = (String, PathBuf, usize);
+type VertexKey = (String, Kind, Option<String>, Option<String>, String);
+type SiteKey = (String, String, PathBuf, usize);
 type AttrKey = (String, bool, String, Vec<String>, Option<String>);
+type RootKey = (String, String, bool);
 
 #[derive(Default)]
 pub(crate) struct Registry {
     sites: Vec<Site>,
     attrs: BTreeMap<AttrKey, Vec<(PathBuf, usize)>>,
-    roots: BTreeMap<(String, bool), Vec<(PathBuf, usize)>>,
+    roots: BTreeMap<RootKey, Vec<(PathBuf, usize)>>,
     members: Vec<Member>,
 }
 
@@ -27,6 +28,7 @@ struct Member {
     id: String,
     start: usize,
     file: PathBuf,
+    module: String,
     cfg: Option<String>,
     unsafe_: bool,
 }
@@ -49,14 +51,20 @@ pub(crate) struct Identities {
     sites: BTreeMap<SiteKey, String>,
     aliases: BTreeMap<String, Vec<Target>>,
     attrs: BTreeMap<AttrKey, Vec<String>>,
-    annotated_roots: BTreeMap<(String, bool), Vec<String>>,
+    annotated_roots: BTreeMap<RootKey, Vec<String>>,
     members: Vec<Edge>,
     pub groups: usize,
     pub extra: usize,
 }
 
 fn vertex_key(v: &Vertex) -> VertexKey {
-    (v.id.clone(), v.kind, v.position.clone(), v.cfg.clone())
+    (
+        v.id.clone(),
+        v.kind,
+        v.position.clone(),
+        v.cfg.clone(),
+        v.module.clone(),
+    )
 }
 
 fn attr_key(reference: &AttrRef) -> AttrKey {
@@ -92,6 +100,7 @@ impl Registry {
             id: vertex.id.clone(),
             start,
             file: file.to_path_buf(),
+            module: vertex.module.clone(),
             cfg: vertex.cfg.clone(),
             unsafe_,
         });
@@ -105,9 +114,9 @@ impl Registry {
         }
     }
 
-    pub fn note_root(&mut self, id: &str, test: bool, file: &Path, start: usize) {
+    pub fn note_root(&mut self, id: &str, module: &str, test: bool, file: &Path, start: usize) {
         self.roots
-            .entry((id.to_string(), test))
+            .entry((id.to_string(), module.to_string(), test))
             .or_default()
             .push((file.to_path_buf(), start));
     }
@@ -162,11 +171,20 @@ impl Registry {
                 let (parent, name) = legacy
                     .rsplit_once("::")
                     .expect("non-root items have an owner");
-                v.id = format!("{parent}::@{encoded}#{}#{:?}::{name}", site.start, v.kind);
+                let module = encode_text(&v.module);
+                v.id = format!(
+                    "{parent}::@{encoded}#{}#{:?}#{module}::{name}",
+                    site.start, v.kind
+                );
             }
             if !matches!(v.kind, Kind::Crate | Kind::Module) {
                 out.sites.insert(
-                    (legacy.clone(), site.file.clone(), site.start),
+                    (
+                        legacy.clone(),
+                        v.module.clone(),
+                        site.file.clone(),
+                        site.start,
+                    ),
                     v.id.clone(),
                 );
             }
@@ -191,7 +209,7 @@ impl Registry {
                 key.clone(),
                 sites
                     .iter()
-                    .map(|(file, start)| out.owner(&key.0, file, *start))
+                    .map(|(file, start)| out.owner(&key.0, &key.2, file, *start))
                     .collect(),
             );
         }
@@ -200,21 +218,26 @@ impl Registry {
                 key.clone(),
                 sites
                     .iter()
-                    .map(|(file, start)| out.owner(&key.0, file, *start))
+                    .map(|(file, start)| out.owner(&key.0, &key.1, file, *start))
                     .collect(),
             );
         }
         for member in &self.members {
             let mut edge = Edge::new(
-                out.owner(&member.owner, &member.file, member.owner_start),
-                out.owner(&member.id, &member.file, member.start),
+                out.owner(
+                    &member.owner,
+                    &member.module,
+                    &member.file,
+                    member.owner_start,
+                ),
+                out.owner(&member.id, &member.module, &member.file, member.start),
                 EdgeKind::Contains,
             );
             edge.cfg = member.cfg.clone();
             edge.unsafe_ = member.unsafe_;
             out.members.push(edge);
         }
-        // 같은 파일·범위가 공유 lib/bin 루트로 다시 들어온 경우는 같은 선언이다.
+        // 같은 파일·범위·모듈 문맥이 다시 들어온 경우만 같은 선언이다.
         let mut seen = BTreeSet::new();
         vertices.retain(|v| seen.insert(v.id.clone()));
         out
@@ -222,8 +245,12 @@ impl Registry {
 }
 
 fn encode_path(path: &Path) -> String {
+    encode_text(&path.to_string_lossy())
+}
+
+fn encode_text(text: &str) -> String {
     let mut out = String::new();
-    for byte in path.to_string_lossy().as_bytes() {
+    for byte in text.as_bytes() {
         if byte.is_ascii_alphanumeric() || b"/_-.".contains(byte) {
             out.push(char::from(*byte));
         } else {
@@ -252,9 +279,13 @@ impl Identities {
     }
 
     pub fn annotated_roots(&self, roots: &mut [String], test: bool) {
-        let mut used = BTreeMap::<(String, bool), usize>::new();
+        let mut used = BTreeMap::<RootKey, usize>::new();
         for root in roots {
-            let key = (root.clone(), test);
+            let module = root
+                .rsplit_once("::")
+                .map(|(module, _)| module.to_string())
+                .unwrap_or_default();
+            let key = (root.clone(), module, test);
             let n = used.entry(key.clone()).or_default();
             if let Some(owner) = self
                 .annotated_roots
@@ -266,9 +297,14 @@ impl Identities {
             *n += 1;
         }
     }
-    pub fn owner(&self, id: &str, file: &Path, start: usize) -> String {
+    pub fn owner(&self, id: &str, module: &str, file: &Path, start: usize) -> String {
         self.sites
-            .get(&(id.to_string(), file.to_path_buf(), start))
+            .get(&(
+                id.to_string(),
+                module.to_string(),
+                file.to_path_buf(),
+                start,
+            ))
             .cloned()
             .unwrap_or_else(|| id.to_string())
     }

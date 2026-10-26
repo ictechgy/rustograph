@@ -217,10 +217,22 @@ pub(crate) fn decls_with_markers<'a>(
                         .push(v(id.clone(), Kind::Fn, is_pub(&f.vis), unsafe_));
                     if is_extern_entry(&f.attrs) {
                         out.entry_roots.push(id.clone());
-                        identities.note_root(&id, false, file, f.span().byte_range().start);
+                        identities.note_root(
+                            &id,
+                            module_path,
+                            false,
+                            file,
+                            f.span().byte_range().start,
+                        );
                     } else if is_test_entry(&f.attrs) {
                         out.test_roots.push(id.clone());
-                        identities.note_root(&id, true, file, f.span().byte_range().start);
+                        identities.note_root(
+                            &id,
+                            module_path,
+                            true,
+                            file,
+                            f.span().byte_range().start,
+                        );
                     }
                     out.bodies.push(BodyItem {
                         id,

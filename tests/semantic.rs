@@ -63,6 +63,28 @@ fn call<'a>(d: &'a Document, from: &str, to: &str) -> Option<&'a Edge> {
         .find(|e| e.from == from && e.to == to && e.kind == EdgeKind::Call)
 }
 
+/// ID 문자열 규칙을 재구현하지 않고 독립적인 선언 모듈·파일·줄로 실제 정점을 고른다.
+fn method_at<'a>(d: &'a Document, module: &str, file_suffix: &str, line: usize) -> &'a str {
+    let location = format!("{file_suffix}:{line}");
+    let methods: Vec<_> = d
+        .vertices
+        .iter()
+        .filter(|v| {
+            v.kind == rustograph::graph::Kind::Method
+                && v.module == module
+                && v.position
+                    .as_deref()
+                    .is_some_and(|p| p.ends_with(&location))
+        })
+        .collect();
+    assert_eq!(
+        methods.len(),
+        1,
+        "one exact source method at {module} {location}"
+    );
+    &methods[0].id
+}
+
 fn edge_key(e: &Edge) -> (&str, &str, EdgeKind, bool) {
     (e.from.as_str(), e.to.as_str(), e.kind, e.tentative)
 }
@@ -416,15 +438,24 @@ fn block_local_ctor_does_not_collide() {
 #[test]
 fn generated_impl_does_not_steal_sibling_vertex() {
     let d = sem_doc();
+    let real = method_at(&d, "fixture_core", "fixture_core/src/lib.rs", 398);
     // a::Tr 디스패치 — syn이 수확한 진짜 메서드 정점으로 간다.
-    assert!(
-        call(&d, "fixture_core::dispatch_a", "fixture_core::S::<Tr>::m")
-            .is_some_and(|e| e.tentative)
-    );
+    assert!(call(&d, "fixture_core::dispatch_a", real).is_some_and(|e| e.tentative));
     // b::Tr 디스패치 — 확장 안의 메서드는 정점이 없으니 impl 대상 타입으로.
     assert!(call(&d, "fixture_core::dispatch_b", "fixture_core::S").is_some_and(|e| e.tentative));
     // 충돌하는 a::Tr 정점으로 가는 간선은 만들어지면 안 된다.
-    assert!(call(&d, "fixture_core::dispatch_b", "fixture_core::S::<Tr>::m").is_none());
+    for (module, file, line) in [
+        ("fixture_core", "fixture_core/src/lib.rs", 398),
+        ("fixture_core::outer_a::duplex", "outer_a/duplex.rs", 9),
+        ("fixture_core::outer_b::inner", "outer_a/duplex.rs", 9),
+    ] {
+        assert!(call(
+            &d,
+            "fixture_core::dispatch_b",
+            method_at(&d, module, file, line)
+        )
+        .is_none());
+    }
 }
 
 /// span 보존 생성 메서드 — proc 매크로가 입력 토큰의 위치를 재사용해
@@ -435,7 +466,18 @@ fn generated_impl_does_not_steal_sibling_vertex() {
 fn span_preserved_generated_method_does_not_steal() {
     let d = sem_doc();
     assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S").is_some_and(|e| e.tentative));
-    assert!(call(&d, "fixture_core::dispatch_c", "fixture_core::S::<Tr>::m").is_none());
+    for (module, file, line) in [
+        ("fixture_core", "fixture_core/src/lib.rs", 398),
+        ("fixture_core::outer_a::duplex", "outer_a/duplex.rs", 9),
+        ("fixture_core::outer_b::inner", "outer_a/duplex.rs", 9),
+    ] {
+        assert!(call(
+            &d,
+            "fixture_core::dispatch_c",
+            method_at(&d, module, file, line)
+        )
+        .is_none());
+    }
 }
 
 /// 같은 소스 표기(`impl Tr for S2`)지만 다른 트레이트를 가리키는 생성
@@ -495,24 +537,22 @@ fn const_wrapped_real_impl_keeps_method_vertex() {
 #[test]
 fn shared_file_resolves_per_module_context() {
     let d = sem_doc();
+    let a = method_at(&d, "fixture_core::outer_a::duplex", "outer_a/duplex.rs", 9);
+    let b = method_at(&d, "fixture_core::outer_b::inner", "outer_a/duplex.rs", 9);
+    assert_ne!(
+        a, b,
+        "same file/range under different imports is a different source context"
+    );
     assert!(
-        call(
-            &d,
-            "fixture_core::S::<Tr>::m",
-            "fixture_core::outer_a::probe"
-        )
-        .is_some(),
+        call(&d, a, "fixture_core::outer_a::probe").is_some_and(|e| !e.tentative),
         "outer_a::duplex 문맥의 본문이 빠졌다 — 잘못된 문맥 귀속"
     );
     assert!(
-        call(
-            &d,
-            "fixture_core::S::<Tr>::m",
-            "fixture_core::outer_b::probe"
-        )
-        .is_some(),
+        call(&d, b, "fixture_core::outer_b::probe").is_some_and(|e| !e.tentative),
         "outer_b::inner 문맥의 본문이 빠졌다 — 잘못된 문맥 귀속"
     );
+    assert!(call(&d, a, "fixture_core::outer_b::probe").is_none());
+    assert!(call(&d, b, "fixture_core::outer_a::probe").is_none());
 }
 
 /// 원본 impl이 함수형 매크로 호출(`passthrough!`) 안에 숨겨지고,

@@ -981,10 +981,15 @@ fn harvest(
     edges = identities.edges(edges, true);
     edges.extend_from_slice(identities.members());
     for body in &mut bodies {
-        body.id = identities.owner(&body.id, &body.file, body.range.start);
+        body.id = identities.owner(&body.id, &body.module, &body.file, body.range.start);
     }
     for span in &mut item_spans {
-        span.id = identities.owner(&span.id, &span.file, span.range.start);
+        let module = span
+            .id
+            .rsplit_once("::")
+            .map(|(module, _)| module)
+            .unwrap_or_default();
+        span.id = identities.owner(&span.id, module, &span.file, span.range.start);
     }
     identities.attributes(&mut attr_refs);
     identities.roots(&mut entry_roots);

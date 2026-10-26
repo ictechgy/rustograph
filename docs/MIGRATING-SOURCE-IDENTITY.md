@@ -14,17 +14,22 @@ When several harvested declarations share a path, non-module declarations now
 receive a source-instance segment before their final name:
 
 ```text
-base_db::target::TargetLoadError::<From>::@crates/base-db/src/target.rs#1234#Method::from
+base_db::target::TargetLoadError::<From>::@crates/base-db/src/target.rs#1234#Method#base_db%3A%3Atarget::from
 ```
 
 The number above illustrates a declaration byte offset; it is not a real source
 location. The segment contains the workspace-relative file, declaration byte
-offset and vertex kind. Unsafe path bytes are percent encoded. A file outside
+offset, vertex kind and declaring module context. Unsafe path/context bytes are percent encoded. A file outside
 the workspace retains its full path. Modules and a sole type owner sharing a
 name with a value retain their original paths so their children, projection
 and name resolution still have an anchor. Declarations with an
 already unique path keep their original ID. Repeated loading of the exact same
 source occurrence is coalesced; distinct cfg alternatives remain separate.
+The same file and byte range included under two modules remains two source
+instances: those modules can bind the written trait/path names differently.
+Body, attribute, annotated-root and trait-membership remap keys retain that
+module context as well as the file/range. Public source-span and harvest APIs
+remain unchanged.
 
 These IDs identify source occurrences, not compiler-resolved generic types.
 Inserting text before a colliding declaration changes its byte offset. Adding

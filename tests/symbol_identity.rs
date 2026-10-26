@@ -5,6 +5,62 @@ use rustograph::source;
 use std::collections::BTreeSet;
 
 #[test]
+fn one_physical_impl_file_keeps_distinct_module_binding_contexts() {
+    let root =
+        std::env::temp_dir().join(format!("rustograph-shared-context-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='shared_context'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub struct S;\npub mod a;\npub mod b;\n",
+    )
+    .unwrap();
+    for (name, value) in [("a", 1), ("b", 2)] {
+        std::fs::write(root.join(format!("src/{name}.rs")), format!("pub trait Tr {{ fn m(&self)->u32; }}\n#[path=\"shared.rs\"] pub mod inner;\npub fn probe()->u32 {{ {value} }}\npub fn marker() {{}}\n")).unwrap();
+    }
+    std::fs::write(root.join("src/shared.rs"), "use super::Tr;\nimpl Tr for crate::S { #[cfg_attr(any(), super::marker)] fn m(&self)->u32 { super::probe() } }\n").unwrap();
+    let meta = rustograph::cargo_meta::load(&root).unwrap();
+    let (d, spans) = source::owner_spans(&root, &meta).unwrap();
+    let methods: Vec<_> = d
+        .vertices
+        .iter()
+        .filter(|v| {
+            v.kind == Kind::Method
+                && v.position
+                    .as_deref()
+                    .is_some_and(|p| p.contains("src/shared.rs:"))
+        })
+        .collect();
+    assert_eq!(methods.len(), 2);
+    assert_ne!(methods[0].id, methods[1].id);
+    for (module, other) in [("a", "b"), ("b", "a")] {
+        let method = methods
+            .iter()
+            .find(|v| v.module == format!("shared_context::{module}::inner"))
+            .unwrap();
+        for target in ["probe", "marker"] {
+            assert!(d.edges.iter().any(|e| e.from == method.id
+                && e.to == format!("shared_context::{module}::{target}")
+                && !e.tentative));
+            assert!(!d.edges.iter().any(
+                |e| e.from == method.id && e.to == format!("shared_context::{other}::{target}")
+            ));
+        }
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.id == method.id && span.file.ends_with("shared.rs")),
+            "public source spans retain each context's exact ID"
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn distinct_impls_cfg_and_namespaces_keep_source_identity() {
     let root =
         std::env::temp_dir().join(format!("rustograph-symbol-identity-{}", std::process::id()));
