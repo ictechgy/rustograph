@@ -18,6 +18,17 @@ pub(crate) struct Registry {
     sites: Vec<Site>,
     attrs: BTreeMap<AttrKey, Vec<(PathBuf, usize)>>,
     roots: BTreeMap<(String, bool), Vec<(PathBuf, usize)>>,
+    members: Vec<Member>,
+}
+
+struct Member {
+    owner: String,
+    owner_start: usize,
+    id: String,
+    start: usize,
+    file: PathBuf,
+    cfg: Option<String>,
+    unsafe_: bool,
 }
 
 struct Site {
@@ -39,6 +50,7 @@ pub(crate) struct Identities {
     aliases: BTreeMap<String, Vec<Target>>,
     attrs: BTreeMap<AttrKey, Vec<String>>,
     annotated_roots: BTreeMap<(String, bool), Vec<String>>,
+    members: Vec<Edge>,
     pub groups: usize,
     pub extra: usize,
 }
@@ -65,6 +77,25 @@ fn type_owner(kind: Kind) -> bool {
 }
 
 impl Registry {
+    pub fn note_member(
+        &mut self,
+        owner: &str,
+        owner_start: usize,
+        vertex: &Vertex,
+        file: &Path,
+        start: usize,
+        unsafe_: bool,
+    ) {
+        self.members.push(Member {
+            owner: owner.to_string(),
+            owner_start,
+            id: vertex.id.clone(),
+            start,
+            file: file.to_path_buf(),
+            cfg: vertex.cfg.clone(),
+            unsafe_,
+        });
+    }
     pub fn note_attrs(&mut self, references: &[AttrRef], file: &Path, start: usize) {
         for reference in references {
             self.attrs
@@ -173,6 +204,16 @@ impl Registry {
                     .collect(),
             );
         }
+        for member in &self.members {
+            let mut edge = Edge::new(
+                out.owner(&member.owner, &member.file, member.owner_start),
+                out.owner(&member.id, &member.file, member.start),
+                EdgeKind::Contains,
+            );
+            edge.cfg = member.cfg.clone();
+            edge.unsafe_ = member.unsafe_;
+            out.members.push(edge);
+        }
         // 같은 파일·범위가 공유 lib/bin 루트로 다시 들어온 경우는 같은 선언이다.
         let mut seen = BTreeSet::new();
         vertices.retain(|v| seen.insert(v.id.clone()));
@@ -194,6 +235,9 @@ fn encode_path(path: &Path) -> String {
 }
 
 impl Identities {
+    pub fn members(&self) -> &[Edge] {
+        &self.members
+    }
     /// AttrRef의 공개 모양은 바꾸지 않고 수집 순서별 실제 선언을 되찾는다.
     pub fn attributes(&self, references: &mut [AttrRef]) {
         let mut used = BTreeMap::<AttrKey, usize>::new();

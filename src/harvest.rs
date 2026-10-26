@@ -275,6 +275,14 @@ pub(crate) fn decls_with_markers<'a>(
                             let mut vertex = v(mid.clone(), Kind::Method, is_pub(&t.vis), unsafe_);
                             vertex.cfg = mcfg.clone();
                             identities.note(&vertex, file, m.span().byte_range().start);
+                            identities.note_member(
+                                &format!("{module_path}::{}", t.ident),
+                                t.span().byte_range().start,
+                                &vertex,
+                                file,
+                                m.span().byte_range().start,
+                                t.unsafety.is_some(),
+                            );
                             out.vertices.push(vertex);
                             if let Some(body) = body {
                                 out.bodies.push(BodyItem {

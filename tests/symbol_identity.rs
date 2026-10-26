@@ -66,6 +66,13 @@ pub struct Same { x: i32 }
 #[allow(non_snake_case)] pub fn Same() {}
 impl Same { pub fn method() { string_body() } }
 pub fn use_same() { Same() }
+#[cfg(unix)] pub struct Choice;
+#[cfg(not(unix))] pub struct Choice;
+mod helper_one { pub fn help() {} }
+mod helper_two { pub fn help() {} }
+impl Choice { pub fn act() { helper_one::help() } }
+#[cfg(unix)] pub trait ConditionalParent { fn route() { helper_one::help() } }
+#[cfg(not(unix))] pub trait ConditionalParent { fn route() { helper_two::help() } }
 "#,
     )
     .unwrap();
@@ -74,7 +81,10 @@ pub fn use_same() { Same() }
         &source::Options {
             symbol_level: true,
             tests: true,
-            extra_roots: vec!["identity_case::Value::<From>::from".to_string()],
+            extra_roots: vec![
+                "identity_case::Value::<From>::from".to_string(),
+                "identity_case::Choice::act".to_string(),
+            ],
             ..Default::default()
         },
     )
@@ -269,4 +279,57 @@ pub fn use_same() { Same() }
     assert!(types.edges.iter().any(|e| e.from == "identity_case::Same"
         && e.to == "identity_case"
         && e.kind == EdgeKind::Call));
+    let choices: Vec<_> = types
+        .vertices
+        .iter()
+        .filter(|v| v.kind == Kind::Struct && v.id.ends_with("::Choice"))
+        .collect();
+    assert_eq!(choices.len(), 2);
+    for choice in &choices {
+        assert!(
+            types.edges.iter().any(|e| e.from == choice.id
+                && e.to == "identity_case::helper_one"
+                && e.kind == EdgeKind::Call
+                && e.tentative),
+            "a shared method must project to every possible type owner"
+        );
+        assert!(
+            types.roots.contains(&choice.id),
+            "a shared source root projects to all candidate owners"
+        );
+        assert!(!types.edges.iter().any(|e| e.from == choice.id && e.kind == EdgeKind::Contains), "collapsing shared method ownership must not invent type-to-type or type-to-crate containment");
+    }
+    let parents: Vec<_> = types
+        .vertices
+        .iter()
+        .filter(|v| v.kind == Kind::Trait && v.id.ends_with("::ConditionalParent"))
+        .collect();
+    assert_eq!(parents.len(), 2);
+    for parent in parents {
+        let helper = if parent.cfg.as_ref().unwrap().contains("not") {
+            "identity_case::helper_two"
+        } else {
+            "identity_case::helper_one"
+        };
+        assert!(
+            types.edges.iter().any(|e| e.from == parent.id
+                && e.to == helper
+                && e.kind == EdgeKind::Call
+                && !e.tentative),
+            "known trait member ownership must project to the exact declaration"
+        );
+        let other = if helper.ends_with("one") {
+            "identity_case::helper_two"
+        } else {
+            "identity_case::helper_one"
+        };
+        assert!(!types
+            .edges
+            .iter()
+            .any(|e| e.from == parent.id && e.to == other && e.kind == EdgeKind::Call));
+    }
+    assert!(types
+        .limitations
+        .iter()
+        .any(|l| l.contains("project to multiple owners")));
 }

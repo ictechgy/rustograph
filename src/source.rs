@@ -979,6 +979,7 @@ fn harvest(
     let identities = identity_registry.identify(&mut vertices, &meta.workspace_root);
     drop(identity_registry);
     edges = identities.edges(edges, true);
+    edges.extend_from_slice(identities.members());
     for body in &mut bodies {
         body.id = identities.owner(&body.id, &body.file, body.range.start);
     }

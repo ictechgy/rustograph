@@ -46,6 +46,17 @@ module paths. The measured collision count is included in `limitations`.
 External dependency boundary vertices still represent package names and do not
 inspect or distinguish the internals of different dependency versions.
 
+Shallow views follow structural `contains` ownership, including explicit
+trait-to-method membership. A shared impl method can belong to several cfg
+type declarations: type projection preserves every candidate owner and root,
+marks projected dependencies tentative, and counts the ambiguity. Collapsing
+ownership does not create type-to-type containment edges. Owner sets are
+indexed once per view; iterative traversal terminates even on containment
+cycles. Legacy documents without source-instance IDs can still use the old
+prefix fallback when structural ownership is absent. A newer document missing
+ownership does not guess from opaque IDs: omitted vertices, dependencies and
+roots are counted in `limitations` and require regeneration/repair.
+
 Old v1 snapshots retain their original IDs when loaded. They cannot be split
 reliably without their source revision. `query`, `impact` and `paths` report duplicate ID
 counts in `limitations` and downgrade related evidence to `candidate`, including
