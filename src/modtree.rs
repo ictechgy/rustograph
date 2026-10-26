@@ -165,6 +165,8 @@ pub fn mod_file(dir: &Path, name: &str, path_attr: Option<&str>) -> Option<PathB
         let f = dir.join(p);
         return f.exists().then(|| f.canonicalize().unwrap_or(f));
     }
+    // r#은 식별자 표기이고 파일명 일부가 아니다. 명시적 #[path] 문자열은 위에서 그대로 쓴다.
+    let name = name.strip_prefix("r#").unwrap_or(name);
     for cand in [
         dir.join(format!("{name}.rs")),
         dir.join(name).join("mod.rs"),
@@ -335,12 +337,21 @@ pub(crate) fn collect_target_submodules(
     // 있다.
     let (path_base, child_base, parent_file) = {
         let parent = &tree.modules[parent_path];
-        let path_base = if parent.file_module {
-            parent.file.parent().unwrap_or(Path::new(".")).to_path_buf()
+        if let Some(root) =
+            target_root.filter(|_| !parent_path.contains("::") && parent.file_module)
+        {
+            // 병합 루트의 대표 파일은 lib일 수 있다. 현재 타깃의 mod 선언은
+            // 실제 루트 파일의 디렉터리를 기준으로 읽어야 하며 파일명은 임의여도 된다.
+            let base = root.parent().unwrap_or(Path::new(".")).to_path_buf();
+            (base.clone(), base, root.to_path_buf())
         } else {
-            parent.dir.clone()
-        };
-        (path_base, parent.dir.clone(), parent.file.clone())
+            let path_base = if parent.file_module {
+                parent.file.parent().unwrap_or(Path::new(".")).to_path_buf()
+            } else {
+                parent.dir.clone()
+            };
+            (path_base, parent.dir.clone(), parent.file.clone())
+        }
     };
     // 자식 경로의 세그먼트 수 — 상한을 넘는 선언은 싣지 않고 센다.
     let child_depth = parent_path.split("::").count() + 1;
@@ -377,7 +388,7 @@ pub(crate) fn collect_target_submodules(
             // 디렉터리 세그먼트를 덮어쓴다.
             let dir = match &path_attr {
                 Some(p) => path_base.join(p),
-                None => child_base.join(&name),
+                None => child_base.join(name.strip_prefix("r#").unwrap_or(&name)),
             };
             Some((parent_file.clone(), false, dir))
         } else {

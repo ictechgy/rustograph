@@ -1649,7 +1649,8 @@ fn module_items(
         }
         top = modtree::parent_of(&top)?;
     }
-    let mut items: &'static [syn::Item] = arena.get(&tree.modules[&top].file).copied()?;
+    // 병합 루트의 대표 파일과 이 인라인 모듈이 선언된 실제 파일은 다를 수 있다.
+    let mut items: &'static [syn::Item] = arena.get(&module.file).copied()?;
     // 파일 루트에서 목표까지 인라인 mod 본문을 따라 내려간다.
     let rel = path.strip_prefix(&format!("{top}::"))?;
     for seg in rel.split("::") {
@@ -1665,7 +1666,7 @@ fn module_items(
         }
         items = next?;
     }
-    Some(vec![(tree.modules[&top].file.clone(), items)])
+    Some(vec![(module.file.clone(), items)])
 }
 
 /// 파일 그룹을 아이템 목록으로 펼친다 — 스코프 채우기·mod 수집처럼

@@ -31,6 +31,14 @@ Body, attribute, annotated-root and trait-membership remap keys retain that
 module context as well as the file/range. Public source-span and harvest APIs
 remain unchanged.
 
+Default module file lookup treats `r#` as identifier spelling: `mod r#type;`
+loads `type.rs` or `type/mod.rs`, and an inline raw module uses the unescaped
+directory name. An explicit `#[path]` string remains literal. Graph names keep
+their written spelling. For a shared lib/bin root, module paths and inline AST
+selection use each declaration's actual target file, including binaries rooted
+outside `src/` or named differently from `main.rs`. The existing merged target
+namespace model is unchanged; this is not a per-target/feature variant graph.
+
 These IDs identify source occurrences, not compiler-resolved generic types.
 Inserting text before a colliding declaration changes its byte offset. Adding
 a new collision can also change a formerly unique ID. Treat IDs as opaque
