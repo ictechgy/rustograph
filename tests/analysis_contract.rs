@@ -75,6 +75,14 @@ impl Drop for Snapshot {
     }
 }
 
+fn direct_neighbor(id: &str, edges: &[&str], depth: usize) -> Value {
+    let evidence: Vec<_> = edges
+        .iter()
+        .map(|kind| json!({"relationship":kind,"evidence":"direct"}))
+        .collect();
+    json!({"id":id,"edges":edges,"direction":"in","depth":depth,"evidence":"direct","edge_evidence":evidence})
+}
+
 #[test]
 fn cli_impact_reports_only_reverse_reachability() {
     let snapshot = Snapshot::new("cli-direction");
@@ -82,8 +90,8 @@ fn cli_impact_reports_only_reverse_reachability() {
     assert_eq!(
         report["impacted"],
         json!([
-            {"id": "caller", "edges": ["call", "references"], "direction": "in", "depth": 1},
-            {"id": "entry", "edges": ["call"], "direction": "in", "depth": 2}
+            direct_neighbor("caller", &["call", "references"], 1),
+            direct_neighbor("entry", &["call"], 2)
         ])
     );
     assert_eq!(report["truncated"], false);
@@ -150,10 +158,10 @@ fn cli_and_mcp_depth_zero_walk_the_whole_closure() {
         json!({
             "id": "shared", "found": true, "depth": 0, "truncated": false,
             "impacted": [
-                {"id": "root", "edges": ["call"], "direction": "in", "depth": 1},
-                {"id": "sibling", "edges": ["call"], "direction": "in", "depth": 1},
-                {"id": "caller", "edges": ["call", "references"], "direction": "in", "depth": 2},
-                {"id": "entry", "edges": ["call"], "direction": "in", "depth": 3}
+                direct_neighbor("root", &["call"], 1),
+                direct_neighbor("sibling", &["call"], 1),
+                direct_neighbor("caller", &["call", "references"], 2),
+                direct_neighbor("entry", &["call"], 3)
             ]
         })
     );

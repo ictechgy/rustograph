@@ -491,10 +491,19 @@ handler and continues into the client code with `impact`.
 
 ## Agent output contract
 
+The unreleased [source identity correction](docs/MIGRATING-SOURCE-IDENTITY.md)
+separates colliding declarations without claiming compiler type resolution.
+Regenerate saved ID-keyed inputs together when upgrading from an older graph.
+
 `query`/`impact` JSON reports `level`, `depth`, `truncated`, all edge kinds
 between neighbors, and per-project `limitations`. Optional fields that have
 no value are omitted — an absent `tentative` means confirmed, an absent
 `truncated` means complete.
+
+Neighbor rows include `evidence` and `edge_evidence` (`direct` or `candidate`)
+for each relationship. A tentative call or any earlier tentative hop makes a
+path a candidate. A confirmed reference does not make a simultaneous tentative
+call confirmed; inspect the per-relationship evidence rather than only `edges`.
 
 `impact` follows incoming dependency edges only. Sharing a dependency with
 another symbol does not make that symbol impacted. `query` walks both directions;

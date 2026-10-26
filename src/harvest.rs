@@ -14,6 +14,7 @@ use syn::parse::Parser;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
+pub(crate) mod identity;
 mod locals;
 
 /// 수확 중간 산출물 — 문서 조립 전의 실측 카운터.
@@ -161,6 +162,7 @@ pub fn decls<'a>(
         groups,
         &file_has_generated_marker,
         harvest,
+        &mut identity::Registry::default(),
     )
 }
 
@@ -174,6 +176,7 @@ pub(crate) fn decls_with_markers<'a>(
     groups: &[(PathBuf, &'a [syn::Item])],
     is_generated_file: &dyn Fn(&Path) -> bool,
     harvest: &mut Harvest,
+    identities: &mut identity::Registry,
 ) -> ModuleDecls<'a> {
     let mut out = ModuleDecls {
         vertices: Vec::new(),
@@ -187,6 +190,7 @@ pub(crate) fn decls_with_markers<'a>(
     for (file, items) in groups {
         let generated = is_generated_file(file);
         for item in items.iter() {
+            let first_vertex = out.vertices.len();
             let cfg = cfg_of(attrs_of(item));
             if cfg.is_some() {
                 harvest.cfg_items += 1;
@@ -255,17 +259,20 @@ pub(crate) fn decls_with_markers<'a>(
                     // 트레이트 기본 메서드는 트레이트 소유 메서드 정점이다.
                     for ti in &t.items {
                         if let syn::TraitItem::Fn(m) = ti {
+                            let own_cfg = cfg_of(&m.attrs);
+                            harvest.cfg_items += usize::from(own_cfg.is_some());
+                            let mcfg = match own_cfg {
+                                Some(ref condition) => conjoin(&cfg, condition),
+                                None => cfg.clone(),
+                            };
                             let mid = format!("{module_path}::{}::{}", t.ident, m.sig.ident);
                             // 기본 구현이 없는 선언은 본문이 없다 — 정점만 남는다.
                             let body = m.default.as_ref().map(|b| Body::Stmts(&b.stmts));
                             let unsafe_ =
                                 m.sig.unsafety.is_some() || body.is_some_and(body_has_unsafe);
-                            out.vertices.push(v(
-                                mid.clone(),
-                                Kind::Method,
-                                is_pub(&t.vis),
-                                unsafe_,
-                            ));
+                            let mut vertex = v(mid.clone(), Kind::Method, is_pub(&t.vis), unsafe_);
+                            vertex.cfg = mcfg.clone();
+                            out.vertices.push(vertex);
                             if let Some(body) = body {
                                 out.bodies.push(BodyItem {
                                     id: mid,
@@ -274,7 +281,7 @@ pub(crate) fn decls_with_markers<'a>(
                                     body,
                                     params: locals::param_bindings(&m.sig),
                                     signature_surface: fn_signature_types(&m.sig),
-                                    cfg: cfg.clone(),
+                                    cfg: mcfg,
                                     file: file.to_path_buf(),
                                     range: m.span().byte_range(),
                                 });
@@ -369,6 +376,25 @@ pub(crate) fn decls_with_markers<'a>(
                 }
                 _ => {}
             }
+            for vertex in &out.vertices[first_vertex..] {
+                let start = if let syn::Item::Trait(t) = item {
+                    t.items
+                        .iter()
+                        .find_map(|ti| match ti {
+                            syn::TraitItem::Fn(m)
+                                if vertex.kind == Kind::Method
+                                    && vertex.id.ends_with(&format!("::{}", m.sig.ident)) =>
+                            {
+                                Some(m.span().byte_range().start)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| item.span().byte_range().start)
+                } else {
+                    item.span().byte_range().start
+                };
+                identities.note(vertex, file, start);
+            }
             // 본문 없는 소유 아이템의 범위 — 필드 어트리뷰트 같은 선언 수준
             // 사실은 그 타입 정점이 감싼다.
             let owner_kind = match item {
@@ -436,6 +462,23 @@ pub fn impls<'a>(
     tree: &ModTree,
     harvest: &mut Harvest,
 ) -> (Vec<Vertex>, Vec<Edge>, Vec<AttrRef>, Vec<BodyItem<'a>>) {
+    impls_with_identities(
+        blocks,
+        krate,
+        tree,
+        harvest,
+        &mut identity::Registry::default(),
+    )
+}
+
+/// 소스 수확의 전역 충돌 판정에 선언 위치를 넘긴다. 공개 수확 API는 그대로 둔다.
+pub(crate) fn impls_with_identities<'a>(
+    blocks: &[ImplBlock<'a>],
+    krate: &str,
+    tree: &ModTree,
+    harvest: &mut Harvest,
+    identities: &mut identity::Registry,
+) -> (Vec<Vertex>, Vec<Edge>, Vec<AttrRef>, Vec<BodyItem<'a>>) {
     let mut vertices = Vec::new();
     let mut edges = Vec::new();
     let mut attr_refs = Vec::new();
@@ -458,6 +501,12 @@ pub fn impls<'a>(
             }
         }
         for &m in &b.methods {
+            let own_cfg = cfg_of(&m.attrs);
+            harvest.cfg_items += usize::from(own_cfg.is_some());
+            let mcfg = match own_cfg {
+                Some(ref condition) => conjoin(&b.cfg, condition),
+                None => b.cfg.clone(),
+            };
             // 트레이트 impl 메서드는 `Type::<Trait>::m` — 고유 선언과 충돌 안 함.
             let mid = match &b.trait_path {
                 Some(tp) => {
@@ -477,20 +526,21 @@ pub fn impls<'a>(
                 position: Some(format!("{}:{}", b.file.display(), line_of(&m.sig.ident))),
                 exported: matches!(m.vis, syn::Visibility::Public(_)),
                 generated: b.generated,
-                cfg: b.cfg.clone(),
+                cfg: mcfg.clone(),
                 unsafe_,
             });
+            identities.note(
+                vertices.last().expect("method vertex was just inserted"),
+                &b.file,
+                m.span().byte_range().start,
+            );
             let mut contains = Edge::new(self_id.clone(), mid.clone(), EdgeKind::Contains);
-            contains.cfg = b.cfg.clone();
+            contains.cfg = mcfg.clone();
             contains.unsafe_ = b.unsafe_;
             edges.push(contains);
             // 메서드 속성의 경로 참조 — #[dep::attr] fn m()도 사용 증거다.
             // impl과 메서드 자신의 cfg를 둘 다 물린다 — 둘 다 성립해야
             // 이 참조가 존재한다.
-            let mcfg = match (&b.cfg, cfg_of(&m.attrs)) {
-                (a, Some(b)) => conjoin(a, b.as_str()),
-                (a, None) => a.clone(),
-            };
             harvest.unparsed_attrs += collect_attr_refs(
                 &m.attrs,
                 &mid,
@@ -506,7 +556,7 @@ pub fn impls<'a>(
                 body,
                 params: locals::param_bindings(&m.sig),
                 signature_surface: fn_signature_types(&m.sig),
-                cfg: b.cfg.clone(),
+                cfg: mcfg,
                 file: b.file.clone(),
                 range: m.span().byte_range(),
             });

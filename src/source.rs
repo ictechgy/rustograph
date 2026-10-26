@@ -570,7 +570,8 @@ fn fingerprint(dir: &Path, meta: &Metadata, opts: &Options) -> Option<u64> {
     // 스키마·도구 버전 — 출력 계약이 바뀌면 캐시도 무효다.
     // v2: 커버리지 규칙 강화(루트 밖·target/·숨김 디렉터리·include!) —
     // v1 아래 쓰인 엔트리는 새 규칙에서 불법일 수 있어 키가 다르다.
-    feed(b"rustograph-cache-v2");
+    // v3: 서로 다른 소스 선언의 ID를 분리한다. v2 문서는 충돌한 ID·간선을 품을 수 있다.
+    feed(b"rustograph-cache-v3-source-identities");
     feed(env!("CARGO_PKG_VERSION").as_bytes());
     feed(&graph::DOCUMENT_VERSION.to_le_bytes());
     // 툴체인과 빌드 env도 수확 입력이다 — rustc/ra_ap 버전과
@@ -673,6 +674,9 @@ fn read_cache(path: &Path, key: u64, root: &Path) -> Option<Document> {
     let src = std::fs::read_to_string(path).ok()?;
     let cf: CacheFile = serde_json::from_str(&src).ok()?;
     if cf.key != format!("{key:016x}") || cf.document.version > graph::DOCUMENT_VERSION {
+        return None;
+    }
+    if cf.document.vertex_ids().len() != cf.document.vertices.len() {
         return None;
     }
     if has_uncovered_input(&cf.document, root) {
@@ -881,6 +885,7 @@ fn harvest(
     let mut test_roots: Vec<String> = Vec::new();
     // 지역명이 fn owner_spans와 같으면 이름 해석이 함수 정점으로 읽어 거짓 순환이 된다.
     let mut item_spans: Vec<harvest::OwnerSpan> = Vec::new();
+    let mut identity_registry = harvest::identity::Registry::default();
     for mp in tree.modules.keys().cloned().collect::<Vec<_>>() {
         let mh = harvest_module(
             &mut tree,
@@ -889,6 +894,7 @@ fn harvest(
             &mp,
             &mut harvest,
             &dep_vertices,
+            &mut identity_registry,
         );
         vertices.push(mh.vertex);
         edges.extend(mh.edges);
@@ -902,12 +908,34 @@ fn harvest(
     }
     for block in &impls {
         let krate = modtree::crate_of(&block.items_module);
-        let (vs, es, ar, bs) =
-            harvest::impls(std::slice::from_ref(block), &krate, &tree, &mut harvest);
+        let (vs, es, ar, bs) = harvest::impls_with_identities(
+            std::slice::from_ref(block),
+            &krate,
+            &tree,
+            &mut harvest,
+            &mut identity_registry,
+        );
         vertices.extend(vs);
         edges.extend(es);
         attr_refs.extend(ar);
         bodies.extend(bs);
+    }
+    let identities = identity_registry.identify(&mut vertices, &meta.workspace_root);
+    drop(identity_registry);
+    edges = identities.edges(edges, true);
+    for body in &mut bodies {
+        body.id = identities.owner(&body.id, &body.file, body.range.start);
+    }
+    for span in &mut item_spans {
+        span.id = identities.owner(&span.id, &span.file, span.range.start);
+    }
+    identities.roots(&mut entry_roots);
+    identities.roots(&mut test_roots);
+    if identities.groups > 0 {
+        limitations.push(format!(
+            "{} declaration paths have {} additional distinct source instances; source-instance IDs preserve them independently, and syntactically ambiguous references remain tentative",
+            identities.groups, identities.extra
+        ));
     }
     if let Some(out) = sink.as_deref_mut().and_then(|k| k.spans.as_mut()) {
         collect_owner_spans(&tree, &impls, &bodies, item_spans, out);
@@ -973,50 +1001,60 @@ fn harvest(
                 match eng.body_edges_within(&site, &ids, &method_index, visible, &mut st) {
                     Some(es) => {
                         // 시그니처 간선은 엔진과 무관하게 syn이 권위다.
-                        edges.extend(harvest::signature_edges(b, &tree, &dep_crates));
+                        edges.extend(
+                            identities
+                                .edges(harvest::signature_edges(b, &tree, &dep_crates), false),
+                        );
                         edges.extend(es);
                     }
                     None => {
                         st.unmapped += 1;
-                        edges.extend(harvest::bodies_within(
-                            std::slice::from_ref(b),
-                            &tree,
-                            &dep_crates,
-                            &method_index,
-                            &fan_out_scope,
-                            &mut harvest,
+                        edges.extend(identities.edges(
+                            harvest::bodies_within(
+                                std::slice::from_ref(b),
+                                &tree,
+                                &dep_crates,
+                                &method_index,
+                                &fan_out_scope,
+                                &mut harvest,
+                            ),
+                            false,
                         ));
                     }
                 }
             }
             push_sem_stats(&st, eng.has_proc_macros(), &mut limitations, &mut harvest);
         } else {
-            edges.extend(harvest::bodies_within(
+            edges.extend(identities.edges(
+                harvest::bodies_within(
+                    &bodies,
+                    &tree,
+                    &dep_crates,
+                    &method_index,
+                    &fan_out_scope,
+                    &mut harvest,
+                ),
+                false,
+            ));
+        }
+        #[cfg(not(feature = "semantic"))]
+        edges.extend(identities.edges(
+            harvest::bodies_within(
                 &bodies,
                 &tree,
                 &dep_crates,
                 &method_index,
                 &fan_out_scope,
                 &mut harvest,
-            ));
-        }
-        #[cfg(not(feature = "semantic"))]
-        edges.extend(harvest::bodies_within(
-            &bodies,
-            &tree,
-            &dep_crates,
-            &method_index,
-            &fan_out_scope,
-            &mut harvest,
+            ),
+            false,
         ));
 
         // 속성 경로 참조 — 모드와 무관하게 syn이 권위다. `#[dep::attr]`나
         // `#[derive(dep::X)]`는 의미 해석이 더 잘 아는 것이 없다.
-        edges.extend(harvest::attr_edges(
-            &attr_refs,
-            &tree,
-            &dep_crates,
-            &mut harvest,
+        edges.extend(identities.edges(
+            harvest::attr_edges(&attr_refs, &tree, &dep_crates, &mut harvest),
+            true,
         ));
     }
 
@@ -1580,6 +1618,7 @@ fn harvest_module<'a>(
     mp: &str,
     out: &mut Harvest,
     dep_vertices: &BTreeSet<String>,
+    identities: &mut harvest::identity::Registry,
 ) -> ModuleHarvest<'a> {
     let groups = module_items(tree, arena, mp).expect("module items must exist");
     let file = tree.modules[mp].file.clone();
@@ -1587,7 +1626,7 @@ fn harvest_module<'a>(
     let markers_of = |f: &Path| markers.get(f).copied().unwrap_or_default();
     // 파라미터 이름이 fn harvest와 충돌하면 ident 경로가 함수 정점으로
     // 해석돼 거짓 간선·사이클이 생긴다 — 지역명은 `out`으로 둔다.
-    let decls = harvest::decls_with_markers(mp, &krate, &groups, &markers_of, out);
+    let decls = harvest::decls_with_markers(mp, &krate, &groups, &markers_of, out, identities);
 
     // 모듈 정점 — 타깃 루트는 크레이트 정점을 겸한다(rustc 의미론).
     // 위치는 파일 시작, exported는 `pub mod` 여부를 따른다.
@@ -1606,6 +1645,7 @@ fn harvest_module<'a>(
         cfg: mod_cfg.clone(),
         unsafe_: false,
     };
+    identities.note(&vertex, &file, 0);
     let mut edges = Vec::new();
     if let Some(parent) = modtree::parent_of(mp) {
         // 조건부 mod 선언의 contains는 그 조건 아래서만 성립한다.

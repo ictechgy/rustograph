@@ -38,10 +38,15 @@ fn mermaid_edge(e: &crate::graph::Edge) -> String {
     } else {
         ""
     };
+    let label = if e.tentative {
+        format!("{} (candidate)", edge_label(e.kind))
+    } else {
+        edge_label(e.kind).to_string()
+    };
     format!(
         "    {}[\"{from}\"] -->|{}| {}[\"{to}\"]{end}\n",
         node_id(&e.from),
-        edge_label(e.kind),
+        label,
         node_id(&e.to)
     )
 }

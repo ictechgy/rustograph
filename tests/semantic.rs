@@ -626,18 +626,31 @@ fn fn_local_path_module_does_not_steal() {
 /// 메서드 호출의 *확정* 간선으로 검증한다 — syn 폴백은 메서드 호출을
 /// 추정으로만 만들어 같은 단언을 위조할 수 없다.
 #[test]
-fn generic_impls_sharing_id_keep_both_bodies() {
+fn generic_impls_have_distinct_source_ids_and_exact_bodies() {
     let d = sem_doc();
-    assert!(
-        call(&d, "fixture_core::Gen::pick", "fixture_core::Used::doubled")
-            .is_some_and(|e| !e.tentative)
-    );
-    assert!(call(
-        &d,
-        "fixture_core::Gen::pick",
-        "fixture_core::Used::quadrupled"
-    )
-    .is_some_and(|e| !e.tentative));
+    let methods: Vec<_> = d
+        .vertices
+        .iter()
+        .filter(|v| v.id.starts_with("fixture_core::Gen::") && v.id.ends_with("::pick"))
+        .collect();
+    assert_eq!(methods.len(), 2);
+    assert_ne!(methods[0].id, methods[1].id);
+    for method in methods {
+        let (expected, other) = if method.position.as_deref().unwrap().ends_with(":500") {
+            (
+                "fixture_core::Used::doubled",
+                "fixture_core::Used::quadrupled",
+            )
+        } else {
+            assert!(method.position.as_deref().unwrap().ends_with(":506"));
+            (
+                "fixture_core::Used::quadrupled",
+                "fixture_core::Used::doubled",
+            )
+        };
+        assert!(call(&d, &method.id, expected).is_some_and(|e| !e.tentative));
+        assert!(call(&d, &method.id, other).is_none());
+    }
 }
 
 /// 익명 const 안의 생성 impl(serde_derive 패턴) — self 타입이 모듈

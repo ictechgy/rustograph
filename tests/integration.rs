@@ -1747,9 +1747,20 @@ pub fn nested_fn() { let _ = { fn go(helper: u32) -> u32 { helper } go(1) }; }
     // 블록을 나가면 지역이 사라진다.
     assert!(has("locals::block_scope", "locals::item"));
     // 모듈과 같은 이름의 fn(다른 이름공간)은 값 자리에서 fn으로 남는다.
+    let util_fn = d
+        .vertices
+        .iter()
+        .find(|v| v.kind == Kind::Fn && v.id.ends_with("::util"))
+        .expect("function namespace is retained separately");
     assert!(
-        has("locals::same_name", "locals::util"),
+        has("locals::same_name", &util_fn.id),
         "fn sharing a module name"
+    );
+    assert!(
+        !d.edges.iter().any(|e| e.from == "locals::same_name"
+            && e.to == "locals::util"
+            && e.kind == EdgeKind::Call),
+        "a module is not the called function"
     );
     // 블록 안 fn의 매개변수도 지역이다.
     assert!(
