@@ -107,6 +107,8 @@ pub struct Engine {
     /// hir 정의의 정점 provenance 검증에 쓴다. 문자열 ID만으로는 생성
     /// 메서드가 같은 이름의 진짜 정점과 충돌하는 것을 구분 못 한다.
     sites: BTreeMap<String, Vec<SynSite>>,
+    /// 옛 구문 경로 → 충돌을 분리한 ID. 전체 사이트를 호출마다 순회하지 않는다.
+    aliases: BTreeMap<String, Vec<String>>,
     /// 크레이트 스코프에 보이는 impl들 — `Impl::all_in_crate`가 익명
     /// const 블록까지 따라가 수집한 집합이다. fn 본문 안 블록 모듈의
     /// impl은 여기 없으므로 지역 정의와 모듈 정의를 구분하는 열쇠다.
@@ -267,6 +269,13 @@ impl Engine {
         LOADED_SITES.with(|c| c.set(c.get() + site_map.values().map(Vec::len).sum::<usize>()));
         // 타입 소속(self_ty)·트레이트 쿼리는 next-solver의 스레드 로컬
         // attached db를 요구한다 — 인덱스 빌드·사이트 서명 해석부터 붙인다.
+        let mut aliases: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for id in site_map.keys() {
+            let legacy = legacy_id(id);
+            if legacy != *id {
+                aliases.entry(legacy).or_default().push(id.clone());
+            }
+        }
         let (sites, index) = ra_ap_hir::attach_db(&db, || {
             let sema = Semantics::new(&db);
             let mut site_map = site_map;
@@ -275,7 +284,7 @@ impl Engine {
                     s.def = site_def(&sema, s.file, s.range, &s.module);
                 }
             }
-            let index = build_index(&db, &site_map);
+            let index = build_index(&db, &site_map, &aliases);
             (site_map, index)
         });
         Ok(Engine {
@@ -284,6 +293,7 @@ impl Engine {
             proc_macro,
             defs: index.defs,
             sites,
+            aliases,
             impls: index.impls,
             matrix: index.matrix,
         })
@@ -375,6 +385,7 @@ impl Engine {
                 method_index,
                 visible,
                 sites: &self.sites,
+                aliases: &self.aliases,
                 impls: &self.impls,
                 matrix: &self.matrix,
                 st,
@@ -390,7 +401,11 @@ impl Engine {
 /// 정점은 syn이 만들었으므로 여기서는 "본문 소유자를 찾는" 매핑만 필요하다.
 /// 모듈은 루트에서 children으로만 걷는다 — `krate.modules()`는 fn 안의
 /// 블록 모듈까지 포함해 정규 경로가 부모 체인과 어긋날 수 있다.
-fn build_index(db: &RootDatabase, sites: &BTreeMap<String, Vec<SynSite>>) -> Index {
+fn build_index(
+    db: &RootDatabase,
+    sites: &BTreeMap<String, Vec<SynSite>>,
+    aliases: &BTreeMap<String, Vec<String>>,
+) -> Index {
     let sema = Semantics::new(db);
     let mut defs: BTreeMap<String, Vec<BodyEntry>> = BTreeMap::new();
     let mut impls: HashSet<Impl> = HashSet::new();
@@ -404,9 +419,11 @@ fn build_index(db: &RootDatabase, sites: &BTreeMap<String, Vec<SynSite>>) -> Ind
         while let Some(module) = stack.pop() {
             for def in module.declarations(db) {
                 match def {
-                    ModuleDef::Function(f) => push_fn(&sema, &impls, &mut defs, f),
+                    ModuleDef::Function(f) => push_fn(&sema, &impls, &mut defs, sites, aliases, f),
                     ModuleDef::Const(c) => {
                         if let Some(id) = const_id(db, c) {
+                            let id =
+                                source_id(sites, aliases, BodyDef::Const(c), &id).unwrap_or(id);
                             if let Some(e) = body_entry(&sema, &impls, BodyDef::Const(c)) {
                                 defs.entry(id).or_default().push(e);
                             }
@@ -414,6 +431,8 @@ fn build_index(db: &RootDatabase, sites: &BTreeMap<String, Vec<SynSite>>) -> Ind
                     }
                     ModuleDef::Static(s) => {
                         if let Some(id) = static_id(db, s) {
+                            let id =
+                                source_id(sites, aliases, BodyDef::Static(s), &id).unwrap_or(id);
                             if let Some(e) = body_entry(&sema, &impls, BodyDef::Static(s)) {
                                 defs.entry(id).or_default().push(e);
                             }
@@ -423,7 +442,7 @@ fn build_index(db: &RootDatabase, sites: &BTreeMap<String, Vec<SynSite>>) -> Ind
                         // 트레이트 기본 메서드 — 선언점 메서드 정점의 본문.
                         for item in t.items(db) {
                             if let AssocItem::Function(f) = item {
-                                push_fn(&sema, &impls, &mut defs, f);
+                                push_fn(&sema, &impls, &mut defs, sites, aliases, f);
                             }
                         }
                     }
@@ -463,7 +482,7 @@ fn build_index(db: &RootDatabase, sites: &BTreeMap<String, Vec<SynSite>>) -> Ind
                 let AssocItem::Function(f) = item else {
                     continue;
                 };
-                push_fn(&sema, &impls, &mut defs, f);
+                push_fn(&sema, &impls, &mut defs, sites, aliases, f);
                 if let Some(tid) = &tid {
                     // 후보 ID는 syn provenance가 확인될 때만 — fn_id는
                     // 문자열이라 생성 메서드가 같은 이름의 진짜 정점과
@@ -471,7 +490,8 @@ fn build_index(db: &RootDatabase, sites: &BTreeMap<String, Vec<SynSite>>) -> Ind
                     // (blanket·원시 타입 impl)도 버리지 않고 남긴다 —
                     // 디스패치 지점에서 external로 세어져야 limitation이
                     // 정직하다.
-                    let method = fn_id(&sema, f).filter(|id| syn_backed(sites, f, id));
+                    let method = fn_id(&sema, f)
+                        .and_then(|id| source_id(sites, aliases, BodyDef::Fn(f), &id));
                     matrix
                         .entry((tid.clone(), f.name(db).as_str().to_string()))
                         .or_default()
@@ -519,10 +539,41 @@ impl BodyDef {
 /// 같은 정의다 — intern ID 비교라 `a::Tr`/`b::Tr`처럼 같은 정규 ID를
 /// 갖는 다른 impl의 메서드는 구분되고, 인덱스 자기 항목과의 비교처럼
 /// 생성 정의가 자기 자신으로 검증을 통과하는 구멍도 없다.
-fn syn_backed(sites: &BTreeMap<String, Vec<SynSite>>, f: Function, id: &str) -> bool {
-    sites
-        .get(id)
-        .is_some_and(|ss| ss.iter().any(|s| s.def == Some(BodyDef::Fn(f))))
+fn legacy_id(id: &str) -> String {
+    // source-instance ID의 위치 세그먼트는 opaque하다. 이름 경로는 조회 키일 뿐이고,
+    // 최종 선택에는 아래에서 실제 hir 정의와 syn provenance의 일치가 필요하다.
+    if let Some((parent, rest)) = id.rsplit_once("::@") {
+        if let Some((_, name)) = rest.split_once("::") {
+            return format!("{parent}::{name}");
+        }
+    }
+    id.to_string()
+}
+
+fn source_id(
+    sites: &BTreeMap<String, Vec<SynSite>>,
+    aliases: &BTreeMap<String, Vec<String>>,
+    def: BodyDef,
+    legacy: &str,
+) -> Option<String> {
+    let mut found = std::iter::once(legacy)
+        .chain(
+            aliases
+                .get(legacy)
+                .into_iter()
+                .flatten()
+                .map(String::as_str),
+        )
+        .filter(|id| {
+            sites
+                .get(*id)
+                .is_some_and(|ss| ss.iter().any(|s| s.def == Some(def)))
+        });
+    match (found.next(), found.next()) {
+        (Some(id), None) => Some(id.to_string()),
+        // 하나의 hir 정의가 여러 소스 선언과 매칭되면 소유자를 추측하지 않는다.
+        _ => None,
+    }
 }
 
 /// 사이트 선언이 가리키는 hir 정의 — syn이 수확한 위치에서 선언을
@@ -1130,9 +1181,12 @@ fn push_fn(
     sema: &Semantics<RootDatabase>,
     impls: &HashSet<Impl>,
     defs: &mut BTreeMap<String, Vec<BodyEntry>>,
+    sites: &BTreeMap<String, Vec<SynSite>>,
+    aliases: &BTreeMap<String, Vec<String>>,
     f: Function,
 ) {
     if let Some(id) = fn_id(sema, f) {
+        let id = source_id(sites, aliases, BodyDef::Fn(f), &id).unwrap_or(id);
         if let Some(e) = body_entry(sema, impls, BodyDef::Fn(f)) {
             // 같은 ID의 정의가 여럿일 수 있다(`impl S<u8>`/`S<u16>`,
             // cfg 변형) — 덮어쓰지 않고 전부 보관한다.
@@ -1284,6 +1338,7 @@ struct Walker<'a, 'b> {
     visible: Option<&'a BTreeSet<String>>,
     /// 정규 ID → syn이 수확한 선언 위치 — 생성·충돌 정의를 가른다.
     sites: &'a BTreeMap<String, Vec<SynSite>>,
+    aliases: &'a BTreeMap<String, Vec<String>>,
     /// 크레이트 스코프 impl 집합 — fn 블록 모듈의 impl 구분에 쓴다.
     impls: &'a HashSet<Impl>,
     /// (트레이트 ID, 메서드 이름) → impl 메서드 후보 — 빌드 때 계산됐다.
@@ -1458,13 +1513,13 @@ impl<'a, 'b> Walker<'a, 'b> {
         // 정규 ID가 인덱스의 실제 선언과 일치할 때만 정점으로 — fn_id는
         // 문자열이라 생성 메서드가 같은 이름의 진짜 정점과 충돌할 수 있다.
         // 속성 매크로가 감싼 impl의 메서드는 소스 정체가 일치한다.
-        if let Some(id) = fn_id(self.sema, f) {
-            if syn_backed(self.sites, f, &id)
-                && matches!(
-                    self.push(id, kind, false, un),
-                    Pushed::Yes | Pushed::SelfEdge
-                )
-            {
+        if let Some(id) = fn_id(self.sema, f)
+            .and_then(|id| source_id(self.sites, self.aliases, BodyDef::Fn(f), &id))
+        {
+            if matches!(
+                self.push(id, kind, false, un),
+                Pushed::Yes | Pushed::SelfEdge
+            ) {
                 return;
             }
         }
@@ -1507,8 +1562,10 @@ impl<'a, 'b> Walker<'a, 'b> {
     /// 함수 정점으로의 확정 간선 — 정규 ID가 실제 선언과 일치하고 정점이
     /// 있어야 확정이다. 정점이 없거나 생성·충돌 정의면 외부다.
     fn emit_fn_vertex(&mut self, f: Function, kind: EdgeKind, un: bool) {
-        match fn_id(self.sema, f) {
-            Some(id) if syn_backed(self.sites, f, &id) => {
+        match fn_id(self.sema, f)
+            .and_then(|id| source_id(self.sites, self.aliases, BodyDef::Fn(f), &id))
+        {
+            Some(id) => {
                 if let Pushed::Miss = self.push(id, kind, false, un) {
                     self.st.external += 1;
                 }
@@ -1525,6 +1582,7 @@ impl<'a, 'b> Walker<'a, 'b> {
         self.st.trait_sites += 1;
         let db = self.db();
         if let Some(id) = fn_id(self.sema, def_fn) {
+            let id = source_id(self.sites, self.aliases, BodyDef::Fn(def_fn), &id).unwrap_or(id);
             if let Pushed::Miss = self.push(id, kind, true, un) {
                 self.st.external += 1;
             }
@@ -1690,14 +1748,20 @@ impl<'a, 'b> Walker<'a, 'b> {
             ModuleDef::Adt(a) => adt_id(db, a),
             ModuleDef::EnumVariant(v) => enum_id(db, v.parent_enum(db)),
             ModuleDef::Const(c) => match const_id(db, c) {
-                Some(id) => id,
+                Some(id) => {
+                    source_id(self.sites, self.aliases, BodyDef::Const(c), &id).unwrap_or(id)
+                }
                 // 연관 상수 — 정점 스킴이 없어 외부로 센다.
                 None => {
                     self.st.external += 1;
                     return;
                 }
             },
-            ModuleDef::Static(s) => static_id(db, s).unwrap_or_default(),
+            ModuleDef::Static(s) => static_id(db, s)
+                .map(|id| {
+                    source_id(self.sites, self.aliases, BodyDef::Static(s), &id).unwrap_or(id)
+                })
+                .unwrap_or_default(),
             ModuleDef::Trait(t) => trait_id(db, t),
             ModuleDef::TypeAlias(t) => alias_id(db, t),
             ModuleDef::Module(m) => module_path(db, m),
