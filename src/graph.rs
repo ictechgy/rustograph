@@ -5,7 +5,7 @@
 //! 정의해서 문서 형식의 권위가 하나가 되게 한다.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// 문서 스키마 버전. 형식이 깨지는 변경이 있으면 올린다.
 pub const DOCUMENT_VERSION: u32 = 1;
@@ -23,6 +23,11 @@ pub(crate) const CAPPED_FAN_OUT_MARK: &str = " candidate methods and were not fa
 /// serde skip 조건 — 0인 카운터는 키를 뺀다("없는 것"과 "0"을 구분하는 계약).
 pub fn is_zero(n: &usize) -> bool {
     *n == 0
+}
+
+/// 옛 snapshot의 손실된 선언 정체는 모든 출력 경로에서 같은 한계로 보고한다.
+pub(crate) fn identity_limitation(groups: usize, extra: usize) -> String {
+    format!("{groups} vertex IDs are shared by {extra} additional rows in this stored graph; source declarations cannot be separated, so related graph, query, impact and paths evidence is candidate; regenerate the graph with a source-identity-aware build")
 }
 
 /// 정점 ID·모듈·크레이트 이름에 올 수 없는 문자인가 — C0·DEL·C1(NEL 포함) 제어 문자와
@@ -282,6 +287,30 @@ impl Document {
         self.vertices.iter().map(|v| v.id.as_str()).collect()
     }
 
+    /// 저장 파일 자체는 그대로 두고, 복원 불가한 중복 끝점의 간선을 추정으로 낮춘다.
+    /// 그래프 내보내기·cycles·rules도 옛 중복 ID를 확정 증거로 쓸 수 없다.
+    pub(crate) fn mark_ambiguous_identities(&mut self) {
+        let mut seen = BTreeSet::new();
+        let mut ambiguous = BTreeSet::new();
+        for v in &self.vertices {
+            if !seen.insert(v.id.as_str()) {
+                ambiguous.insert(v.id.as_str());
+            }
+        }
+        if ambiguous.is_empty() {
+            return;
+        }
+        let message = identity_limitation(ambiguous.len(), self.vertices.len() - seen.len());
+        if !self.limitations.contains(&message) {
+            self.limitations.push(message);
+        }
+        for e in &mut self.edges {
+            if ambiguous.contains(e.from.as_str()) || ambiguous.contains(e.to.as_str()) {
+                e.tentative = true;
+            }
+        }
+    }
+
     /// outgoing 인접 목록 — 의존 간선만. contains는 소유라 제외한다.
     pub fn outgoing(&self) -> BTreeMap<&str, Vec<(&EdgeKind, &str)>> {
         let mut map: BTreeMap<&str, Vec<(&EdgeKind, &str)>> = BTreeMap::new();
@@ -341,7 +370,24 @@ impl Document {
         }
         let by_id: BTreeMap<&str, &Vertex> =
             self.vertices.iter().map(|v| (v.id.as_str(), v)).collect();
-        let owner = |id: &str| -> Option<String> { self.owner_at_level(id, level, &by_id) };
+        let mut parents: BTreeMap<&str, Vec<&Edge>> = BTreeMap::new();
+        for edge in &self.edges {
+            if edge.kind == EdgeKind::Contains {
+                parents.entry(&edge.to).or_default().push(edge);
+            }
+        }
+        let legacy_fallback = !self.vertices.iter().any(|v| v.id.contains("::@"));
+        // 간선마다 다시 거슬러 올라가지 않는다. 소스 선언 하나가 cfg별 여러 타입에
+        // 속할 수 있으므로 소유자 하나를 임의로 고르지 않고 정점별 결과를 한 번 색인한다.
+        let owners: BTreeMap<_, _> = by_id
+            .keys()
+            .map(|id| {
+                (
+                    *id,
+                    self.owners_at_level(id, level, &by_id, &parents, legacy_fallback),
+                )
+            })
+            .collect();
         let mut vertices: BTreeMap<String, Vertex> = BTreeMap::new();
         // 같은 (from,to,kind,cfg)에 확정·추정 간선이 섞여 투영되면 확정으로 —
         // AND 병합이 아니라 "하나라도 확정이면 확정"이다. unsafe는 OR — 하나의
@@ -350,25 +396,70 @@ impl Document {
         type ProjectedKey = (String, String, EdgeKind, Option<String>);
         let mut edges: BTreeMap<ProjectedKey, (bool, bool)> = BTreeMap::new();
         for v in &self.vertices {
-            if let Some(oid) = owner(&v.id) {
-                if let Some(src) = by_id.get(oid.as_str()) {
-                    vertices.entry(oid).or_insert_with(|| (*src).clone());
+            for oid in owners
+                .get(v.id.as_str())
+                .into_iter()
+                .flat_map(|os| os.keys())
+            {
+                if let Some(src) = by_id.get(oid) {
+                    vertices
+                        .entry((*oid).to_string())
+                        .or_insert_with(|| (*src).clone());
                 }
             }
         }
         for e in &self.edges {
-            let (Some(f), Some(t)) = (owner(&e.from), owner(&e.to)) else {
+            let (Some(from), Some(to)) = (owners.get(e.from.as_str()), owners.get(e.to.as_str()))
+            else {
                 continue;
             };
-            if f != t {
-                edges
-                    .entry((f, t, e.kind, e.cfg.clone()))
-                    .and_modify(|(tent, uns)| {
-                        *tent &= e.tentative;
-                        *uns |= e.unsafe_;
-                    })
-                    .or_insert((e.tentative, e.unsafe_));
+            // 하위 아이템 소유 간선은 그 부모로 접힌다. 공유 메서드의 다른
+            // 소유자와 곱하면 서로 다른 타입이 서로를 포함하는 가짜 간선이 된다.
+            if e.kind == EdgeKind::Contains
+                && by_id
+                    .get(e.to.as_str())
+                    .is_some_and(|v| !Self::kind_at_level(v.kind, level))
+            {
+                continue;
             }
+            for (&f, &from_candidate) in from {
+                for (&t, &to_candidate) in to {
+                    if f != t {
+                        let candidate = e.tentative || from_candidate || to_candidate;
+                        edges
+                            .entry((f.to_string(), t.to_string(), e.kind, e.cfg.clone()))
+                            .and_modify(|(tent, uns)| {
+                                *tent &= candidate;
+                                *uns |= e.unsafe_;
+                            })
+                            .or_insert((candidate, e.unsafe_));
+                    }
+                }
+            }
+        }
+        let mut limitations = self.limitations.clone();
+        let multiple = owners.values().filter(|os| os.len() > 1).count();
+        if multiple > 0 {
+            limitations.push(format!("{multiple} source vertices project to multiple owners through contains; their projected dependency edges remain tentative"));
+        }
+        let missing = owners.values().filter(|os| os.is_empty()).count();
+        let missing_edges = self
+            .edges
+            .iter()
+            .filter(|e| {
+                e.kind.is_dependency()
+                    && [e.from.as_str(), e.to.as_str()]
+                        .iter()
+                        .any(|id| owners.get(id).is_none_or(|os| os.is_empty()))
+            })
+            .count();
+        let missing_roots = self
+            .roots
+            .iter()
+            .filter(|r| owners.get(r.as_str()).is_none_or(|os| os.is_empty()))
+            .count();
+        if missing > 0 || missing_edges > 0 || missing_roots > 0 {
+            limitations.push(format!("{missing} vertices have no structural owner at the requested projection level; {missing_edges} dependency edges and {missing_roots} roots were omitted; restore contains ownership or regenerate the graph before treating this view as complete"));
         }
         Ok(Document {
             version: self.version,
@@ -380,7 +471,12 @@ impl Document {
             roots: self
                 .roots
                 .iter()
-                .filter_map(|r| owner(r))
+                .flat_map(|r| {
+                    owners
+                        .get(r.as_str())
+                        .into_iter()
+                        .flat_map(|os| os.keys().map(|id| (*id).to_string()))
+                })
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect(),
@@ -396,12 +492,78 @@ impl Document {
                     unsafe_,
                 })
                 .collect(),
-            limitations: self.limitations.clone(),
+            limitations,
         })
     }
 
-    /// 정점 ID를 주어진 레벨의 소유자로 귀속한다. 상위로 올라가는 기준은
-    /// ID의 `::` 경로 접두사 — ID가 곧 소유 경로다.
+    fn kind_at_level(kind: Kind, level: Level) -> bool {
+        match level {
+            Level::Crate => kind == Kind::Crate,
+            Level::Module => matches!(kind, Kind::Module | Kind::Crate),
+            Level::Type => !matches!(
+                kind,
+                Kind::Fn | Kind::Method | Kind::Const | Kind::Static | Kind::Macro
+            ),
+            Level::Symbol => true,
+        }
+    }
+
+    fn owners_at_level<'a>(
+        &'a self,
+        id: &'a str,
+        level: Level,
+        by_id: &BTreeMap<&'a str, &'a Vertex>,
+        parents: &BTreeMap<&'a str, Vec<&'a Edge>>,
+        legacy_fallback: bool,
+    ) -> BTreeMap<&'a str, bool> {
+        let mut owners = BTreeMap::new();
+        let mut seen = BTreeMap::new();
+        let mut pending = VecDeque::from([(id, false)]);
+        while let Some((current, candidate)) = pending.pop_front() {
+            if seen.get(current).is_some_and(|best| !best || candidate) {
+                continue;
+            }
+            seen.insert(current, candidate);
+            let Some(vertex) = by_id.get(current) else {
+                continue;
+            };
+            if Self::kind_at_level(vertex.kind, level) {
+                owners
+                    .entry(current)
+                    .and_modify(|old| *old &= candidate)
+                    .or_insert(candidate);
+                continue;
+            }
+            let mut followed = false;
+            for edge in parents.get(current).into_iter().flatten() {
+                if by_id.contains_key(edge.from.as_str()) {
+                    followed = true;
+                    pending.push_back((edge.from.as_str(), candidate || edge.tentative));
+                }
+            }
+            if !followed && legacy_fallback {
+                // 옛 수동 문서에는 contains가 없을 수 있다. 실제 소유 근거가
+                // 없는 경우에만 기존 경로 규칙을 호환 폴백으로 쓴다.
+                if let Some(owner) = self.owner_at_level(current, level, by_id) {
+                    if let Some(owner) = by_id.get(owner.as_str()) {
+                        owners
+                            .entry(owner.id.as_str())
+                            .and_modify(|old| *old &= candidate)
+                            .or_insert(candidate);
+                    }
+                }
+            }
+        }
+        if owners.len() > 1 {
+            for candidate in owners.values_mut() {
+                *candidate = true;
+            }
+        }
+        owners
+    }
+
+    /// 소스 정체 ID 이전의 희소 문서를 위한 호환 폴백이다.
+    /// 새 문서의 정체를 ID 문자열 접두사에서 추측하지 않는다.
     fn owner_at_level(
         &self,
         id: &str,
@@ -853,6 +1015,53 @@ mod tests {
             .any(|e| e.from == "c::a" && e.to == "c::b" && e.kind == EdgeKind::Call));
         // 루트도 투영된다.
         assert!(d.roots.contains(&"c::a".to_string()));
+    }
+
+    #[test]
+    fn opaque_source_ids_without_structural_owners_do_not_guess_prefixes() {
+        let missing = "c::@src/lib.rs#10#Method::missing";
+        let d = document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec![missing.into()],
+            vec![v("c", Kind::Crate), v(missing, Kind::Method)],
+            vec![Edge::new(missing.into(), "c".into(), EdgeKind::Call)],
+            vec![],
+        );
+        let projected = d.view(Level::Type).unwrap();
+        assert_eq!(projected.vertices.len(), 1);
+        assert!(projected.edges.is_empty() && projected.roots.is_empty());
+        assert!(projected
+            .limitations
+            .iter()
+            .any(|l| l.contains("1 vertices have no structural owner")
+                && l.contains("1 dependency edges and 1 roots were omitted")));
+    }
+
+    #[test]
+    fn contains_cycles_terminate_without_inventing_owners() {
+        let a = "c::@a.rs#1#Method::a";
+        let b = "c::@b.rs#2#Method::b";
+        let d = document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec![a.into()],
+            vec![v("c", Kind::Crate), v(a, Kind::Method), v(b, Kind::Method)],
+            vec![
+                Edge::new(a.into(), b.into(), EdgeKind::Contains),
+                Edge::new(b.into(), a.into(), EdgeKind::Contains),
+            ],
+            vec![],
+        );
+        let projected = d.view(Level::Type).unwrap();
+        assert_eq!(projected.vertices.len(), 1);
+        assert!(projected.edges.is_empty() && projected.roots.is_empty());
+        assert!(projected
+            .limitations
+            .iter()
+            .any(|l| l.contains("2 vertices have no structural owner")));
     }
 
     #[test]

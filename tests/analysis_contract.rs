@@ -75,6 +75,14 @@ impl Drop for Snapshot {
     }
 }
 
+fn direct_neighbor(id: &str, edges: &[&str], depth: usize) -> Value {
+    let evidence: Vec<_> = edges
+        .iter()
+        .map(|kind| json!({"relationship":kind,"evidence":"direct"}))
+        .collect();
+    json!({"id":id,"edges":edges,"direction":"in","depth":depth,"evidence":"direct","edge_evidence":evidence})
+}
+
 #[test]
 fn cli_impact_reports_only_reverse_reachability() {
     let snapshot = Snapshot::new("cli-direction");
@@ -82,8 +90,8 @@ fn cli_impact_reports_only_reverse_reachability() {
     assert_eq!(
         report["impacted"],
         json!([
-            {"id": "caller", "edges": ["call", "references"], "direction": "in", "depth": 1},
-            {"id": "entry", "edges": ["call"], "direction": "in", "depth": 2}
+            direct_neighbor("caller", &["call", "references"], 1),
+            direct_neighbor("entry", &["call"], 2)
         ])
     );
     assert_eq!(report["truncated"], false);
@@ -150,10 +158,10 @@ fn cli_and_mcp_depth_zero_walk_the_whole_closure() {
         json!({
             "id": "shared", "found": true, "depth": 0, "truncated": false,
             "impacted": [
-                {"id": "root", "edges": ["call"], "direction": "in", "depth": 1},
-                {"id": "sibling", "edges": ["call"], "direction": "in", "depth": 1},
-                {"id": "caller", "edges": ["call", "references"], "direction": "in", "depth": 2},
-                {"id": "entry", "edges": ["call"], "direction": "in", "depth": 3}
+                direct_neighbor("root", &["call"], 1),
+                direct_neighbor("sibling", &["call"], 1),
+                direct_neighbor("caller", &["call", "references"], 2),
+                direct_neighbor("entry", &["call"], 3)
             ]
         })
     );
@@ -237,6 +245,64 @@ fn mcp_reports(snapshot: &Snapshot, calls: &[Value]) -> Vec<Value> {
                 .unwrap()
         })
         .collect()
+}
+
+#[test]
+fn legacy_duplicate_ids_are_candidates_in_cli_mcp_and_graph_exports() {
+    let snapshot = Snapshot::write(
+        "legacy-duplicate-identity",
+        &json!({
+            "version":1,"tool":"rustograph","level":"symbol","root":".","roots":[],
+            "vertices":[
+                {"id":"caller","kind":"fn","crate":"app","module":"app"},
+                {"id":"duplicate","kind":"method","crate":"app","module":"app","position":"one.rs:1"},
+                {"id":"duplicate","kind":"method","crate":"app","module":"app","position":"two.rs:2"}
+            ],
+            "edges":[{"from":"caller","to":"duplicate","kind":"call"}]
+        }),
+    );
+    let before = std::fs::read(&snapshot.0).unwrap();
+    let q = snapshot.cli(&["query", "duplicate"]);
+    assert_eq!(q["neighbors"][0]["evidence"], "candidate");
+    let impact = snapshot.cli(&["impact", "duplicate"]);
+    assert_eq!(impact["witnesses"][0]["evidence"], "candidate");
+    for from in ["caller", "duplicate"] {
+        let paths = snapshot.cli(&["paths", from, "duplicate"]);
+        assert_eq!(paths["paths"][0]["tentative"], true);
+        assert_eq!(paths["limitations"].as_array().unwrap().len(), 1);
+    }
+    let graph = snapshot.cli(&["graph", "--level", "symbol"]);
+    assert_eq!(graph["vertices"].as_array().unwrap().len(), 3);
+    assert_eq!(graph["edges"][0]["tentative"], true);
+    let diagram = Command::new(env!("CARGO_BIN_EXE_rustograph"))
+        .args([
+            "graph", "--level", "symbol", "--format", "mermaid", "--graph",
+        ])
+        .arg(&snapshot.0)
+        .output()
+        .unwrap();
+    assert!(diagram.status.success());
+    assert!(String::from_utf8(diagram.stdout)
+        .unwrap()
+        .contains("|call (candidate)|"));
+    let mcp = mcp_reports(
+        &snapshot,
+        &[
+            json!({"name":"rustograph_query","arguments":{"id":"duplicate"}}),
+            json!({"name":"rustograph_impact","arguments":{"id":"duplicate"}}),
+            json!({"name":"rustograph_paths","arguments":{"from":"caller","to":"duplicate"}}),
+            json!({"name":"rustograph_paths","arguments":{"from":"duplicate","to":"duplicate"}}),
+        ],
+    );
+    assert_eq!(mcp[0]["neighbors"][0]["evidence"], "candidate");
+    assert_eq!(mcp[1]["witnesses"][0]["evidence"], "candidate");
+    assert_eq!(mcp[2]["paths"][0]["tentative"], true);
+    assert_eq!(mcp[3]["paths"][0]["tentative"], true);
+    assert_eq!(
+        std::fs::read(&snapshot.0).unwrap(),
+        before,
+        "loading a legacy snapshot must not rewrite it"
+    );
 }
 
 /// MCP 서버는 질의 색인·cycles 보고서를 세션 안에서 재사용한다 — 같은 세션에서 섞어

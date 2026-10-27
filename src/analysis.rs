@@ -15,6 +15,17 @@ pub struct Neighbor {
     pub edges: Vec<EdgeKind>,
     pub direction: String,
     pub depth: usize,
+    /// 최단 경로에 확정 증거가 하나라도 있으면 direct, 전부 추정이면 candidate.
+    pub evidence: &'static str,
+    /// edges의 각 관계가 확정 경로인지 이름 팬아웃을 거친 후보인지 함께 준다.
+    pub edge_evidence: Vec<NeighborEvidence>,
+}
+
+/// 서로 다른 관계의 확실성을 하나로 합치지 않도록 관계별 증거를 보존한다.
+#[derive(Debug, Serialize)]
+pub struct NeighborEvidence {
+    pub relationship: EdgeKind,
+    pub evidence: &'static str,
 }
 
 /// query의 결과 — 깊이·절단 여부를 항상 싣는다.
@@ -25,6 +36,8 @@ pub struct QueryResult {
     pub depth: usize,
     pub truncated: bool,
     pub neighbors: Vec<Neighbor>,
+    /// 저장 문서의 수확 한계와 복원할 수 없는 옛 중복 ID를 질의에도 남긴다.
+    pub limitations: Vec<String>,
 }
 
 /// 정점의 양방향 이웃을 depth까지 BFS로 찾는다.
@@ -34,7 +47,8 @@ pub fn query(doc: &Document, id: &str, depth: usize, max: usize) -> QueryResult 
 }
 
 /// 방향별 간선 종류를 색인한다 — 역방향 종류나 contains를 증거에 섞지 않는다.
-type NeighborIndex<'a> = BTreeMap<&'a str, BTreeMap<(&'a str, &'static str), BTreeSet<EdgeKind>>>;
+type NeighborIndex<'a> =
+    BTreeMap<&'a str, BTreeMap<(&'a str, &'static str), BTreeMap<EdgeKind, bool>>>;
 
 /// 경로 탐색 인접 목록 — (from,to) 쌍마다 간선 하나(확정·최소 종류).
 type PathAdjacency<'a> = BTreeMap<&'a str, Vec<(&'a str, EdgeKind, bool)>>;
@@ -93,6 +107,7 @@ pub struct QueryIndex<'a> {
     adjacency: OnceLock<PathAdjacency<'a>>,
     reach: OnceLock<ReachMap<'a>>,
     impact_edges: OnceLock<BTreeMap<&'a str, Vec<&'a Edge>>>,
+    ambiguous_ids: OnceLock<BTreeSet<&'a str>>,
 }
 
 impl<'a> QueryIndex<'a> {
@@ -106,6 +121,7 @@ impl<'a> QueryIndex<'a> {
             adjacency: OnceLock::new(),
             reach: OnceLock::new(),
             impact_edges: OnceLock::new(),
+            ambiguous_ids: OnceLock::new(),
         }
     }
 
@@ -135,7 +151,8 @@ impl<'a> QueryIndex<'a> {
                     .any(|((next, _), _)| !distances.contains_key(next))
         });
         let mut witnesses = Vec::new();
-        let mut evidence: BTreeMap<&str, bool> = BTreeMap::from([(id, false)]);
+        let mut evidence: BTreeMap<&str, bool> =
+            BTreeMap::from([(id, self.ambiguous_set().contains(id))]);
         for row in &q.neighbors {
             let edge = self
                 .impact_edges
@@ -160,14 +177,17 @@ impl<'a> QueryIndex<'a> {
                 })
                 .min_by_key(|e| {
                     (
-                        e.tentative || evidence.get(e.to.as_str()).copied().unwrap_or(true),
+                        e.tentative
+                            || self.ambiguous_set().contains(e.from.as_str())
+                            || evidence.get(e.to.as_str()).copied().unwrap_or(true),
                         &e.to,
                         e.kind,
                     )
                 });
             if let Some(edge) = edge {
-                let candidate =
-                    edge.tentative || evidence.get(edge.to.as_str()).copied().unwrap_or(true);
+                let candidate = edge.tentative
+                    || self.ambiguous_set().contains(edge.from.as_str())
+                    || evidence.get(edge.to.as_str()).copied().unwrap_or(true);
                 evidence.insert(&row.id, candidate);
                 witnesses.push(ImpactWitness {
                     id: row.id.clone(),
@@ -197,7 +217,7 @@ impl<'a> QueryIndex<'a> {
             max_results: max,
             depth_limited,
             truncation_reasons,
-            limitations: self.doc.limitations.clone(),
+            limitations: q.limitations,
             provenance: ImpactProvenance { origin: "graph-document", revision: self.doc.revision.clone(),
                 content_freshness: "unverified", project: self.doc.root.clone(), workspace: self.doc.workspace.clone() },
             witnesses,
@@ -234,8 +254,39 @@ impl<'a> QueryIndex<'a> {
         self.ids.get_or_init(|| {
             #[cfg(test)]
             note_indexed(self.doc.vertices.len());
-            self.doc.vertex_ids()
+            let mut ids = BTreeSet::new();
+            let mut ambiguous = BTreeSet::new();
+            for vertex in &self.doc.vertices {
+                if !ids.insert(vertex.id.as_str()) {
+                    ambiguous.insert(vertex.id.as_str());
+                }
+            }
+            self.ambiguous_ids
+                .set(ambiguous)
+                .expect("vertex index initializes ambiguity exactly once");
+            ids
         })
+    }
+
+    fn ambiguous_set(&self) -> &BTreeSet<&'a str> {
+        self.vertex_set();
+        self.ambiguous_ids
+            .get()
+            .expect("vertex index initialized ambiguity")
+    }
+
+    fn limitations(&self) -> Vec<String> {
+        let mut limitations = self.doc.limitations.clone();
+        if !self.ambiguous_set().is_empty() {
+            let message = crate::graph::identity_limitation(
+                self.ambiguous_set().len(),
+                self.doc.vertices.len() - self.vertex_set().len(),
+            );
+            if !limitations.contains(&message) {
+                limitations.push(message);
+            }
+        }
+        limitations
     }
 
     /// 방향별 이웃 색인 — impact는 역방향만, query는 양방향을 쓴다.
@@ -245,13 +296,20 @@ impl<'a> QueryIndex<'a> {
         } else {
             &self.neighbors
         };
-        slot.get_or_init(|| neighbor_index(self.doc, self.vertex_set(), incoming_only))
+        slot.get_or_init(|| {
+            neighbor_index(
+                self.doc,
+                self.vertex_set(),
+                self.ambiguous_set(),
+                incoming_only,
+            )
+        })
     }
 
     /// 경로 탐색 인접 목록.
     fn path_adjacency(&self) -> &PathAdjacency<'a> {
         self.adjacency
-            .get_or_init(|| adjacency_of(self.doc, self.vertex_set()))
+            .get_or_init(|| adjacency_of(self.doc, self.vertex_set(), self.ambiguous_set()))
     }
 
     /// 보존 루트 BFS가 따라가는 도달성 인접 목록.
@@ -267,6 +325,7 @@ impl<'a> QueryIndex<'a> {
 fn neighbor_index<'a>(
     doc: &'a Document,
     ids: &BTreeSet<&str>,
+    ambiguous: &BTreeSet<&str>,
     incoming_only: bool,
 ) -> NeighborIndex<'a> {
     let mut index: NeighborIndex<'a> = BTreeMap::new();
@@ -279,19 +338,26 @@ fn neighbor_index<'a>(
         {
             continue;
         }
+        let tentative = edge.tentative
+            || ambiguous.contains(edge.from.as_str())
+            || ambiguous.contains(edge.to.as_str());
         index
             .entry(&edge.to)
             .or_default()
             .entry((&edge.from, "in"))
             .or_default()
-            .insert(edge.kind);
+            .entry(edge.kind)
+            .and_modify(|seen| *seen &= tentative)
+            .or_insert(tentative);
         if !incoming_only {
             index
                 .entry(&edge.from)
                 .or_default()
                 .entry((&edge.to, "out"))
                 .or_default()
-                .insert(edge.kind);
+                .entry(edge.kind)
+                .and_modify(|seen| *seen &= tentative)
+                .or_insert(tentative);
         }
     }
     index
@@ -312,6 +378,7 @@ fn walk_neighbors(
         depth,
         truncated: false,
         neighbors: Vec::new(),
+        limitations: index.limitations(),
     };
     if !result.found || depth == 0 {
         return result;
@@ -320,15 +387,24 @@ fn walk_neighbors(
     let mut seen = BTreeSet::from([id]);
     let mut reported = BTreeSet::new();
     let mut frontier = BTreeSet::from([id]);
+    let mut route_evidence = BTreeMap::from([(id, false)]);
     for distance in 1..=depth {
         if frontier.is_empty() {
             break;
         }
-        let mut step: BTreeMap<(&str, &str), BTreeSet<EdgeKind>> = BTreeMap::new();
+        let mut step: BTreeMap<(&str, &str), BTreeMap<EdgeKind, bool>> = BTreeMap::new();
         for current in frontier {
             for (&key, kinds) in edges_of.get(current).into_iter().flatten() {
                 if key.0 != id && !reported.contains(&key) {
-                    step.entry(key).or_default().extend(kinds);
+                    let inherited = route_evidence[current];
+                    for (kind, tentative) in kinds {
+                        let candidate = inherited || *tentative;
+                        step.entry(key)
+                            .or_default()
+                            .entry(*kind)
+                            .and_modify(|seen| *seen &= candidate)
+                            .or_insert(candidate);
+                    }
                 }
             }
         }
@@ -339,14 +415,29 @@ fn walk_neighbors(
                 return result;
             }
             reported.insert((neighbor, direction));
+            let candidate = kinds.values().all(|t| *t);
             result.neighbors.push(Neighbor {
                 id: neighbor.to_string(),
-                edges: kinds.into_iter().collect(),
+                edges: kinds.keys().copied().collect(),
                 direction: direction.to_string(),
                 depth: distance,
+                evidence: if candidate { "candidate" } else { "direct" },
+                edge_evidence: kinds
+                    .into_iter()
+                    .map(|(relationship, tentative)| NeighborEvidence {
+                        relationship,
+                        evidence: if tentative { "candidate" } else { "direct" },
+                    })
+                    .collect(),
             });
             if seen.insert(neighbor) {
                 frontier.insert(neighbor);
+                route_evidence.insert(neighbor, candidate);
+            } else if frontier.contains(neighbor) {
+                // 같은 깊이의 다른 최단 경로가 확정이면 이후 전이에도 그 증거를 쓴다.
+                route_evidence
+                    .entry(neighbor)
+                    .and_modify(|tentative| *tentative &= candidate);
             }
         }
     }
@@ -428,6 +519,8 @@ pub struct PathsReport {
     /// 탐색이 펼친 정점 수 — 예산 소비량 측정.
     pub expanded: usize,
     pub paths: Vec<Path>,
+    /// 중복 ID의 모호성과 원래 수확 한계를 경로 결과에서도 보존한다.
+    pub limitations: Vec<String>,
 }
 
 /// A→B 경로 탐색 — 의존 간선만 따라가는 bounded BFS.
@@ -443,15 +536,23 @@ pub fn paths(doc: &Document, from: &str, to: &str, max_paths: usize, budget: usi
 /// 종류만큼 중복 보고하지 않기 위함이다. 끝점이 없는 간선은 건너뛴다
 /// — 비형식 문서의 dangling 간선이 경로에 없는 정점을 끼워 넣는
 /// 것을 막는다.
-fn adjacency_of<'a>(doc: &'a Document, ids: &BTreeSet<&str>) -> PathAdjacency<'a> {
+fn adjacency_of<'a>(
+    doc: &'a Document,
+    ids: &BTreeSet<&str>,
+    ambiguous: &BTreeSet<&str>,
+) -> PathAdjacency<'a> {
     let mut adj: PathAdjacency<'a> = BTreeMap::new();
     for e in &doc.edges {
         #[cfg(test)]
         note_indexed(1);
         if e.kind.is_dependency() && ids.contains(e.from.as_str()) && ids.contains(e.to.as_str()) {
-            adj.entry(e.from.as_str())
-                .or_default()
-                .push((e.to.as_str(), e.kind, e.tentative));
+            adj.entry(e.from.as_str()).or_default().push((
+                e.to.as_str(),
+                e.kind,
+                e.tentative
+                    || ambiguous.contains(e.from.as_str())
+                    || ambiguous.contains(e.to.as_str()),
+            ));
         }
     }
     for outs in adj.values_mut() {
@@ -476,6 +577,7 @@ fn paths_bounded(
         truncated: false,
         expanded: 0,
         paths: Vec::new(),
+        limitations: index.limitations(),
     };
     if !index.has_vertex(from) || !index.has_vertex(to) {
         return report; // 끝점이 없으면 경로도 없다 — 호출자가 404를 처리한다.
@@ -489,7 +591,7 @@ fn paths_bounded(
             report.paths.push(Path {
                 vertices: vec![from.to_string()],
                 edges: Vec::new(),
-                tentative: false,
+                tentative: index.ambiguous_set().contains(from),
             });
         }
         return report;
@@ -499,7 +601,7 @@ fn paths_bounded(
     let mut steps = vec![PathStep {
         vertex: from,
         via: None,
-        tentative: false,
+        tentative: index.ambiguous_set().contains(from),
     }];
     let mut queue: VecDeque<usize> = VecDeque::from([0]);
     let mut pending_states = 1usize;
@@ -1123,6 +1225,7 @@ mod tests {
             truncated: false,
             expanded: 0,
             paths: Vec::new(),
+            limitations: index.limitations(),
         };
         if !index.has_vertex(from) || !index.has_vertex(to) {
             return report; // 끝점이 없으면 경로도 없다 — 호출자가 404를 처리한다.
