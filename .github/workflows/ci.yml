@@ -43,15 +43,16 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      - run: cargo build --all-targets
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo build --locked --all-targets
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo fmt --check
+      - run: cargo test --locked --features semantic
       - run: scripts/coverage.sh
       - run: scripts/verify-cli-contract.sh
 
       # 도그푸딩 — 이 도구로 이 저장소를 분석한다
-      - run: cargo run --quiet -- rules --strict
-      - run: cargo run --quiet -- cycles --level symbol --strict
+      - run: cargo run --locked --quiet -- rules --strict
+      - run: cargo run --locked --quiet -- cycles --level symbol --strict
 
   windows-output-safety:
     runs-on: windows-latest

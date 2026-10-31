@@ -1,5 +1,11 @@
 # Migrating to rustograph 0.6
 
+For source builds after 0.6.0, Rust callers constructing `harvest::BodyItem`
+must provide `generic_scopes` (use an empty vector when there are no enclosing
+generic parameters). Callers constructing `harvest::ImplBlock` must provide its
+borrowed `generics`. This preserves lexical type/const namespaces when body
+references are harvested. CLI and graph document schemas are unchanged.
+
 `change-impact --base REV [--head REV | --working-tree]` and the MCP tool
 `rustograph_change_impact` capture actual changes into separate before/after
 source graphs. See [the workflow and limitations](CHANGE-IMPACT.md).
