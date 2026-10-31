@@ -874,7 +874,11 @@ impl BodyVisitor<'_> {
     /// 모듈로 오독한 것이다. 외부 크레이트로 붕괴한 정점은 모듈 표에 없어
     /// 그대로 남는다(`dep::f()`는 크레이트 경계 증거다).
     fn resolve_value(&mut self, segs: &[String]) -> ValueRes {
-        if segs.first().is_some_and(|name| self.type_params.contains(name)) {
+        if segs.len() > 1
+            && segs
+                .first()
+                .is_some_and(|name| self.type_params.contains(name))
+        {
             return ValueRes::Local;
         }
         if let [only] = segs {
@@ -1165,11 +1169,31 @@ impl Visit<'_> for BodyVisitor<'_> {
         // 블록 안 아이템은 바깥 지역을 캡처하지 않는다. 블록 안 fn은 자기
         // 매개변수를 첫 겹으로 가진다.
         let saved = self.scopes.take();
+        let saved_types = self.type_params.clone();
+        let generics = match i {
+            syn::Item::Fn(item) => Some(&item.sig.generics),
+            syn::Item::Struct(item) => Some(&item.generics),
+            syn::Item::Enum(item) => Some(&item.generics),
+            syn::Item::Union(item) => Some(&item.generics),
+            syn::Item::Trait(item) => Some(&item.generics),
+            syn::Item::TraitAlias(item) => Some(&item.generics),
+            syn::Item::Impl(item) => Some(&item.generics),
+            syn::Item::Type(item) => Some(&item.generics),
+            _ => None,
+        };
+        let mut params = Vec::new();
         if let syn::Item::Fn(f) = i {
-            self.scopes = locals::Scopes::with_params(&locals::param_bindings(&f.sig));
+            params = locals::param_bindings(&f.sig);
         }
+        if let Some(generics) = generics {
+            self.type_params
+                .extend(generics.type_params().map(|param| param.ident.to_string()));
+            params.extend(generics.const_params().map(|param| param.ident.to_string()));
+        }
+        self.scopes = locals::Scopes::with_params(&params);
         syn::visit::visit_item(self, i);
         self.scopes.restore(saved);
+        self.type_params = saved_types;
     }
 
     fn visit_expr_if(&mut self, e: &syn::ExprIf) {

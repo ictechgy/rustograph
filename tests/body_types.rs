@@ -3,6 +3,95 @@
 use rustograph::{graph::EdgeKind, source};
 
 #[test]
+fn review_nested_item_generics_do_not_resolve_to_global_symbols() {
+    let root = std::env::temp_dir().join(format!(
+        "rustograph-nested-type-scope-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='nested_scope'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/main.rs"),
+        r#"
+struct T;
+const N: usize = 2;
+struct Actual;
+fn main() {
+    { fn inner<T, const N: usize>() { let _: T; let _: [u8; N]; } }
+    let _: Actual;
+}
+"#,
+    )
+    .unwrap();
+    let document = source::load(
+        &root,
+        &source::Options {
+            symbol_level: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    for target in ["T", "N"] {
+        assert!(
+            !document
+                .edges
+                .iter()
+                .any(|edge| edge.from == "nested_scope::main"
+                    && edge.to == format!("nested_scope::{target}")),
+            "nested generic resolved to global {target}"
+        );
+    }
+    assert!(document
+        .edges
+        .iter()
+        .any(|edge| edge.from == "nested_scope::main"
+            && edge.to == "nested_scope::Actual"
+            && edge.kind == EdgeKind::References));
+}
+
+#[test]
+fn review_type_generic_does_not_hide_a_bare_value_function() {
+    let root =
+        std::env::temp_dir().join(format!("rustograph-value-namespace-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='value_namespace'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/main.rs"),
+        "fn T() {}\nfn generic<T>() { T(); }\nfn main() { generic::<u8>(); }\n",
+    )
+    .unwrap();
+    let document = source::load(
+        &root,
+        &source::Options {
+            symbol_level: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(document
+        .edges
+        .iter()
+        .any(|edge| edge.from == "value_namespace::generic"
+            && edge.to == "value_namespace::T"
+            && edge.kind == EdgeKind::Call));
+    assert!(!rustograph::analysis::dead(&document)
+        .unwrap()
+        .findings
+        .iter()
+        .any(|finding| finding.id == "value_namespace::T"));
+}
+
+#[test]
 fn feedback_type_walk_keeps_const_expressions_and_generic_shadowing() {
     let root =
         std::env::temp_dir().join(format!("rustograph-body-type-scope-{}", std::process::id()));
