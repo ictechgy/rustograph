@@ -18,7 +18,7 @@ export LLVM_COV="${LLVM_COV:-$TOOLCHAIN_BIN/llvm-cov}"
 export LLVM_PROFDATA="${LLVM_PROFDATA:-$TOOLCHAIN_BIN/llvm-profdata}"
 
 mkdir -p coverage
-OUT=$(cargo llvm-cov --workspace --summary-only 2>/dev/null)
+OUT=$(cargo llvm-cov --locked --workspace --summary-only)
 
 TOTAL=$(echo "$OUT" | awk '/^TOTAL/ {for(i=1;i<=NF;i++) if ($i ~ /%$/ && $i+0 > 0) t=$i; gsub(/%/,"",t); print t+0}')
 

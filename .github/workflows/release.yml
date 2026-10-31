@@ -197,7 +197,7 @@ jobs:
           \`\`\`bash
           brew install ictechgy/tap/rustograph
           # or
-          cargo install --git https://github.com/ictechgy/rustograph --tag ${TAG}
+          cargo install --locked --git https://github.com/ictechgy/rustograph --tag ${TAG}
           \`\`\`
 
           ## Assets
