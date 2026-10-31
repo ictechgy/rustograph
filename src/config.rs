@@ -274,21 +274,48 @@ pub fn read_bounded_text(path: &Path, max_bytes: u64, kinds: FileKinds) -> std::
     Ok(text)
 }
 
-/// 패턴 매칭 — 정확 일치, `x/**` 재귀 접두사, `*` 한 세그먼트 글롭.
+/// 패턴 매칭 — 정확 일치, `x/**` 재귀 접두사, 세그먼트 안의 `*`·`?` 글롭.
 /// 긴 패턴이 이긴다(호출자가 정렬해 쓴다).
 pub fn matches(pattern: &str, path: &str) -> bool {
-    if let Some(prefix) = pattern.strip_suffix("/**") {
-        return path == prefix || path.starts_with(&format!("{prefix}::"));
-    }
-    if !pattern.contains('*') {
-        return pattern == path;
-    }
-    let pp: Vec<&str> = pattern.split("::").collect();
+    let recursive = pattern.ends_with("/**");
+    let pp: Vec<&str> = pattern
+        .strip_suffix("/**")
+        .unwrap_or(pattern)
+        .split("::")
+        .collect();
     let tp: Vec<&str> = path.split("::").collect();
-    if pp.len() != tp.len() {
+    if pp.len() != tp.len() && !(recursive && pp.len() < tp.len()) {
         return false;
     }
-    pp.iter().zip(tp.iter()).all(|(p, t)| *p == "*" || p == t)
+    pp.iter().zip(tp.iter()).all(|(p, t)| matches_segment(p, t))
+}
+
+/// 별표의 마지막 위치로만 되돌아가며 유니코드 문자 단위로 한 세그먼트를 맞춘다.
+fn matches_segment(pattern: &str, value: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+    let (mut p, mut v, mut retry) = (0, 0, 0);
+    let mut star = None;
+    while v < value.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == value[v]) {
+            p += 1;
+            v += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            p += 1;
+            retry = v;
+        } else if let Some(index) = star {
+            p = index + 1;
+            retry += 1;
+            v = retry;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 #[cfg(test)]
@@ -631,5 +658,15 @@ signature:
         assert!(!matches("a::*", "a::b::c")); // 길이가 다르면 불일치.
         assert!(matches("a::b::c", "a::b::c"));
         assert!(!matches("a::b", "a::b::c"));
+    }
+
+    #[test]
+    fn feedback_globs_match_within_segments_without_crossing_modules() {
+        assert!(matches("my::core*", "my::core_utils"));
+        assert!(matches("my::c?re*", "my::core_utils"));
+        assert!(!matches("my::core*", "my::core::utils"));
+        assert!(matches("my::core*/**", "my::core_utils::nested"));
+        assert!(!matches("my::core*/**", "my::other::nested"));
+        assert!(matches("my::?", "my::한"));
     }
 }
