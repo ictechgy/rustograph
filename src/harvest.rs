@@ -95,6 +95,8 @@ pub struct AttrRef {
 /// impl 블록 — self 타입·트레이트·메서드 목록.
 #[derive(Clone)]
 pub struct ImplBlock<'a> {
+    /// 메서드 본문에서도 유효한 impl의 타입·const 매개변수 스코프다.
+    pub generics: &'a syn::Generics,
     pub self_ty: Vec<String>,
     pub trait_path: Option<Vec<String>>,
     /// impl 안의 메서드 — 파싱한 AST 아레나의 노드를 빌린다. 예전에는 메서드를 통째로 복제해
@@ -128,6 +130,8 @@ pub enum Body<'a> {
 
 /// 본문을 나중에 방문할 항목.
 pub struct BodyItem<'a> {
+    /// 본문을 감싸는 impl·trait·함수의 제네릭 스코프다. 전역 아이템과 구분한다.
+    pub generic_scopes: Vec<&'a syn::Generics>,
     pub id: String,
     pub module: String,
     /// Self가 가리키는 타입(impl 안이면 Some).
@@ -235,6 +239,7 @@ pub(crate) fn decls_with_markers<'a>(
                         );
                     }
                     out.bodies.push(BodyItem {
+                        generic_scopes: generic_scopes([&f.sig.generics]),
                         id,
                         module: module_path.to_string(),
                         self_ty: None,
@@ -298,6 +303,7 @@ pub(crate) fn decls_with_markers<'a>(
                             out.vertices.push(vertex);
                             if let Some(body) = body {
                                 out.bodies.push(BodyItem {
+                                    generic_scopes: generic_scopes([&t.generics, &m.sig.generics]),
                                     id: mid,
                                     module: module_path.to_string(),
                                     self_ty: None,
@@ -335,6 +341,7 @@ pub(crate) fn decls_with_markers<'a>(
                     out.vertices
                         .push(v(id.clone(), Kind::Const, is_pub(&c.vis), unsafe_));
                     out.bodies.push(BodyItem {
+                        generic_scopes: Vec::new(),
                         id,
                         module: module_path.to_string(),
                         self_ty: None,
@@ -354,6 +361,7 @@ pub(crate) fn decls_with_markers<'a>(
                     out.vertices
                         .push(v(id.clone(), Kind::Static, is_pub(&s.vis), unsafe_));
                     out.bodies.push(BodyItem {
+                        generic_scopes: Vec::new(),
                         id,
                         module: module_path.to_string(),
                         self_ty: None,
@@ -379,6 +387,7 @@ pub(crate) fn decls_with_markers<'a>(
                 }
                 syn::Item::Impl(i) => {
                     out.impls.push(ImplBlock {
+                        generics: &i.generics,
                         self_ty: type_path(&i.self_ty),
                         trait_path: i.trait_.as_ref().map(|(_, p, _)| path_segments(p)),
                         methods: i
@@ -573,6 +582,7 @@ pub(crate) fn impls_with_identities<'a>(
                 m.span().byte_range().start,
             );
             bodies.push(BodyItem {
+                generic_scopes: generic_scopes([b.generics, &m.sig.generics]),
                 id: mid,
                 module: b.items_module.clone(),
                 self_ty: Some(b.self_ty.clone()),
@@ -711,7 +721,15 @@ fn body_edges_within(
     visible: Option<&BTreeSet<String>>,
     harvest: &mut Harvest,
 ) -> Vec<Edge> {
+    let mut params = b.params.clone();
+    params.extend(
+        b.generic_scopes
+            .iter()
+            .flat_map(|scope| scope.const_params())
+            .map(|param| param.ident.to_string()),
+    );
     let mut vis = BodyVisitor {
+        type_params: generic_type_parameters(b),
         owner: &b.id,
         module: &b.module,
         self_ty: b.self_ty.as_deref(),
@@ -721,7 +739,7 @@ fn body_edges_within(
         visible,
         edge_cfg: &b.cfg,
         in_unsafe: 0,
-        scopes: locals::Scopes::with_params(&b.params),
+        scopes: locals::Scopes::with_params(&params),
         edges: Vec::new(),
         unresolved: 0,
         fanned: 0,
@@ -745,11 +763,15 @@ fn body_edges_within(
 /// 같은 간선을 내므로 엔진 선택과 무관하게 일관된다.
 pub fn signature_edges(b: &BodyItem, tree: &ModTree, dep_crates: &DepCrates) -> Vec<Edge> {
     let mut edges = Vec::new();
+    let type_params = generic_type_parameters(b);
     // 소유 아이템이 cfg면 시그니처 자체가 그 조건 아래 있으니 간선도 물려받는다.
     for t in &b.signature_surface {
         let mut sv = TypeVisitor { paths: Vec::new() };
         sv.visit_type(t);
         for p in sv.paths {
+            if p.first().is_some_and(|name| type_params.contains(name)) {
+                continue;
+            }
             if let Some(id) = tree.resolve(&b.module, &p, dep_crates) {
                 if id != b.id {
                     let mut e = Edge::new(b.id.clone(), id, EdgeKind::Signature);
@@ -765,6 +787,7 @@ pub fn signature_edges(b: &BodyItem, tree: &ModTree, dep_crates: &DepCrates) -> 
 /// 본문 방문자 — 호출·경로 참조·매크로 호출을 간선으로 옮긴다.
 /// `unsafe {}` 블록 안에서 만든 간선은 경계 진입으로 표시한다.
 struct BodyVisitor<'a> {
+    type_params: BTreeSet<String>,
     owner: &'a str,
     module: &'a str,
     self_ty: Option<&'a [String]>,
@@ -851,6 +874,9 @@ impl BodyVisitor<'_> {
     /// 모듈로 오독한 것이다. 외부 크레이트로 붕괴한 정점은 모듈 표에 없어
     /// 그대로 남는다(`dep::f()`는 크레이트 경계 증거다).
     fn resolve_value(&mut self, segs: &[String]) -> ValueRes {
+        if segs.first().is_some_and(|name| self.type_params.contains(name)) {
+            return ValueRes::Local;
+        }
         if let [only] = segs {
             if only == "self" || self.scopes.is_local(only) {
                 return ValueRes::Local;
@@ -982,6 +1008,24 @@ enum ValueRes {
 }
 
 impl Visit<'_> for BodyVisitor<'_> {
+    fn visit_type_path(&mut self, ty: &syn::TypePath) {
+        // 타입 경로만 추가하고 기본 방문을 유지해야 배열 길이·const 인자도 사라지지 않는다.
+        let path = path_segments(&ty.path);
+        if !path
+            .first()
+            .is_some_and(|name| self.type_params.contains(name))
+        {
+            if let Some(id) = self.resolve(&path) {
+                self.push(id, EdgeKind::References);
+            }
+        }
+        syn::visit::visit_type_path(self, ty);
+    }
+
+    fn visit_type_macro(&mut self, ty: &syn::TypeMacro) {
+        self.visit_macro_call(&ty.mac);
+    }
+
     fn visit_expr_call(&mut self, e: &syn::ExprCall) {
         // foo::bar() — 경로 호출은 정확히 해석된다.
         if let syn::Expr::Path(p) = &*e.func {
@@ -1014,6 +1058,19 @@ impl Visit<'_> for BodyVisitor<'_> {
                         self.unresolved += 1;
                     }
                 }
+            }
+            // 호출 경로 자체는 중복 계수하지 않되, 그 안의 타입 인자와 qself는 참조다.
+            if let Some(qself) = &p.qself {
+                self.visit_type(&qself.ty);
+                let path = path_segments(&p.path);
+                if qself.position > 0 {
+                    if let Some(id) = self.resolve(&path[..qself.position]) {
+                        self.push(id, EdgeKind::References);
+                    }
+                }
+            }
+            for segment in &p.path.segments {
+                syn::visit::visit_path_arguments(self, &segment.arguments);
             }
             // func 경로는 call로 처리했으니 references로 이중 계수하지 않는다.
             for arg in &e.args {
@@ -1162,6 +1219,9 @@ impl Visit<'_> for BodyVisitor<'_> {
             syn::visit::visit_pat(self, input);
             self.scopes.bind(input);
         }
+        if let syn::ReturnType::Type(_, ty) = &e.output {
+            self.visit_type(ty);
+        }
         self.visit_expr(&e.body);
         self.scopes.pop();
     }
@@ -1186,6 +1246,25 @@ impl Visit<'_> for BodyVisitor<'_> {
         }
         syn::visit::visit_expr_path(self, e);
     }
+}
+
+/// 빈 제네릭 스코프는 저장하지 않아 일반 함수의 본문 메타데이터를 늘리지 않는다.
+fn generic_scopes<'a>(
+    scopes: impl IntoIterator<Item = &'a syn::Generics>,
+) -> Vec<&'a syn::Generics> {
+    scopes
+        .into_iter()
+        .filter(|scope| !scope.params.is_empty())
+        .collect()
+}
+
+/// 타입 이름 공간을 가리는 제네릭 매개변수다. const는 값 묶음에서 따로 다룬다.
+fn generic_type_parameters(body: &BodyItem<'_>) -> BTreeSet<String> {
+    body.generic_scopes
+        .iter()
+        .flat_map(|scope| scope.type_params())
+        .map(|param| param.ident.to_string())
+        .collect()
 }
 
 /// 타입 안의 경로들을 수집하는 방문자 — 제네릭 인자까지 재귀한다.
