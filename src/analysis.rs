@@ -81,7 +81,21 @@ impl<'a> ReachIndex<'a> {
 }
 
 /// [`dead`]의 보존 선택지. 기본값은 보존 루트에서 의존 간선으로 닿는 정점만 닿은 것으로 본다.
+///
+/// 선택지는 늘 수 있다 — 크레이트 밖 호출자는 기본값에서 필드를 바꿔 만든다(구조체 리터럴은 새
+/// 선택지가 생기면 깨지므로 받지 않는다).
+///
+/// ```
+/// let mut opts = rustograph::analysis::DeadOptions::default();
+/// opts.retain_external_trait_impls = true;
+/// # assert!(opts.retain_external_trait_impls);
+/// ```
+///
+/// ```compile_fail,E0639
+/// let opts = rustograph::analysis::DeadOptions { retain_external_trait_impls: true };
+/// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeadOptions {
     /// 워크스페이스 밖에서 선언된 트레이트(std·의존 크레이트의 `Drop`·`Display`·`Iterator`·`From`·
     /// visitor 등)의 impl 메서드를 self 타입이 닿으면 함께 닿은 것으로 본다. 그 호출은 언어(drop glue,

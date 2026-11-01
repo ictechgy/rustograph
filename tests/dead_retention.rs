@@ -51,6 +51,14 @@ fn symbols(dir: &Path) -> rustograph::graph::Document {
     .unwrap()
 }
 
+/// 보존 선택지를 켠 [`analysis::DeadOptions`] — 크레이트 밖 호출자처럼 기본값에서 필드를 바꿔 만든다
+/// (`#[non_exhaustive]`라 구조체 리터럴은 받지 않는다).
+fn retaining_external_trait_impls() -> analysis::DeadOptions {
+    let mut opts = analysis::DeadOptions::default();
+    opts.retain_external_trait_impls = true;
+    opts
+}
+
 fn ids(rep: &analysis::DeadReport) -> Vec<&str> {
     rep.findings.iter().map(|f| f.id.as_str()).collect()
 }
@@ -184,13 +192,7 @@ fn retaining_external_trait_impls_removes_the_cascade_only() {
         ],
     );
     let doc = symbols(krate.path());
-    let rep = analysis::dead_with_options(
-        &doc,
-        analysis::DeadOptions {
-            retain_external_trait_impls: true,
-        },
-    )
-    .unwrap();
+    let rep = analysis::dead_with_options(&doc, retaining_external_trait_impls()).unwrap();
     let found = ids(&rep);
     for gone in [
         "rgfx::Counter::<Iterator>::next",
@@ -366,10 +368,7 @@ fn main() { let _s = S; let _w = Shown; }
         "{:?}",
         rep.limitations
     );
-    let opts = analysis::DeadOptions {
-        retain_external_trait_impls: true,
-    };
-    let kept = analysis::dead_with_options(&doc, opts).unwrap();
+    let kept = analysis::dead_with_options(&doc, retaining_external_trait_impls()).unwrap();
     assert_eq!(
         ids(&kept),
         [

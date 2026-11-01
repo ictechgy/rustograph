@@ -28,6 +28,8 @@
   impl과 닿지 않는 타입의 impl은 계속 보고한다. 기본 판정은 그대로이고, 기본 `dead` 보고서는 닿는 타입에 붙은 그런
   미도달 메서드 수를 limitation으로 센다(셀 것이 없으면 싣지 않는다). 라이브러리 호출자용 `analysis::DeadOptions`·
   `dead_with_options`·`explain_path_with_options`·`QueryIndex::dead_with_options`를 더했다(기존 함수는 그대로다).
+  `DeadOptions`는 `#[non_exhaustive]`라 선택지가 늘어도 호출자가 깨지지 않는다 — `DeadOptions::default()`에서 필드를
+  바꿔 만든다.
 - `cycles --level module --exclude-nested-modules`(opt-in, CLI): 구성원이 한 모듈과 그 자손뿐인 순환(자식의
   `super::` 호출 등)을 빼고 판정한다(`--strict` 포함). JSON 보고서에는 뺀 수를 `excluded_nested`로 싣는다. 형제나
   다른 모듈이 끼는 순환은 계속 보고한다. 기본 판정과 JSON은 그대로이고, 기본 텍스트 출력은 그런 순환이 있을 때 그
