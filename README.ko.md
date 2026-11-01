@@ -94,7 +94,10 @@ rustograph impact --format language-traversal --roots-from schema-facts.json  # 
 `#[cfg(...)]` 토큰, 간선의 `cfg`는 그 조건 아래서만 성립하는 의존을
 표시합니다. `unsafe`는 경계를 표시합니다 — `unsafe fn`/`unsafe trait`이거나
 `unsafe {}` 블록을 품은 정점에 `unsafe: true`, `unsafe {}` 안에서 만든
-간선은 경계 진입 간선입니다.
+간선은 경계 진입 간선입니다. 자기 자신으로 가는 간선은 만들지 않습니다 —
+직접 재귀(`fn f() { f() }`)는 `cycles --level symbol`에 나오지 않고, 서로
+부르는 두 심볼은 순환으로 나옵니다. 재귀 함수도 호출자에게서 닿으므로
+도달성에는 영향이 없습니다.
 
 `rustograph mcp`는 개행 구분 JSON-RPC 2.0을 stdio로 말하고 도구 9종
 (`rustograph_summary`/`_query`/`_impact`/`_paths`/`_search`/`_cycles`/

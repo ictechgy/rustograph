@@ -171,6 +171,10 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
 `contains`, `call`, `references`, `implements`, `signature`.
 
 - `contains` is ownership, not a dependency — it never feeds cycles or rules.
+- No edge points from a symbol to itself: direct recursion (`fn f() { f() }`)
+  is not reported by `cycles --level symbol`, while mutual recursion between
+  two symbols is. Reachability is unaffected — a recursive function is reached
+  through its callers.
 - Name fan-out: a method call `x.m()` whose receiver type is unknown gets
   `tentative` call edges to the same-name workspace methods it could reach.
   Inherent (`T::m`) and trait-declared (`Tr::m`) methods come only
