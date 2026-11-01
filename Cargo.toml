@@ -2,6 +2,8 @@
 name = "rustograph"
 version = "0.6.0"
 edition = "2021"
+# 최소 지원 Rust — CI msrv 잡이 이 툴체인으로 기본·semantic 빌드를 확인한다. ra_ap_* pin(아래)과 맞물린다.
+rust-version = "1.96"
 license = "MIT"
 description = "Queryable dependency graph for Rust codebases — the graph is the artifact; everything else is a query over it"
 
