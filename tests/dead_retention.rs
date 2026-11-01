@@ -296,7 +296,7 @@ fn library_without_roots_points_at_retain_public() {
         "lib",
         &[("Cargo.toml", &manifest("rglib")), ("src/lib.rs", LIB)],
     );
-    let hint = "4 unreachable symbols are exported items of crates with no retention root (rglib); a library's public API is called from outside the workspace — --retain-public (MCP: retainPublic) retains exported symbols";
+    let hint = "4 unreachable symbols are exported items of crates with no retention root (rglib); callers outside this workspace are not in the graph, so if these crates are libraries used elsewhere, --retain-public (MCP: retainPublic) treats exported symbols as roots — otherwise these items have no caller in the workspace";
     let (code, json) = run(krate.path(), &["dead", "--strict", "--format", "json"]);
     assert_eq!(code, Some(1));
     let json: serde_json::Value = serde_json::from_str(&json).unwrap();

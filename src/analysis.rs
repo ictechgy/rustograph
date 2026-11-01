@@ -1316,7 +1316,9 @@ fn dead_with(
 }
 
 /// 보존 루트가 하나도 없는 크레이트의 unreachable exported 정점을 센 limitation — 셀 것이 없으면 없다.
-/// main 없는 lib의 공개 API는 워크스페이스 밖에서 불려 루트 없이는 전부 unreachable이다. 루트가 있는
+/// main 없는 lib을 워크스페이스 밖에서 쓰면 그 호출자는 그래프에 없어 루트 없이는 공개 API가 전부
+/// unreachable이다. 워크스페이스 안에서만 쓰는 lib이면 그 아이템은 정말 호출자가 없다 — 그래서 문장은
+/// 조건부로 `--retain-public`을 알린다(따르면 진짜 미사용이 가려질 수 있다). 루트가 있는
 /// 크레이트(bin, `--root`를 준 크레이트)의 `pub` 아이템은 그 크레이트 밖 호출자가 없으니 세지 않는다.
 /// 공개 아이템을 루트로 삼으면(`--retain-public`) 공개 미도달이 없어 조용하다.
 fn rootless_api_limitation(
@@ -1345,7 +1347,7 @@ fn rootless_api_limitation(
         crates.insert(v.krate.as_str());
     }
     (count > 0).then(|| format!(
-        "{count} unreachable symbols are exported items of crates with no retention root ({}); a library's public API is called from outside the workspace — --retain-public (MCP: retainPublic) retains exported symbols",
+        "{count} unreachable symbols are exported items of crates with no retention root ({}); callers outside this workspace are not in the graph, so if these crates are libraries used elsewhere, --retain-public (MCP: retainPublic) treats exported symbols as roots — otherwise these items have no caller in the workspace",
         crates.into_iter().collect::<Vec<_>>().join(", ")
     ))
 }
@@ -1974,14 +1976,14 @@ mod tests {
         );
         assert_eq!(
             rep.limitations,
-            ["3 unreachable symbols are exported items of crates with no retention root (core, macros); a library's public API is called from outside the workspace — --retain-public (MCP: retainPublic) retains exported symbols"]
+            ["3 unreachable symbols are exported items of crates with no retention root (core, macros); callers outside this workspace are not in the graph, so if these crates are libraries used elsewhere, --retain-public (MCP: retainPublic) treats exported symbols as roots — otherwise these items have no caller in the workspace"]
         );
         // 루트가 없는 문서(main 없는 lib만 있는 워크스페이스)도 같다.
         let mut lib = d.clone();
         lib.roots.clear();
         assert_eq!(
             dead(&lib).unwrap().limitations,
-            ["5 unreachable symbols are exported items of crates with no retention root (app, core, macros); a library's public API is called from outside the workspace — --retain-public (MCP: retainPublic) retains exported symbols"]
+            ["5 unreachable symbols are exported items of crates with no retention root (app, core, macros); callers outside this workspace are not in the graph, so if these crates are libraries used elsewhere, --retain-public (MCP: retainPublic) treats exported symbols as roots — otherwise these items have no caller in the workspace"]
         );
         // 공개 아이템이 루트면 공개 미도달이 없어 limitation도 없다.
         let public: Vec<String> = d

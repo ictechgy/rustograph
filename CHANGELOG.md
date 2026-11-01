@@ -35,8 +35,9 @@
   다른 모듈이 끼는 순환은 계속 보고한다. 기본 판정과 JSON은 그대로이고, 기본 텍스트 출력은 그런 순환이 있을 때 그
   수와 플래그를 `note:` 줄로 알린다. 모듈 레벨이 아니면 사용법 오류다.
 - `dead`·MCP `rustograph_dead`: 보존 루트가 하나도 없는 크레이트(main·`#[no_mangle]` 없는 lib)의 unreachable 공개
-  아이템 수와 크레이트 이름을 limitation으로 세고 `--retain-public`(MCP `retainPublic`)을 알린다. 판정과 종료 코드는
-  그대로다. 이전에는 lib 크레이트의 첫 `dead`가 공개 API 전부를 unreachable로 내면서 아무 안내가 없었다.
+  아이템 수와 크레이트 이름을 limitation으로 세고, 워크스페이스 밖에서 쓰는 라이브러리라면 `--retain-public`(MCP
+  `retainPublic`)을 쓰라고 조건부로 알린다(워크스페이스 안에서만 쓰는 lib이면 그 아이템은 정말 호출자가 없다). 판정과
+  종료 코드는 그대로다. 이전에는 lib 크레이트의 첫 `dead`가 공개 API 전부를 unreachable로 내면서 아무 안내가 없었다.
 
 ## [0.6.0]
 
