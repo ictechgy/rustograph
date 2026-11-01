@@ -54,8 +54,8 @@ jobs:
       - run: cargo run --locked --quiet -- rules --strict
       - run: cargo run --locked --quiet -- cycles --level symbol --strict
 
-  # Cargo.toml의 rust-version과 같은 최소 툴체인 — 선언한 MSRV가 실제로 빌드되는지 본다.
-  # clippy·테스트는 test 잡이 stable에서 돌린다.
+  # Cargo.toml의 rust-version과 같은 최소 툴체인 — 선언한 MSRV가 실제로 빌드되는지 본다. 1.96을 정하는
+  # 것은 semantic feature다(ra_ap_tt의 std::assert_matches). clippy·테스트는 test 잡이 stable에서 돌린다.
   msrv:
     runs-on: ubuntu-latest
     steps:

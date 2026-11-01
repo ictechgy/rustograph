@@ -2,7 +2,10 @@
 name = "rustograph"
 version = "0.6.0"
 edition = "2021"
-# 최소 지원 Rust — CI msrv 잡이 이 툴체인으로 기본·semantic 빌드를 확인한다. ra_ap_* pin(아래)과 맞물린다.
+# 최소 지원 Rust — semantic feature가 정한다. ra_ap_* 0.0.349는 rust-version 1.95를 선언하지만
+# ra_ap_tt가 1.95에서 불안정한 `std::assert_matches`를 써서(E0658) 1.96부터 빌드된다. 기본 빌드는 더 낮은
+# 툴체인에서도 될 수 있지만 rust-version은 패키지 단위라 두 빌드가 함께 되는 1.96을 선언한다. CI msrv
+# 잡이 이 툴체인으로 기본·semantic 빌드를 확인한다.
 rust-version = "1.96"
 license = "MIT"
 description = "Queryable dependency graph for Rust codebases — the graph is the artifact; everything else is a query over it"

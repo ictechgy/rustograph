@@ -6,7 +6,9 @@
 
 - CI가 잠금 파일을 사용해 semantic feature를 빌드·검증하고, 커버리지 실패의 stderr를 보존한다.
 - `Cargo.toml`에 최소 지원 Rust `rust-version = "1.96"`을 선언하고, CI `msrv` 잡이 rustc 1.96.0으로 기본·semantic
-  빌드를 `--locked`로 확인한다. 더 오래된 툴체인의 `cargo install`은 컴파일 오류 대신 요구 버전을 알린다.
+  빌드를 `--locked`로 확인한다. 1.96을 정하는 것은 semantic feature다 — 잠근 ra_ap_* 0.0.349는 1.95를 선언하지만
+  ra_ap_tt가 1.95에서 불안정한 `std::assert_matches`를 쓴다. 더 오래된 툴체인의 `cargo install`은 컴파일 오류 대신
+  요구 버전을 알린다.
 
 - 본문 타입·제네릭 인자·qself·클로저 반환형의 참조를 수확하고, const 표현식 방문과
   타입/const 제네릭 매개변수의 이름 가림을 보존한다.
