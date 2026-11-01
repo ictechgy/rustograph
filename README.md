@@ -574,11 +574,17 @@ call, and the report counts the ones on reachable types. `dead
 `retainExternalTraitImpls`) treats each of them as reachable once its type is
 reachable and follows what it calls; its report counts the methods kept that
 way. An impl counts as external when none of the workspace traits its type
-`implements` has that name or declares that method — an impl written through
-an alias or re-export (`use t::Tr as Alias; impl Alias for S`) is a workspace
-impl. Impls of workspace traits — whose calls are visible — are still reported
-when unused, and so are impls on types nothing reaches. A reachable type does not prove the trait is used: code reached only
-through such an impl is not reported even where the impl is never called.
+`implements` has that name or declares that method. Trait paths resolve through
+aliases and re-exports to the defining trait, so `use t::Tr as Alias; impl
+Alias for S`, `use crate::Tr` for a crate-root `pub use inner::Tr`, a prelude
+glob, or `use other_member::Tr` all make workspace impls. When a trait path does
+not resolve at all (a re-export a macro generates, for example), the impl is
+still a workspace impl if a workspace trait of that name declares that method.
+Impls of workspace traits — whose calls are visible, or reach them through
+name fan-out — are still reported when unused, and so are impls on types
+nothing reaches. A reachable type does not prove the trait is used: code
+reached only through such an impl is not reported even where the impl is never
+called.
 
 Callers outside the workspace are not in the graph, so a crate with no
 retention root — a library without `fn main` or `#[no_mangle]` entry points,

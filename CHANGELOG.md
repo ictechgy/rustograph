@@ -29,6 +29,9 @@
   트레이트 impl로 분류됐다. 명시 임포트는 같은 이름의 글롭 임포트를 소스 순서와 무관하게 가린다. 재노출 사슬은 임포트 표가
   더 바뀌지 않을 때까지 해석을 되풀이해 풀고(최대 32바퀴), 그 안에 끝나지 않은 모듈 수는 limitation으로 센다. 라이브러리
   호출자용 `modtree::fill_imports_settled`·`MAX_IMPORT_PASSES`를 더했다([0.6 migration](docs/MIGRATING-0.6.md)).
+- `dead --retain-external-trait-impls`·기본 보고서의 외부 트레이트 impl 계수: 트레이트 경로가 해석되지 않아 implements
+  간선이 없는 impl도, 그 이름의 워크스페이스 트레이트가 같은 이름의 메서드를 선언하면 워크스페이스 impl로 보아 보존하거나
+  세지 않는다(보존을 줄이는 쪽으로만 틀린다).
 - `rules`·MCP `rustograph_rules`: 간선이 정렬되지 않은 문서(`--graph`로 읽은 다른 도구의 문서 등)에서 같은
   `(rule, from, to)`의 간선 종류가 call·references·call처럼 섞여도 같은 기준선 키(`rule|from|to|kind`)의 위반을
   한 번만 보고한다. 이전에는 정렬 키에 kind가 없어 같은 위반이 두 번 나올 수 있었다. 수확한 문서의 결과는 같다.
