@@ -460,7 +460,10 @@ impl<'d> Server<'d> {
                     }
                 }
                 let roots: Vec<String> = roots.into_iter().collect();
-                let rep = self.index.dead(&roots)?;
+                let opts = analysis::DeadOptions {
+                    retain_external_trait_impls: arg_bool(args, "retainExternalTraitImpls"),
+                };
+                let rep = self.index.dead_with_options(&roots, opts)?;
                 let mut out = serde_json::to_value(&rep).expect("report must serialize");
                 if !unknown_roots.is_empty() {
                     out["unknownRoots"] = serde_json::json!(unknown_roots);
@@ -618,6 +621,7 @@ fn tool_list() -> serde_json::Value {
                 "type": "object",
                 "properties": {
                     "retainPublic": {"type": "boolean", "description": "retain all exported symbols (use for libraries)"},
+                    "retainExternalTraitImpls": {"type": "boolean", "description": "treat impl methods of traits declared outside the workspace (Drop, Display, Iterator, From, ...) as reachable when their type is reachable"},
                     "roots": {"type": "array", "items": {"type": "string"}, "description": "extra retention root vertex IDs"},
                 },
             },

@@ -12,6 +12,12 @@
 - `rules`·MCP `rustograph_rules`: 간선이 정렬되지 않은 문서(`--graph`로 읽은 다른 도구의 문서 등)에서 같은
   `(rule, from, to)`의 간선 종류가 call·references·call처럼 섞여도 같은 기준선 키(`rule|from|to|kind`)의 위반을
   한 번만 보고한다. 이전에는 정렬 키에 kind가 없어 같은 위반이 두 번 나올 수 있었다. 수확한 문서의 결과는 같다.
+- `dead --retain-external-trait-impls`·MCP `rustograph_dead`의 `retainExternalTraitImpls`(opt-in): 워크스페이스 밖에서
+  선언된 트레이트(`Drop`·`Iterator`·`Display`·`From`·`syn` visitor 등)의 impl 메서드를 self 타입이 닿으면 함께 닿은
+  것으로 보고, 그 메서드가 부르는 코드까지 따라간다. `--explain`도 같은 규칙을 쓴다. 워크스페이스 트레이트의 미사용
+  impl과 닿지 않는 타입의 impl은 계속 보고한다. 기본 판정은 그대로이고, 기본 `dead` 보고서는 닿는 타입에 붙은 그런
+  미도달 메서드 수를 limitation으로 센다(셀 것이 없으면 싣지 않는다). 라이브러리 호출자용 `analysis::DeadOptions`·
+  `dead_with_options`·`explain_path_with_options`·`QueryIndex::dead_with_options`를 더했다(기존 함수는 그대로다).
 
 ## [0.6.0]
 

@@ -92,6 +92,7 @@ rustograph dead                           # symbol level, always
 rustograph dead --retain-public           # libraries: keep exported API
 rustograph dead --tests                   # also retain #[test]/#[bench]
 rustograph dead --root mycrate::setup     # extra retention root
+rustograph dead --retain-external-trait-impls  # keep Drop/Display/Iterator/From… impls of reachable types
 rustograph dead --explain mycrate::f      # why alive? show a reachability path
 
 # Check layer rules from .rustograph.yml
@@ -550,6 +551,21 @@ vertices, edge kinds, `tentative`, `limitations` — is unchanged; only
 accuracy improves. Bodies the semantic engine cannot see (cfg-disabled,
 macro-generated) fall back to the syntactic path with measured counters, and
 calls it cannot resolve fall back to the same bounded name fan-out.
+
+`dead` sees no caller for an impl method of a trait declared outside the
+workspace — `Drop::drop` (scope end), `Iterator::next` (`for`),
+`Display::fmt` (formatting macros), `From::from` (`.into()`), or a `syn`
+visitor's `visit_*` — because the language or the external crate makes the
+call. By default such methods stay unreachable, together with code only they
+call, and the report counts the ones on reachable types. `dead
+--retain-external-trait-impls` (MCP `rustograph_dead`:
+`retainExternalTraitImpls`) treats each of them as reachable once its type is
+reachable and follows what it calls; its report counts the methods kept that
+way. An impl counts as external when its type has no `implements` edge to a
+workspace trait of that name, so impls of workspace traits — whose calls are
+visible — are still reported when unused, and so are impls on types nothing
+reaches. A reachable type does not prove the trait is used: code reached only
+through such an impl is not reported even where the impl is never called.
 
 The syntactic harvest does not read a module file — a `mod` file or a crate
 root — larger than 64 MiB. Its module or crate vertex stays, but the items and

@@ -21,7 +21,7 @@ usage:
                    [--dir DIR] [--deps] [--tests] [--root ID] [--out FILE]
   rustograph cycles [--level L] [--strict] [--format text|json]
   rustograph dead [--strict] [--explain ID] [--root ID] [--retain-public] [--tests]
-                  [--format text|json]
+                  [--retain-external-trait-impls] [--format text|json]
   rustograph rules [--strict] [--format text|json|sarif] [--config FILE]
                    [--baseline FILE] [--write-baseline]
   rustograph deps [--strict] [--format text|json]
@@ -401,15 +401,24 @@ fn cmd_dead(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
         a,
         &[
             cli_args::DOCUMENT_FLAGS,
-            &["strict", "explain", "root", "format"],
+            &[
+                "strict",
+                "explain",
+                "root",
+                "format",
+                "retain-external-trait-impls",
+            ],
         ],
         0,
     )?;
     // dead는 항상 심볼 레벨 — 도달성은 심볼에서만 의미 있다.
     let doc = cli_args::document_for(a, true)?;
+    let opts = analysis::DeadOptions {
+        retain_external_trait_impls: a.has("retain-external-trait-impls"),
+    };
     if let Some(target) = a.get("explain") {
         let target = require_id(&doc, target)?;
-        match analysis::explain_path(&doc, &target) {
+        match analysis::explain_path_with_options(&doc, &target, opts) {
             Some(path) => {
                 writeln!(out, "{}", path.join(" -> ")).ok();
                 return Ok(0);
@@ -420,7 +429,7 @@ fn cmd_dead(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
             }
         }
     }
-    let report = analysis::dead(&doc)?;
+    let report = analysis::dead_with_options(&doc, opts)?;
     match a.get("format").unwrap_or("text") {
         "json" => write!(out, "{}", export::to_json(&report)).ok(),
         "text" => {

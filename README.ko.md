@@ -68,6 +68,7 @@ rustograph graph --out .rustograph/graph.json  # 저장(트리가 깨끗하면 g
 rustograph cycles --graph .rustograph/graph.json --strict
 rustograph dead --retain-public --tests
 rustograph dead --explain mycrate::f     # 왜 살아 있나 — 도달 경로
+rustograph dead --retain-external-trait-impls  # 닿는 타입의 Drop/Display/Iterator/From… impl 보존
 rustograph rules --strict                # .rustograph.yml 레이어 규칙
 rustograph rules --format sarif          # GitHub 코드 스캐닝용
 rustograph rules --write-baseline        # 기존 위반을 기준선으로 얼림
@@ -322,6 +323,20 @@ feature(`--features semantic` 빌드 후 `--semantic`)는 rust-analyzer
 보지 못하는 본문(cfg 비활성·매크로 생성)은 syn 경로로 되돌아가고 그 수를
 셉니다. 의미 해석도 해석하지 못한 메서드 호출은 아래와 같은 이름 팬아웃으로
 돌아갑니다.
+
+워크스페이스 밖에서 선언된 트레이트의 impl 메서드 — `Drop::drop`(스코프 끝),
+`Iterator::next`(`for`), `Display::fmt`(포맷 매크로), `From::from`(`.into()`),
+`syn` visitor의 `visit_*` — 는 호출을 언어나 외부 크레이트가 하므로 `dead`가
+호출자를 보지 못합니다. 기본값에서는 그 메서드와 그것만 부르는 코드가
+unreachable로 남고, 보고서가 닿는 타입에 붙은 그런 메서드 수를 셉니다.
+`dead --retain-external-trait-impls`(MCP `rustograph_dead`의
+`retainExternalTraitImpls`)는 타입이 닿으면 그 메서드도 닿은 것으로 보고 그
+메서드가 부르는 코드까지 따라가며, 그렇게 보존한 메서드 수를 보고서에 셉니다.
+타입에서 같은 이름의 워크스페이스 트레이트로 가는 `implements` 간선이 없는
+impl을 외부 트레이트 impl로 봅니다 — 호출이 보이는 워크스페이스 트레이트의
+미사용 impl과 아무도 닿지 않는 타입의 impl은 계속 보고됩니다. 타입이 닿는다고
+트레이트가 쓰인다는 뜻은 아니므로, 그런 impl로만 닿는 코드는 그 impl이 불리지
+않아도 보고되지 않습니다.
 
 이름 팬아웃(수신자 타입을 모르는 `x.m()`)의 후보는 호출 크레이트의 의존으로
 좁힙니다. 고유 메서드(`T::m`)와 트레이트 선언 메서드(`Tr::m`)는 호출 크레이트,
