@@ -86,6 +86,7 @@ rustograph cycles --graph .rustograph/graph.json --strict
 
 # Detect dependency cycles (tentative edges excluded, count reported)
 rustograph cycles --level symbol --strict
+rustograph cycles --level module --exclude-nested-modules  # leave out parent/child-only module cycles
 
 # Report symbols unreachable from retention roots (fn main, #[no_mangle])
 rustograph dead                           # symbol level, always
@@ -171,6 +172,13 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
 `contains`, `call`, `references`, `implements`, `signature`.
 
 - `contains` is ownership, not a dependency — it never feeds cycles or rules.
+- A module-level cycle whose members are all one module and its own
+  descendants — a parent using its child while the child calls `super::` — is
+  idiomatic Rust. `cycles --level module` still reports it, and its text
+  output counts such cycles in a `note:` line; `--exclude-nested-modules`
+  leaves them out (also for `--strict`) and the JSON report then carries
+  `excluded_nested`. A cycle that also involves a sibling or unrelated module
+  is always reported. The flag is CLI-only and module-level only.
 - No edge points from a symbol to itself: direct recursion (`fn f() { f() }`)
   is not reported by `cycles --level symbol`, while mutual recursion between
   two symbols is. Reachability is unaffected — a recursive function is reached

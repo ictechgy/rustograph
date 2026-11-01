@@ -24,6 +24,10 @@
   impl과 닿지 않는 타입의 impl은 계속 보고한다. 기본 판정은 그대로이고, 기본 `dead` 보고서는 닿는 타입에 붙은 그런
   미도달 메서드 수를 limitation으로 센다(셀 것이 없으면 싣지 않는다). 라이브러리 호출자용 `analysis::DeadOptions`·
   `dead_with_options`·`explain_path_with_options`·`QueryIndex::dead_with_options`를 더했다(기존 함수는 그대로다).
+- `cycles --level module --exclude-nested-modules`(opt-in, CLI): 구성원이 한 모듈과 그 자손뿐인 순환(자식의
+  `super::` 호출 등)을 빼고 판정한다(`--strict` 포함). JSON 보고서에는 뺀 수를 `excluded_nested`로 싣는다. 형제나
+  다른 모듈이 끼는 순환은 계속 보고한다. 기본 판정과 JSON은 그대로이고, 기본 텍스트 출력은 그런 순환이 있을 때 그
+  수와 플래그를 `note:` 줄로 알린다. 모듈 레벨이 아니면 사용법 오류다.
 - `dead`·MCP `rustograph_dead`: 보존 루트가 하나도 없는 크레이트(main·`#[no_mangle]` 없는 lib)의 unreachable 공개
   아이템 수와 크레이트 이름을 limitation으로 세고 `--retain-public`(MCP `retainPublic`)을 알린다. 판정과 종료 코드는
   그대로다. 이전에는 lib 크레이트의 첫 `dead`가 공개 API 전부를 unreachable로 내면서 아무 안내가 없었다.

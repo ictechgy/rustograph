@@ -20,6 +20,7 @@ usage:
   rustograph graph [--level crate|module|type|symbol] [--format json|mermaid]
                    [--dir DIR] [--deps] [--tests] [--root ID] [--out FILE]
   rustograph cycles [--level L] [--strict] [--format text|json]
+                    [--exclude-nested-modules]
   rustograph dead [--strict] [--explain ID] [--root ID] [--retain-public] [--tests]
                   [--retain-external-trait-impls] [--format text|json]
   rustograph rules [--strict] [--format text|json|sarif] [--config FILE]
@@ -361,18 +362,58 @@ fn recorded_revision(a: &Args, format: &str) -> Option<String> {
 fn cmd_cycles(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     cli_args::reject_unused(
         a,
-        &[cli_args::DOCUMENT_FLAGS, &["level", "format", "strict"]],
+        &[
+            cli_args::DOCUMENT_FLAGS,
+            &["level", "format", "strict", "exclude-nested-modules"],
+        ],
         0,
     )?;
     let level = cli_args::level_of(a)?;
+    let exclude_nested = a.has("exclude-nested-modules");
+    if exclude_nested && level != crate::graph::Level::Module {
+        return Err(
+            "cycles --exclude-nested-modules applies to module-level cycles; pass --level module"
+                .to_string(),
+        );
+    }
     let doc = cli_args::document_for(a, true)?.view(level)?;
-    let rep = analysis::cycles(&doc);
+    let mut rep = analysis::cycles(&doc);
+    // 부모·자식 모듈만으로 된 순환 — 기본 판정과 JSON은 그대로 두고, 요청이 있을 때만 뺀다.
+    let nested = if level == crate::graph::Level::Module {
+        rep.cycles
+            .iter()
+            .filter(|c| analysis::is_nested_module_cycle(c))
+            .count()
+    } else {
+        0
+    };
+    if exclude_nested {
+        rep.cycles.retain(|c| !analysis::is_nested_module_cycle(c));
+    }
     match a.get("format").unwrap_or("text") {
+        "json" if exclude_nested && nested > 0 => {
+            let mut json = serde_json::to_value(&rep).expect("cycle report must serialize");
+            json["excluded_nested"] = serde_json::json!(nested);
+            write!(out, "{}", export::to_json(&json)).ok()
+        }
         "json" => write!(out, "{}", export::to_json(&rep)).ok(),
         "text" => {
             writeln!(out, "{} cycle(s)", rep.cycles.len()).ok();
             for c in &rep.cycles {
                 writeln!(out, "  cycle: {}", c.members.join(" -> ")).ok();
+            }
+            if exclude_nested && nested > 0 {
+                writeln!(
+                    out,
+                    "  note: {nested} cycles involving only a module and its own descendants were excluded (--exclude-nested-modules)"
+                )
+                .ok();
+            } else if nested > 0 {
+                writeln!(
+                    out,
+                    "  note: {nested} of these cycles involve only a module and its own descendants (e.g. a child calling `super::`); --exclude-nested-modules leaves them out"
+                )
+                .ok();
             }
             if rep.excluded_tentative > 0 {
                 writeln!(

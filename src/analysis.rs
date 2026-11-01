@@ -836,6 +836,21 @@ pub struct Cycle {
     pub evidence: Vec<CycleEdge>,
 }
 
+/// 모듈 레벨 순환의 구성원이 모듈 트리의 한 갈래(서로 조상·자손)에만 있는가 — 부모가 자식을 쓰고
+/// 자식이 `super::`로 부모를 부르는, Rust에서 관용적인 부모-자식 상호 참조다. 형제 모듈이나 갈래
+/// 밖 모듈이 끼면 중첩 순환이 아니다. 정점 ID는 모듈 경로라 조상은 `::` 경계까지의 접두사다.
+pub fn is_nested_module_cycle(cycle: &Cycle) -> bool {
+    let mut members: Vec<&str> = cycle.members.iter().map(String::as_str).collect();
+    // 사전순이면 조상이 자손보다 앞선다 — 이웃한 쌍이 모두 조상·자손이면 한 갈래다(전이적).
+    members.sort_unstable();
+    members.len() > 1
+        && members.windows(2).all(|pair| {
+            pair[1]
+                .strip_prefix(pair[0])
+                .is_some_and(|rest| rest.starts_with("::"))
+        })
+}
+
 /// cycles 보고서 — 순환과 함께 탐지에서 제외한 추정 간선 수를 싣는다.
 #[derive(Debug, Serialize)]
 pub struct CycleReport {
@@ -1912,6 +1927,24 @@ mod tests {
         assert_eq!(rep.cycles.len(), 1);
         assert!(rep.cycles[0].members.contains(&"c::a".to_string()));
         assert!(!rep.cycles[0].evidence.is_empty());
+    }
+
+    /// 구성원이 모듈 트리의 한 갈래(서로 조상·자손)에만 있는 순환만 중첩 순환이다 — 형제 모듈이나
+    /// 갈래 밖 모듈이 끼면 아니다. `a::bc`는 `a::b`의 자손이 아니다(세그먼트 경계).
+    #[test]
+    fn nested_module_cycle_needs_one_ancestor_chain() {
+        let cycle = |members: &[&str]| Cycle {
+            members: members.iter().map(|m| m.to_string()).collect(),
+            evidence: vec![],
+        };
+        assert!(is_nested_module_cycle(&cycle(&["c::m", "c::m::inner"])));
+        assert!(is_nested_module_cycle(&cycle(&["c", "c::m", "c::m::a::b"])));
+        assert!(!is_nested_module_cycle(&cycle(&["c::a", "c::b"])));
+        assert!(!is_nested_module_cycle(&cycle(&[
+            "c::m", "c::m::a", "c::m::b"
+        ])));
+        assert!(!is_nested_module_cycle(&cycle(&["c::a::b", "c::a::bc"])));
+        assert!(!is_nested_module_cycle(&cycle(&["c::m"])));
     }
 
     /// 재귀 Tarjan은 DFS 경로 길이만큼 호출 스택을 써서 수만 정점 고리·사슬에서
