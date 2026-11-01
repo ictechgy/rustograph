@@ -216,7 +216,16 @@ impl ModTree {
             }
             first => {
                 let module = self.modules.get(from)?;
-                if module.items.contains(first) || module.children.contains_key(first) {
+                // 뒤에 세그먼트가 이어지는 첫 세그먼트는 타입 이름공간(모듈·타입)이다 — 값
+                // 아이템(fn·const·static)은 경로를 시작하지 못한다. 같은 이름의 임포트와 값
+                // 아이템이 한 모듈에 있으면 컴파일되는 코드에서 임포트가 타입 이름공간이므로,
+                // `fn harvest`가 있는 모듈의 `harvest::f()`는 `use crate::harvest`를 따른다.
+                let imported_prefix = segs.len() > 1
+                    && module.value_items.contains(first)
+                    && module.imports.contains_key(first);
+                if !imported_prefix
+                    && (module.items.contains(first) || module.children.contains_key(first))
+                {
                     format!("{from}::{first}")
                 } else if let Some(imp) = module.imports.get(first) {
                     imp.target.clone()
@@ -754,6 +763,34 @@ mod tests {
         assert_eq!(
             t.resolve("c::m", &["util".into(), "h".into()], &none),
             Some("c::util::h".to_string())
+        );
+    }
+
+    /// 뒤에 세그먼트가 이어지는 첫 세그먼트는 타입 이름공간이다 — 같은 모듈의 값 아이템
+    /// (`fn util`)이 같은 이름으로 들인 모듈(`use crate::util`)을 가리지 않는다. 한 세그먼트
+    /// 값 자리(`util(1)`)는 지금처럼 그 fn이다. 두 이름이 한 모듈에 함께 있으면 컴파일되는
+    /// 코드에서 임포트는 타입 이름공간(모듈·타입)일 수밖에 없다.
+    #[test]
+    fn value_item_does_not_shadow_an_imported_module_prefix() {
+        let mut t = tree();
+        let none = DepCrates::new();
+        let m = t.modules.get_mut("c::m").expect("fixture module");
+        m.items.insert("util".to_string());
+        m.value_items.insert("util".to_string());
+        m.imports.insert(
+            "util".to_string(),
+            Import {
+                target: "c::util".to_string(),
+                cfg: None,
+            },
+        );
+        assert_eq!(
+            t.resolve("c::m", &["util".into(), "h".into()], &none),
+            Some("c::util::h".to_string())
+        );
+        assert_eq!(
+            t.resolve("c::m", &["util".into()], &none),
+            Some("c::m::util".to_string())
         );
     }
 

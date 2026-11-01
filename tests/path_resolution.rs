@@ -76,3 +76,36 @@ fn main() { a::call(); b::call(); }
     let rep = analysis::dead(&doc).unwrap();
     assert!(rep.findings.is_empty(), "{:?}", rep.findings);
 }
+
+/// 같은 모듈에 `fn util`과 `use crate::util`이 함께 있으면 `util::g()`의 `util`은 임포트한 모듈이다
+/// (경로 접두사는 타입 이름공간). 한 세그먼트 호출 `util(1)`은 지금처럼 그 fn이다. 이전에는 fn이
+/// 접두사를 가려 `util::g()`가 미해석이 되고 `util::g`가 unreachable로 나왔다.
+#[test]
+fn value_item_does_not_hide_an_imported_module_prefix() {
+    let doc = harvest(
+        "valueprefix",
+        r#"
+mod util { pub fn g() {} }
+mod b {
+    use crate::util;
+    fn util(x: u8) -> u8 { x }
+    pub fn caller() { util::g(); let _ = util(1); }
+}
+fn main() { b::caller(); }
+"#,
+    );
+    assert!(has_edge(
+        &doc,
+        "valueprefix::b::caller",
+        "valueprefix::util::g",
+        EdgeKind::Call
+    ));
+    assert!(has_edge(
+        &doc,
+        "valueprefix::b::caller",
+        "valueprefix::b::util",
+        EdgeKind::Call
+    ));
+    let rep = analysis::dead(&doc).unwrap();
+    assert!(rep.findings.is_empty(), "{:?}", rep.findings);
+}
