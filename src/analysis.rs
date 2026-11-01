@@ -1255,6 +1255,7 @@ fn dead_with(
         ));
     }
     limitations.extend(external_impl_limitation(index, &reach, implied));
+    limitations.extend(rootless_api_limitation(doc, roots, &reach));
     // 이름 팬아웃 폭 상한을 넘은 호출에는 간선이 없고, `--focus`는 보존 루트·들어오는 간선을 지운다.
     // 둘 다 이 판정의 입력을 줄이므로 그 문서 limitation은 판정 한계로도 싣는다 — JSON 보고서만 읽는
     // 소비자가 거짓 unreachable을 완전한 답으로 받지 않게. 수확 문장(폭 상한)을 포커스 문장보다 먼저
@@ -1266,6 +1267,41 @@ fn dead_with(
         findings,
         limitations,
     }
+}
+
+/// 보존 루트가 하나도 없는 크레이트의 unreachable exported 정점을 센 limitation — 셀 것이 없으면 없다.
+/// main 없는 lib의 공개 API는 워크스페이스 밖에서 불려 루트 없이는 전부 unreachable이다. 루트가 있는
+/// 크레이트(bin, `--root`를 준 크레이트)의 `pub` 아이템은 그 크레이트 밖 호출자가 없으니 세지 않는다.
+/// 공개 아이템을 루트로 삼으면(`--retain-public`) 공개 미도달이 없어 조용하다.
+fn rootless_api_limitation(
+    doc: &Document,
+    roots: &[String],
+    reach: &BTreeSet<&str>,
+) -> Option<String> {
+    let roots: BTreeSet<&str> = roots.iter().map(String::as_str).collect();
+    let rooted: BTreeSet<&str> = doc
+        .vertices
+        .iter()
+        .filter(|v| roots.contains(v.id.as_str()))
+        .map(|v| v.krate.as_str())
+        .collect();
+    let mut crates = BTreeSet::new();
+    let mut count = 0usize;
+    for v in &doc.vertices {
+        if !v.exported
+            || matches!(v.kind, Kind::Crate | Kind::Module)
+            || rooted.contains(v.krate.as_str())
+            || reach.contains(v.id.as_str())
+        {
+            continue;
+        }
+        count += 1;
+        crates.insert(v.krate.as_str());
+    }
+    (count > 0).then(|| format!(
+        "{count} unreachable symbols are exported items of crates with no retention root ({}); a library's public API is called from outside the workspace — --retain-public (MCP: retainPublic) retains exported symbols",
+        crates.into_iter().collect::<Vec<_>>().join(", ")
+    ))
 }
 
 /// 닿은 타입에 붙은 워크스페이스 밖 트레이트 impl 메서드를 센 limitation — 셀 것이 없으면 없다.
@@ -1782,6 +1818,78 @@ mod tests {
         );
         assert!(explain_path(&d, "c::cleanup").is_none());
         assert!(explain_path_with_options(&d, "c::only_unused", opts).is_none());
+    }
+
+    /// 크레이트 `krate`의 정점 — `exported`는 `pub` 선언이다.
+    fn in_crate(id: &str, kind: Kind, krate: &str, exported: bool) -> Vertex {
+        Vertex {
+            krate: krate.to_string(),
+            module: krate.to_string(),
+            exported,
+            ..v(id, kind)
+        }
+    }
+
+    /// 보존 루트가 하나도 없는 크레이트(main 없는 lib)의 공개 아이템은 워크스페이스 안에 호출자가
+    /// 없어 전부 unreachable이다 — 판정은 그대로 두고, 그 수와 크레이트를 세어 `--retain-public`을
+    /// 알린다. 루트가 있는 크레이트(bin)의 `pub` 아이템은 세지 않는다 — 그 크레이트 밖에서 불리지
+    /// 않는다. 공개 아이템을 루트로 삼으면(`--retain-public`) 셀 것이 없어 조용하다.
+    #[test]
+    fn dead_counts_exported_items_of_crates_without_roots() {
+        let d = document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec!["app::main".into()],
+            vec![
+                in_crate("app::main", Kind::Fn, "app", false),
+                in_crate("app::helper", Kind::Fn, "app", true),
+                in_crate("core::api", Kind::Fn, "core", true),
+                in_crate("core::Api", Kind::Struct, "core", true),
+                in_crate("core::private", Kind::Fn, "core", false),
+                in_crate("core::used", Kind::Fn, "core", true),
+                in_crate("macros::derive", Kind::Fn, "macros", true),
+            ],
+            vec![Edge::new(
+                "app::main".into(),
+                "core::used".into(),
+                EdgeKind::Call,
+            )],
+            vec![],
+        );
+        let rep = dead(&d).unwrap();
+        assert_eq!(
+            finding_ids(&rep),
+            [
+                "app::helper",
+                "core::Api",
+                "core::api",
+                "core::private",
+                "macros::derive"
+            ]
+        );
+        assert_eq!(
+            rep.limitations,
+            ["3 unreachable symbols are exported items of crates with no retention root (core, macros); a library's public API is called from outside the workspace — --retain-public (MCP: retainPublic) retains exported symbols"]
+        );
+        // 루트가 없는 문서(main 없는 lib만 있는 워크스페이스)도 같다.
+        let mut lib = d.clone();
+        lib.roots.clear();
+        assert_eq!(
+            dead(&lib).unwrap().limitations,
+            ["5 unreachable symbols are exported items of crates with no retention root (app, core, macros); a library's public API is called from outside the workspace — --retain-public (MCP: retainPublic) retains exported symbols"]
+        );
+        // 공개 아이템이 루트면 공개 미도달이 없어 limitation도 없다.
+        let public: Vec<String> = d
+            .vertices
+            .iter()
+            .filter(|v| v.exported)
+            .map(|v| v.id.clone())
+            .chain(d.roots.iter().cloned())
+            .collect();
+        let retained = QueryIndex::new(&d).dead(&public).unwrap();
+        assert_eq!(finding_ids(&retained), ["core::private"]);
+        assert!(retained.limitations.is_empty());
     }
 
     #[test]

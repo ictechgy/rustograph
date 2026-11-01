@@ -18,6 +18,9 @@
   impl과 닿지 않는 타입의 impl은 계속 보고한다. 기본 판정은 그대로이고, 기본 `dead` 보고서는 닿는 타입에 붙은 그런
   미도달 메서드 수를 limitation으로 센다(셀 것이 없으면 싣지 않는다). 라이브러리 호출자용 `analysis::DeadOptions`·
   `dead_with_options`·`explain_path_with_options`·`QueryIndex::dead_with_options`를 더했다(기존 함수는 그대로다).
+- `dead`·MCP `rustograph_dead`: 보존 루트가 하나도 없는 크레이트(main·`#[no_mangle]` 없는 lib)의 unreachable 공개
+  아이템 수와 크레이트 이름을 limitation으로 세고 `--retain-public`(MCP `retainPublic`)을 알린다. 판정과 종료 코드는
+  그대로다. 이전에는 lib 크레이트의 첫 `dead`가 공개 API 전부를 unreachable로 내면서 아무 안내가 없었다.
 
 ## [0.6.0]
 

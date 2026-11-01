@@ -567,6 +567,14 @@ visible — are still reported when unused, and so are impls on types nothing
 reaches. A reachable type does not prove the trait is used: code reached only
 through such an impl is not reported even where the impl is never called.
 
+A library's public API is called from outside the workspace, so a crate with
+no retention root — a library without `fn main` or `#[no_mangle]` entry
+points, given no `--root` — has every exported item unreachable unless
+`--retain-public` (MCP: `retainPublic`) makes exported symbols roots. `dead`
+still reports them by default; its report counts those exported items and
+names the crates (exported items of crates that have a root, such as `pub`
+items of a binary, are not counted).
+
 The syntactic harvest does not read a module file — a `mod` file or a crate
 root — larger than 64 MiB. Its module or crate vertex stays, but the items and
 submodules it declares are missing, and `limitations` counts such files, so

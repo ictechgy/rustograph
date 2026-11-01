@@ -275,3 +275,51 @@ fn retaining_external_trait_impls_removes_the_cascade_only() {
     assert_eq!(body["findings"], json["findings"]);
     assert_eq!(body["limitations"], json["limitations"]);
 }
+
+/// main 없는 lib — 공개 아이템 넷과 비공개 미사용 하나.
+const LIB: &str = r#"
+pub struct Config;
+pub fn parse() -> Config { Config }
+pub fn render(_: &Config) {}
+pub mod nested { pub fn helper() {} }
+fn private_unused() {}
+"#;
+
+/// 루트가 없는 lib 크레이트에서 기본 `dead`는 지금처럼 공개 API를 전부 unreachable로 보고하고
+/// `--strict`는 1이다. 대신 텍스트·JSON 보고서가 그 수와 `--retain-public`을 알린다. `--retain-public`
+/// 실행에서는 공개 아이템이 루트라 보고서도 limitation도 조용하다(비공개 미사용만 남는다).
+#[test]
+fn library_without_roots_points_at_retain_public() {
+    let krate = Crate::new(
+        "lib",
+        &[("Cargo.toml", &manifest("rglib")), ("src/lib.rs", LIB)],
+    );
+    let hint = "4 unreachable symbols are exported items of crates with no retention root (rglib); a library's public API is called from outside the workspace — --retain-public (MCP: retainPublic) retains exported symbols";
+    let (code, json) = run(krate.path(), &["dead", "--strict", "--format", "json"]);
+    assert_eq!(code, Some(1));
+    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(json["roots"], serde_json::json!([]));
+    assert_eq!(json["findings"].as_array().unwrap().len(), 5);
+    assert!(
+        json["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l == hint),
+        "{}",
+        json["limitations"]
+    );
+    let (_, text) = run(krate.path(), &["dead"]);
+    assert!(text.contains("5 unreachable\n"), "{text}");
+    assert!(text.contains(&format!("limitation: {hint}\n")), "{text}");
+
+    let (code, kept) = run(krate.path(), &["dead", "--retain-public"]);
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        kept.lines()
+            .filter(|l| l.starts_with("unreachable "))
+            .collect::<Vec<_>>(),
+        ["unreachable fn: rglib::private_unused"]
+    );
+    assert!(!kept.contains("--retain-public"), "{kept}");
+}
