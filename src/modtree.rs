@@ -629,6 +629,14 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
     }
 }
 
+/// use 경로 끝 세그먼트를 붙인다. 그룹 안의 `self`(`use a::b::{self}`·`{self as x}`)는 그룹 앞
+/// 경로 자체라 붙이지 않는다 — 임포트 이름은 그 마지막 세그먼트(`b`)나 별칭이다.
+fn push_use_segment(path: &mut Vec<String>, ident: &syn::Ident) {
+    if ident != "self" || path.is_empty() {
+        path.push(ident.to_string());
+    }
+}
+
 /// `use` 트리를 평탄한 경로 목록으로 펼친다 — `{a, b}` 그룹과 `as` 별칭을 처리한다.
 /// 경로마다 use 아이템의 cfg를 붙여야 해서 결과는 콜백으로 흘려보낸다.
 fn flatten_use(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut dyn FnMut(Vec<String>)) {
@@ -640,12 +648,12 @@ fn flatten_use(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut dyn FnMu
         }
         syn::UseTree::Name(n) => {
             let mut p = prefix.clone();
-            p.push(n.ident.to_string());
+            push_use_segment(&mut p, &n.ident);
             out(p);
         }
         syn::UseTree::Rename(r) => {
             let mut p = prefix.clone();
-            p.push(r.ident.to_string());
+            push_use_segment(&mut p, &r.ident);
             p.push(format!("as {}", r.rename));
             out(p);
         }
@@ -714,6 +722,38 @@ mod tests {
         assert_eq!(
             t.resolve("c", &["f".into()], &none),
             Some("c::f".to_string())
+        );
+    }
+
+    /// 그룹 안의 `self`(`use crate::util::{self, h as hh}`·`{self as u2}`)는 그룹 앞 경로 자체를
+    /// 들인다 — 이름은 그 마지막 세그먼트나 별칭이다. `self`를 세그먼트로 붙여 해석하면
+    /// `c::util::self`가 없어 임포트가 조용히 사라지고, `util::h()`와 모듈 `uses` 간선이 빠진다.
+    #[test]
+    fn use_group_self_imports_the_prefix_module() {
+        let mut t = tree();
+        let none = DepCrates::new();
+        let file: syn::File =
+            syn::parse_str("use crate::util::{self, h as hh}; use crate::util::{self as u2};")
+                .expect("valid use items");
+        let items: Vec<&syn::Item> = file.items.iter().collect();
+        fill_imports(&mut t, "c::m", &items, &none);
+        let imports = &t.modules["c::m"].imports;
+        let targets: Vec<(&str, &str)> = imports
+            .iter()
+            .map(|(alias, imp)| (alias.as_str(), imp.target.as_str()))
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                ("h", "c::util::h"),
+                ("hh", "c::util::h"),
+                ("u2", "c::util"),
+                ("util", "c::util")
+            ]
+        );
+        assert_eq!(
+            t.resolve("c::m", &["util".into(), "h".into()], &none),
+            Some("c::util::h".to_string())
         );
     }
 

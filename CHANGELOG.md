@@ -9,6 +9,9 @@
 - 본문 타입·제네릭 인자·qself·클로저 반환형의 참조를 수확하고, const 표현식 방문과
   타입/const 제네릭 매개변수의 이름 가림을 보존한다.
 - 컴포넌트 패턴의 세그먼트 안에서 `*`·`?`를 지원한다. `::` 경계는 넘지 않는다.
+- `use a::b::{self}`·`use a::b::{self as x}`가 모듈 `b`를 임포트한다. 이전에는 `b::self`를 찾다 임포트가 사라져
+  `b::f()` 호출과 모듈 `uses` 간선이 빠졌다 — 최상위가 아닌 모듈의 함수가 `dead`에 unreachable로 나오고,
+  `impact`가 그 호출자를, `rules`·모듈 레벨 `cycles`가 그 의존을 보지 못했다.
 - `rules`·MCP `rustograph_rules`: 간선이 정렬되지 않은 문서(`--graph`로 읽은 다른 도구의 문서 등)에서 같은
   `(rule, from, to)`의 간선 종류가 call·references·call처럼 섞여도 같은 기준선 키(`rule|from|to|kind`)의 위반을
   한 번만 보고한다. 이전에는 정렬 키에 kind가 없어 같은 위반이 두 번 나올 수 있었다. 수확한 문서의 결과는 같다.
