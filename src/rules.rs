@@ -259,7 +259,10 @@ pub fn check(doc: &Document, cfg: &Config) -> RulesReport {
             });
         }
     }
-    violations.sort_by(|a, b| (&a.rule, &a.from, &a.to).cmp(&(&b.rule, &b.from, &b.to)));
+    // 정렬 키는 dedup 키(기준선 키의 넷)와 같아야 한다 — kind가 빠지면 정렬되지 않은 문서에서
+    // 같은 키가 이웃하지 않아 중복이 남는다. 수확 문서는 간선이 (from, to, kind) 순이라 순서가 같다.
+    violations
+        .sort_by(|a, b| (&a.rule, &a.from, &a.to, a.kind).cmp(&(&b.rule, &b.from, &b.to, b.kind)));
     violations
         .dedup_by(|a, b| a.rule == b.rule && a.from == b.from && a.to == b.to && a.kind == b.kind);
     RulesReport {
@@ -368,6 +371,29 @@ mod tests {
         assert_eq!(rep.violations.len(), 1);
         assert_eq!(rep.violations[0].rule, "signature");
         assert_eq!(rep.violations[0].from, "c::ui::b");
+    }
+
+    /// 정렬되지 않은 문서(`--graph`로 읽은 다른 도구의 문서, 라이브러리 호출자가 만든 문서)에서
+    /// 같은 (rule, from, to)의 간선 종류가 call·references·call로 섞여도 위반은 기준선 키
+    /// (`rule|from|to|kind`)마다 하나다 — 정렬 키에 kind가 없으면 dedup이 이웃한 중복만 지워
+    /// 같은 키가 두 번 남는다.
+    #[test]
+    fn violations_dedup_by_kind_regardless_of_edge_order() {
+        let mut d = doc(vec![]);
+        d.edges = vec![
+            Edge::new("c::core::a".into(), "c::ui::b".into(), EdgeKind::Call),
+            Edge::new("c::core::a".into(), "c::ui::b".into(), EdgeKind::References),
+            Edge::new("c::core::a".into(), "c::ui::b".into(), EdgeKind::Call),
+        ];
+        let rep = check(&d, &cfg());
+        let keys: Vec<String> = rep.violations.iter().map(Violation::key).collect();
+        assert_eq!(
+            keys,
+            [
+                "deny|c::core::a|c::ui::b|call",
+                "deny|c::core::a|c::ui::b|references"
+            ]
+        );
     }
 
     #[test]
