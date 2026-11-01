@@ -391,7 +391,8 @@ fn cmd_cycles(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
         rep.cycles.retain(|c| !analysis::is_nested_module_cycle(c));
     }
     match a.get("format").unwrap_or("text") {
-        "json" if exclude_nested && nested > 0 => {
+        // 플래그를 준 보고서는 뺀 수가 0이어도 키를 싣는다 — 소비자가 적용 여부를 안다.
+        "json" if exclude_nested => {
             let mut json = serde_json::to_value(&rep).expect("cycle report must serialize");
             json["excluded_nested"] = serde_json::json!(nested);
             write!(out, "{}", export::to_json(&json)).ok()
@@ -405,13 +406,13 @@ fn cmd_cycles(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
             if exclude_nested && nested > 0 {
                 writeln!(
                     out,
-                    "  note: {nested} cycles involving only a module and its own descendants were excluded (--exclude-nested-modules)"
+                    "  note: excluded {nested} cycle(s) that involve only a module and its own descendants (--exclude-nested-modules)"
                 )
                 .ok();
             } else if nested > 0 {
                 writeln!(
                     out,
-                    "  note: {nested} of these cycles involve only a module and its own descendants (e.g. a child calling `super::`); --exclude-nested-modules leaves them out"
+                    "  note: {nested} cycle(s) above involve only a module and its own descendants (e.g. a child calling `super::`); --exclude-nested-modules leaves them out"
                 )
                 .ok();
             }

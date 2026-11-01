@@ -99,7 +99,7 @@ rustograph impact --format language-traversal --roots-from schema-facts.json  # 
 자식을 쓰고 자식이 `super::`로 부모를 부르는 관용 구조)은 `cycles --level module`이
 지금처럼 보고하고 텍스트 출력의 `note:` 줄에 그 수를 셉니다.
 `--exclude-nested-modules`는 그 순환을 빼고(`--strict` 판정 포함) JSON 보고서에
-`excluded_nested`를 싣습니다. 형제나 다른 모듈이 끼는 순환은 항상 보고합니다. 이
+뺀 수 `excluded_nested`(없으면 `0`)를 싣습니다. 형제나 다른 모듈이 끼는 순환은 항상 보고합니다. 이
 플래그는 CLI 전용이고 모듈 레벨에서만 받습니다. 자기 자신으로 가는 간선은 만들지 않습니다 —
 직접 재귀(`fn f() { f() }`)는 `cycles --level symbol`에 나오지 않고, 서로
 부르는 두 심볼은 순환으로 나옵니다. 재귀 함수도 호출자에게서 닿으므로

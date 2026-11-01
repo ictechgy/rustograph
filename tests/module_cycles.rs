@@ -67,7 +67,7 @@ fn nested_module_cycles_are_noted_and_excluded_only_on_request() {
         ),
         "{text}"
     );
-    assert!(text.contains("  note: 1 of these cycles involve only a module and its own descendants (e.g. a child calling `super::`); --exclude-nested-modules leaves them out\n"), "{text}");
+    assert!(text.contains("  note: 1 cycle(s) above involve only a module and its own descendants (e.g. a child calling `super::`); --exclude-nested-modules leaves them out\n"), "{text}");
     let (_, json, _) = run(&dir, &["cycles", "--level", "module", "--format", "json"]);
     let json: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(json["cycles"].as_array().unwrap().len(), 2);
@@ -77,7 +77,7 @@ fn nested_module_cycles_are_noted_and_excluded_only_on_request() {
     let flag = ["cycles", "--level", "module", "--exclude-nested-modules"];
     let (code, text, _) = run(&dir, &[&flag[..], &["--strict"]].concat());
     assert_eq!(code, Some(1));
-    assert!(text.starts_with("1 cycle(s)\n  cycle: modcyc::a -> modcyc::b\n  note: 1 cycles involving only a module and its own descendants were excluded (--exclude-nested-modules)\n"), "{text}");
+    assert!(text.starts_with("1 cycle(s)\n  cycle: modcyc::a -> modcyc::b\n  note: excluded 1 cycle(s) that involve only a module and its own descendants (--exclude-nested-modules)\n"), "{text}");
     let (_, json, _) = run(&dir, &[&flag[..], &["--format", "json"]].concat());
     let json: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(
@@ -93,6 +93,9 @@ fn nested_module_cycles_are_noted_and_excluded_only_on_request() {
     let (code, text, _) = run(&dir, &[&flag[..], &["--strict"]].concat());
     assert_eq!(code, Some(0), "{text}");
     assert!(text.starts_with("0 cycle(s)\n"), "{text}");
+    let (_, json, _) = run(&dir, &[&flag[..], &["--format", "json"]].concat());
+    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(json["excluded_nested"], 1);
     // 모듈 레벨이 아니면 쓰지 않는 플래그라 사용법 오류다.
     let (code, _, err) = run(
         &dir,
@@ -101,4 +104,37 @@ fn nested_module_cycles_are_noted_and_excluded_only_on_request() {
     assert_eq!(code, Some(2));
     assert!(err.contains("--exclude-nested-modules"), "{err}");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 플래그를 주면 뺀 순환이 없어도 JSON에 `excluded_nested: 0`을 싣는다 — 소비자가 플래그가 적용된
+/// 보고서인지 안다. 기본 JSON에는 키가 없고, 텍스트는 셀 것이 없으면 조용하다.
+#[test]
+fn exclude_nested_modules_reports_zero_when_nothing_was_excluded() {
+    let root = std::env::temp_dir().join(format!(
+        "rustograph-module-cycles-none-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='nocyc'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/main.rs"),
+        "mod a { pub fn f() {} }\nfn main() { a::f(); }\n",
+    )
+    .unwrap();
+    let flag = ["cycles", "--level", "module", "--exclude-nested-modules"];
+    let (code, json, _) = run(&root, &[&flag[..], &["--format", "json"]].concat());
+    assert_eq!(code, Some(0));
+    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(json["cycles"], serde_json::json!([]));
+    assert_eq!(json["excluded_nested"], 0);
+    let (_, plain, _) = run(&root, &["cycles", "--level", "module", "--format", "json"]);
+    let plain: serde_json::Value = serde_json::from_str(&plain).unwrap();
+    assert!(plain.get("excluded_nested").is_none());
+    let (_, text, _) = run(&root, &flag);
+    assert!(!text.contains("note: excluded"), "{text}");
+    std::fs::remove_dir_all(&root).unwrap();
 }

@@ -31,7 +31,7 @@
   `DeadOptions`는 `#[non_exhaustive]`라 선택지가 늘어도 호출자가 깨지지 않는다 — `DeadOptions::default()`에서 필드를
   바꿔 만든다.
 - `cycles --level module --exclude-nested-modules`(opt-in, CLI): 구성원이 한 모듈과 그 자손뿐인 순환(자식의
-  `super::` 호출 등)을 빼고 판정한다(`--strict` 포함). JSON 보고서에는 뺀 수를 `excluded_nested`로 싣는다. 형제나
+  `super::` 호출 등)을 빼고 판정한다(`--strict` 포함). JSON 보고서에는 뺀 수를 `excluded_nested`로 싣는다(없으면 `0`). 형제나
   다른 모듈이 끼는 순환은 계속 보고한다. 기본 판정과 JSON은 그대로이고, 기본 텍스트 출력은 그런 순환이 있을 때 그
   수와 플래그를 `note:` 줄로 알린다. 모듈 레벨이 아니면 사용법 오류다.
 - `dead`·MCP `rustograph_dead`: 보존 루트가 하나도 없는 크레이트(main·`#[no_mangle]` 없는 lib)의 unreachable 공개

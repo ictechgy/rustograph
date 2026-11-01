@@ -177,7 +177,7 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
   idiomatic Rust. `cycles --level module` still reports it, and its text
   output counts such cycles in a `note:` line; `--exclude-nested-modules`
   leaves them out (also for `--strict`) and the JSON report then carries
-  `excluded_nested`. A cycle that also involves a sibling or unrelated module
+  `excluded_nested`, the number left out (`0` when there were none). A cycle that also involves a sibling or unrelated module
   is always reported. The flag is CLI-only and module-level only.
 - No edge points from a symbol to itself: direct recursion (`fn f() { f() }`)
   is not reported by `cycles --level symbol`, while mutual recursion between
