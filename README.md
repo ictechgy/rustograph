@@ -573,10 +573,11 @@ call, and the report counts the ones on reachable types. `dead
 --retain-external-trait-impls` (MCP `rustograph_dead`:
 `retainExternalTraitImpls`) treats each of them as reachable once its type is
 reachable and follows what it calls; its report counts the methods kept that
-way. An impl counts as external when its type has no `implements` edge to a
-workspace trait of that name, so impls of workspace traits — whose calls are
-visible — are still reported when unused, and so are impls on types nothing
-reaches. A reachable type does not prove the trait is used: code reached only
+way. An impl counts as external when none of the workspace traits its type
+`implements` has that name or declares that method — an impl written through
+an alias or re-export (`use t::Tr as Alias; impl Alias for S`) is a workspace
+impl. Impls of workspace traits — whose calls are visible — are still reported
+when unused, and so are impls on types nothing reaches. A reachable type does not prove the trait is used: code reached only
 through such an impl is not reported even where the impl is never called.
 
 A library's public API is called from outside the workspace, so a crate with

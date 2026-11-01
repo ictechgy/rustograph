@@ -323,3 +323,62 @@ fn library_without_roots_points_at_retain_public() {
     );
     assert!(!kept.contains("--retain-public"), "{kept}");
 }
+
+/// 별칭으로 구현한 워크스페이스 트레이트(`use t::Tr as Alias; impl Alias for S`)는 외부 트레이트가 아니다 —
+/// 보존 선택지를 켜도 그 impl과 그것만 부르는 함수를 보고하고, 기본 보고서의 외부 impl 계수에도 넣지
+/// 않는다. 닿는 타입의 std `Display` impl은 계속 보존·계수되고, 만들지 않는 타입의 `Drop`은 보고된다.
+#[test]
+fn aliased_workspace_trait_impl_is_not_retained() {
+    let krate = Crate::new(
+        "alias",
+        &[
+            ("Cargo.toml", &manifest("traits")),
+            (
+                "src/main.rs",
+                r#"
+mod t { pub trait Tr { fn run(&self); } }
+use t::Tr as Alias;
+pub struct S;
+impl Alias for S { fn run(&self) { only_from_alias_impl() } }
+fn only_from_alias_impl() {}
+
+mod g { pub struct G; impl Drop for G { fn drop(&mut self) { super::only_from_drop() } } }
+#[allow(unused_imports)]
+use g::G;
+fn only_from_drop() {}
+
+pub struct Shown;
+impl std::fmt::Display for Shown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_helper(); write!(f, "x") }
+}
+fn fmt_helper() {}
+
+fn main() { let _s = S; let _w = Shown; }
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(krate.path());
+    let rep = analysis::dead(&doc).unwrap();
+    assert!(
+        rep.limitations.iter().any(|l| l
+            .starts_with("1 unreachable methods implement traits declared outside the workspace")),
+        "{:?}",
+        rep.limitations
+    );
+    let opts = analysis::DeadOptions {
+        retain_external_trait_impls: true,
+    };
+    let kept = analysis::dead_with_options(&doc, opts).unwrap();
+    assert_eq!(
+        ids(&kept),
+        [
+            "traits::S::<Alias>::run",
+            "traits::g::G",
+            "traits::g::G::<Drop>::drop",
+            "traits::only_from_alias_impl",
+            "traits::only_from_drop",
+            "traits::t::Tr::run",
+        ]
+    );
+}

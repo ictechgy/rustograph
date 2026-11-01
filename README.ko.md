@@ -341,8 +341,9 @@ unreachable로 남고, 보고서가 닿는 타입에 붙은 그런 메서드 수
 `dead --retain-external-trait-impls`(MCP `rustograph_dead`의
 `retainExternalTraitImpls`)는 타입이 닿으면 그 메서드도 닿은 것으로 보고 그
 메서드가 부르는 코드까지 따라가며, 그렇게 보존한 메서드 수를 보고서에 셉니다.
-타입에서 같은 이름의 워크스페이스 트레이트로 가는 `implements` 간선이 없는
-impl을 외부 트레이트 impl로 봅니다 — 호출이 보이는 워크스페이스 트레이트의
+타입이 `implements`로 구현하는 워크스페이스 트레이트 가운데 그 이름이거나 그
+메서드를 선언한 것이 없는 impl을 외부 트레이트 impl로 봅니다(별칭·재노출 이름으로
+쓴 `use t::Tr as Alias; impl Alias for S`는 워크스페이스 impl입니다) — 호출이 보이는 워크스페이스 트레이트의
 미사용 impl과 아무도 닿지 않는 타입의 impl은 계속 보고됩니다. 타입이 닿는다고
 트레이트가 쓰인다는 뜻은 아니므로, 그런 impl로만 닿는 코드는 그 impl이 불리지
 않아도 보고되지 않습니다.

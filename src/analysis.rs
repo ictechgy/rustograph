@@ -1123,13 +1123,17 @@ pub fn reachable(doc: &Document) -> BTreeSet<&str> {
 /// 도달성 색인을 간선 한 바퀴로 만든다. 의존 간선은 [`Document::outgoing`]과 같은 순서로 싣는다.
 ///
 /// 트레이트 impl 메서드 ID는 `Type::<Trait>::m`(같은 경로의 선언이 겹치면 `Type::<Trait>::@…`)이고
-/// self 타입이 `contains`로 소유한다. 트레이트가 워크스페이스 정점으로 해석되면 수확이
-/// `Type → Trait` implements 간선을 남긴다. 같은 타입에서 마지막 세그먼트가 `Trait`인 implements가
-/// 없으면 그 impl의 트레이트는 워크스페이스 밖(std·의존 크레이트)이거나 해석되지 않은 것이다 — 어느
-/// 쪽이든 그 메서드의 호출자는 그래프에 없다.
+/// self 타입이 `contains`로 소유한다. `Trait`은 impl에 쓴 이름이라 별칭(`use t::Tr as Alias`)이나 재노출
+/// 이름일 수 있고, 트레이트가 워크스페이스 정점으로 해석되면 수확이 해석된 트레이트로 `Type → Trait`
+/// implements 간선을 남긴다. 그래서 같은 타입이 구현하는 워크스페이스 트레이트 가운데 마지막 세그먼트가
+/// `Trait`이거나 같은 이름의 메서드(`Trait::m`)를 선언한 것이 있으면 워크스페이스 트레이트 impl로 본다.
+/// 둘 다 없으면 그 impl의 트레이트는 워크스페이스 밖(std·의존 크레이트)이거나 해석되지 않은 것이다 —
+/// 어느 쪽이든 그 메서드의 호출자는 그래프에 없다.
 fn reach_index(doc: &Document) -> ReachIndex<'_> {
     let mut out: ReachMap<'_> = BTreeMap::new();
-    let mut implemented: BTreeSet<(&str, &str)> = BTreeSet::new();
+    // self 타입 → 구현하는 워크스페이스 트레이트, (소유자, 바로 아래 한 세그먼트 이름) 소유 쌍.
+    let mut implemented: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut owned: BTreeSet<(&str, &str)> = BTreeSet::new();
     let mut impl_methods: Vec<(&str, &str, &str)> = Vec::new();
     for e in &doc.edges {
         if e.kind.is_dependency() {
@@ -1137,16 +1141,29 @@ fn reach_index(doc: &Document) -> ReachIndex<'_> {
                 .or_default()
                 .push((&e.kind, e.to.as_str()));
             if e.kind == EdgeKind::Implements {
-                let name = e.to.rsplit("::").next().unwrap_or(&e.to);
-                implemented.insert((e.from.as_str(), name));
+                implemented
+                    .entry(e.from.as_str())
+                    .or_default()
+                    .push(e.to.as_str());
             }
         } else if let Some(name) = trait_impl_name(&e.from, &e.to) {
             impl_methods.push((e.from.as_str(), name, e.to.as_str()));
+        } else if let Some(member) =
+            e.to.strip_prefix(e.from.as_str())
+                .and_then(|rest| rest.strip_prefix("::"))
+        {
+            owned.insert((e.from.as_str(), member));
         }
     }
     let mut external_impls: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for (owner, name, method) in impl_methods {
-        if !implemented.contains(&(owner, name)) {
+        let method_name = method.rsplit("::").next().unwrap_or(method);
+        let workspace = implemented.get(owner).is_some_and(|traits| {
+            traits.iter().any(|tr| {
+                tr.rsplit("::").next() == Some(name) || owned.contains(&(*tr, method_name))
+            })
+        });
+        if !workspace {
             external_impls.entry(owner).or_default().insert(method);
         }
     }
@@ -1833,6 +1850,64 @@ mod tests {
         );
         assert!(explain_path(&d, "c::cleanup").is_none());
         assert!(explain_path_with_options(&d, "c::only_unused", opts).is_none());
+    }
+
+    /// 별칭(`use t::Tr as Alias; impl Alias for S`)이나 재노출 이름으로 구현한 워크스페이스 트레이트는
+    /// 외부가 아니다 — 메서드 ID는 쓴 이름(`S::<Alias>::run`)이지만 implements는 해석된 트레이트
+    /// (`t::Tr`)로 가고, 그 트레이트가 같은 이름의 메서드(`t::Tr::run`)를 선언한다. 호출이 보이는
+    /// 워크스페이스 트레이트의 미사용 impl이므로 보존 선택지를 켜도 그것과 그것만 부르는 코드를 보고하고,
+    /// 기본 보고서의 외부 impl 계수에도 넣지 않는다.
+    #[test]
+    fn aliased_workspace_trait_impls_are_not_external() {
+        let edge = |from: &str, to: &str, kind| Edge::new(from.into(), to.into(), kind);
+        let d = document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec!["c::main".into()],
+            vec![
+                v("c::main", Kind::Fn),
+                v("c::t::Tr", Kind::Trait),
+                v("c::t::Tr::run", Kind::Method),
+                v("c::S", Kind::Struct),
+                v("c::S::<Alias>::run", Kind::Method),
+                v("c::only_from_alias_impl", Kind::Fn),
+                v("c::S::<Display>::fmt", Kind::Method),
+            ],
+            vec![
+                edge("c::main", "c::S", EdgeKind::References),
+                edge("c::t::Tr", "c::t::Tr::run", EdgeKind::Contains),
+                edge("c::S", "c::t::Tr", EdgeKind::Implements),
+                edge("c::S", "c::S::<Alias>::run", EdgeKind::Contains),
+                edge("c::S", "c::S::<Display>::fmt", EdgeKind::Contains),
+                edge(
+                    "c::S::<Alias>::run",
+                    "c::only_from_alias_impl",
+                    EdgeKind::Call,
+                ),
+            ],
+            vec![],
+        );
+        let rep = dead(&d).unwrap();
+        assert!(
+            rep.limitations[1]
+                .starts_with("1 unreachable methods implement traits declared outside"),
+            "{:?}",
+            rep.limitations
+        );
+        let opts = DeadOptions {
+            retain_external_trait_impls: true,
+        };
+        let kept = dead_with_options(&d, opts).unwrap();
+        assert_eq!(
+            finding_ids(&kept),
+            [
+                "c::S::<Alias>::run",
+                "c::only_from_alias_impl",
+                "c::t::Tr::run"
+            ]
+        );
+        assert!(kept.limitations[1].starts_with("1 methods implementing traits declared outside"));
     }
 
     /// 크레이트 `krate`의 정점 — `exported`는 `pub` 선언이다.
