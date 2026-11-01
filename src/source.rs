@@ -927,10 +927,25 @@ fn harvest(
             modtree::fill_items(&mut tree, &mp, &flatten_items(&groups));
         }
     }
-    for mp in tree.modules.keys().cloned().collect::<Vec<_>>() {
-        if let Some(groups) = module_items(&tree, &arena, &mp) {
-            modtree::fill_imports(&mut tree, &mp, &flatten_items(&groups), &dep_crates);
-        }
+    // 재노출(`pub use`)을 따라가는 해석은 다른 모듈의 임포트 표를 읽는다 — 표가 더 바뀌지 않을 때까지
+    // 되풀이한다. 상한 안에서 끝나지 않은 모듈은 그 경로가 미해석일 수 있어 센다.
+    let module_uses: Vec<(String, Vec<&syn::Item>)> = tree
+        .modules
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .filter_map(|mp| {
+            let groups = module_items(&tree, &arena, &mp)?;
+            Some((mp, flatten_items(&groups)))
+        })
+        .collect();
+    let unsettled = modtree::fill_imports_settled(&mut tree, &module_uses, &dep_crates);
+    if unsettled > 0 {
+        limitations.push(format!(
+            "{unsettled} modules still changed their `use` imports after {} resolution passes (re-export chains); paths through those imports may be unresolved",
+            modtree::MAX_IMPORT_PASSES
+        ));
     }
 
     // 1패스: 모듈·아이템 선언 — 정점과 contains/uses/implements 간선.

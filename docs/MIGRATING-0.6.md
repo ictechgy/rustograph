@@ -11,6 +11,12 @@ empty and `fill_items` fills it. Callers constructing `Module` by struct
 literal must provide it. A path prefix (`name::item`) resolves to such a local
 item before a same-named import, and to the import when the local name is only
 a value or macro item.
+Paths now resolve through `use` re-exports to the defining item, so one
+`fill_imports` pass per module no longer settles every import: callers that
+build a `ModTree` themselves should call `modtree::fill_imports_settled`, which
+repeats the pass until the import tables stop changing (at most
+`modtree::MAX_IMPORT_PASSES`) and returns the number of modules still changing.
+`modtree::Import` now implements `PartialEq` and `Eq`.
 
 `change-impact --base REV [--head REV | --working-tree]` and the MCP tool
 `rustograph_change_impact` capture actual changes into separate before/after

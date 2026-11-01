@@ -21,6 +21,14 @@
   그 이름의 임포트를 따른다. 이전에는 `fn harvest`가 `use crate::harvest`를 가려 `harvest::f()`가 미해석이 됐다.
   한 세그먼트 호출 `name()`은 지금처럼 그 fn이다. 라이브러리 호출자용 `modtree::Module`에 `type_items`가 늘었다
   ([0.6 migration](docs/MIGRATING-0.6.md)).
+- 경로 해석이 재노출을 따라간다: 다른 모듈이 `use`로 들인 이름(`pub use inner::Tr`, `pub use inner::*`,
+  `pub use inner::deep as shortcut`, 다른 멤버 크레이트 루트의 재노출)을 지나는 경로(`crate::Tr`, `use crate::prelude::*`가
+  들인 이름, `crate::shortcut::f()`, `use a::Tr`)를 정의 위치로 해석하고, 글롭은 대상 모듈의 재노출도 펼친다. 이전에는
+  그런 임포트·호출·impl의 트레이트 경로가 미해석이라 정의가 `dead`에 unreachable로 나오고 `impact`·`rules`·`cycles`에서도
+  빠졌으며, 재노출로 이름 붙인 워크스페이스 트레이트의 impl이 `--retain-external-trait-impls`와 기본 보고서의 계수에서 외부
+  트레이트 impl로 분류됐다. 명시 임포트는 같은 이름의 글롭 임포트를 소스 순서와 무관하게 가린다. 재노출 사슬은 임포트 표가
+  더 바뀌지 않을 때까지 해석을 되풀이해 풀고(최대 32바퀴), 그 안에 끝나지 않은 모듈 수는 limitation으로 센다. 라이브러리
+  호출자용 `modtree::fill_imports_settled`·`MAX_IMPORT_PASSES`를 더했다([0.6 migration](docs/MIGRATING-0.6.md)).
 - `rules`·MCP `rustograph_rules`: 간선이 정렬되지 않은 문서(`--graph`로 읽은 다른 도구의 문서 등)에서 같은
   `(rule, from, to)`의 간선 종류가 call·references·call처럼 섞여도 같은 기준선 키(`rule|from|to|kind`)의 위반을
   한 번만 보고한다. 이전에는 정렬 키에 kind가 없어 같은 위반이 두 번 나올 수 있었다. 수확한 문서의 결과는 같다.

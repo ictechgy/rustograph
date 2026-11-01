@@ -57,7 +57,7 @@ impl DepCrates {
 
 /// `use` 임포트 하나 — 해석된 정규 경로와 `#[cfg]` 조건.
 /// 조건이 있으면 그 빌드에서만 존재하는 임포트다 — 간선도 조건을 물려받는다.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Import {
     /// 정규 ID (`crate::mod::item`).
     pub target: String,
@@ -236,7 +236,7 @@ impl ModTree {
                         // 별칭은 그 멤버의 루트 정점으로 재작성해 계속 걷는다
                         // — 패키지 이름과 타깃(루트) 이름이 다를 수 있다.
                         return if t.member {
-                            match self.walk(&t.vertex, &segs[1..]) {
+                            match self.walk(&t.vertex, &segs[1..], dep_crates) {
                                 Some(x) => Some(x),
                                 // 루트 모듈이 트리에 없는 멤버(proc-macro
                                 // 크레이트 등)는 내부를 모른다 — 외부처럼
@@ -255,7 +255,7 @@ impl ModTree {
                         // 같은 워크스페이스의 다른 크레이트 루트 모듈 —
                         // 선언 없는 직접 참조는 컴파일되지 않지만, 관대하게
                         // 해석하는 쪽이 잃는 것보다 낫다.
-                        return self.walk(first, &segs[1..]);
+                        return self.walk(first, &segs[1..], dep_crates);
                     } else {
                         return None;
                     }
@@ -268,17 +268,32 @@ impl ModTree {
         if dep_crates.external.contains(start.as_str()) {
             return Some(start);
         }
-        self.walk(&start, &segs[i..])
+        self.walk(&start, &segs[i..], dep_crates)
     }
 
     /// 시작 경로에서 나머지 세그먼트를 따라 걷는다.
     /// 중간 세그먼트가 모듈이면 내려가고, 아니면 아이템 경로로 존재를 확인한다.
-    fn walk(&self, start: &str, rest: &[String]) -> Option<String> {
+    /// 지나는 모듈이 그 세그먼트를 선언하지 않고 `use`로 들였으면(재노출 — `pub use inner::Tr`,
+    /// `pub use inner::*`가 펼친 이름, 모듈 별칭) 그 임포트의 대상에서 이어 걷는다 — 정규 ID는
+    /// 정의 위치다. 따라갈 때마다 세그먼트를 하나 소비하므로 재노출이 서로를 가리켜도 끝난다.
+    /// 대상이 외부 크레이트 정점이면 그 정점으로 붕괴한다([`ModTree::resolve`]와 같다).
+    fn walk(&self, start: &str, rest: &[String], dep_crates: &DepCrates) -> Option<String> {
         let mut cur = start.to_string();
-        for (j, seg) in rest.iter().enumerate() {
+        let mut j = 0;
+        while j < rest.len() {
+            let seg = &rest[j];
             let next = format!("{cur}::{seg}");
             if self.modules.contains_key(&next) {
                 cur = next;
+                j += 1;
+                continue;
+            }
+            if let Some(target) = self.reexport(&cur, seg, j + 1 < rest.len()) {
+                if dep_crates.external.contains(target) {
+                    return Some(target.to_string());
+                }
+                cur = target.to_string();
+                j += 1;
                 continue;
             }
             // 모듈이 아니면 아이템이다 — 뒤는 전부 아이템 하위 경로.
@@ -290,6 +305,18 @@ impl ModTree {
             return Some(cur);
         }
         self.item_exists(&cur).then_some(cur)
+    }
+
+    /// 모듈 `module`이 `name`을 로컬 아이템으로 해석하지 않고 `use`로 들였으면(재노출) 그 임포트의
+    /// 대상 — 로컬 아이템 우선은 첫 세그먼트와 같은 규칙이다([`prefers_local`]). 비공개 `use`도
+    /// 따른다 — 크레이트 안에서는 자손 모듈이 볼 수 있고, 보이지 않는 경로는 컴파일되지 않으니 관대하게
+    /// 해석해 잃는 것이 없다.
+    fn reexport(&self, module: &str, name: &str, prefix: bool) -> Option<&str> {
+        let module = self.modules.get(module)?;
+        if prefers_local(module, name, prefix) {
+            return None;
+        }
+        module.imports.get(name).map(|imp| imp.target.as_str())
     }
 
     /// 경로의 마지막 세그먼트가 어떤 모듈의 선언 아이템인지 확인한다.
@@ -604,9 +631,11 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
         }
     }
     // 해석은 불변 참조가 필요하니 먼저 모으고 그 다음 심는다.
-    // 글롭(`use m::*`)은 대상 모듈의 모든 공개 아이템과 자식 모듈을
-    // 임포트한다 — `m` 자체만 매핑하면 `f()` 호출이 미해석으로 새니
-    // 아이템별로 임포트 맵을 펼친다.
+    // 글롭(`use m::*`)은 대상 모듈의 모든 공개 아이템과 자식 모듈, 그리고 그 모듈이 `use`로
+    // 들인 이름(재노출)을 임포트한다 — `m` 자체만 매핑하면 `f()` 호출이 미해석으로 새니
+    // 아이템별로 임포트 맵을 펼친다. 명시 임포트는 같은 이름의 글롭 임포트를 소스 순서와 무관하게
+    // 가린다(rustc와 같다) — 글롭이 펼친 이름을 먼저 심고 명시 임포트를 나중에 심는다.
+    let mut globbed: Vec<(String, Import)> = Vec::new();
     let mut resolved: Vec<(String, Import)> = Vec::new();
     for (segs, cfg) in &uses {
         let glob = segs.last().is_some_and(|s| s == "*");
@@ -620,8 +649,18 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
         };
         if glob {
             if let Some(target) = tree.modules.get(&full) {
+                // 재노출을 먼저 — 같은 이름이면 대상 모듈의 선언 아이템이 이긴다.
+                for (name, imp) in &target.imports {
+                    globbed.push((
+                        name.clone(),
+                        Import {
+                            target: imp.target.clone(),
+                            cfg: glob_cfg(cfg, &imp.cfg),
+                        },
+                    ));
+                }
                 for name in target.items.iter().chain(target.children.keys()) {
-                    resolved.push((
+                    globbed.push((
                         name.clone(),
                         Import {
                             target: format!("{full}::{name}"),
@@ -630,7 +669,7 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
                     ));
                 }
             }
-            resolved.push((
+            globbed.push((
                 full.rsplit("::").next().unwrap_or(&full).to_string(),
                 Import {
                     target: full,
@@ -654,9 +693,47 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
         ));
     }
     let module = tree.modules.get_mut(path).expect("module must exist");
-    for (alias, imp) in resolved {
+    for (alias, imp) in globbed.into_iter().chain(resolved) {
         module.imports.insert(alias, imp);
     }
+}
+
+/// [`fill_imports_settled`]가 돌리는 해석 바퀴의 상한.
+pub const MAX_IMPORT_PASSES: usize = 32;
+
+/// 전 모듈의 `use`를 임포트 표가 더 바뀌지 않을 때까지 되풀이해 해석한다 — `modules`는 (모듈 경로,
+/// 그 모듈의 아이템). 재노출을 따라가는 해석([`ModTree::resolve`])은 다른 모듈의 임포트 표를 읽으므로,
+/// 한 바퀴로는 처리 순서상 뒤에 오는 모듈의 재노출(`pub use zz::Tr`이 거치는 `zz`의 `pub use`)을
+/// 못 본다. 바퀴는 [`MAX_IMPORT_PASSES`]까지 — 돌려주는 값은 마지막 바퀴에서도 임포트 표가 바뀐
+/// 모듈 수다(0이면 수렴). 호출자는 0이 아니면 limitation으로 센다.
+pub fn fill_imports_settled(
+    tree: &mut ModTree,
+    modules: &[(String, Vec<&syn::Item>)],
+    dep_crates: &DepCrates,
+) -> usize {
+    let mut changed = 0;
+    for _ in 0..MAX_IMPORT_PASSES {
+        changed = 0;
+        for (path, items) in modules {
+            let before = tree.modules.get(path).map(|m| m.imports.clone());
+            fill_imports(tree, path, items, dep_crates);
+            if tree.modules.get(path).map(|m| &m.imports) != before.as_ref() {
+                changed += 1;
+            }
+        }
+        if changed == 0 {
+            break;
+        }
+    }
+    changed
+}
+
+/// 글롭이 펼친 재노출의 `#[cfg]` — 글롭 `use`의 조건이 있으면 그것, 없으면 재노출의 조건. 둘을
+/// `all(..)`로 겹치지 않는다: 서로를 글롭으로 들이는 모듈에서 바퀴마다 조건이 자라 임포트 표가
+/// 수렴하지 않는다. 둘 다 있으면 실제 조건보다 약한 조건이 남아, `--target`·`--exclude-tests`가 그
+/// 임포트의 간선을 덜 지운다(간선을 남기는 쪽 — 거짓 unreachable을 만들지 않는다).
+fn glob_cfg(glob: &Option<String>, reexport: &Option<String>) -> Option<String> {
+    glob.clone().or_else(|| reexport.clone())
 }
 
 /// use 경로 끝 세그먼트를 붙인다. 그룹 안의 `self`(`use a::b::{self}`·`{self as x}`)는 그룹 앞
@@ -758,6 +835,43 @@ mod tests {
     /// 그룹 안의 `self`(`use crate::util::{self, h as hh}`·`{self as u2}`)는 그룹 앞 경로 자체를
     /// 들인다 — 이름은 그 마지막 세그먼트나 별칭이다. `self`를 세그먼트로 붙여 해석하면
     /// `c::util::self`가 없어 임포트가 조용히 사라지고, `util::h()`와 모듈 `uses` 간선이 빠진다.
+    /// 서로를 글롭으로 들이는 두 모듈(`a`의 `#[cfg(fa)] use crate::b::*`, `b`의 `#[cfg(fb)] use
+    /// crate::a::*`)도 임포트 표가 수렴한다 — 글롭이 펼친 재노출의 cfg를 바퀴마다 겹쳐 붙이면
+    /// (`all(fb , all(fa , …))`) 표가 끝없이 바뀐다. 대상은 정의 위치(`c::src::x`)다.
+    #[test]
+    fn mutual_globs_with_cfg_settle() {
+        let mut t = ModTree::default();
+        let mut root = Module::new(PathBuf::from("lib.rs"), true, true);
+        for child in ["a", "b", "src"] {
+            root.items.insert(child.to_string());
+            root.children
+                .insert(child.to_string(), format!("c::{child}"));
+        }
+        t.modules.insert("c".to_string(), root);
+        for child in ["a", "b", "src"] {
+            t.modules.insert(
+                format!("c::{child}"),
+                Module::new(PathBuf::from(format!("{child}.rs")), true, true),
+            );
+        }
+        let src = t.modules.get_mut("c::src").expect("fixture module");
+        src.items.insert("x".to_string());
+        src.value_items.insert("x".to_string());
+        let a: syn::File =
+            syn::parse_str("use crate::src::*; #[cfg(feature = \"fa\")] use crate::b::*;")
+                .expect("valid use items");
+        let b: syn::File =
+            syn::parse_str("#[cfg(feature = \"fb\")] use crate::a::*;").expect("valid use items");
+        let modules = vec![
+            ("c::a".to_string(), a.items.iter().collect::<Vec<_>>()),
+            ("c::b".to_string(), b.items.iter().collect::<Vec<_>>()),
+        ];
+        assert_eq!(fill_imports_settled(&mut t, &modules, &DepCrates::new()), 0);
+        for module in ["c::a", "c::b"] {
+            assert_eq!(t.modules[module].imports["x"].target, "c::src::x");
+        }
+    }
+
     #[test]
     fn use_group_self_imports_the_prefix_module() {
         let mut t = tree();
