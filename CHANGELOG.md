@@ -5,10 +5,41 @@
 ## [Unreleased]
 
 - CI가 잠금 파일을 사용해 semantic feature를 빌드·검증하고, 커버리지 실패의 stderr를 보존한다.
+- `Cargo.toml`에 최소 지원 Rust `rust-version = "1.96"`을 선언하고, CI `msrv` 잡이 rustc 1.96.0으로 기본·semantic
+  빌드를 `--locked`로 확인한다. 1.96을 정하는 것은 semantic feature다 — 잠근 ra_ap_* 0.0.349는 1.95를 선언하지만
+  ra_ap_tt가 1.95에서 불안정한 `std::assert_matches`를 쓴다. 더 오래된 툴체인의 `cargo install`은 컴파일 오류 대신
+  요구 버전을 알린다.
 
 - 본문 타입·제네릭 인자·qself·클로저 반환형의 참조를 수확하고, const 표현식 방문과
   타입/const 제네릭 매개변수의 이름 가림을 보존한다.
 - 컴포넌트 패턴의 세그먼트 안에서 `*`·`?`를 지원한다. `::` 경계는 넘지 않는다.
+- `use a::b::{self}`·`use a::b::{self as x}`가 모듈 `b`를 임포트한다. 이전에는 `b::self`를 찾다 임포트가 사라져
+  `b::f()` 호출과 모듈 `uses` 간선이 빠졌다 — 최상위가 아닌 모듈의 함수가 `dead`에 unreachable로 나오고,
+  `impact`가 그 호출자를, `rules`·모듈 레벨 `cycles`가 그 의존을 보지 못했다.
+- `name::item` 경로의 접두사 `name`을 타입 이름공간으로 해석한다. 로컬 타입 이름공간 아이템(자식 모듈·struct·enum·
+  union·trait·type)은 같은 이름의 임포트(글롭 포함)를 이기고, 로컬 이름이 값(`fn`·`const`·`static`)·매크로 아이템뿐이면
+  그 이름의 임포트를 따른다. 이전에는 `fn harvest`가 `use crate::harvest`를 가려 `harvest::f()`가 미해석이 됐다.
+  한 세그먼트 호출 `name()`은 지금처럼 그 fn이다. 라이브러리 호출자용 `modtree::Module`에 `type_items`가 늘었다
+  ([0.6 migration](docs/MIGRATING-0.6.md)).
+- `rules`·MCP `rustograph_rules`: 간선이 정렬되지 않은 문서(`--graph`로 읽은 다른 도구의 문서 등)에서 같은
+  `(rule, from, to)`의 간선 종류가 call·references·call처럼 섞여도 같은 기준선 키(`rule|from|to|kind`)의 위반을
+  한 번만 보고한다. 이전에는 정렬 키에 kind가 없어 같은 위반이 두 번 나올 수 있었다. 수확한 문서의 결과는 같다.
+- `dead --retain-external-trait-impls`·MCP `rustograph_dead`의 `retainExternalTraitImpls`(opt-in): 워크스페이스 밖에서
+  선언된 트레이트(`Drop`·`Iterator`·`Display`·`From`·`syn` visitor 등)의 impl 메서드를 self 타입이 닿으면 함께 닿은
+  것으로 보고, 그 메서드가 부르는 코드까지 따라간다. `--explain`도 같은 규칙을 쓴다. 워크스페이스 트레이트의 미사용
+  impl과 닿지 않는 타입의 impl은 계속 보고한다. 기본 판정은 그대로이고, 기본 `dead` 보고서는 닿는 타입에 붙은 그런
+  미도달 메서드 수를 limitation으로 센다(셀 것이 없으면 싣지 않는다). 라이브러리 호출자용 `analysis::DeadOptions`·
+  `dead_with_options`·`explain_path_with_options`·`QueryIndex::dead_with_options`를 더했다(기존 함수는 그대로다).
+  `DeadOptions`는 `#[non_exhaustive]`라 선택지가 늘어도 호출자가 깨지지 않는다 — `DeadOptions::default()`에서 필드를
+  바꿔 만든다.
+- `cycles --level module --exclude-nested-modules`(opt-in, CLI): 구성원이 한 모듈과 그 자손뿐인 순환(자식의
+  `super::` 호출 등)을 빼고 판정한다(`--strict` 포함). JSON 보고서에는 뺀 수를 `excluded_nested`로 싣는다(없으면 `0`). 형제나
+  다른 모듈이 끼는 순환은 계속 보고한다. 기본 판정과 JSON은 그대로이고, 기본 텍스트 출력은 그런 순환이 있을 때 그
+  수와 플래그를 `note:` 줄로 알린다. 모듈 레벨이 아니면 사용법 오류다.
+- `dead`·MCP `rustograph_dead`: 보존 루트가 하나도 없는 크레이트(main·`#[no_mangle]` 없는 lib)의 unreachable 공개
+  아이템 수와 크레이트 이름을 limitation으로 세고, 워크스페이스 밖에서 쓰는 라이브러리라면 `--retain-public`(MCP
+  `retainPublic`)을 쓰라고 조건부로 알린다(워크스페이스 안에서만 쓰는 lib이면 그 아이템은 정말 호출자가 없다). 판정과
+  종료 코드는 그대로다. 이전에는 lib 크레이트의 첫 `dead`가 공개 API 전부를 unreachable로 내면서 아무 안내가 없었다.
 
 ## [0.6.0]
 

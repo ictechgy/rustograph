@@ -20,8 +20,9 @@ usage:
   rustograph graph [--level crate|module|type|symbol] [--format json|mermaid]
                    [--dir DIR] [--deps] [--tests] [--root ID] [--out FILE]
   rustograph cycles [--level L] [--strict] [--format text|json]
+                    [--exclude-nested-modules]
   rustograph dead [--strict] [--explain ID] [--root ID] [--retain-public] [--tests]
-                  [--format text|json]
+                  [--retain-external-trait-impls] [--format text|json]
   rustograph rules [--strict] [--format text|json|sarif] [--config FILE]
                    [--baseline FILE] [--write-baseline]
   rustograph deps [--strict] [--format text|json]
@@ -361,18 +362,59 @@ fn recorded_revision(a: &Args, format: &str) -> Option<String> {
 fn cmd_cycles(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
     cli_args::reject_unused(
         a,
-        &[cli_args::DOCUMENT_FLAGS, &["level", "format", "strict"]],
+        &[
+            cli_args::DOCUMENT_FLAGS,
+            &["level", "format", "strict", "exclude-nested-modules"],
+        ],
         0,
     )?;
     let level = cli_args::level_of(a)?;
+    let exclude_nested = a.has("exclude-nested-modules");
+    if exclude_nested && level != crate::graph::Level::Module {
+        return Err(
+            "cycles --exclude-nested-modules applies to module-level cycles; pass --level module"
+                .to_string(),
+        );
+    }
     let doc = cli_args::document_for(a, true)?.view(level)?;
-    let rep = analysis::cycles(&doc);
+    let mut rep = analysis::cycles(&doc);
+    // 부모·자식 모듈만으로 된 순환 — 기본 판정과 JSON은 그대로 두고, 요청이 있을 때만 뺀다.
+    let nested = if level == crate::graph::Level::Module {
+        rep.cycles
+            .iter()
+            .filter(|c| analysis::is_nested_module_cycle(c))
+            .count()
+    } else {
+        0
+    };
+    if exclude_nested {
+        rep.cycles.retain(|c| !analysis::is_nested_module_cycle(c));
+    }
     match a.get("format").unwrap_or("text") {
+        // 플래그를 준 보고서는 뺀 수가 0이어도 키를 싣는다 — 소비자가 적용 여부를 안다.
+        "json" if exclude_nested => {
+            let mut json = serde_json::to_value(&rep).expect("cycle report must serialize");
+            json["excluded_nested"] = serde_json::json!(nested);
+            write!(out, "{}", export::to_json(&json)).ok()
+        }
         "json" => write!(out, "{}", export::to_json(&rep)).ok(),
         "text" => {
             writeln!(out, "{} cycle(s)", rep.cycles.len()).ok();
             for c in &rep.cycles {
                 writeln!(out, "  cycle: {}", c.members.join(" -> ")).ok();
+            }
+            if exclude_nested && nested > 0 {
+                writeln!(
+                    out,
+                    "  note: excluded {nested} cycle(s) that involve only a module and its own descendants (--exclude-nested-modules)"
+                )
+                .ok();
+            } else if nested > 0 {
+                writeln!(
+                    out,
+                    "  note: {nested} cycle(s) above involve only a module and its own descendants (e.g. a child calling `super::`); --exclude-nested-modules leaves them out"
+                )
+                .ok();
             }
             if rep.excluded_tentative > 0 {
                 writeln!(
@@ -401,15 +443,24 @@ fn cmd_dead(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
         a,
         &[
             cli_args::DOCUMENT_FLAGS,
-            &["strict", "explain", "root", "format"],
+            &[
+                "strict",
+                "explain",
+                "root",
+                "format",
+                "retain-external-trait-impls",
+            ],
         ],
         0,
     )?;
     // dead는 항상 심볼 레벨 — 도달성은 심볼에서만 의미 있다.
     let doc = cli_args::document_for(a, true)?;
+    let opts = analysis::DeadOptions {
+        retain_external_trait_impls: a.has("retain-external-trait-impls"),
+    };
     if let Some(target) = a.get("explain") {
         let target = require_id(&doc, target)?;
-        match analysis::explain_path(&doc, &target) {
+        match analysis::explain_path_with_options(&doc, &target, opts) {
             Some(path) => {
                 writeln!(out, "{}", path.join(" -> ")).ok();
                 return Ok(0);
@@ -420,7 +471,7 @@ fn cmd_dead(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
             }
         }
     }
-    let report = analysis::dead(&doc)?;
+    let report = analysis::dead_with_options(&doc, opts)?;
     match a.get("format").unwrap_or("text") {
         "json" => write!(out, "{}", export::to_json(&report)).ok(),
         "text" => {

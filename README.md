@@ -86,12 +86,14 @@ rustograph cycles --graph .rustograph/graph.json --strict
 
 # Detect dependency cycles (tentative edges excluded, count reported)
 rustograph cycles --level symbol --strict
+rustograph cycles --level module --exclude-nested-modules  # leave out parent/child-only module cycles
 
 # Report symbols unreachable from retention roots (fn main, #[no_mangle])
 rustograph dead                           # symbol level, always
 rustograph dead --retain-public           # libraries: keep exported API
 rustograph dead --tests                   # also retain #[test]/#[bench]
 rustograph dead --root mycrate::setup     # extra retention root
+rustograph dead --retain-external-trait-impls  # keep Drop/Display/Iterator/From… impls of reachable types
 rustograph dead --explain mycrate::f      # why alive? show a reachability path
 
 # Check layer rules from .rustograph.yml
@@ -170,6 +172,17 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
 `contains`, `call`, `references`, `implements`, `signature`.
 
 - `contains` is ownership, not a dependency — it never feeds cycles or rules.
+- A module-level cycle whose members are all one module and its own
+  descendants — a parent using its child while the child calls `super::` — is
+  idiomatic Rust. `cycles --level module` still reports it, and its text
+  output counts such cycles in a `note:` line; `--exclude-nested-modules`
+  leaves them out (also for `--strict`) and the JSON report then carries
+  `excluded_nested`, the number left out (`0` when there were none). A cycle that also involves a sibling or unrelated module
+  is always reported. The flag is CLI-only and module-level only.
+- No edge points from a symbol to itself: direct recursion (`fn f() { f() }`)
+  is not reported by `cycles --level symbol`, while mutual recursion between
+  two symbols is. Reachability is unaffected — a recursive function is reached
+  through its callers.
 - Name fan-out: a method call `x.m()` whose receiver type is unknown gets
   `tentative` call edges to the same-name workspace methods it could reach.
   Inherent (`T::m`) and trait-declared (`Tr::m`) methods come only
@@ -550,6 +563,32 @@ vertices, edge kinds, `tentative`, `limitations` — is unchanged; only
 accuracy improves. Bodies the semantic engine cannot see (cfg-disabled,
 macro-generated) fall back to the syntactic path with measured counters, and
 calls it cannot resolve fall back to the same bounded name fan-out.
+
+`dead` sees no caller for an impl method of a trait declared outside the
+workspace — `Drop::drop` (scope end), `Iterator::next` (`for`),
+`Display::fmt` (formatting macros), `From::from` (`.into()`), or a `syn`
+visitor's `visit_*` — because the language or the external crate makes the
+call. By default such methods stay unreachable, together with code only they
+call, and the report counts the ones on reachable types. `dead
+--retain-external-trait-impls` (MCP `rustograph_dead`:
+`retainExternalTraitImpls`) treats each of them as reachable once its type is
+reachable and follows what it calls; its report counts the methods kept that
+way. An impl counts as external when none of the workspace traits its type
+`implements` has that name or declares that method — an impl written through
+an alias or re-export (`use t::Tr as Alias; impl Alias for S`) is a workspace
+impl. Impls of workspace traits — whose calls are visible — are still reported
+when unused, and so are impls on types nothing reaches. A reachable type does not prove the trait is used: code reached only
+through such an impl is not reported even where the impl is never called.
+
+Callers outside the workspace are not in the graph, so a crate with no
+retention root — a library without `fn main` or `#[no_mangle]` entry points,
+given no `--root` — has every exported item unreachable unless
+`--retain-public` (MCP: `retainPublic`) makes exported symbols roots. `dead`
+still reports them by default; its report counts those exported items, names
+the crates, and points at `--retain-public` for libraries used outside the
+workspace. For a library used only inside the workspace these items really
+have no caller, and `--retain-public` would hide them. Exported items of
+crates that have a root, such as `pub` items of a binary, are not counted.
 
 The syntactic harvest does not read a module file — a `mod` file or a crate
 root — larger than 64 MiB. Its module or crate vertex stays, but the items and

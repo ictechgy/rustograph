@@ -56,6 +56,55 @@ type PathAdjacency<'a> = BTreeMap<&'a str, Vec<(&'a str, EdgeKind, bool)>>;
 /// 도달성 인접 목록 — 의존 간선의 outgoing([`Document::outgoing`]).
 type ReachMap<'a> = BTreeMap<&'a str, Vec<(&'a EdgeKind, &'a str)>>;
 
+/// 도달성 색인 — 의존 간선의 outgoing과, self 타입 정점에서 그 타입에 붙은 워크스페이스 밖
+/// 트레이트 impl 메서드로 가는 소유 간선. 둘 다 간선 한 바퀴로 만든다([`reach_index`]).
+struct ReachIndex<'a> {
+    out: ReachMap<'a>,
+    /// self 타입 → 워크스페이스 정점으로 해석되지 않은 트레이트(std·의존 크레이트)의 impl 메서드.
+    external_impls: BTreeMap<&'a str, BTreeSet<&'a str>>,
+}
+
+impl<'a> ReachIndex<'a> {
+    /// `from`에서 한 걸음에 닿는 정점 — 의존 간선을 간선 순서대로, `implied`면 이어서 그 타입의
+    /// 워크스페이스 밖 트레이트 impl 메서드를 ID 순서대로.
+    fn successors(&self, from: &str, implied: bool) -> impl Iterator<Item = &'a str> + '_ {
+        let firm = self.out.get(from).into_iter().flatten().map(|&(_, to)| to);
+        let implied = self
+            .external_impls
+            .get(from)
+            .filter(|_| implied)
+            .into_iter()
+            .flatten()
+            .copied();
+        firm.chain(implied)
+    }
+}
+
+/// [`dead`]의 보존 선택지. 기본값은 보존 루트에서 의존 간선으로 닿는 정점만 닿은 것으로 본다.
+///
+/// 선택지는 늘 수 있다 — 크레이트 밖 호출자는 기본값에서 필드를 바꿔 만든다(구조체 리터럴은 새
+/// 선택지가 생기면 깨지므로 받지 않는다).
+///
+/// ```
+/// let mut opts = rustograph::analysis::DeadOptions::default();
+/// opts.retain_external_trait_impls = true;
+/// # assert!(opts.retain_external_trait_impls);
+/// ```
+///
+/// ```compile_fail,E0639
+/// let opts = rustograph::analysis::DeadOptions { retain_external_trait_impls: true };
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DeadOptions {
+    /// 워크스페이스 밖에서 선언된 트레이트(std·의존 크레이트의 `Drop`·`Display`·`Iterator`·`From`·
+    /// visitor 등)의 impl 메서드를 self 타입이 닿으면 함께 닿은 것으로 본다. 그 호출은 언어(drop glue,
+    /// `for`, 포맷 매크로)나 외부 크레이트 안에 있어 구문 그래프에 호출 간선이 없다. 타입이 살아
+    /// 있어도 그 트레이트가 실제로 쓰이는지는 모른다 — 그 메서드로만 닿는 코드는 진짜 미사용이어도
+    /// 보고되지 않으므로 기본값이 아니다.
+    pub retain_external_trait_impls: bool,
+}
+
 #[cfg(test)]
 thread_local! {
     /// 색인을 만들며 살핀 정점·간선 수 — 같은 문서에 질의를 되풀이할 때 색인을 다시 만들지
@@ -105,7 +154,7 @@ pub struct QueryIndex<'a> {
     neighbors: OnceLock<NeighborIndex<'a>>,
     dependers: OnceLock<NeighborIndex<'a>>,
     adjacency: OnceLock<PathAdjacency<'a>>,
-    reach: OnceLock<ReachMap<'a>>,
+    reach: OnceLock<ReachIndex<'a>>,
     impact_edges: OnceLock<BTreeMap<&'a str, Vec<&'a Edge>>>,
     ambiguous_ids: OnceLock<BTreeSet<&'a str>>,
 }
@@ -244,9 +293,18 @@ impl<'a> QueryIndex<'a> {
 
     /// `roots`를 보존 루트로 삼은 [`dead`] — 루트만 바꾼 문서 사본을 만들지 않는다.
     pub fn dead(&self, roots: &[String]) -> Result<DeadReport, String> {
+        self.dead_with_options(roots, DeadOptions::default())
+    }
+
+    /// `roots`를 보존 루트로 삼고 `opts`의 보존 선택지를 적용한 [`dead`].
+    pub fn dead_with_options(
+        &self,
+        roots: &[String],
+        opts: DeadOptions,
+    ) -> Result<DeadReport, String> {
         // 레벨이 모자라면 도달 인접을 만들기 전에 거절한다.
         self.doc.require_level(crate::graph::Level::Symbol)?;
-        Ok(dead_with(self.doc, self.reach_map(), roots))
+        Ok(dead_with(self.doc, self.reach_index(), roots, opts))
     }
 
     /// 정점 ID 집합 — 같은 ID의 cfg 변형은 하나다.
@@ -312,12 +370,12 @@ impl<'a> QueryIndex<'a> {
             .get_or_init(|| adjacency_of(self.doc, self.vertex_set(), self.ambiguous_set()))
     }
 
-    /// 보존 루트 BFS가 따라가는 도달성 인접 목록.
-    fn reach_map(&self) -> &ReachMap<'a> {
+    /// 보존 루트 BFS가 따라가는 도달성 색인.
+    fn reach_index(&self) -> &ReachIndex<'a> {
         self.reach.get_or_init(|| {
             #[cfg(test)]
             note_indexed(self.doc.edges.len());
-            self.doc.outgoing()
+            reach_index(self.doc)
         })
     }
 }
@@ -792,6 +850,21 @@ pub struct Cycle {
     pub evidence: Vec<CycleEdge>,
 }
 
+/// 모듈 레벨 순환의 구성원이 모듈 트리의 한 갈래(서로 조상·자손)에만 있는가 — 부모가 자식을 쓰고
+/// 자식이 `super::`로 부모를 부르는, Rust에서 관용적인 부모-자식 상호 참조다. 형제 모듈이나 갈래
+/// 밖 모듈이 끼면 중첩 순환이 아니다. 정점 ID는 모듈 경로라 조상은 `::` 경계까지의 접두사다.
+pub fn is_nested_module_cycle(cycle: &Cycle) -> bool {
+    let mut members: Vec<&str> = cycle.members.iter().map(String::as_str).collect();
+    // 사전순이면 조상이 자손보다 앞선다 — 이웃한 쌍이 모두 조상·자손이면 한 갈래다(전이적).
+    members.sort_unstable();
+    members.len() > 1
+        && members.windows(2).all(|pair| {
+            pair[1]
+                .strip_prefix(pair[0])
+                .is_some_and(|rest| rest.starts_with("::"))
+        })
+}
+
 /// cycles 보고서 — 순환과 함께 탐지에서 제외한 추정 간선 수를 싣는다.
 #[derive(Debug, Serialize)]
 pub struct CycleReport {
@@ -1058,11 +1131,72 @@ pub struct DeadReport {
 
 /// 루트에서 도달 가능한 정점 집합 — 의존 간선만.
 pub fn reachable(doc: &Document) -> BTreeSet<&str> {
-    reach_from(&doc.outgoing(), &doc.roots)
+    reach_from(&reach_index(doc), &doc.roots, false)
 }
 
-/// `roots`에서 도달 인접 목록을 따라 닿는 정점 집합 — [`reachable`]과 색인을 쓰는 dead가 공유한다.
-fn reach_from<'a>(out: &ReachMap<'a>, roots: &'a [String]) -> BTreeSet<&'a str> {
+/// 도달성 색인을 간선 한 바퀴로 만든다. 의존 간선은 [`Document::outgoing`]과 같은 순서로 싣는다.
+///
+/// 트레이트 impl 메서드 ID는 `Type::<Trait>::m`(같은 경로의 선언이 겹치면 `Type::<Trait>::@…`)이고
+/// self 타입이 `contains`로 소유한다. `Trait`은 impl에 쓴 이름이라 별칭(`use t::Tr as Alias`)이나 재노출
+/// 이름일 수 있고, 트레이트가 워크스페이스 정점으로 해석되면 수확이 해석된 트레이트로 `Type → Trait`
+/// implements 간선을 남긴다. 그래서 같은 타입이 구현하는 워크스페이스 트레이트 가운데 마지막 세그먼트가
+/// `Trait`이거나 같은 이름의 메서드(`Trait::m`)를 선언한 것이 있으면 워크스페이스 트레이트 impl로 본다.
+/// 둘 다 없으면 그 impl의 트레이트는 워크스페이스 밖(std·의존 크레이트)이거나 해석되지 않은 것이다 —
+/// 어느 쪽이든 그 메서드의 호출자는 그래프에 없다.
+fn reach_index(doc: &Document) -> ReachIndex<'_> {
+    let mut out: ReachMap<'_> = BTreeMap::new();
+    // self 타입 → 구현하는 워크스페이스 트레이트, (소유자, 바로 아래 한 세그먼트 이름) 소유 쌍.
+    let mut implemented: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut owned: BTreeSet<(&str, &str)> = BTreeSet::new();
+    let mut impl_methods: Vec<(&str, &str, &str)> = Vec::new();
+    for e in &doc.edges {
+        if e.kind.is_dependency() {
+            out.entry(e.from.as_str())
+                .or_default()
+                .push((&e.kind, e.to.as_str()));
+            if e.kind == EdgeKind::Implements {
+                implemented
+                    .entry(e.from.as_str())
+                    .or_default()
+                    .push(e.to.as_str());
+            }
+        } else if let Some(name) = trait_impl_name(&e.from, &e.to) {
+            impl_methods.push((e.from.as_str(), name, e.to.as_str()));
+        } else if let Some(member) =
+            e.to.strip_prefix(e.from.as_str())
+                .and_then(|rest| rest.strip_prefix("::"))
+        {
+            owned.insert((e.from.as_str(), member));
+        }
+    }
+    let mut external_impls: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (owner, name, method) in impl_methods {
+        let method_name = method.rsplit("::").next().unwrap_or(method);
+        let workspace = implemented.get(owner).is_some_and(|traits| {
+            traits.iter().any(|tr| {
+                tr.rsplit("::").next() == Some(name) || owned.contains(&(*tr, method_name))
+            })
+        });
+        if !workspace {
+            external_impls.entry(owner).or_default().insert(method);
+        }
+    }
+    ReachIndex {
+        out,
+        external_impls,
+    }
+}
+
+/// `owner`가 소유한 `method`가 트레이트 impl 메서드(`owner::<Trait>::…`)면 그 트레이트 이름.
+fn trait_impl_name<'a>(owner: &str, method: &'a str) -> Option<&'a str> {
+    let rest = method.strip_prefix(owner)?.strip_prefix("::<")?;
+    let (name, _) = rest.split_once(">::")?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// `roots`에서 도달 색인을 따라 닿는 정점 집합 — [`reachable`]과 색인을 쓰는 dead가 공유한다.
+/// `implied`면 닿은 타입의 워크스페이스 밖 트레이트 impl 메서드도 따라간다([`DeadOptions`]).
+fn reach_from<'a>(index: &ReachIndex<'a>, roots: &'a [String], implied: bool) -> BTreeSet<&'a str> {
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     let mut queue: VecDeque<&str> = VecDeque::new();
     for r in roots {
@@ -1071,7 +1205,7 @@ fn reach_from<'a>(out: &ReachMap<'a>, roots: &'a [String]) -> BTreeSet<&'a str> 
         }
     }
     while let Some(cur) = queue.pop_front() {
-        for (_, to) in out.get(cur).into_iter().flatten() {
+        for to in index.successors(cur, implied) {
             if seen.insert(to) {
                 queue.push_back(to);
             }
@@ -1082,7 +1216,16 @@ fn reach_from<'a>(out: &ReachMap<'a>, roots: &'a [String]) -> BTreeSet<&'a str> 
 
 /// 루트에서 정점까지의 경로 하나를 찾는다(explain용).
 pub fn explain_path(doc: &Document, id: &str) -> Option<Vec<String>> {
-    let out = doc.outgoing();
+    explain_path_with_options(doc, id, DeadOptions::default())
+}
+
+/// `opts`의 보존 선택지를 적용한 [`explain_path`] — [`dead_with_options`]와 같은 도달 규칙이다.
+pub fn explain_path_with_options(
+    doc: &Document,
+    id: &str,
+    opts: DeadOptions,
+) -> Option<Vec<String>> {
+    let index = reach_index(doc);
     let mut parent: BTreeMap<&str, &str> = BTreeMap::new();
     let mut queue: VecDeque<&str> = VecDeque::new();
     let mut seen: BTreeSet<&str> = BTreeSet::new();
@@ -1102,7 +1245,7 @@ pub fn explain_path(doc: &Document, id: &str) -> Option<Vec<String>> {
             path.reverse();
             return Some(path);
         }
-        for (_, to) in out.get(cur).into_iter().flatten() {
+        for to in index.successors(cur, opts.retain_external_trait_impls) {
             if seen.insert(to) {
                 parent.insert(to, cur);
                 queue.push_back(to);
@@ -1118,10 +1261,21 @@ pub fn dead(doc: &Document) -> Result<DeadReport, String> {
     QueryIndex::new(doc).dead(&doc.roots)
 }
 
-/// `roots`를 보존 루트로 삼아 도달 인접 목록 `out` 위에서 [`dead`]를 판정한다 — 레벨
-/// 확인은 호출자([`QueryIndex::dead`])가 먼저 한다.
-fn dead_with(doc: &Document, out: &ReachMap<'_>, roots: &[String]) -> DeadReport {
-    let reach = reach_from(out, roots);
+/// `opts`의 보존 선택지를 적용한 [`dead`].
+pub fn dead_with_options(doc: &Document, opts: DeadOptions) -> Result<DeadReport, String> {
+    QueryIndex::new(doc).dead_with_options(&doc.roots, opts)
+}
+
+/// `roots`를 보존 루트로 삼아 도달 색인 `index` 위에서 [`dead`]를 판정한다 — 레벨
+/// 확인은 호출자([`QueryIndex::dead_with_options`])가 먼저 한다.
+fn dead_with(
+    doc: &Document,
+    index: &ReachIndex<'_>,
+    roots: &[String],
+    opts: DeadOptions,
+) -> DeadReport {
+    let implied = opts.retain_external_trait_impls;
+    let reach = reach_from(index, roots, implied);
     let mut findings = Vec::new();
     for v in &doc.vertices {
         if matches!(v.kind, Kind::Crate | Kind::Module) {
@@ -1146,6 +1300,8 @@ fn dead_with(doc: &Document, out: &ReachMap<'_>, roots: &[String]) -> DeadReport
             "{method_findings} unreachable methods may be invoked via trait objects, generics, or external crates — dispatch not visible to syntactic analysis"
         ));
     }
+    limitations.extend(external_impl_limitation(index, &reach, implied));
+    limitations.extend(rootless_api_limitation(doc, roots, &reach));
     // 이름 팬아웃 폭 상한을 넘은 호출에는 간선이 없고, `--focus`는 보존 루트·들어오는 간선을 지운다.
     // 둘 다 이 판정의 입력을 줄이므로 그 문서 limitation은 판정 한계로도 싣는다 — JSON 보고서만 읽는
     // 소비자가 거짓 unreachable을 완전한 답으로 받지 않게. 수확 문장(폭 상한)을 포커스 문장보다 먼저
@@ -1156,6 +1312,70 @@ fn dead_with(doc: &Document, out: &ReachMap<'_>, roots: &[String]) -> DeadReport
         roots: roots.to_vec(),
         findings,
         limitations,
+    }
+}
+
+/// 보존 루트가 하나도 없는 크레이트의 unreachable exported 정점을 센 limitation — 셀 것이 없으면 없다.
+/// main 없는 lib을 워크스페이스 밖에서 쓰면 그 호출자는 그래프에 없어 루트 없이는 공개 API가 전부
+/// unreachable이다. 워크스페이스 안에서만 쓰는 lib이면 그 아이템은 정말 호출자가 없다 — 그래서 문장은
+/// 조건부로 `--retain-public`을 알린다(따르면 진짜 미사용이 가려질 수 있다). 루트가 있는
+/// 크레이트(bin, `--root`를 준 크레이트)의 `pub` 아이템은 그 크레이트 밖 호출자가 없으니 세지 않는다.
+/// 공개 아이템을 루트로 삼으면(`--retain-public`) 공개 미도달이 없어 조용하다.
+fn rootless_api_limitation(
+    doc: &Document,
+    roots: &[String],
+    reach: &BTreeSet<&str>,
+) -> Option<String> {
+    let roots: BTreeSet<&str> = roots.iter().map(String::as_str).collect();
+    let rooted: BTreeSet<&str> = doc
+        .vertices
+        .iter()
+        .filter(|v| roots.contains(v.id.as_str()))
+        .map(|v| v.krate.as_str())
+        .collect();
+    let mut crates = BTreeSet::new();
+    let mut count = 0usize;
+    for v in &doc.vertices {
+        if !v.exported
+            || matches!(v.kind, Kind::Crate | Kind::Module)
+            || rooted.contains(v.krate.as_str())
+            || reach.contains(v.id.as_str())
+        {
+            continue;
+        }
+        count += 1;
+        crates.insert(v.krate.as_str());
+    }
+    (count > 0).then(|| format!(
+        "{count} unreachable symbols are exported items of crates with no retention root ({}); callers outside this workspace are not in the graph, so if these crates are libraries used elsewhere, --retain-public (MCP: retainPublic) treats exported symbols as roots — otherwise these items have no caller in the workspace",
+        crates.into_iter().collect::<Vec<_>>().join(", ")
+    ))
+}
+
+/// 닿은 타입에 붙은 워크스페이스 밖 트레이트 impl 메서드를 센 limitation — 셀 것이 없으면 없다.
+/// 기본 판정에서는 그중 닿지 않은 메서드(구문 그래프에 호출자가 없는 `Drop::drop`·`Display::fmt` 등)를
+/// 세어 보존 선택지를 알리고, 선택지를 켠 판정에서는 그 규칙으로 닿은 것으로 본 메서드를 센다 —
+/// 어느 쪽이든 JSON 보고서만 읽는 소비자가 판정의 전제를 안다.
+fn external_impl_limitation(
+    index: &ReachIndex<'_>,
+    reach: &BTreeSet<&str>,
+    implied: bool,
+) -> Option<String> {
+    let methods = index
+        .external_impls
+        .iter()
+        .filter(|(owner, _)| reach.contains(*owner))
+        .flat_map(|(_, methods)| methods.iter());
+    if implied {
+        let kept = methods.count();
+        (kept > 0).then(|| format!(
+            "{kept} methods implementing traits declared outside the workspace were treated as reachable because their types are reachable (--retain-external-trait-impls); code reached only through them is not reported even where the trait is never used"
+        ))
+    } else {
+        let unreached = methods.filter(|m| !reach.contains(*m)).count();
+        (unreached > 0).then(|| format!(
+            "{unreached} unreachable methods implement traits declared outside the workspace (std or dependencies, e.g. Drop, Display, Iterator, From) for reachable types; the language or external code calls them without a call site in the graph — --retain-external-trait-impls (MCP: retainExternalTraitImpls) keeps them and what they call"
+        ))
     }
 }
 
@@ -1525,6 +1745,259 @@ mod tests {
         );
     }
 
+    /// 트레이트 impl을 담은 문서 — 닿는 타입 `Guard`의 std 트레이트 impl(`Drop`·`Display`)과 그것만
+    /// 부르는 `cleanup`, 워크스페이스 트레이트 `Local`의 impl(`L::<Local>::run`), 닿지 않는 타입
+    /// `Unused`의 `Drop` impl과 그것만 부르는 `only_unused`. 트레이트 impl 메서드 ID는
+    /// `Type::<Trait>::m`이고, 트레이트가 워크스페이스 정점이면 `Type → Trait` implements가 있다.
+    fn trait_impl_doc() -> Document {
+        let vertices = vec![
+            v("c::main", Kind::Fn),
+            v("c::Guard", Kind::Struct),
+            v("c::Guard::<Drop>::drop", Kind::Method),
+            v("c::Guard::<Display>::fmt", Kind::Method),
+            v("c::cleanup", Kind::Fn),
+            v("c::Local", Kind::Trait),
+            v("c::Local::run", Kind::Method),
+            v("c::L", Kind::Struct),
+            v("c::L::<Local>::run", Kind::Method),
+            v("c::Unused", Kind::Struct),
+            v("c::Unused::<Drop>::drop", Kind::Method),
+            v("c::only_unused", Kind::Fn),
+        ];
+        let edge = |from: &str, to: &str, kind| Edge::new(from.into(), to.into(), kind);
+        let edges = vec![
+            edge("c::main", "c::Guard", EdgeKind::References),
+            edge("c::main", "c::L", EdgeKind::References),
+            edge("c::Guard", "c::Guard::<Drop>::drop", EdgeKind::Contains),
+            edge("c::Guard", "c::Guard::<Display>::fmt", EdgeKind::Contains),
+            edge("c::Guard::<Drop>::drop", "c::cleanup", EdgeKind::Call),
+            edge("c::Local", "c::Local::run", EdgeKind::Contains),
+            edge("c::L", "c::Local", EdgeKind::Implements),
+            edge("c::L", "c::L::<Local>::run", EdgeKind::Contains),
+            edge("c::Unused", "c::Unused::<Drop>::drop", EdgeKind::Contains),
+            edge("c::Unused::<Drop>::drop", "c::only_unused", EdgeKind::Call),
+        ];
+        document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec!["c::main".into()],
+            vertices,
+            edges,
+            vec![],
+        )
+    }
+
+    fn finding_ids(rep: &DeadReport) -> Vec<&str> {
+        rep.findings.iter().map(|f| f.id.as_str()).collect()
+    }
+
+    /// 기본 판정은 그대로다 — 워크스페이스 밖 트레이트 impl 메서드도 호출 간선이 없으면 unreachable이다.
+    /// 다만 닿는 타입에 붙은 그런 메서드의 수를 limitation으로 세어 보존 선택지를 알린다. 닿지 않는
+    /// 타입(`Unused`)과 워크스페이스 트레이트 impl(`L::<Local>::run`)은 세지 않는다.
+    #[test]
+    fn dead_counts_external_trait_impls_of_reachable_types() {
+        let d = trait_impl_doc();
+        let rep = dead(&d).unwrap();
+        assert_eq!(
+            finding_ids(&rep),
+            [
+                "c::Guard::<Display>::fmt",
+                "c::Guard::<Drop>::drop",
+                "c::L::<Local>::run",
+                "c::Local::run",
+                "c::Unused",
+                "c::Unused::<Drop>::drop",
+                "c::cleanup",
+                "c::only_unused",
+            ]
+        );
+        assert_eq!(
+            rep.limitations,
+            [
+                "5 unreachable methods may be invoked via trait objects, generics, or external crates — dispatch not visible to syntactic analysis",
+                "2 unreachable methods implement traits declared outside the workspace (std or dependencies, e.g. Drop, Display, Iterator, From) for reachable types; the language or external code calls them without a call site in the graph — --retain-external-trait-impls (MCP: retainExternalTraitImpls) keeps them and what they call",
+            ]
+        );
+    }
+
+    /// 보존 선택지를 켜면 닿는 타입의 워크스페이스 밖 트레이트 impl 메서드가 타입과 함께 닿고, 그
+    /// 메서드만 부르는 코드(`cleanup`)도 닿는다. 워크스페이스 트레이트의 미사용 impl, 닿지 않는 타입의
+    /// impl과 그 impl만 부르는 코드는 계속 보고한다 — 오탐을 줄이며 누락을 만들지 않는다.
+    #[test]
+    fn retaining_external_trait_impls_keeps_them_and_their_callees() {
+        let d = trait_impl_doc();
+        let opts = DeadOptions {
+            retain_external_trait_impls: true,
+        };
+        let rep = dead_with_options(&d, opts).unwrap();
+        assert_eq!(
+            finding_ids(&rep),
+            [
+                "c::L::<Local>::run",
+                "c::Local::run",
+                "c::Unused",
+                "c::Unused::<Drop>::drop",
+                "c::only_unused",
+            ]
+        );
+        assert_eq!(rep.roots, ["c::main"]);
+        assert_eq!(
+            rep.limitations,
+            [
+                "3 unreachable methods may be invoked via trait objects, generics, or external crates — dispatch not visible to syntactic analysis",
+                "2 methods implementing traits declared outside the workspace were treated as reachable because their types are reachable (--retain-external-trait-impls); code reached only through them is not reported even where the trait is never used",
+            ]
+        );
+        // 루트를 바꿔 묻는 색인 경로(MCP)도 같은 판정이다.
+        let rooted = QueryIndex::new(&d)
+            .dead_with_options(&["c::main".to_string()], opts)
+            .unwrap();
+        assert_eq!(finding_ids(&rooted), finding_ids(&rep));
+        // explain도 같은 도달 규칙으로 경로를 보인다 — 기본값은 지금처럼 경로가 없다.
+        assert_eq!(
+            explain_path_with_options(&d, "c::cleanup", opts).unwrap(),
+            [
+                "c::main",
+                "c::Guard",
+                "c::Guard::<Drop>::drop",
+                "c::cleanup"
+            ]
+        );
+        assert!(explain_path(&d, "c::cleanup").is_none());
+        assert!(explain_path_with_options(&d, "c::only_unused", opts).is_none());
+    }
+
+    /// 별칭(`use t::Tr as Alias; impl Alias for S`)이나 재노출 이름으로 구현한 워크스페이스 트레이트는
+    /// 외부가 아니다 — 메서드 ID는 쓴 이름(`S::<Alias>::run`)이지만 implements는 해석된 트레이트
+    /// (`t::Tr`)로 가고, 그 트레이트가 같은 이름의 메서드(`t::Tr::run`)를 선언한다. 호출이 보이는
+    /// 워크스페이스 트레이트의 미사용 impl이므로 보존 선택지를 켜도 그것과 그것만 부르는 코드를 보고하고,
+    /// 기본 보고서의 외부 impl 계수에도 넣지 않는다.
+    #[test]
+    fn aliased_workspace_trait_impls_are_not_external() {
+        let edge = |from: &str, to: &str, kind| Edge::new(from.into(), to.into(), kind);
+        let d = document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec!["c::main".into()],
+            vec![
+                v("c::main", Kind::Fn),
+                v("c::t::Tr", Kind::Trait),
+                v("c::t::Tr::run", Kind::Method),
+                v("c::S", Kind::Struct),
+                v("c::S::<Alias>::run", Kind::Method),
+                v("c::only_from_alias_impl", Kind::Fn),
+                v("c::S::<Display>::fmt", Kind::Method),
+            ],
+            vec![
+                edge("c::main", "c::S", EdgeKind::References),
+                edge("c::t::Tr", "c::t::Tr::run", EdgeKind::Contains),
+                edge("c::S", "c::t::Tr", EdgeKind::Implements),
+                edge("c::S", "c::S::<Alias>::run", EdgeKind::Contains),
+                edge("c::S", "c::S::<Display>::fmt", EdgeKind::Contains),
+                edge(
+                    "c::S::<Alias>::run",
+                    "c::only_from_alias_impl",
+                    EdgeKind::Call,
+                ),
+            ],
+            vec![],
+        );
+        let rep = dead(&d).unwrap();
+        assert!(
+            rep.limitations[1]
+                .starts_with("1 unreachable methods implement traits declared outside"),
+            "{:?}",
+            rep.limitations
+        );
+        let opts = DeadOptions {
+            retain_external_trait_impls: true,
+        };
+        let kept = dead_with_options(&d, opts).unwrap();
+        assert_eq!(
+            finding_ids(&kept),
+            [
+                "c::S::<Alias>::run",
+                "c::only_from_alias_impl",
+                "c::t::Tr::run"
+            ]
+        );
+        assert!(kept.limitations[1].starts_with("1 methods implementing traits declared outside"));
+    }
+
+    /// 크레이트 `krate`의 정점 — `exported`는 `pub` 선언이다.
+    fn in_crate(id: &str, kind: Kind, krate: &str, exported: bool) -> Vertex {
+        Vertex {
+            krate: krate.to_string(),
+            module: krate.to_string(),
+            exported,
+            ..v(id, kind)
+        }
+    }
+
+    /// 보존 루트가 하나도 없는 크레이트(main 없는 lib)의 공개 아이템은 워크스페이스 안에 호출자가
+    /// 없어 전부 unreachable이다 — 판정은 그대로 두고, 그 수와 크레이트를 세어 `--retain-public`을
+    /// 알린다. 루트가 있는 크레이트(bin)의 `pub` 아이템은 세지 않는다 — 그 크레이트 밖에서 불리지
+    /// 않는다. 공개 아이템을 루트로 삼으면(`--retain-public`) 셀 것이 없어 조용하다.
+    #[test]
+    fn dead_counts_exported_items_of_crates_without_roots() {
+        let d = document(
+            Level::Symbol,
+            ".".into(),
+            None,
+            vec!["app::main".into()],
+            vec![
+                in_crate("app::main", Kind::Fn, "app", false),
+                in_crate("app::helper", Kind::Fn, "app", true),
+                in_crate("core::api", Kind::Fn, "core", true),
+                in_crate("core::Api", Kind::Struct, "core", true),
+                in_crate("core::private", Kind::Fn, "core", false),
+                in_crate("core::used", Kind::Fn, "core", true),
+                in_crate("macros::derive", Kind::Fn, "macros", true),
+            ],
+            vec![Edge::new(
+                "app::main".into(),
+                "core::used".into(),
+                EdgeKind::Call,
+            )],
+            vec![],
+        );
+        let rep = dead(&d).unwrap();
+        assert_eq!(
+            finding_ids(&rep),
+            [
+                "app::helper",
+                "core::Api",
+                "core::api",
+                "core::private",
+                "macros::derive"
+            ]
+        );
+        assert_eq!(
+            rep.limitations,
+            ["3 unreachable symbols are exported items of crates with no retention root (core, macros); callers outside this workspace are not in the graph, so if these crates are libraries used elsewhere, --retain-public (MCP: retainPublic) treats exported symbols as roots — otherwise these items have no caller in the workspace"]
+        );
+        // 루트가 없는 문서(main 없는 lib만 있는 워크스페이스)도 같다.
+        let mut lib = d.clone();
+        lib.roots.clear();
+        assert_eq!(
+            dead(&lib).unwrap().limitations,
+            ["5 unreachable symbols are exported items of crates with no retention root (app, core, macros); callers outside this workspace are not in the graph, so if these crates are libraries used elsewhere, --retain-public (MCP: retainPublic) treats exported symbols as roots — otherwise these items have no caller in the workspace"]
+        );
+        // 공개 아이템이 루트면 공개 미도달이 없어 limitation도 없다.
+        let public: Vec<String> = d
+            .vertices
+            .iter()
+            .filter(|v| v.exported)
+            .map(|v| v.id.clone())
+            .chain(d.roots.iter().cloned())
+            .collect();
+        let retained = QueryIndex::new(&d).dead(&public).unwrap();
+        assert_eq!(finding_ids(&retained), ["core::private"]);
+        assert!(retained.limitations.is_empty());
+    }
+
     #[test]
     fn cycles_excludes_tentative_edges() {
         let d = doc();
@@ -1545,6 +2018,24 @@ mod tests {
         assert_eq!(rep.cycles.len(), 1);
         assert!(rep.cycles[0].members.contains(&"c::a".to_string()));
         assert!(!rep.cycles[0].evidence.is_empty());
+    }
+
+    /// 구성원이 모듈 트리의 한 갈래(서로 조상·자손)에만 있는 순환만 중첩 순환이다 — 형제 모듈이나
+    /// 갈래 밖 모듈이 끼면 아니다. `a::bc`는 `a::b`의 자손이 아니다(세그먼트 경계).
+    #[test]
+    fn nested_module_cycle_needs_one_ancestor_chain() {
+        let cycle = |members: &[&str]| Cycle {
+            members: members.iter().map(|m| m.to_string()).collect(),
+            evidence: vec![],
+        };
+        assert!(is_nested_module_cycle(&cycle(&["c::m", "c::m::inner"])));
+        assert!(is_nested_module_cycle(&cycle(&["c", "c::m", "c::m::a::b"])));
+        assert!(!is_nested_module_cycle(&cycle(&["c::a", "c::b"])));
+        assert!(!is_nested_module_cycle(&cycle(&[
+            "c::m", "c::m::a", "c::m::b"
+        ])));
+        assert!(!is_nested_module_cycle(&cycle(&["c::a::b", "c::a::bc"])));
+        assert!(!is_nested_module_cycle(&cycle(&["c::m"])));
     }
 
     /// 재귀 Tarjan은 DFS 경로 길이만큼 호출 스택을 써서 수만 정점 고리·사슬에서

@@ -66,8 +66,10 @@ rustograph graph --level crate --deps    # 크레이트 + 의존 그래프
 rustograph graph --level symbol          # call/references/implements/signature
 rustograph graph --out .rustograph/graph.json  # 저장(트리가 깨끗하면 git HEAD를 revision으로 기록)
 rustograph cycles --graph .rustograph/graph.json --strict
+rustograph cycles --level module --exclude-nested-modules  # 부모·자식 모듈만으로 된 순환 제외
 rustograph dead --retain-public --tests
 rustograph dead --explain mycrate::f     # 왜 살아 있나 — 도달 경로
+rustograph dead --retain-external-trait-impls  # 닿는 타입의 Drop/Display/Iterator/From… impl 보존
 rustograph rules --strict                # .rustograph.yml 레이어 규칙
 rustograph rules --format sarif          # GitHub 코드 스캐닝용
 rustograph rules --write-baseline        # 기존 위반을 기준선으로 얼림
@@ -93,7 +95,15 @@ rustograph impact --format language-traversal --roots-from schema-facts.json  # 
 `#[cfg(...)]` 토큰, 간선의 `cfg`는 그 조건 아래서만 성립하는 의존을
 표시합니다. `unsafe`는 경계를 표시합니다 — `unsafe fn`/`unsafe trait`이거나
 `unsafe {}` 블록을 품은 정점에 `unsafe: true`, `unsafe {}` 안에서 만든
-간선은 경계 진입 간선입니다.
+간선은 경계 진입 간선입니다. 구성원이 한 모듈과 그 자손뿐인 모듈 레벨 순환(부모가
+자식을 쓰고 자식이 `super::`로 부모를 부르는 관용 구조)은 `cycles --level module`이
+지금처럼 보고하고 텍스트 출력의 `note:` 줄에 그 수를 셉니다.
+`--exclude-nested-modules`는 그 순환을 빼고(`--strict` 판정 포함) JSON 보고서에
+뺀 수 `excluded_nested`(없으면 `0`)를 싣습니다. 형제나 다른 모듈이 끼는 순환은 항상 보고합니다. 이
+플래그는 CLI 전용이고 모듈 레벨에서만 받습니다. 자기 자신으로 가는 간선은 만들지 않습니다 —
+직접 재귀(`fn f() { f() }`)는 `cycles --level symbol`에 나오지 않고, 서로
+부르는 두 심볼은 순환으로 나옵니다. 재귀 함수도 호출자에게서 닿으므로
+도달성에는 영향이 없습니다.
 
 `rustograph mcp`는 개행 구분 JSON-RPC 2.0을 stdio로 말하고 도구 9종
 (`rustograph_summary`/`_query`/`_impact`/`_paths`/`_search`/`_cycles`/
@@ -322,6 +332,31 @@ feature(`--features semantic` 빌드 후 `--semantic`)는 rust-analyzer
 보지 못하는 본문(cfg 비활성·매크로 생성)은 syn 경로로 되돌아가고 그 수를
 셉니다. 의미 해석도 해석하지 못한 메서드 호출은 아래와 같은 이름 팬아웃으로
 돌아갑니다.
+
+워크스페이스 밖에서 선언된 트레이트의 impl 메서드 — `Drop::drop`(스코프 끝),
+`Iterator::next`(`for`), `Display::fmt`(포맷 매크로), `From::from`(`.into()`),
+`syn` visitor의 `visit_*` — 는 호출을 언어나 외부 크레이트가 하므로 `dead`가
+호출자를 보지 못합니다. 기본값에서는 그 메서드와 그것만 부르는 코드가
+unreachable로 남고, 보고서가 닿는 타입에 붙은 그런 메서드 수를 셉니다.
+`dead --retain-external-trait-impls`(MCP `rustograph_dead`의
+`retainExternalTraitImpls`)는 타입이 닿으면 그 메서드도 닿은 것으로 보고 그
+메서드가 부르는 코드까지 따라가며, 그렇게 보존한 메서드 수를 보고서에 셉니다.
+타입이 `implements`로 구현하는 워크스페이스 트레이트 가운데 그 이름이거나 그
+메서드를 선언한 것이 없는 impl을 외부 트레이트 impl로 봅니다(별칭·재노출 이름으로
+쓴 `use t::Tr as Alias; impl Alias for S`는 워크스페이스 impl입니다) — 호출이 보이는 워크스페이스 트레이트의
+미사용 impl과 아무도 닿지 않는 타입의 impl은 계속 보고됩니다. 타입이 닿는다고
+트레이트가 쓰인다는 뜻은 아니므로, 그런 impl로만 닿는 코드는 그 impl이 불리지
+않아도 보고되지 않습니다.
+
+워크스페이스 밖의 호출자는 그래프에 없으므로, 보존 루트가 하나도 없는
+크레이트(`fn main`·`#[no_mangle]` 진입점이 없고 `--root`도 주지 않은 lib)의
+공개 아이템은 `--retain-public`(MCP: `retainPublic`)으로 공개 심볼을 루트로
+삼지 않으면 전부 unreachable입니다. `dead`는 기본값에서 지금처럼 그것을
+보고하고, 보고서가 그 공개 아이템 수와 크레이트 이름을 세어 워크스페이스 밖에서
+쓰는 라이브러리라면 `--retain-public`을 쓰라고 알립니다. 워크스페이스 안에서만
+쓰는 라이브러리라면 그 아이템은 정말 호출자가 없고, `--retain-public`은 그것을
+가립니다. 루트가 있는 크레이트의 공개 아이템(예컨대 bin의 `pub` 아이템)은 세지
+않습니다.
 
 이름 팬아웃(수신자 타입을 모르는 `x.m()`)의 후보는 호출 크레이트의 의존으로
 좁힙니다. 고유 메서드(`T::m`)와 트레이트 선언 메서드(`Tr::m`)는 호출 크레이트,

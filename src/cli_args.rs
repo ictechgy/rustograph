@@ -98,6 +98,8 @@ const BOOL_FLAGS: &[&str] = &[
     "no-cache",
     "write-baseline",
     "working-tree",
+    "retain-external-trait-impls",
+    "exclude-nested-modules",
 ];
 
 pub(crate) fn parse(args: &[String]) -> Result<Args, String> {

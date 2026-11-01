@@ -13,6 +13,8 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --check
 scripts/coverage.sh
 scripts/verify-cli-contract.sh
+cargo +1.96.0 check --locked --all-targets                     # MSRV (`rust-version` in Cargo.toml)
+cargo +1.96.0 check --locked --all-targets --features semantic
 ```
 
 Report checks that could not run and the relevant environment constraints. Preserve coverage and performance gates. Optional features require a feature build; default tests alone do not validate them.
