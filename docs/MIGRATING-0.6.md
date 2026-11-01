@@ -5,6 +5,12 @@ must provide `generic_scopes` (use an empty vector when there are no enclosing
 generic parameters). Callers constructing `harvest::ImplBlock` must provide its
 borrowed `generics`. This preserves lexical type/const namespaces when body
 references are harvested. CLI and graph document schemas are unchanged.
+`modtree::Module` adds `type_items`, the names of its type-namespace items
+(`mod`, `struct`, `enum`, `union`, `trait`, `type`); `Module::new` starts it
+empty and `fill_items` fills it. Callers constructing `Module` by struct
+literal must provide it. A path prefix (`name::item`) resolves to such a local
+item before a same-named import, and to the import when the local name is only
+a value or macro item.
 
 `change-impact --base REV [--head REV | --working-tree]` and the MCP tool
 `rustograph_change_impact` capture actual changes into separate before/after

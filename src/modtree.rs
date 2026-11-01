@@ -92,6 +92,9 @@ pub struct Module {
     /// 그중 값 이름공간의 아이템(fn·const·static) — `mod util`과 `fn util`처럼
     /// 이름공간이 다른 두 아이템이 한 경로를 공유할 때 값 자리 해석이 fn을 고른다.
     pub value_items: BTreeSet<String>,
+    /// 그중 타입 이름공간의 아이템(mod·struct·enum·union·trait·type) — 경로 접두사 자리
+    /// (`name::item`)에서 같은 이름의 임포트를 가리는 로컬 아이템이다.
+    pub type_items: BTreeSet<String>,
     /// `use` 임포트 맵: 마지막 세그먼트(또는 as 이름) → 임포트.
     pub imports: BTreeMap<String, Import>,
     /// 자식 모듈 이름 → 경로.
@@ -110,6 +113,7 @@ impl Module {
             cfg: None,
             items: BTreeSet::new(),
             value_items: BTreeSet::new(),
+            type_items: BTreeSet::new(),
             imports: BTreeMap::new(),
             children: BTreeMap::new(),
         }
@@ -216,16 +220,7 @@ impl ModTree {
             }
             first => {
                 let module = self.modules.get(from)?;
-                // 뒤에 세그먼트가 이어지는 첫 세그먼트는 타입 이름공간(모듈·타입)이다 — 값
-                // 아이템(fn·const·static)은 경로를 시작하지 못한다. 같은 이름의 임포트와 값
-                // 아이템이 한 모듈에 있으면 컴파일되는 코드에서 임포트가 타입 이름공간이므로,
-                // `fn harvest`가 있는 모듈의 `harvest::f()`는 `use crate::harvest`를 따른다.
-                let imported_prefix = segs.len() > 1
-                    && module.value_items.contains(first)
-                    && module.imports.contains_key(first);
-                if !imported_prefix
-                    && (module.items.contains(first) || module.children.contains_key(first))
-                {
+                if prefers_local(module, first, segs.len() > 1) {
                     format!("{from}::{first}")
                 } else if let Some(imp) = module.imports.get(first) {
                     imp.target.clone()
@@ -308,6 +303,24 @@ impl ModTree {
             .get(owner)
             .is_some_and(|m| m.items.contains(name))
     }
+}
+
+/// `first`를 모듈 `module`의 로컬 아이템으로 해석할 것인가 — 아니면 임포트를 본다.
+///
+/// 뒤에 세그먼트가 이어지는 접두사 자리(`prefix`)는 타입 이름공간이다. 로컬 타입 이름공간
+/// 아이템(자식 모듈·struct·enum·union·trait·type)은 같은 이름의 임포트를 이긴다 — 같은 이름공간의
+/// 글롭(`use super::*`)을 가리고, 명시 임포트와는 컴파일되는 코드에서 공존하지 못한다. 로컬 이름이
+/// 값·매크로 아이템뿐이면 접두사가 될 수 없으므로 그 이름의 임포트(명시·글롭)를 따른다 —
+/// `fn harvest`가 있는 모듈의 `harvest::f()`는 `use crate::harvest`다. 임포트도 없으면 지금처럼
+/// 로컬로 본다. 한 세그먼트 자리는 이름공간을 가리지 않고 지금처럼 로컬이 먼저다. 매크로가 만든
+/// 로컬 아이템은 아이템 표에 없어 이 판단에 들어오지 않는다.
+fn prefers_local(module: &Module, first: &str, prefix: bool) -> bool {
+    let typed = module.children.contains_key(first) || module.type_items.contains(first);
+    let local = typed || module.items.contains(first);
+    if prefix && !typed && module.imports.contains_key(first) {
+        return false;
+    }
+    local
 }
 
 /// ast 아이템들에서 `mod` 선언을 찾아 트리에 심는다.
@@ -526,6 +539,7 @@ pub fn cfg_of(attrs: &[syn::Attribute]) -> Option<String> {
 pub fn fill_items(tree: &mut ModTree, path: &str, items: &[&syn::Item]) {
     let mut names = BTreeSet::new();
     let mut values = BTreeSet::new();
+    let mut types = BTreeSet::new();
     for item in items {
         match item {
             syn::Item::Fn(f) => {
@@ -534,18 +548,23 @@ pub fn fill_items(tree: &mut ModTree, path: &str, items: &[&syn::Item]) {
             }
             syn::Item::Struct(s) => {
                 names.insert(s.ident.to_string());
+                types.insert(s.ident.to_string());
             }
             syn::Item::Enum(e) => {
                 names.insert(e.ident.to_string());
+                types.insert(e.ident.to_string());
             }
             syn::Item::Trait(t) => {
                 names.insert(t.ident.to_string());
+                types.insert(t.ident.to_string());
             }
             syn::Item::Union(u) => {
                 names.insert(u.ident.to_string());
+                types.insert(u.ident.to_string());
             }
             syn::Item::Type(t) => {
                 names.insert(t.ident.to_string());
+                types.insert(t.ident.to_string());
             }
             syn::Item::Const(c) => {
                 names.insert(c.ident.to_string());
@@ -557,6 +576,7 @@ pub fn fill_items(tree: &mut ModTree, path: &str, items: &[&syn::Item]) {
             }
             syn::Item::Mod(m) => {
                 names.insert(m.ident.to_string());
+                types.insert(m.ident.to_string());
             }
             syn::Item::Macro(m) => {
                 if let Some(id) = &m.ident {
@@ -569,6 +589,7 @@ pub fn fill_items(tree: &mut ModTree, path: &str, items: &[&syn::Item]) {
     let module = tree.modules.get_mut(path).expect("module must exist");
     module.items.extend(names);
     module.value_items.extend(values);
+    module.type_items.extend(types);
 }
 
 /// 모듈의 `use` 임포트 맵을 해석해 채운다(2단계 — 전 모듈의 fill_items 이후).
@@ -768,8 +789,8 @@ mod tests {
 
     /// 뒤에 세그먼트가 이어지는 첫 세그먼트는 타입 이름공간이다 — 같은 모듈의 값 아이템
     /// (`fn util`)이 같은 이름으로 들인 모듈(`use crate::util`)을 가리지 않는다. 한 세그먼트
-    /// 값 자리(`util(1)`)는 지금처럼 그 fn이다. 두 이름이 한 모듈에 함께 있으면 컴파일되는
-    /// 코드에서 임포트는 타입 이름공간(모듈·타입)일 수밖에 없다.
+    /// 값 자리(`util(1)`)는 지금처럼 그 fn이다. 로컬에 같은 이름의 타입 이름공간 아이템이 없으니
+    /// 접두사 자리는 그 임포트다.
     #[test]
     fn value_item_does_not_shadow_an_imported_module_prefix() {
         let mut t = tree();
@@ -788,6 +809,36 @@ mod tests {
             t.resolve("c::m", &["util".into(), "h".into()], &none),
             Some("c::util::h".to_string())
         );
+        assert_eq!(
+            t.resolve("c::m", &["util".into()], &none),
+            Some("c::m::util".to_string())
+        );
+    }
+
+    /// 로컬 타입 이름공간 아이템은 같은 이름의 임포트(글롭)를 가린다 — 같은 이름의 fn이 함께 있어도
+    /// (`pub struct util {}`와 `pub fn util()`은 이름공간이 달라 공존한다) 접두사 `util::h`는 로컬
+    /// 구조체의 연관 경로이지 글롭이 들인 `c::util` 모듈이 아니다. 연관 아이템은 아이템 표에 없어
+    /// 해석은 None이고, 엉뚱한 `c::util::h`로 확정되지 않는다.
+    #[test]
+    fn local_type_item_shadows_a_glob_import_beside_a_same_named_fn() {
+        let mut t = tree();
+        let none = DepCrates::new();
+        let file: syn::File =
+            syn::parse_str("pub struct util {} pub fn util() {}").expect("valid items");
+        let items: Vec<&syn::Item> = file.items.iter().collect();
+        fill_items(&mut t, "c::m", &items);
+        t.modules
+            .get_mut("c::m")
+            .expect("fixture module")
+            .imports
+            .insert(
+                "util".to_string(),
+                Import {
+                    target: "c::util".to_string(),
+                    cfg: None,
+                },
+            );
+        assert_eq!(t.resolve("c::m", &["util".into(), "h".into()], &none), None);
         assert_eq!(
             t.resolve("c::m", &["util".into()], &none),
             Some("c::m::util".to_string())

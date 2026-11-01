@@ -14,9 +14,11 @@
 - `use a::b::{self}`·`use a::b::{self as x}`가 모듈 `b`를 임포트한다. 이전에는 `b::self`를 찾다 임포트가 사라져
   `b::f()` 호출과 모듈 `uses` 간선이 빠졌다 — 최상위가 아닌 모듈의 함수가 `dead`에 unreachable로 나오고,
   `impact`가 그 호출자를, `rules`·모듈 레벨 `cycles`가 그 의존을 보지 못했다.
-- 같은 모듈에 값 아이템(`fn`·`const`·`static`)과 같은 이름의 임포트가 함께 있으면 `name::item` 경로의 `name`을
-  임포트(모듈·타입)로 해석한다. 이전에는 `fn harvest`가 `use crate::harvest`를 가려 `harvest::f()`가 미해석이 됐다.
-  한 세그먼트 호출 `name()`은 지금처럼 그 fn이다.
+- `name::item` 경로의 접두사 `name`을 타입 이름공간으로 해석한다. 로컬 타입 이름공간 아이템(자식 모듈·struct·enum·
+  union·trait·type)은 같은 이름의 임포트(글롭 포함)를 이기고, 로컬 이름이 값(`fn`·`const`·`static`)·매크로 아이템뿐이면
+  그 이름의 임포트를 따른다. 이전에는 `fn harvest`가 `use crate::harvest`를 가려 `harvest::f()`가 미해석이 됐다.
+  한 세그먼트 호출 `name()`은 지금처럼 그 fn이다. 라이브러리 호출자용 `modtree::Module`에 `type_items`가 늘었다
+  ([0.6 migration](docs/MIGRATING-0.6.md)).
 - `rules`·MCP `rustograph_rules`: 간선이 정렬되지 않은 문서(`--graph`로 읽은 다른 도구의 문서 등)에서 같은
   `(rule, from, to)`의 간선 종류가 call·references·call처럼 섞여도 같은 기준선 키(`rule|from|to|kind`)의 위반을
   한 번만 보고한다. 이전에는 정렬 키에 kind가 없어 같은 위반이 두 번 나올 수 있었다. 수확한 문서의 결과는 같다.
