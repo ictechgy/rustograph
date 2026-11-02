@@ -35,6 +35,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # 러너 디스크 여유 — 이 잡은 semantic 테스트 빌드와 커버리지 계측 빌드를 한 디스크에 쌓는다.
+      - name: Disk usage at job start
+        run: df -h
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
@@ -47,6 +50,15 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo fmt --check
       - run: cargo test --locked --features semantic
+      # 커버리지는 cargo-llvm-cov가 target/llvm-cov-target에 계측 빌드를 새로 만들고 앞 단계의 target/
+      # 산출물(semantic 테스트 바이너리 포함)은 쓰지 않는다 — 지워서 그 빌드가 디스크를 다 쓰지 않게 한다.
+      # 잡에 target 캐시가 없고, 뒤 단계(verify-cli-contract.sh·cargo run)는 필요한 것을 다시 빌드한다.
+      - name: Free target/ before coverage
+        run: |
+          df -h
+          du -sh target
+          cargo clean
+          df -h
       - run: scripts/coverage.sh
       - run: scripts/verify-cli-contract.sh
 
