@@ -16,7 +16,16 @@ Paths now resolve through `use` re-exports to the defining item, so one
 build a `ModTree` themselves should call `modtree::fill_imports_settled`, which
 repeats the pass until the import tables stop changing (at most
 `modtree::MAX_IMPORT_PASSES`) and returns the number of modules still changing.
-`modtree::Import` now implements `PartialEq` and `Eq`.
+`fill_imports` now rebuilds the module's import tables from its own `use`
+items instead of adding to them. Glob imports bring in only the names visible
+from the importing module, so the tables carry visibility: `modtree::Import`
+adds `scope` (a `modtree::Scope`, `Scope::Public` for a `pub use`) and
+implements `PartialEq` and `Eq`; `modtree::Module` adds `item_scopes` (declared
+names to their widest `Scope`; a missing name counts as public) and
+`unresolved_imports` (names an explicit `use` brings in from outside the graph,
+such as `std`, mapped to their `Scope`). Callers constructing `Import` or
+`Module` by struct literal must provide them; `Module::new` starts both maps
+empty.
 
 `change-impact --base REV [--head REV | --working-tree]` and the MCP tool
 `rustograph_change_impact` capture actual changes into separate before/after
