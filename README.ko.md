@@ -323,7 +323,10 @@ cargo run -- rules --strict     # 자기 분석(도그푸딩)
 ## MVP의 한계
 
 구문 분석(syn)은 매크로 확장·`dyn` 디스패치·제네릭을 꿰뚫지 못합니다 —
-모든 사각지대는 `limitations`에 실측으로 잡힙니다. opt-in `semantic`
+모든 사각지대는 `limitations`에 실측으로 잡힙니다. 매크로가 만든 아이템은
+모듈의 아이템 표에도 없어서 글롭 임포트가 들인 같은 이름을 가리지 못합니다 —
+`Config`를 만드는 매크로를 펼치면서 `Config`가 있는 모듈을 글롭으로 들이는
+모듈 안의 `Config` 참조는 글롭의 `Config`로 해석됩니다. opt-in `semantic`
 feature(`--features semantic` 빌드 후 `--semantic`)는 rust-analyzer
 (`ra_ap_*`) 의미론으로 본문 수확을 보강합니다 — 메서드 호출은 수신자
 타입으로 해석하고, 매크로 확장 트리를 걷고, `dyn`/제네릭 트레이트 호출은

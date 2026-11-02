@@ -549,7 +549,11 @@ rustup or the active sysroot.
 ## Limitations of the MVP
 
 Syntactic analysis (syn) cannot see through macros, `dyn` dispatch, or
-generics — every such gap is counted in `limitations`. Name fan-out is
+generics — every such gap is counted in `limitations`. Items a macro generates
+are not in their module's item table either, so they do not shadow a name that
+a glob import brings in: inside a module that both runs a macro generating
+`Config` and globs a module with `Config`, a reference to `Config` resolves to
+the glob's `Config`. Name fan-out is
 bounded by the calling crate's dependencies and by a width cap of 4,096
 candidates per call; wider calls are counted instead of fanned out, so `dead`
 can report methods reached only through them (see
