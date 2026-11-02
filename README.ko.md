@@ -494,6 +494,13 @@ rustograph가 덮지 않는 두 설정도 마찬가지입니다.
 나머지 git 설정과, 설정한 그대로의 `PATH` 절대 경로 항목(체크아웃 안을 가리키는
 항목이라도)은 평소대로 적용됩니다.
 
+## 미출시(0.7.0) 호환성 노트
+
+v0.6.0 뒤 `main`의 변경은 공개 Rust 구조체(`harvest::BodyItem`, `harvest::ImplBlock`,
+`modtree::Module`, `modtree::Import`)에 필드를 더하고 경로를 rustc에 더 가깝게 해석하므로
+(경로 접두사 이름공간, 재노출, 글롭 가시성) 0.7.0으로 나갑니다. CLI 플래그, 그래프 문서 v1,
+순회 문서 v1은 호환됩니다 — [0.7 이행 안내](docs/MIGRATING-0.7.md).
+
 ## 라이선스
 
 MIT — [LICENSE](LICENSE).
