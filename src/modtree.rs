@@ -59,6 +59,7 @@ impl DepCrates {
 /// 보이는 이름만 들인다: 비공개는 선언한 모듈과 그 자손, `pub(super)`는 부모와 그 자손, `pub(crate)`는
 /// 그 크레이트 안, `pub`은 어디서나.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Scope {
     /// `pub` — 어디서나 보인다.
     #[default]
@@ -681,8 +682,9 @@ pub fn fill_items(tree: &mut ModTree, path: &str, items: &[&syn::Item]) {
     }
 }
 
-/// 선언 모듈 `module`에서 쓴 가시성의 범위. `pub(in path)`·`pub(super)`가 가리키는 모듈을 찾지 못하면
-/// (컴파일되지 않는 코드) 관대하게 어디서나 보이는 것으로 둔다.
+/// 선언 모듈 `module`에서 쓴 가시성의 범위. 제한 가시성(`pub(..)`)은 아무리 넓어도 그 크레이트
+/// 안이므로, 가리키는 모듈을 찾지 못하면(`super`가 루트를 넘는 등 컴파일되지 않는 코드) 크레이트
+/// 전체로 둔다 — 크레이트 밖으로 새지 않는다.
 fn scope_of(vis: &syn::Visibility, module: &str) -> Scope {
     match vis {
         syn::Visibility::Public(_) => Scope::Public,
@@ -694,19 +696,20 @@ fn scope_of(vis: &syn::Visibility, module: &str) -> Scope {
                 .iter()
                 .map(|s| s.ident.to_string())
                 .collect();
-            restricted_scope(&segs, module).map_or(Scope::Public, Scope::Within)
+            Scope::Within(restricted_scope(&segs, module).unwrap_or_else(|| crate_of(module)))
         }
     }
 }
 
-/// `pub(crate)`·`pub(self)`·`pub(super)`·`pub(in crate::a)`의 경로를 모듈 경로로.
+/// `pub(crate)`·`pub(self)`·`pub(super)`·`pub(in crate::a)`의 경로를 모듈 경로로. `crate`·`self`·
+/// `super`로 시작하지 않는 `pub(in top::a)`는 2015 판의 크레이트 기준 경로다(2018 판부터는 쓸 수 없다).
 fn restricted_scope(segs: &[String], module: &str) -> Option<String> {
     let (first, rest) = segs.split_first()?;
     let mut cur = match first.as_str() {
         "crate" => crate_of(module),
         "self" => module.to_string(),
         "super" => parent_of(module)?,
-        _ => return None,
+        other => format!("{}::{other}", crate_of(module)),
     };
     for seg in rest {
         cur = if seg == "super" {
@@ -759,11 +762,13 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
                     merge_glob(&mut globbed, name, binding);
                 }
             }
+            // 글롭한 모듈 자신을 그 마지막 이름에 묶는다 — Rust 이름이 아니라 이 글롭의 의존 증거다(대상
+            // 모듈·외부 크레이트 정점으로 가는 uses 간선). 그래서 이 모듈 밖의 글롭으로는 전하지 않는다.
             let name = full.rsplit("::").next().unwrap_or(&full).to_string();
             let module = Binding::Resolved(Import {
                 target: full,
                 cfg: cfg.clone(),
-                scope: scope.clone(),
+                scope: Scope::Within(path.to_string()),
             });
             merge_glob(&mut globbed, name, module);
             continue;

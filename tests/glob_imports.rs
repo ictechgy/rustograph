@@ -445,3 +445,447 @@ fn main() { a::fa(); b::fb(); }
     assert!(!any_edge(&on_linux, "cfgx::b", "cfgx::win::Handle"));
     assert!(!any_edge(&doc.without_tests(), "cfgx::d", "cfgx::t::Fake"));
 }
+
+/// 2015 판의 `pub(in top)`는 크레이트 기준 경로다 — `top::a`의 `pub(in top) use self::inner::g`는 `top`과
+/// 그 자손에서만 보이므로 `other`의 `use top::a::*`로 오지 않고 `util::g`가 쓰인다. 경로를 해석하지 못한
+/// 제한 가시성도 크레이트 밖으로는 새지 않는다. (rustc 실행 결과: `util::g`, `inner::g`)
+#[test]
+fn edition_2015_pub_in_path_is_crate_relative() {
+    let ws = Workspace::new(
+        "ed2015",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname='ed2015'\nversion='0.1.0'\nedition='2015'\n[workspace]\n",
+            ),
+            (
+                "src/main.rs",
+                "mod util { pub fn g() {} }\n\
+                 mod top {\n    pub mod a {\n        mod inner { pub fn g() {} }\n        \
+                 pub(in top) use self::inner::g;\n    }\n    pub fn in_top() { a::g() }\n}\n\
+                 mod other {\n    use util::*;\n    use top::a::*;\n    pub fn call() { g() }\n}\n\
+                 fn main() { other::call(); top::in_top(); }\n",
+            ),
+        ],
+    );
+    let doc = ws.symbols();
+    assert!(has_edge(
+        &doc,
+        "ed2015::other::call",
+        "ed2015::util::g",
+        EdgeKind::Call
+    ));
+    assert!(!has_edge(
+        &doc,
+        "ed2015::other::call",
+        "ed2015::top::a::inner::g",
+        EdgeKind::Call
+    ));
+    assert!(has_edge(
+        &doc,
+        "ed2015::top::in_top",
+        "ed2015::top::a::inner::g",
+        EdgeKind::Call
+    ));
+}
+
+/// `pub(in crate::top)` 재노출은 `top` 안(`top::sib`)의 글롭에는 오고 밖(`other`)의 글롭에는 오지 않는다.
+/// (rustc 실행 결과: `util::g`, `inner::g`, `inner::g`)
+#[test]
+fn pub_in_path_reexport_is_globbed_only_inside_that_module() {
+    let ws = Workspace::package(
+        "pubin",
+        r#"
+mod util { pub fn g() {} }
+mod top {
+    pub mod mid {
+        pub mod a {
+            mod inner { pub fn g() {} }
+            pub(in crate::top) use self::inner::g;
+        }
+        pub fn in_mid() { a::g() }
+    }
+    pub mod sib {
+        use super::mid::a::*;
+        pub fn s() { g() }
+    }
+}
+mod other {
+    use crate::util::*;
+    use crate::top::mid::a::*;
+    pub fn call() { g() }
+}
+fn main() { other::call(); top::sib::s(); top::mid::in_mid(); }
+"#,
+    );
+    let doc = ws.symbols();
+    let inner_g = "pubin::top::mid::a::inner::g";
+    assert!(has_edge(
+        &doc,
+        "pubin::other::call",
+        "pubin::util::g",
+        EdgeKind::Call
+    ));
+    assert!(!has_edge(
+        &doc,
+        "pubin::other::call",
+        inner_g,
+        EdgeKind::Call
+    ));
+    assert!(has_edge(
+        &doc,
+        "pubin::top::sib::s",
+        inner_g,
+        EdgeKind::Call
+    ));
+}
+
+/// `use m::*`가 `m`의 마지막 이름에 `m`을 묶는 항목은 Rust 이름이 아니라 그 글롭의 의존 증거다 — 그
+/// 모듈 밖으로 전해지지 않는다. `b`의 `pub use super::*`(→ `a`)를 글롭으로 들인 `other`, `p`의
+/// `pub use crate::q::*`(→ `q`)를 글롭으로 들인 `importer`는 그 모듈(`a`·`q`)을 들이지 않는다.
+/// 재노출된 아이템(`q::x`)으로 가는 임포트는 그대로다. (rustc 실행 결과: `util::g`, `a::inner::g` / `q::x`)
+#[test]
+fn glob_module_name_entry_does_not_propagate() {
+    let ws = Workspace::package(
+        "chainnarrow",
+        r#"
+mod util { pub fn g() {} }
+mod a {
+    mod inner { pub fn g() {} }
+    #[allow(unused_imports)]
+    use self::inner::g;
+    pub mod b {
+        #[allow(unused_imports)]
+        pub use super::*;
+        pub fn in_a() { g() }
+    }
+}
+mod other {
+    use crate::util::*;
+    use crate::a::b::*;
+    pub fn call() { g(); in_a(); }
+}
+fn main() { other::call(); }
+"#,
+    );
+    let doc = ws.symbols();
+    assert!(!any_edge(&doc, "chainnarrow::other", "chainnarrow::a"));
+    assert!(has_edge(
+        &doc,
+        "chainnarrow::other::call",
+        "chainnarrow::util::g",
+        EdgeKind::Call
+    ));
+    assert!(has_edge(
+        &doc,
+        "chainnarrow::a::b::in_a",
+        "chainnarrow::a::inner::g",
+        EdgeKind::Call
+    ));
+    // 글롭한 모듈 자신(`b`)으로 가는 의존 증거는 남는다.
+    assert!(any_edge(&doc, "chainnarrow::other", "chainnarrow::a::b"));
+
+    let ws = Workspace::package(
+        "pubglob",
+        r#"
+mod q { pub fn x() {} }
+mod p {
+    pub use crate::q::*;
+    pub fn inside() { x() }
+}
+mod importer {
+    use crate::p::*;
+    pub fn call() { x(); inside(); }
+}
+fn main() { importer::call(); }
+"#,
+    );
+    let doc = ws.symbols();
+    assert!(!any_edge(&doc, "pubglob::importer", "pubglob::q"));
+    assert!(has_edge(
+        &doc,
+        "pubglob::importer",
+        "pubglob::q::x",
+        EdgeKind::Uses
+    ));
+    assert!(has_edge(
+        &doc,
+        "pubglob::importer::call",
+        "pubglob::q::x",
+        EdgeKind::Call
+    ));
+    assert!(any_edge(&doc, "pubglob::p", "pubglob::q"));
+}
+
+/// 비공개 글롭이 들인 재노출은 그 모듈 밖에서 보이지 않는다 — `b`의 `use crate::a::*`가 들인 `a`의
+/// `pub use crate::inner::g`는 `b`를 글롭하는 `other`에게 오지 않는다. (rustc 실행 결과: `util::g`, `inner::g`)
+#[test]
+fn private_glob_narrows_the_reexports_it_brings_in() {
+    let ws = Workspace::package(
+        "privglobreexp",
+        r#"
+mod util { pub fn g() {} }
+mod inner { pub fn g() {} }
+mod a { pub use crate::inner::g; }
+mod b {
+    #[allow(unused_imports)]
+    use crate::a::*;
+    pub fn bf() { g() }
+}
+mod other {
+    use crate::util::*;
+    use crate::b::*;
+    pub fn call() { g(); bf(); }
+}
+fn main() { other::call(); }
+"#,
+    );
+    let doc = ws.symbols();
+    let call = "privglobreexp::other::call";
+    assert!(has_edge(
+        &doc,
+        call,
+        "privglobreexp::util::g",
+        EdgeKind::Call
+    ));
+    assert!(!has_edge(
+        &doc,
+        call,
+        "privglobreexp::inner::g",
+        EdgeKind::Call
+    ));
+    assert!(has_edge(
+        &doc,
+        "privglobreexp::b::bf",
+        "privglobreexp::inner::g",
+        EdgeKind::Call
+    ));
+}
+
+/// 비공개 글롭이 들인 공개 아이템도 그 모듈 밖에서 보이지 않는다 — `b`의 `use crate::a::*`가 들인 `a::g`는
+/// `other`에게 오지 않는다. (rustc 실행 결과: `util::g`, `a::g`)
+#[test]
+fn private_glob_narrows_the_items_it_brings_in() {
+    let ws = Workspace::package(
+        "privglobchain",
+        r#"
+mod util { pub fn g() {} }
+mod a { pub fn g() {} }
+mod b {
+    #[allow(unused_imports)]
+    use crate::a::*;
+    pub fn bf() { g() }
+}
+mod other {
+    use crate::util::*;
+    use crate::b::*;
+    pub fn call() { g(); bf(); }
+}
+fn main() { other::call(); }
+"#,
+    );
+    let doc = ws.symbols();
+    let call = "privglobchain::other::call";
+    assert!(has_edge(
+        &doc,
+        call,
+        "privglobchain::util::g",
+        EdgeKind::Call
+    ));
+    assert!(!has_edge(&doc, call, "privglobchain::a::g", EdgeKind::Call));
+    assert!(has_edge(
+        &doc,
+        "privglobchain::b::bf",
+        "privglobchain::a::g",
+        EdgeKind::Call
+    ));
+}
+
+/// 같은 대상을 들이는 두 글롭의 가시성은 넓은 쪽이다 — `k`의 `pub use crate::p::*`와 비공개
+/// `use crate::q::*`(→ 같은 `p::x`)가 겹쳐도 `x`는 공개라 `other`의 `use crate::k::*`로 온다.
+/// (rustc 실행 결과: `p::x`)
+#[test]
+fn same_target_globs_merge_to_the_wider_scope() {
+    let ws = Workspace::package(
+        "widerscope",
+        r#"
+mod p { pub fn x() {} }
+mod q { pub use crate::p::x; }
+mod k {
+    pub use crate::p::*;
+    #[allow(unused_imports)]
+    use crate::q::*;
+}
+mod other {
+    use crate::k::*;
+    pub fn call() { x() }
+}
+fn main() { other::call(); }
+"#,
+    );
+    let doc = ws.symbols();
+    assert!(has_edge(
+        &doc,
+        "widerscope::other::call",
+        "widerscope::p::x",
+        EdgeKind::Call
+    ));
+}
+
+/// 같은 대상을 들이는 두 글롭의 조건은 약한 쪽이다 — 어느 글롭으로든 들어오면 임포트가 있다. 비교할 수
+/// 없는 `unix`와 `windows`는 조건 없음(어느 `--target`에서도 남는다), 부분 집합인 `unix`와
+/// `all(unix , feature = "fb")`는 `unix`, 조건 없는 글롭이 하나라도 있으면 조건 없음이다.
+#[test]
+fn same_target_globs_merge_to_the_weaker_cfg() {
+    let ws = Workspace::new(
+        "cfgmerge",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname='cfgmerge'\nversion='0.1.0'\nedition='2021'\n\
+                 [features]\nfa=[]\nfb=[]\n[workspace]\n",
+            ),
+            (
+                "src/main.rs",
+                r#"
+mod p { pub fn x() {} pub fn y() {} }
+mod q { pub use crate::p::x; pub use crate::p::y; }
+mod incomparable {
+    #[cfg(unix)]
+    #[allow(unused_imports)]
+    use crate::p::*;
+    #[cfg(windows)]
+    #[allow(unused_imports)]
+    use crate::q::*;
+}
+mod comparable {
+    #[cfg(unix)]
+    #[allow(unused_imports)]
+    use crate::p::*;
+    #[cfg(all(unix, feature = "fb"))]
+    #[allow(unused_imports)]
+    use crate::q::*;
+}
+mod one_unconditional {
+    #[allow(unused_imports)]
+    use crate::p::*;
+    #[cfg(feature = "fa")]
+    #[allow(unused_imports)]
+    use crate::q::*;
+}
+fn main() { p::x(); p::y(); }
+"#,
+            ),
+        ],
+    );
+    let doc = ws.symbols();
+    let cfg_of = |from: &str| {
+        doc.edges
+            .iter()
+            .find(|e| e.from == from && e.to == "cfgmerge::p::x" && e.kind == EdgeKind::Uses)
+            .map(|e| e.cfg.clone())
+    };
+    assert_eq!(cfg_of("cfgmerge::incomparable"), Some(None));
+    assert_eq!(
+        cfg_of("cfgmerge::comparable"),
+        Some(Some("unix".to_string()))
+    );
+    assert_eq!(cfg_of("cfgmerge::one_unconditional"), Some(None));
+    let wasm = "wasm32-unknown-unknown";
+    let on_wasm = doc.for_target(wasm, &Facts::from_triple(wasm));
+    assert!(has_edge(
+        &on_wasm,
+        "cfgmerge::incomparable",
+        "cfgmerge::p::x",
+        EdgeKind::Uses
+    ));
+    assert!(!any_edge(
+        &on_wasm,
+        "cfgmerge::comparable",
+        "cfgmerge::p::x"
+    ));
+}
+
+/// 해석되지 않는 임포트의 표지는 재노출 글롭과 자식의 글롭을 거쳐 전해진다 — 손자의 `Error`는 `m`의
+/// `use std::fmt::Error`이고 크레이트 루트의 `Error`가 아니다.
+#[test]
+fn unresolved_import_marker_crosses_reexport_and_child_globs() {
+    let ws = Workspace::package(
+        "markerhops",
+        r#"
+#[allow(dead_code)]
+pub struct Error;
+mod m {
+    #[allow(unused_imports)]
+    use std::fmt::Error;
+    pub mod child {
+        #[allow(unused_imports)]
+        pub use super::*;
+        pub mod grandchild {
+            use super::*;
+            pub fn g() -> Result<(), Error> { Err(Error) }
+        }
+    }
+}
+fn main() { let _ = m::child::grandchild::g(); }
+"#,
+    );
+    let doc = ws.symbols();
+    assert!(!any_edge(
+        &doc,
+        "markerhops::m::child::grandchild::g",
+        "markerhops::Error"
+    ));
+}
+
+/// 비공개 임포트는 자손의 글롭 사슬로 이어진다 — `a`의 비공개 `use crate::x::Y`가 `b`·`c`의
+/// `use super::*`를 거쳐 `c::f`의 `Y`가 된다. 같은 이름의 비공개 `fn x`는 공개 재노출 `x`(모듈)를 글롭
+/// 밖에서 가리지 않는다. (rustc 실행 결과: `m::x::f`)
+#[test]
+fn private_imports_follow_descendant_globs_and_private_items_do_not_mask_reexports() {
+    let ws = Workspace::package(
+        "descchain",
+        r#"
+mod x { pub struct Y; }
+mod a {
+    #[allow(unused_imports)]
+    use crate::x::Y;
+    pub mod b {
+        #[allow(unused_imports)]
+        use super::*;
+        pub mod c {
+            use super::*;
+            pub fn f() -> Y { Y }
+        }
+    }
+}
+fn main() { let _ = a::b::c::f(); }
+"#,
+    );
+    let doc = ws.symbols();
+    assert!(any_edge(&doc, "descchain::a::b::c::f", "descchain::x::Y"));
+
+    let ws = Workspace::package(
+        "nsfilter",
+        r#"
+mod m { pub mod x { pub fn f() {} } }
+mod t {
+    #[allow(dead_code)]
+    fn x() {}
+    pub use crate::m::x;
+}
+mod importer {
+    use crate::t::*;
+    pub fn call() { x::f(); }
+}
+fn main() { importer::call(); }
+"#,
+    );
+    let doc = ws.symbols();
+    assert!(has_edge(
+        &doc,
+        "nsfilter::importer::call",
+        "nsfilter::m::x::f",
+        EdgeKind::Call
+    ));
+}
