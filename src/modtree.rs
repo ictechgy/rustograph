@@ -157,6 +157,9 @@ pub struct Module {
     /// 그 가시 범위. 같은 이름의 글롭 임포트를 가리고, 그 이름의 해석을 크레이트 루트 같은 다른
     /// 후보로 넘기지 않는다.
     pub unresolved_imports: BTreeMap<String, Scope>,
+    /// 이 모듈이 글롭으로 들이는 모듈·외부 크레이트 정점(`use m::*`의 `m`) → 그 `use`의 `#[cfg]`. 그 글롭의
+    /// 의존 증거(uses 간선, deps의 사용 증거)일 뿐 이름이 아니다 — 이름 해석과 다른 모듈의 글롭에 쓰지 않는다.
+    pub glob_targets: BTreeMap<String, Option<String>>,
     /// 자식 모듈 이름 → 경로.
     pub children: BTreeMap<String, String>,
 }
@@ -177,6 +180,7 @@ impl Module {
             item_scopes: BTreeMap::new(),
             imports: BTreeMap::new(),
             unresolved_imports: BTreeMap::new(),
+            glob_targets: BTreeMap::new(),
             children: BTreeMap::new(),
         }
     }
@@ -744,6 +748,7 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
     // 이름의 글롭 임포트를 소스 순서와 무관하게 가린다.
     let mut globbed: BTreeMap<String, Binding> = BTreeMap::new();
     let mut explicit: BTreeMap<String, Binding> = BTreeMap::new();
+    let mut glob_targets: BTreeMap<String, Option<String>> = BTreeMap::new();
     for (segs, cfg, scope) in &uses {
         let glob = segs.last().is_some_and(|s| s == "*");
         let clean: Vec<String> = segs
@@ -762,15 +767,14 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
                     merge_glob(&mut globbed, name, binding);
                 }
             }
-            // 글롭한 모듈 자신을 그 마지막 이름에 묶는다 — Rust 이름이 아니라 이 글롭의 의존 증거다(대상
-            // 모듈·외부 크레이트 정점으로 가는 uses 간선). 그래서 이 모듈 밖의 글롭으로는 전하지 않는다.
-            let name = full.rsplit("::").next().unwrap_or(&full).to_string();
-            let module = Binding::Resolved(Import {
-                target: full,
-                cfg: cfg.clone(),
-                scope: Scope::Within(path.to_string()),
-            });
-            merge_glob(&mut globbed, name, module);
+            // 글롭한 모듈 자신은 이름으로 묶지 않는다(`use m::*`는 `m`을 들이지 않는다) — 그 글롭의 의존
+            // 증거(대상 모듈·외부 크레이트 정점으로 가는 uses 간선)로만 따로 둔다. 같은 대상을 여러 글롭이
+            // 들이면 약한 조건이다.
+            let cfg = match glob_targets.remove(&full) {
+                Some(seen) => weaker_cfg(&seen, cfg),
+                None => cfg.clone(),
+            };
+            glob_targets.insert(full, cfg);
             continue;
         }
         let alias = segs
@@ -805,6 +809,7 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
     let module = tree.modules.get_mut(path).expect("module must exist");
     module.imports = imports;
     module.unresolved_imports = unresolved;
+    module.glob_targets = glob_targets;
 }
 
 /// 한 `use` 이름이 묶이는 것 — 그래프 정점으로 해석된 임포트, 또는 그래프 밖이라 해석되지 않는 이름과
@@ -888,9 +893,13 @@ pub fn fill_imports_settled(
     dep_crates: &DepCrates,
 ) -> usize {
     let tables = |tree: &ModTree, path: &str| {
-        tree.modules
-            .get(path)
-            .map(|m| (m.imports.clone(), m.unresolved_imports.clone()))
+        tree.modules.get(path).map(|m| {
+            (
+                m.imports.clone(),
+                m.unresolved_imports.clone(),
+                m.glob_targets.clone(),
+            )
+        })
     };
     let mut changed = 0;
     for _ in 0..MAX_IMPORT_PASSES {
@@ -1118,6 +1127,28 @@ mod tests {
             t.resolve("c", &["f".into()], &none),
             Some("c::f".to_string())
         );
+    }
+
+    /// 가시성을 모듈 범위로 — 제한 가시성은 가리키는 모듈을 찾지 못해도(루트를 넘는 `super`) 크레이트
+    /// 전체에 그친다. 컴파일되는 코드는 이 경로에 오지 않아 통합 테스트로는 닿지 않는다.
+    #[test]
+    fn scope_of_restricted_visibility_never_widens_past_the_crate() {
+        let scope = |vis: &str, module: &str| {
+            let vis: syn::Visibility = syn::parse_str(vis).expect("valid visibility");
+            scope_of(&vis, module)
+        };
+        let within = |m: &str| Scope::Within(m.to_string());
+        assert_eq!(scope("pub", "c::m"), Scope::Public);
+        assert_eq!(scope("", "c::m"), within("c::m"));
+        assert_eq!(scope("pub(self)", "c::m"), within("c::m"));
+        assert_eq!(scope("pub(crate)", "c::m::n"), within("c"));
+        assert_eq!(scope("pub(super)", "c::m::n"), within("c::m"));
+        assert_eq!(scope("pub(in crate::m)", "c::m::n"), within("c::m"));
+        // 2015 판의 크레이트 기준 경로.
+        assert_eq!(scope("pub(in m)", "c::m::n"), within("c::m"));
+        // 루트를 넘는 `super`는 크레이트 전체로 — 어디서나 보이는 것으로 떨어지지 않는다.
+        assert_eq!(scope("pub(super)", "c"), within("c"));
+        assert_eq!(scope("pub(in super::super)", "c::m"), within("c"));
     }
 
     /// 서로를 재노출 글롭으로 들이는 두 모듈(`a`의 `#[cfg(fa)] pub use crate::b::*`, `b`의

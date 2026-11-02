@@ -889,3 +889,126 @@ fn main() { importer::call(); }
         EdgeKind::Call
     ));
 }
+
+/// 글롭한 모듈 자신(`use crate::inner::extdep::*`의 `extdep`)은 이름이 아니다 — 그 모듈과 자손(`use super::*`)에서
+/// 이름 해석에 끼지 않아, `child`의 `extdep::Thing`은 같은 이름의 외부 크레이트다. 글롭한 모듈로 가는 uses
+/// 증거와 외부 크레이트 글롭(`pub use extdep::*`)의 의존 증거는 남는다. (rustc 실행 결과: 외부 크레이트의
+/// `Thing::new`)
+#[test]
+fn glob_module_name_is_not_a_binding_but_stays_dependency_evidence() {
+    let ws = Workspace::new(
+        "fakedesc",
+        &[
+            (
+                "extdep/Cargo.toml",
+                "[package]\nname='extdep'\nversion='0.1.0'\nedition='2021'\n",
+            ),
+            (
+                "extdep/src/lib.rs",
+                "pub struct Thing; pub struct Other; impl Thing { pub fn new() -> Thing { Thing } }\n",
+            ),
+            (
+                "app/Cargo.toml",
+                "[package]\nname='fakedesc'\nversion='0.1.0'\nedition='2021'\n\
+                 [dependencies]\nextdep = { path = '../extdep' }\n[workspace]\n",
+            ),
+            (
+                "app/src/main.rs",
+                r#"
+mod inner {
+    pub mod extdep {
+        pub struct Thing;
+        impl Thing { pub fn new() -> Thing { Thing } }
+    }
+}
+mod m {
+    #[allow(unused_imports)]
+    use crate::inner::extdep::*;
+    pub mod child {
+        #[allow(unused_imports)]
+        use super::*;
+        pub fn f() -> extdep::Thing { extdep::Thing::new() }
+    }
+}
+fn main() { let _ = m::child::f(); }
+"#,
+            ),
+        ],
+    );
+    let app = ws.path().join("app");
+    for include_deps in [false, true] {
+        let doc = source::load(
+            &app,
+            &source::Options {
+                symbol_level: true,
+                include_deps,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let f = "fakedesc::m::child::f";
+        assert!(!any_edge(&doc, f, "fakedesc::inner::extdep::Thing::new"));
+        assert!(!any_edge(&doc, f, "fakedesc::inner::extdep::Thing"));
+        assert!(has_edge(
+            &doc,
+            "fakedesc::m",
+            "fakedesc::inner::extdep",
+            EdgeKind::Uses
+        ));
+        assert!(!any_edge(
+            &doc,
+            "fakedesc::m::child",
+            "fakedesc::inner::extdep"
+        ));
+        if include_deps {
+            assert!(has_edge(&doc, f, "extdep", EdgeKind::References));
+        }
+    }
+
+    // 외부 크레이트를 글롭으로 재노출해도(`pub use extdep::*`) 그 의존 증거는 남는다 — deps가 미사용으로 보지 않는다.
+    let ws = Workspace::new(
+        "extws2",
+        &[
+            (
+                "extdep/Cargo.toml",
+                "[package]\nname='extdep'\nversion='0.1.0'\nedition='2021'\n",
+            ),
+            (
+                "extdep/src/lib.rs",
+                "pub struct Thing; impl Thing { pub fn new() -> Thing { Thing } }\n",
+            ),
+            (
+                "ws/Cargo.toml",
+                "[workspace]\nmembers = ['a']\nresolver = '2'\n",
+            ),
+            (
+                "ws/a/Cargo.toml",
+                "[package]\nname='a'\nversion='0.1.0'\nedition='2021'\n\
+                 [dependencies]\nextdep = { path = '../../extdep' }\n",
+            ),
+            (
+                "ws/a/src/main.rs",
+                "mod m {\n    pub use extdep::*;\n}\nmod user {\n    use crate::m::*;\n    \
+                 pub fn f() -> Thing { Thing::new() }\n}\nfn main() { let _ = user::f(); }\n",
+            ),
+        ],
+    );
+    let dir = ws.path().join("ws");
+    let doc = source::load(
+        &dir,
+        &source::Options {
+            symbol_level: true,
+            include_deps: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(has_edge(&doc, "a::m", "extdep", EdgeKind::Uses));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rustograph"))
+        .args(["deps", "--format", "json", "--dir"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["unused"], serde_json::json!([]), "{report}");
+}

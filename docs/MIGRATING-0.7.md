@@ -21,8 +21,11 @@ every field. Add the new fields, or end such patterns with `..`.
   `enum`, `union`, `trait` and `type` items), `item_scopes` (declared names to
   their widest `modtree::Scope`; a missing name counts as public) and
   `unresolved_imports` (names an explicit `use` brings in from outside the
-  graph, such as `std`, mapped to their `Scope`). `Module::new` starts them
-  empty, and `fill_items` and `fill_imports` fill them.
+  graph, such as `std`, mapped to their `Scope`) and `glob_targets` (the
+  modules or external crate vertices it glob-imports, mapped to the glob's
+  `#[cfg]`; dependency evidence, not names). `Module::new` starts them empty,
+  and `fill_items` and `fill_imports` fill them. A glob no longer binds the
+  globbed module's own name in `imports`.
 - `modtree::Import` adds `scope`, the visibility of the import as a
   `modtree::Scope` (`Scope::Public` for a `pub use`), and implements
   `PartialEq` and `Eq`.
