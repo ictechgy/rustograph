@@ -381,3 +381,195 @@ fn main() { let _s = S; let _w = Shown; }
         ]
     );
 }
+
+/// 재노출(`pub use`)을 거쳐 이름 붙인 워크스페이스 트레이트의 impl — `name` 패키지의 `files`를 수확해,
+/// 트레이트 경로가 정의 위치 `trait_id`로 해석되어 `S → trait_id` implements가 있고, 보존 선택지를 켜도
+/// 그 미사용 impl(`impl_method`)과 그것만 부르는 함수(`callee`)를 계속 보고하며, 기본 보고서의 외부
+/// 트레이트 impl 계수에도 들지 않는지 본다.
+fn assert_reexported_workspace_impl(
+    tag: &str,
+    files: &[(&str, &str)],
+    owner: &str,
+    trait_id: &str,
+    impl_method: &str,
+    callee: &str,
+) {
+    let krate = Crate::new(tag, files);
+    let doc = symbols(krate.path());
+    assert!(
+        doc.edges.iter().any(|e| e.from == owner
+            && e.to == trait_id
+            && e.kind == rustograph::graph::EdgeKind::Implements),
+        "{tag}: no {owner} -> {trait_id} implements edge in {:?}",
+        doc.edges
+    );
+    let kept = analysis::dead_with_options(&doc, retaining_external_trait_impls()).unwrap();
+    for id in [impl_method, callee] {
+        assert!(
+            ids(&kept).contains(&id),
+            "{tag}: {id} missing from {:?}",
+            ids(&kept)
+        );
+    }
+    let outside = "traits declared outside the workspace";
+    for rep in [&kept, &analysis::dead(&doc).unwrap()] {
+        assert!(
+            !rep.limitations.iter().any(|l| l.contains(outside)),
+            "{tag}: {:?}",
+            rep.limitations
+        );
+    }
+}
+
+const REEXPORT_TRAIT: &str = "mod inner { pub trait Tr { fn run(&self); } }\n";
+
+/// 크레이트 루트의 `pub use inner::Tr`을 `use crate::Tr`로 받아 구현한다.
+#[test]
+fn root_reexported_workspace_trait_impl_is_not_external() {
+    let main = format!(
+        "{REEXPORT_TRAIT}pub use inner::Tr;\n\
+         mod user {{\n    use crate::Tr;\n    pub struct S;\n    \
+         impl Tr for S {{ fn run(&self) {{ super::only_from_impl() }} }}\n}}\n\
+         fn only_from_impl() {{}}\nfn main() {{ let _s = user::S; }}\n"
+    );
+    assert_reexported_workspace_impl(
+        "reexp-root",
+        &[("Cargo.toml", &manifest("rgroot")), ("src/main.rs", &main)],
+        "rgroot::user::S",
+        "rgroot::inner::Tr",
+        "rgroot::user::S::<Tr>::run",
+        "rgroot::only_from_impl",
+    );
+}
+
+/// 재노출 모듈을 거친 경로(`pub mod api { pub use crate::inner::Tr; }`, `impl api::Tr for S`).
+#[test]
+fn module_path_reexported_workspace_trait_impl_is_not_external() {
+    let main = format!(
+        "{REEXPORT_TRAIT}pub mod api {{ pub use crate::inner::Tr; }}\npub struct S;\n\
+         impl api::Tr for S {{ fn run(&self) {{ only_from_impl() }} }}\n\
+         fn only_from_impl() {{}}\nfn main() {{ let _s = S; }}\n"
+    );
+    assert_reexported_workspace_impl(
+        "reexp-path",
+        &[("Cargo.toml", &manifest("rgpath")), ("src/main.rs", &main)],
+        "rgpath::S",
+        "rgpath::inner::Tr",
+        "rgpath::S::<Tr>::run",
+        "rgpath::only_from_impl",
+    );
+}
+
+/// 루트의 글롭 재노출(`pub use inner::*`)과 prelude 모듈의 재노출을 글롭으로 받는 경우.
+#[test]
+fn glob_reexported_workspace_trait_impls_are_not_external() {
+    let root_glob = format!(
+        "{REEXPORT_TRAIT}pub use inner::*;\n\
+         mod user {{\n    use crate::Tr;\n    pub struct S;\n    \
+         impl Tr for S {{ fn run(&self) {{ super::only_from_impl() }} }}\n}}\n\
+         fn only_from_impl() {{}}\nfn main() {{ let _s = user::S; }}\n"
+    );
+    assert_reexported_workspace_impl(
+        "reexp-glob",
+        &[
+            ("Cargo.toml", &manifest("rgglob")),
+            ("src/main.rs", &root_glob),
+        ],
+        "rgglob::user::S",
+        "rgglob::inner::Tr",
+        "rgglob::user::S::<Tr>::run",
+        "rgglob::only_from_impl",
+    );
+    let prelude = format!(
+        "{REEXPORT_TRAIT}pub mod prelude {{ pub use crate::inner::Tr; }}\n\
+         mod user {{\n    use crate::prelude::*;\n    pub struct S;\n    \
+         impl Tr for S {{ fn run(&self) {{ super::only_from_impl() }} }}\n}}\n\
+         fn only_from_impl() {{}}\nfn main() {{ let _s = user::S; }}\n"
+    );
+    assert_reexported_workspace_impl(
+        "reexp-prelude",
+        &[
+            ("Cargo.toml", &manifest("rgprelude")),
+            ("src/main.rs", &prelude),
+        ],
+        "rgprelude::user::S",
+        "rgprelude::inner::Tr",
+        "rgprelude::user::S::<Tr>::run",
+        "rgprelude::only_from_impl",
+    );
+}
+
+/// 재노출을 별칭으로 받아 구현한다(`use crate::Tr as Alias; impl Alias for S`) — 메서드 ID는 쓴 이름이다.
+#[test]
+fn aliased_reexported_workspace_trait_impl_is_not_external() {
+    let main = format!(
+        "{REEXPORT_TRAIT}pub use inner::Tr;\n\
+         mod user {{\n    use crate::Tr as Alias;\n    pub struct S;\n    \
+         impl Alias for S {{ fn run(&self) {{ super::only_from_impl() }} }}\n}}\n\
+         fn only_from_impl() {{}}\nfn main() {{ let _s = user::S; }}\n"
+    );
+    assert_reexported_workspace_impl(
+        "reexp-alias",
+        &[("Cargo.toml", &manifest("rgalias")), ("src/main.rs", &main)],
+        "rgalias::user::S",
+        "rgalias::inner::Tr",
+        "rgalias::user::S::<Alias>::run",
+        "rgalias::only_from_impl",
+    );
+}
+
+/// 재노출 사슬이 모듈 처리 순서와 거꾸로다 — 루트(`pub use zz::Tr`)가 뒤에 오는 `zz`의 재노출
+/// (`pub use crate::aa::Tr`)을 거친다. 한 바퀴로는 루트가 `zz`의 임포트를 아직 못 본다.
+#[test]
+fn reexport_chain_against_module_order_is_not_external() {
+    let main = "mod aa { pub trait Tr { fn run(&self); } }\n\
+                mod zz { pub use crate::aa::Tr; }\npub use zz::Tr;\n\
+                mod user {\n    use crate::Tr;\n    pub struct S;\n    \
+                impl Tr for S { fn run(&self) { super::only_from_impl() } }\n}\n\
+                fn only_from_impl() {}\nfn main() { let _s = user::S; }\n";
+    assert_reexported_workspace_impl(
+        "reexp-chain",
+        &[("Cargo.toml", &manifest("rgchain")), ("src/main.rs", main)],
+        "rgchain::user::S",
+        "rgchain::aa::Tr",
+        "rgchain::user::S::<Tr>::run",
+        "rgchain::only_from_impl",
+    );
+}
+
+/// 다른 멤버 크레이트의 루트 재노출(`a`의 `pub use traits::Tr`)을 `use a::Tr`로 받아 구현한다.
+#[test]
+fn sibling_crate_reexported_workspace_trait_impl_is_not_external() {
+    assert_reexported_workspace_impl(
+        "reexp-ws",
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = ['a', 'b']\nresolver = '2'\n",
+            ),
+            (
+                "a/Cargo.toml",
+                "[package]\nname='a'\nversion='0.1.0'\nedition='2021'\n",
+            ),
+            (
+                "a/src/lib.rs",
+                "mod traits { pub trait Tr { fn run(&self); } }\npub use traits::Tr;\n",
+            ),
+            (
+                "b/Cargo.toml",
+                "[package]\nname='b'\nversion='0.1.0'\nedition='2021'\n\
+                 [dependencies]\na = { path = '../a' }\n",
+            ),
+            (
+                "b/src/main.rs",
+                "use a::Tr;\npub struct S;\n\
+                 impl Tr for S { fn run(&self) { only_from_impl() } }\n\
+                 fn only_from_impl() {}\nfn main() { let _s = S; }\n",
+            ),
+        ],
+        "b::S",
+        "a::traits::Tr",
+        "b::S::<Tr>::run",
+        "b::only_from_impl",
+    );
+}

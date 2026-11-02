@@ -323,7 +323,10 @@ cargo run -- rules --strict     # 자기 분석(도그푸딩)
 ## MVP의 한계
 
 구문 분석(syn)은 매크로 확장·`dyn` 디스패치·제네릭을 꿰뚫지 못합니다 —
-모든 사각지대는 `limitations`에 실측으로 잡힙니다. opt-in `semantic`
+모든 사각지대는 `limitations`에 실측으로 잡힙니다. 매크로가 만든 아이템은
+모듈의 아이템 표에도 없어서 글롭 임포트가 들인 같은 이름을 가리지 못합니다 —
+`Config`를 만드는 매크로를 펼치면서 `Config`가 있는 모듈을 글롭으로 들이는
+모듈 안의 `Config` 참조는 글롭의 `Config`로 해석됩니다. opt-in `semantic`
 feature(`--features semantic` 빌드 후 `--semantic`)는 rust-analyzer
 (`ra_ap_*`) 의미론으로 본문 수확을 보강합니다 — 메서드 호출은 수신자
 타입으로 해석하고, 매크로 확장 트리를 걷고, `dyn`/제네릭 트레이트 호출은
@@ -342,9 +345,13 @@ unreachable로 남고, 보고서가 닿는 타입에 붙은 그런 메서드 수
 `retainExternalTraitImpls`)는 타입이 닿으면 그 메서드도 닿은 것으로 보고 그
 메서드가 부르는 코드까지 따라가며, 그렇게 보존한 메서드 수를 보고서에 셉니다.
 타입이 `implements`로 구현하는 워크스페이스 트레이트 가운데 그 이름이거나 그
-메서드를 선언한 것이 없는 impl을 외부 트레이트 impl로 봅니다(별칭·재노출 이름으로
-쓴 `use t::Tr as Alias; impl Alias for S`는 워크스페이스 impl입니다) — 호출이 보이는 워크스페이스 트레이트의
-미사용 impl과 아무도 닿지 않는 타입의 impl은 계속 보고됩니다. 타입이 닿는다고
+메서드를 선언한 것이 없는 impl을 외부 트레이트 impl로 봅니다. 트레이트 경로는 별칭과
+재노출을 정의 위치까지 따라 해석되므로 `use t::Tr as Alias; impl Alias for S`, 크레이트
+루트의 `pub use inner::Tr`을 받은 `use crate::Tr`, prelude 글롭, 다른 멤버의
+`use other_member::Tr`은 모두 워크스페이스 impl입니다. 트레이트 경로가 아예 해석되지
+않아도(매크로가 만든 재노출 등) 그 이름의 워크스페이스 트레이트가 그 메서드를 선언하면
+워크스페이스 impl로 봅니다. 호출이 보이는(이름 팬아웃으로 닿는 경우 포함) 워크스페이스
+트레이트의 미사용 impl과 아무도 닿지 않는 타입의 impl은 계속 보고됩니다. 타입이 닿는다고
 트레이트가 쓰인다는 뜻은 아니므로, 그런 impl로만 닿는 코드는 그 impl이 불리지
 않아도 보고되지 않습니다.
 
@@ -486,6 +493,13 @@ rustograph가 덮지 않는 두 설정도 마찬가지입니다.
 분석한 revision은 `--revision`으로 직접 줄 수 있습니다.
 나머지 git 설정과, 설정한 그대로의 `PATH` 절대 경로 항목(체크아웃 안을 가리키는
 항목이라도)은 평소대로 적용됩니다.
+
+## 미출시(0.7.0) 호환성 노트
+
+v0.6.0 뒤 `main`의 변경은 공개 Rust 구조체(`harvest::BodyItem`, `harvest::ImplBlock`,
+`modtree::Module`, `modtree::Import`)에 필드를 더하고 경로를 rustc에 더 가깝게 해석하므로
+(경로 접두사 이름공간, 재노출, 글롭 가시성) 0.7.0으로 나갑니다. CLI 플래그, 그래프 문서 v1,
+순회 문서 v1은 호환됩니다 — [0.7 이행 안내](docs/MIGRATING-0.7.md).
 
 ## 라이선스
 

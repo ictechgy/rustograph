@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+다음 릴리스는 v0.7.0이다 — 아래 변경에는 Rust 라이브러리 호출자를 깨는 공개 구조체 필드 추가가 있다
+([0.7 migration](docs/MIGRATING-0.7.md)). CLI 플래그·기본값, 그래프 문서 v1, 순회 문서 v1은 그대로다.
+
 - CI가 잠금 파일을 사용해 semantic feature를 빌드·검증하고, 커버리지 실패의 stderr를 보존한다.
 - `Cargo.toml`에 최소 지원 Rust `rust-version = "1.96"`을 선언하고, CI `msrv` 잡이 rustc 1.96.0으로 기본·semantic
   빌드를 `--locked`로 확인한다. 1.96을 정하는 것은 semantic feature다 — 잠근 ra_ap_* 0.0.349는 1.95를 선언하지만
@@ -20,7 +23,28 @@
   union·trait·type)은 같은 이름의 임포트(글롭 포함)를 이기고, 로컬 이름이 값(`fn`·`const`·`static`)·매크로 아이템뿐이면
   그 이름의 임포트를 따른다. 이전에는 `fn harvest`가 `use crate::harvest`를 가려 `harvest::f()`가 미해석이 됐다.
   한 세그먼트 호출 `name()`은 지금처럼 그 fn이다. 라이브러리 호출자용 `modtree::Module`에 `type_items`가 늘었다
-  ([0.6 migration](docs/MIGRATING-0.6.md)).
+  ([0.7 migration](docs/MIGRATING-0.7.md)).
+- 경로 해석이 재노출을 따라간다: 다른 모듈이 `use`로 들인 이름(`pub use inner::Tr`, `pub use inner::*`,
+  `pub use inner::deep as shortcut`, 다른 멤버 크레이트 루트의 재노출)을 지나는 경로(`crate::Tr`, `use crate::prelude::*`가
+  들인 이름, `crate::shortcut::f()`, `use a::Tr`)를 정의 위치로 해석하고, 글롭은 대상 모듈의 재노출도 펼친다. 이전에는
+  그런 임포트·호출·impl의 트레이트 경로가 미해석이라 정의가 `dead`에 unreachable로 나오고 `impact`·`rules`·`cycles`에서도
+  빠졌으며, 재노출로 이름 붙인 워크스페이스 트레이트의 impl이 `--retain-external-trait-impls`와 기본 보고서의 계수에서 외부
+  트레이트 impl로 분류됐다. 재노출 사슬은 임포트 표가 더 바뀌지 않을 때까지 해석을 되풀이해 풀고(최대 32바퀴, 표는 바퀴마다
+  다시 만든다), 그 안에 끝나지 않은 모듈 수는 limitation으로 센다. 라이브러리 호출자용 `modtree::fill_imports_settled`·
+  `MAX_IMPORT_PASSES`·`Scope`를 더했다([0.7 migration](docs/MIGRATING-0.7.md)).
+- 글롭 임포트(`use m::*`)가 rustc처럼 들이는 모듈에서 보이는 이름만 들인다 — 비공개 아이템·`use`는 선언한 모듈과 그 자손,
+  `pub(super)`는 부모와 그 자손, `pub(crate)`는 그 크레이트 안에서만 보인다. 제한 가시성(`pub(..)`)은 가리키는 모듈을
+  찾지 못해도 크레이트를 넘지 않고, 2015 판의 `pub(in top)`는 크레이트 기준 경로로 읽는다. 글롭한 모듈 자신
+  (`use m::*`의 `m`)은 이름으로 묶지 않고 그 글롭을 쓴 모듈의 `uses` 의존 증거로만 남긴다 — 이전에는 `m`이 그 모듈에서 이름처럼
+  해석에 쓰여, 같은 이름의 외부 크레이트 경로(`extdep::Thing`)가 로컬 모듈로 확정될 수 있었다. 이전에는 형제·다른 크레이트의 글롭이 비공개
+  `use`와 아이템까지 들여 다른 글롭의 같은 이름을 덮어써, 확정 간선이 엉뚱한 정의로 가고 진짜 대상이 unreachable로 나왔으며
+  `rules`가 없는 계층 위반(`ui → db`)을 냈다. 명시 임포트는 해석되지 않는 std 경로(`use std::error::Error`)여도 같은 이름의
+  글롭 임포트를 소스 순서와 무관하게 가리고, 그 이름의 해석을 크레이트 루트의 같은 이름으로 넘기지 않는다. 글롭이 펼친
+  재노출은 글롭의 `#[cfg]`와 재노출의 `#[cfg]`를 함께 싣는다(`--target`·`--exclude-tests`가 어느 빌드에도 없는 임포트 간선을
+  지운다).
+- `dead --retain-external-trait-impls`·기본 보고서의 외부 트레이트 impl 계수: 트레이트 경로가 해석되지 않아 implements
+  간선이 없는 impl도, 그 이름의 워크스페이스 트레이트가 같은 이름의 메서드를 선언하면 워크스페이스 impl로 보아 보존하거나
+  세지 않는다(보존을 줄이는 쪽으로만 틀린다).
 - `rules`·MCP `rustograph_rules`: 간선이 정렬되지 않은 문서(`--graph`로 읽은 다른 도구의 문서 등)에서 같은
   `(rule, from, to)`의 간선 종류가 call·references·call처럼 섞여도 같은 기준선 키(`rule|from|to|kind`)의 위반을
   한 번만 보고한다. 이전에는 정렬 키에 kind가 없어 같은 위반이 두 번 나올 수 있었다. 수확한 문서의 결과는 같다.

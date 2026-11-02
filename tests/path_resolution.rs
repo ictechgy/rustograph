@@ -197,3 +197,132 @@ fn main() { m::make(); }
         EdgeKind::Call
     ));
 }
+
+/// 재노출(`pub use`)을 거친 경로가 정의 위치로 해석된다 — 루트 재노출 함수(`crate::via_root()`),
+/// prelude 모듈의 재노출을 들인 글롭(`use crate::prelude::*`), 재노출한 모듈 별칭
+/// (`crate::shortcut::f()`), 재노출 타입의 연관 함수(`Config::new()`). 이전에는 재노출을 따라가지
+/// 않아 다섯 정의가 모두 unreachable로 나왔다.
+#[test]
+fn reexported_paths_resolve_to_their_definitions() {
+    let doc = harvest(
+        "reexp",
+        r#"
+mod inner {
+    pub fn via_root() {}
+    pub fn via_glob() {}
+    pub mod deep { pub fn via_module_alias() {} }
+    pub struct Config;
+    impl Config { pub fn new() -> Self { Config } }
+}
+pub use inner::via_root;
+pub use inner::deep as shortcut;
+pub use inner::Config;
+pub mod prelude { pub use crate::inner::via_glob; }
+mod user {
+    use crate::prelude::*;
+    use crate::Config;
+    pub fn run() {
+        crate::via_root();
+        via_glob();
+        crate::shortcut::via_module_alias();
+        let _c = Config::new();
+    }
+}
+fn main() { user::run(); }
+"#,
+    );
+    for to in [
+        "reexp::inner::via_root",
+        "reexp::inner::via_glob",
+        "reexp::inner::deep::via_module_alias",
+        "reexp::inner::Config::new",
+    ] {
+        assert!(
+            has_edge(&doc, "reexp::user::run", to, EdgeKind::Call),
+            "{to}: {:?}",
+            doc.edges
+        );
+    }
+    // `use crate::Config`는 재노출의 정의 위치로 가는 uses 간선이다.
+    assert!(has_edge(
+        &doc,
+        "reexp::user",
+        "reexp::inner::Config",
+        EdgeKind::Uses
+    ));
+    let rep = analysis::dead(&doc).unwrap();
+    assert!(rep.findings.is_empty(), "{:?}", rep.findings);
+}
+
+/// 명시 임포트는 같은 이름의 글롭 임포트를 가린다 — 소스 순서와 무관하다(rustc와 같다). 이전에는 뒤에
+/// 오는 글롭이 앞의 명시 임포트를 덮어 `foo()`가 `b::foo`로 확정됐다.
+#[test]
+fn explicit_import_shadows_a_later_glob_of_the_same_name() {
+    let doc = harvest(
+        "shadowglob",
+        r#"
+mod a { pub fn foo() {} }
+mod b { pub fn foo() {} }
+mod m {
+    use crate::a::foo;
+    #[allow(unused_imports)]
+    use crate::b::*;
+    pub fn call() { foo() }
+}
+fn main() { m::call(); }
+"#,
+    );
+    assert!(has_edge(
+        &doc,
+        "shadowglob::m::call",
+        "shadowglob::a::foo",
+        EdgeKind::Call
+    ));
+    assert!(!has_edge(
+        &doc,
+        "shadowglob::m::call",
+        "shadowglob::b::foo",
+        EdgeKind::Call
+    ));
+}
+
+/// 모듈 처리 순서와 거꾸로 이어지는 재노출 사슬은 해석을 여러 바퀴 돌려야 풀린다. 바퀴 수에는 상한이
+/// 있다 — 상한을 넘는 사슬(`m00`→…→`m39`, 한 바퀴에 한 고리씩 풀림)은 남은 모듈 수를 limitation으로
+/// 세고 조용히 잃지 않는다. 상한 안의 사슬은 끝까지 풀린다.
+#[test]
+fn reexport_chains_settle_or_are_counted() {
+    let chain = |len: usize| {
+        let mut src = String::new();
+        for i in 0..len - 1 {
+            src.push_str(&format!(
+                "pub mod m{i:02} {{ pub use crate::m{:02}::f; }}\n",
+                i + 1
+            ));
+        }
+        src.push_str(&format!("pub mod m{:02} {{ pub fn f() {{}} }}\n", len - 1));
+        src.push_str("fn main() { m00::f(); }\n");
+        src
+    };
+    let short = harvest("chainshort", &chain(8));
+    assert!(has_edge(
+        &short,
+        "chainshort::main",
+        "chainshort::m07::f",
+        EdgeKind::Call
+    ));
+    assert!(
+        !short
+            .limitations
+            .iter()
+            .any(|l| l.contains("resolution passes")),
+        "{:?}",
+        short.limitations
+    );
+    let long = harvest("chainlong", &chain(40));
+    assert!(
+        long.limitations.iter().any(|l| l
+            .ends_with("modules still changed their `use` imports after 32 resolution passes (re-export chains); paths through those imports may be unresolved")),
+        "{:?}",
+        long.limitations
+    );
+}

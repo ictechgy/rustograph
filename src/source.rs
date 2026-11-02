@@ -927,10 +927,25 @@ fn harvest(
             modtree::fill_items(&mut tree, &mp, &flatten_items(&groups));
         }
     }
-    for mp in tree.modules.keys().cloned().collect::<Vec<_>>() {
-        if let Some(groups) = module_items(&tree, &arena, &mp) {
-            modtree::fill_imports(&mut tree, &mp, &flatten_items(&groups), &dep_crates);
-        }
+    // 재노출(`pub use`)을 따라가는 해석은 다른 모듈의 임포트 표를 읽는다 — 표가 더 바뀌지 않을 때까지
+    // 되풀이한다. 상한 안에서 끝나지 않은 모듈은 그 경로가 미해석일 수 있어 센다.
+    let module_uses: Vec<(String, Vec<&syn::Item>)> = tree
+        .modules
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .filter_map(|mp| {
+            let groups = module_items(&tree, &arena, &mp)?;
+            Some((mp, flatten_items(&groups)))
+        })
+        .collect();
+    let unsettled = modtree::fill_imports_settled(&mut tree, &module_uses, &dep_crates);
+    if unsettled > 0 {
+        limitations.push(format!(
+            "{unsettled} modules still changed their `use` imports after {} resolution passes (re-export chains); paths through those imports may be unresolved",
+            modtree::MAX_IMPORT_PASSES
+        ));
     }
 
     // 1패스: 모듈·아이템 선언 — 정점과 contains/uses/implements 간선.
@@ -1743,22 +1758,25 @@ fn harvest_module<'a>(
     // use 임포트 → uses 간선. 해석된 정규 경로가 아이템이면 그 정점으로,
     // 아니면 소유 모듈로. 아이템 표는 1단계에서 전 모듈에 채워졌으므로
     // 모듈 처리 순서와 무관하게 같은 결과가 나온다. 임포트에 cfg가 있으면
-    // 간선도 그 조건 아래서만 성립한다.
-    for imp in tree.modules[mp].imports.values() {
-        let to = if tree.item_exists(&imp.target) {
-            imp.target.clone()
-        } else if dep_vertices.contains(imp.target.as_str()) {
+    // 간선도 그 조건 아래서만 성립한다. 글롭이 들이는 모듈·외부 크레이트 자신(`use m::*`의 `m`)도
+    // 같은 의존 증거다.
+    let module = &tree.modules[mp];
+    let imports = module.imports.values().map(|imp| (&imp.target, &imp.cfg));
+    for (target, cfg) in imports.chain(&module.glob_targets) {
+        let to = if tree.item_exists(target) {
+            target.clone()
+        } else if dep_vertices.contains(target.as_str()) {
             // 외부 크레이트 정점 — `use dep::X`는 선언 의존의 실제 사용 증거다.
-            imp.target.clone()
+            target.clone()
         } else {
-            match owner_module(tree, &imp.target) {
+            match owner_module(tree, target) {
                 Some(m) if m != mp => m.clone(),
                 _ => continue,
             }
         };
         if to != mp {
             let mut e = Edge::new(mp.to_string(), to, EdgeKind::Uses);
-            e.cfg = imp.cfg.clone();
+            e.cfg = cfg.clone();
             edges.push(e);
         }
     }
