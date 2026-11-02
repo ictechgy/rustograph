@@ -734,6 +734,15 @@ points into the checkout), apply as usual.
 MIT — see [LICENSE](LICENSE).
 
 
+## Unreleased (0.7.0) compatibility notes
+
+Changes on `main` after v0.6.0 add fields to public Rust structs
+(`harvest::BodyItem`, `harvest::ImplBlock`, `modtree::Module`,
+`modtree::Import`) and resolve paths more like rustc does (path-prefix
+namespaces, re-exports, glob visibility), so they ship in 0.7.0. CLI flags,
+graph document v1 and traversal v1 remain compatible; see
+[0.7 migration](docs/MIGRATING-0.7.md).
+
 ## 0.6.0 compatibility notes
 
 Use [the Git change workflow](docs/CHANGE-IMPACT.md) for independent before/after

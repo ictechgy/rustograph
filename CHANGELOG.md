@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+다음 릴리스는 v0.7.0이다 — 아래 변경에는 Rust 라이브러리 호출자를 깨는 공개 구조체 필드 추가가 있다
+([0.7 migration](docs/MIGRATING-0.7.md)). CLI 플래그·기본값, 그래프 문서 v1, 순회 문서 v1은 그대로다.
+
 - CI가 잠금 파일을 사용해 semantic feature를 빌드·검증하고, 커버리지 실패의 stderr를 보존한다.
 - `Cargo.toml`에 최소 지원 Rust `rust-version = "1.96"`을 선언하고, CI `msrv` 잡이 rustc 1.96.0으로 기본·semantic
   빌드를 `--locked`로 확인한다. 1.96을 정하는 것은 semantic feature다 — 잠근 ra_ap_* 0.0.349는 1.95를 선언하지만
@@ -20,7 +23,7 @@
   union·trait·type)은 같은 이름의 임포트(글롭 포함)를 이기고, 로컬 이름이 값(`fn`·`const`·`static`)·매크로 아이템뿐이면
   그 이름의 임포트를 따른다. 이전에는 `fn harvest`가 `use crate::harvest`를 가려 `harvest::f()`가 미해석이 됐다.
   한 세그먼트 호출 `name()`은 지금처럼 그 fn이다. 라이브러리 호출자용 `modtree::Module`에 `type_items`가 늘었다
-  ([0.6 migration](docs/MIGRATING-0.6.md)).
+  ([0.7 migration](docs/MIGRATING-0.7.md)).
 - 경로 해석이 재노출을 따라간다: 다른 모듈이 `use`로 들인 이름(`pub use inner::Tr`, `pub use inner::*`,
   `pub use inner::deep as shortcut`, 다른 멤버 크레이트 루트의 재노출)을 지나는 경로(`crate::Tr`, `use crate::prelude::*`가
   들인 이름, `crate::shortcut::f()`, `use a::Tr`)를 정의 위치로 해석하고, 글롭은 대상 모듈의 재노출도 펼친다. 이전에는
@@ -28,7 +31,7 @@
   빠졌으며, 재노출로 이름 붙인 워크스페이스 트레이트의 impl이 `--retain-external-trait-impls`와 기본 보고서의 계수에서 외부
   트레이트 impl로 분류됐다. 재노출 사슬은 임포트 표가 더 바뀌지 않을 때까지 해석을 되풀이해 풀고(최대 32바퀴, 표는 바퀴마다
   다시 만든다), 그 안에 끝나지 않은 모듈 수는 limitation으로 센다. 라이브러리 호출자용 `modtree::fill_imports_settled`·
-  `MAX_IMPORT_PASSES`·`Scope`를 더했다([0.6 migration](docs/MIGRATING-0.6.md)).
+  `MAX_IMPORT_PASSES`·`Scope`를 더했다([0.7 migration](docs/MIGRATING-0.7.md)).
 - 글롭 임포트(`use m::*`)가 rustc처럼 들이는 모듈에서 보이는 이름만 들인다 — 비공개 아이템·`use`는 선언한 모듈과 그 자손,
   `pub(super)`는 부모와 그 자손, `pub(crate)`는 그 크레이트 안에서만 보인다. 제한 가시성(`pub(..)`)은 가리키는 모듈을
   찾지 못해도 크레이트를 넘지 않고, 2015 판의 `pub(in top)`는 크레이트 기준 경로로 읽는다. 글롭한 모듈 자신으로 가는
