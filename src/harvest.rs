@@ -395,6 +395,18 @@ pub(crate) fn decls_with_markers<'a>(
                     let unsafe_ = body_has_unsafe(body);
                     out.vertices
                         .push(v(id.clone(), Kind::Static, is_pub(&s.vis), unsafe_));
+                    // `#[used]`·`#[no_mangle]`·`#[global_allocator]` static은 링커·런타임이 쓴다 —
+                    // 초기식이 가리키는 함수·타입도 그 루트에서 닿는다.
+                    if is_extern_entry(&s.attrs) {
+                        out.entry_roots.push(id.clone());
+                        identities.note_root(
+                            &id,
+                            module_path,
+                            false,
+                            file,
+                            s.span().byte_range().start,
+                        );
+                    }
                     out.bodies.push(BodyItem {
                         generic_scopes: Vec::new(),
                         id,
@@ -530,13 +542,24 @@ pub fn impls<'a>(
     tree: &ModTree,
     harvest: &mut Harvest,
 ) -> (Vec<Vertex>, Vec<Edge>, Vec<AttrRef>, Vec<BodyItem<'a>>) {
-    impls_with_identities(
+    let parts = impls_with_identities(
         blocks,
         krate,
         tree,
         harvest,
         &mut identity::Registry::default(),
-    )
+    );
+    (parts.vertices, parts.edges, parts.attr_refs, parts.bodies)
+}
+
+/// [`impls_with_identities`]의 산출물 — 공개 [`impls`]의 네 묶음에 impl 메서드 진입점 루트를 더한다.
+pub(crate) struct ImplParts<'a> {
+    pub vertices: Vec<Vertex>,
+    pub edges: Vec<Edge>,
+    pub attr_refs: Vec<AttrRef>,
+    pub bodies: Vec<BodyItem<'a>>,
+    /// `#[no_mangle]` 같은 진입점 속성이 붙은 impl 메서드 — 항상 보존 루트다.
+    pub entry_roots: Vec<String>,
 }
 
 /// 소스 수확의 전역 충돌 판정에 선언 위치를 넘긴다. 공개 수확 API는 그대로 둔다.
@@ -546,11 +569,12 @@ pub(crate) fn impls_with_identities<'a>(
     tree: &ModTree,
     harvest: &mut Harvest,
     identities: &mut identity::Registry,
-) -> (Vec<Vertex>, Vec<Edge>, Vec<AttrRef>, Vec<BodyItem<'a>>) {
+) -> ImplParts<'a> {
     let mut vertices = Vec::new();
     let mut edges = Vec::new();
     let mut attr_refs = Vec::new();
     let mut bodies = Vec::new();
+    let mut entry_roots = Vec::new();
     for b in blocks {
         // self 타입을 해석한다 — 모듈 로컬이면 정점이 있다.
         let Some(self_id) = tree.resolve(&b.items_module, &b.self_ty, &DepCrates::new()) else {
@@ -602,6 +626,16 @@ pub(crate) fn impls_with_identities<'a>(
                 &b.file,
                 m.span().byte_range().start,
             );
+            if is_extern_entry(&m.attrs) {
+                entry_roots.push(mid.clone());
+                identities.note_root(
+                    &mid,
+                    &b.items_module,
+                    false,
+                    &b.file,
+                    m.span().byte_range().start,
+                );
+            }
             let mut contains = Edge::new(self_id.clone(), mid.clone(), EdgeKind::Contains);
             contains.cfg = mcfg.clone();
             contains.unsafe_ = b.unsafe_;
@@ -637,7 +671,13 @@ pub(crate) fn impls_with_identities<'a>(
             });
         }
     }
-    (vertices, edges, attr_refs, bodies)
+    ImplParts {
+        vertices,
+        edges,
+        attr_refs,
+        bodies,
+        entry_roots,
+    }
 }
 
 /// 시그니처 표면(파라미터·반환·where)의 타입 목록.
@@ -1929,21 +1969,50 @@ pub fn is_test_entry(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
-/// no_mangle/export_name/used/proc_macro 계열 — 링커·매크로가 부르는 진입점.
+/// 링커·런타임·매크로 확장기가 부르는 진입점 속성 — 이 속성이 붙은 fn·static·impl 메서드는 그래프
+/// 밖에서 불리므로 보존 루트다.
+const ENTRY_ATTRIBUTES: &[&str] = &[
+    "no_mangle",
+    "export_name",
+    "used",
+    "proc_macro",
+    "proc_macro_derive",
+    "proc_macro_attribute",
+    "global_allocator",
+    "panic_handler",
+];
+
+/// no_mangle/export_name/used/proc_macro/global_allocator 계열 — 링커·런타임·매크로가 부르는 진입점.
+///
+/// Rust 2024가 요구하는 `#[unsafe(no_mangle)]`·`#[unsafe(export_name = "..")]`와
+/// `#[cfg_attr(pred, no_mangle)]`의 안쪽 속성도 본다. 속성 경로의 마지막 세그먼트만 보면 앞의 둘은
+/// `unsafe`·`cfg_attr`로 읽혀 2024 판 FFI export 전부가 unreachable로 보였다. cfg_attr 술어는
+/// 평가하지 않는다 — 거짓일 수 있지만 보존하는 쪽으로 기운다.
 pub fn is_extern_entry(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|a| {
-        a.path().segments.last().is_some_and(|s| {
-            matches!(
-                s.ident.to_string().as_str(),
-                "no_mangle"
-                    | "export_name"
-                    | "used"
-                    | "proc_macro"
-                    | "proc_macro_derive"
-                    | "proc_macro_attribute"
-            )
-        })
-    })
+    attrs.iter().any(|a| meta_is_entry(&a.meta))
+}
+
+/// 속성 메타 하나가 진입점 속성인가 — `unsafe(..)`·`cfg_attr(pred, ..)` 안쪽까지 내려간다.
+fn meta_is_entry(meta: &syn::Meta) -> bool {
+    let Some(name) = meta.path().segments.last().map(|s| s.ident.to_string()) else {
+        return false;
+    };
+    if ENTRY_ATTRIBUTES.contains(&name.as_str()) {
+        return true;
+    }
+    let syn::Meta::List(list) = meta else {
+        return false;
+    };
+    match name.as_str() {
+        "unsafe" => syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+            .parse2(list.tokens.clone())
+            .is_ok_and(|inner| inner.iter().any(meta_is_entry)),
+        "cfg_attr" => matches!(
+            split_cfg_attr(&list.tokens),
+            Some((_, Ok(inner))) if inner.iter().any(meta_is_entry)
+        ),
+        _ => false,
+    }
 }
 
 #[cfg(test)]

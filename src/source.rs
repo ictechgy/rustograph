@@ -981,17 +981,18 @@ fn harvest(
     }
     for block in &impls {
         let krate = modtree::crate_of(&block.items_module);
-        let (vs, es, ar, bs) = harvest::impls_with_identities(
+        let parts = harvest::impls_with_identities(
             std::slice::from_ref(block),
             &krate,
             &tree,
             &mut harvest,
             &mut identity_registry,
         );
-        vertices.extend(vs);
-        edges.extend(es);
-        attr_refs.extend(ar);
-        bodies.extend(bs);
+        vertices.extend(parts.vertices);
+        edges.extend(parts.edges);
+        attr_refs.extend(parts.attr_refs);
+        bodies.extend(parts.bodies);
+        annotated_roots.extend(parts.entry_roots);
     }
     let identities = identity_registry.identify(&mut vertices, &meta.workspace_root);
     drop(identity_registry);

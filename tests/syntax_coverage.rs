@@ -362,6 +362,86 @@ fn make<T>() -> Outer<T> { unimplemented!() }
     );
 }
 
+/// 링커·런타임이 부르는 진입점 속성 — Rust 2024의 `#[unsafe(no_mangle)]`, `cfg_attr` 안쪽의
+/// `no_mangle`, `#[used]`·`#[no_mangle]`·`#[global_allocator]` static, impl 메서드의 `#[no_mangle]`.
+/// 예제·통합 테스트·벤치 타깃은 수확하지 않는다는 사실도 limitation으로 센다.
+#[test]
+fn linker_entry_attributes_are_retention_roots() {
+    let ws = Workspace::new(
+        "roots",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname='roots'\nversion='0.1.0'\nedition='2021'\n[workspace]\n[lib]\npath='src/lib.rs'\n[[bin]]\nname='roots'\npath='src/main.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                r#"
+use std::alloc::{GlobalAlloc, Layout, System};
+pub fn used_by_main() {}
+fn helper_unsafe_mangle() {}
+#[unsafe(no_mangle)]
+pub extern "C" fn ffi_unsafe_mangle() { helper_unsafe_mangle(); }
+fn helper_cfg_attr_mangle() {}
+#[cfg_attr(all(), no_mangle)]
+pub extern "C" fn ffi_cfg_attr_mangle() { helper_cfg_attr_mangle(); }
+fn helper_unsafe_export() {}
+#[unsafe(export_name = "renamed")]
+pub extern "C" fn ffi_unsafe_export() { helper_unsafe_export(); }
+fn used_target() {}
+#[used]
+static KEEP: fn() = used_target;
+#[no_mangle]
+pub static EXPORTED_STATIC: u32 = 5;
+pub struct MyAlloc;
+unsafe impl GlobalAlloc for MyAlloc {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 { unsafe { System.alloc(l) } }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) { unsafe { System.dealloc(p, l) } }
+}
+#[global_allocator]
+static GLOBAL: MyAlloc = MyAlloc;
+pub struct S;
+fn helper_method_mangle() {}
+impl S {
+    #[no_mangle]
+    pub extern "C" fn method_mangle() { helper_method_mangle(); }
+}
+fn truly_dead() {}
+pub fn only_from_example() {}
+"#,
+            ),
+            ("src/main.rs", "fn main() { roots::used_by_main(); }\n"),
+            (
+                "examples/demo.rs",
+                "fn main() { roots::only_from_example(); }\n",
+            ),
+            ("tests/it.rs", "#[test]\nfn t() {}\n"),
+            ("benches/b.rs", "fn main() {}\n"),
+        ],
+    );
+    let doc = symbols(ws.path());
+    let report = analysis::dead(&doc).unwrap();
+    assert_not_reported(
+        &report,
+        &[
+            "roots::ffi_unsafe_mangle",
+            "roots::helper_unsafe_mangle",
+            "roots::ffi_cfg_attr_mangle",
+            "roots::helper_cfg_attr_mangle",
+            "roots::ffi_unsafe_export",
+            "roots::helper_unsafe_export",
+            "roots::KEEP",
+            "roots::used_target",
+            "roots::EXPORTED_STATIC",
+            "roots::GLOBAL",
+            "roots::MyAlloc",
+            "roots::S::method_mangle",
+            "roots::helper_method_mangle",
+        ],
+    );
+    assert_reported(&report, &["roots::truly_dead", "roots::only_from_example"]);
+}
+
 /// 함수 본문 최상위의 아이템(중첩 `fn`, 지역 `impl`)과 `macro_rules!` 정의 본문의 경로도 간선이
 /// 된다. 매크로 본문은 토큰이라 호출 위치를 모르니 추정(tentative) 간선이다.
 #[test]
