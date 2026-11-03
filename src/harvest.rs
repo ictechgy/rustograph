@@ -772,6 +772,12 @@ pub fn signature_edges(b: &BodyItem, tree: &ModTree, dep_crates: &DepCrates) -> 
             if p.first().is_some_and(|name| type_params.contains(name)) {
                 continue;
             }
+            // `-> Self`·`other: &Self`는 impl self 타입이다.
+            let p = b
+                .self_ty
+                .as_deref()
+                .and_then(|ty| substitute_self(&p, ty))
+                .unwrap_or(p);
             if let Some(id) = tree.resolve(&b.module, &p, dep_crates) {
                 if id != b.id {
                     let mut e = Edge::new(b.id.clone(), id, EdgeKind::Signature);
@@ -861,8 +867,13 @@ impl BodyVisitor<'_> {
         }
     }
 
+    /// 경로를 이 본문의 모듈에서 해석한다. impl 본문의 `Self`는 impl self 타입 경로로 바꿔 해석한다
+    /// ([`substitute_self`]) — `Self::f()`·`Self(..)`·`Self { .. }`·`Self::CONST`가 모두 그 타입을 가리킨다.
     fn resolve(&mut self, segs: &[String]) -> Option<String> {
-        self.tree.resolve(self.module, segs, self.dep_crates)
+        match self.self_ty.and_then(|ty| substitute_self(segs, ty)) {
+            Some(path) => self.tree.resolve(self.module, &path, self.dep_crates),
+            None => self.tree.resolve(self.module, segs, self.dep_crates),
+        }
     }
 
     /// 값 자리(표현식 경로·호출 대상·포맷 캡처)의 경로를 해석한다.
@@ -1170,6 +1181,9 @@ impl Visit<'_> for BodyVisitor<'_> {
         // 매개변수를 첫 겹으로 가진다.
         let saved = self.scopes.take();
         let saved_types = self.type_params.clone();
+        // 안쪽 아이템은 바깥 impl의 `Self`를 쓸 수 없다(rustc E0401) — 안쪽 `impl`의 `Self`는
+        // 그 impl의 타입이라, 바깥 self 타입으로 바꾸면 거짓 간선이 된다. 안쪽에서는 바꾸지 않는다.
+        let saved_self = self.self_ty.take();
         let generics = match i {
             syn::Item::Fn(item) => Some(&item.sig.generics),
             syn::Item::Struct(item) => Some(&item.generics),
@@ -1194,6 +1208,7 @@ impl Visit<'_> for BodyVisitor<'_> {
         syn::visit::visit_item(self, i);
         self.scopes.restore(saved);
         self.type_params = saved_types;
+        self.self_ty = saved_self;
     }
 
     fn visit_expr_if(&mut self, e: &syn::ExprIf) {
@@ -1301,6 +1316,17 @@ impl Visit<'_> for TypeVisitor {
         self.paths.push(path_segments(p));
         syn::visit::visit_path(self, p);
     }
+}
+
+/// `Self`로 시작하는 경로를 impl self 타입 경로로 바꾼다 — `Self`로 시작하지 않거나 self 타입
+/// 경로가 비었으면(참조·튜플 같은 이름 없는 타입) None이다. `Self`는 본문이 속한 impl 모듈에서
+/// self 타입과 같은 이름이므로, 바꾼 경로도 같은 모듈에서 해석한다.
+fn substitute_self(segs: &[String], self_ty: &[String]) -> Option<Vec<String>> {
+    let (first, rest) = segs.split_first()?;
+    if first != "Self" || self_ty.is_empty() {
+        return None;
+    }
+    Some(self_ty.iter().chain(rest).cloned().collect())
 }
 
 /// `a::b::C` 경로를 세그먼트 목록으로 — 제네릭 인자는 버린다.

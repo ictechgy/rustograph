@@ -98,6 +98,134 @@ fn has_edge(doc: &Document, from: &str, to: &str, kind: EdgeKind) -> bool {
         .any(|e| e.from == from && e.to == to && e.kind == kind)
 }
 
+/// impl 본문의 `Self::f()`·`Self(..)`·`Self { .. }`·`-> Self`는 impl self 타입으로 해석된다.
+#[test]
+fn self_paths_resolve_to_the_impl_type() {
+    let ws = Workspace::new(
+        "self",
+        &[
+            ("Cargo.toml", &manifest("selfcall")),
+            (
+                "src/main.rs",
+                r#"
+pub struct D { pub n: u32 }
+impl D {
+    pub fn a(&self) -> bool { Self::b(self.n) }
+    fn b(n: u32) -> bool { n > 0 }
+    pub fn c(&self) -> bool { Some(self.n).is_some_and(|v| Self::d(v)) }
+    fn d(n: u32) -> bool { n > 1 }
+    pub fn make() -> Self { Self { n: helper_in_literal() } }
+}
+fn helper_in_literal() -> u32 { 1 }
+fn never_called() {}
+fn main() {
+    let x = D::make();
+    x.a();
+    x.c();
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(has_edge(
+        &doc,
+        "selfcall::D::a",
+        "selfcall::D::b",
+        EdgeKind::Call
+    ));
+    assert!(has_edge(
+        &doc,
+        "selfcall::D::make",
+        "selfcall::D",
+        EdgeKind::References
+    ));
+    assert!(has_edge(
+        &doc,
+        "selfcall::D::make",
+        "selfcall::D",
+        EdgeKind::Signature
+    ));
+    let report = analysis::dead(&doc).unwrap();
+    assert_not_reported(&report, &["selfcall::D::b", "selfcall::D::d"]);
+    assert_reported(&report, &["selfcall::never_called"]);
+}
+
+/// RAII 관용구 — `Self(1)` 생성자로만 만드는 타입의 `Drop`은 외부 트레이트 impl 보존 선택지로 산다.
+#[test]
+fn self_constructor_keeps_raii_drop_reachable() {
+    let ws = Workspace::new(
+        "guard",
+        &[
+            ("Cargo.toml", &manifest("guard")),
+            (
+                "src/main.rs",
+                r#"
+pub struct Guard(u32);
+impl Guard {
+    pub fn new() -> Self { Self(1) }
+}
+impl Drop for Guard {
+    fn drop(&mut self) { cleanup(); }
+}
+fn cleanup() {}
+fn main() {
+    let _g = Guard::new();
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    let report = analysis::dead_with_options(&doc, retaining_external_trait_impls()).unwrap();
+    assert_not_reported(
+        &report,
+        &[
+            "guard::Guard",
+            "guard::Guard::<Drop>::drop",
+            "guard::cleanup",
+        ],
+    );
+}
+
+/// 함수 안 `impl`의 `Self`는 바깥 impl의 self 타입이 아니다 — 안쪽 아이템이 바깥 `Self`를 빌려
+/// 쓰지 못하는 rustc 규칙대로, 바깥 타입으로 간선을 만들지 않는다.
+#[test]
+fn nested_item_self_does_not_borrow_the_outer_impl() {
+    let ws = Workspace::new(
+        "nested-self",
+        &[
+            ("Cargo.toml", &manifest("nestedself")),
+            (
+                "src/main.rs",
+                r#"
+pub struct Outer;
+impl Outer {
+    pub fn run(&self) {
+        struct Inner;
+        impl Inner { fn go() -> u32 { Self::value() } fn value() -> u32 { 1 } }
+        Inner::go();
+    }
+    fn value() -> u32 { 2 }
+}
+fn main() { Outer.run(); }
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(
+        !has_edge(
+            &doc,
+            "nestedself::Outer::run",
+            "nestedself::Outer::value",
+            EdgeKind::Call
+        ),
+        "inner Self resolved to the outer impl: {:?}",
+        doc.edges
+    );
+}
+
 /// `[lib] crate-type`을 적은 lib(cdylib·rlib)과 proc-macro 크레이트도 수확한다 — 예전에는 cargo
 /// metadata의 kind가 `lib`이 아니라는 이유로 크레이트가 통째로 빠졌고, deps는 그 크레이트가 실제로
 /// 쓰는 의존을 unused로 보고했다.
