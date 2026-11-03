@@ -379,6 +379,9 @@ fn main() {
             "extimpl::ui::from_vec_impl",
             "extimpl::ui::from_ref_impl",
             "extimpl::only_from_blanket",
+            // 워크스페이스 밖 타입에만 구현한 트레이트도 그 메서드를 쓰면 닿는다.
+            "extimpl::Render",
+            "extimpl::Greet",
         ],
     );
     assert!(

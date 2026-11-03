@@ -1023,8 +1023,21 @@ fn harvest(
     // 선언 메서드가 소스 인스턴스 ID로 바뀌었으면 impl 모듈이 소유한다(유령 정점 금지).
     let vertex_ids: BTreeSet<&str> = vertices.iter().map(|v| v.id.as_str()).collect();
     for mut body in foreign_bodies {
-        if !vertex_ids.contains(body.id.as_str()) {
-            body.id = body.module.clone();
+        let trait_id = (body.id != body.module && vertex_ids.contains(body.id.as_str()))
+            .then(|| body.id.rsplit_once("::").map(|(t, _)| t.to_string()))
+            .flatten()
+            .filter(|t| vertex_ids.contains(t.as_str()));
+        match trait_id {
+            // 선언 메서드가 소유한 본문은 그 트레이트의 impl이다. self 타입 정점이 없어 implements
+            // 간선을 둘 수 없으니 소유 메서드에서 트레이트로 references 간선을 둔다 — 워크스페이스 밖
+            // 타입에만 구현한 확장 트레이트(`impl ItemIdent for syn::Item`)는 이것이 없으면 메서드를
+            // 써도 트레이트 정점이 unreachable이었다.
+            Some(trait_id) => {
+                let mut e = Edge::new(body.id.clone(), trait_id, EdgeKind::References);
+                e.cfg = body.cfg.clone();
+                edges.push(e);
+            }
+            None => body.id = body.module.clone(),
         }
         bodies.push(body);
     }
