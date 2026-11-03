@@ -40,3 +40,55 @@ fn direct_recursion_is_not_a_cycle_but_mutual_recursion_is() {
     assert_eq!(members, [["rec::ping", "rec::pong"]]);
     assert!(analysis::dead(&doc).unwrap().findings.is_empty());
 }
+
+/// 서로를 필드로 담는 재귀 데이터 정의는 심볼 레벨 순환이 아니다 — 직접 재귀처럼 고칠 대상이 아닌
+/// 한 타입 묶음이다. 필드 간선은 그대로 있어 type 레벨 순환과 dead에는 쓰인다. 같은 타입 쌍이
+/// 메서드로 서로를 부르면 그것은 호출 재귀라 계속 순환이다.
+#[test]
+fn recursive_data_types_are_not_symbol_level_cycles() {
+    let root = std::env::temp_dir().join(format!("rustograph-data-rec-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='datarec'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/main.rs"),
+        "enum Expr { Lit(u8), Block(Box<Stmt>) }\n\
+         struct Stmt { e: Expr }\n\
+         fn walk_expr(e: &Expr) { if let Expr::Block(s) = e { walk_stmt(s) } }\n\
+         fn walk_stmt(s: &Stmt) { walk_expr(&s.e) }\n\
+         fn main() { walk_expr(&Expr::Lit(1)); }\n",
+    )
+    .unwrap();
+    let doc = source::load(
+        &root,
+        &source::Options {
+            symbol_level: true,
+            ..Default::default()
+        },
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+    let doc = doc.unwrap();
+    let field = |from: &str, to: &str| {
+        doc.edges.iter().any(|e| {
+            e.from == from && e.to == to && e.kind == rustograph::graph::EdgeKind::References
+        })
+    };
+    assert!(field("datarec::Expr", "datarec::Stmt") && field("datarec::Stmt", "datarec::Expr"));
+    let members: Vec<Vec<String>> = analysis::cycles(&doc)
+        .cycles
+        .into_iter()
+        .map(|c| c.members)
+        .collect();
+    assert_eq!(members, [["datarec::walk_expr", "datarec::walk_stmt"]]);
+    let types = doc.view(rustograph::graph::Level::Type).unwrap();
+    assert!(
+        analysis::cycles(&types)
+            .cycles
+            .iter()
+            .any(|c| c.members == ["datarec::Expr", "datarec::Stmt"]),
+        "type-level cycles keep field recursion"
+    );
+}

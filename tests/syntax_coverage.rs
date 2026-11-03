@@ -304,3 +304,60 @@ fn lib_crate_types_and_proc_macros_are_harvested() {
         "used dependencies reported unused: {unused:?}"
     );
 }
+
+/// struct·enum 필드의 타입은 그 타입 정점에서 나가는 references 간선이다 — 없으면 DTO 필드로만
+/// 쓰는 타입이 unreachable로 보이고 필드가 다른 모듈을 가리키는 의존이 규칙에서 사라진다.
+#[test]
+fn field_types_are_references_from_the_owning_type() {
+    let ws = Workspace::new(
+        "fields",
+        &[
+            ("Cargo.toml", &manifest("fields")),
+            (
+                "src/main.rs",
+                r#"
+mod db;
+pub struct Inner;
+pub enum Kind { A, B(Payload) }
+pub struct Payload;
+pub struct Outer<T> { inner: Vec<Inner>, kind: Option<Kind>, conn: db::Conn, generic: T, me: Option<Box<Self>> }
+fn main() {
+    let o: Outer<u8> = make();
+    let _ = &o;
+}
+fn make<T>() -> Outer<T> { unimplemented!() }
+"#,
+            ),
+            ("src/db.rs", "pub struct Conn;\n"),
+        ],
+    );
+    let doc = symbols(ws.path());
+    for to in ["fields::Inner", "fields::Kind", "fields::db::Conn"] {
+        assert!(
+            has_edge(&doc, "fields::Outer", to, EdgeKind::References),
+            "missing Outer -> {to}"
+        );
+    }
+    assert!(has_edge(
+        &doc,
+        "fields::Kind",
+        "fields::Payload",
+        EdgeKind::References
+    ));
+    assert!(
+        !doc.edges
+            .iter()
+            .any(|e| e.from == "fields::Outer" && e.to == "fields::Outer"),
+        "Self in a field must not become a self edge"
+    );
+    let report = analysis::dead(&doc).unwrap();
+    assert_not_reported(
+        &report,
+        &[
+            "fields::Inner",
+            "fields::Kind",
+            "fields::Payload",
+            "fields::db::Conn",
+        ],
+    );
+}

@@ -59,6 +59,32 @@ pub struct ModuleDecls<'a> {
     /// 범위 — persistence 사실을 감싸는 그래프 정점으로 귀속할 때 쓴다.
     /// 본문 아이템의 범위는 BodyItem이 이미 들고 있다.
     pub owner_spans: Vec<OwnerSpan>,
+    /// 본문 밖 선언이 담은 경로 참조 — 필드 타입. 해석은 임포트가 채워진 뒤 2패스에서
+    /// [`decl_edges`]가 한다.
+    pub decl_refs: Vec<DeclRef>,
+}
+
+/// 본문 밖 선언이 담은 경로 참조 하나.
+///
+/// struct·enum·union 필드의 타입은 그 타입이 쓰는 타입이다 — 모으지 않으면 DTO 필드로만 쓰는
+/// 타입이 unreachable로 보이고, 필드가 다른 모듈을 가리키는 의존이 규칙·순환에서 사라진다.
+/// `tentative` 참조는 쓰임이 확정되지 않은 경로라 추정 간선으로 dead·도달성에만 쓰인다.
+#[derive(Debug, Clone)]
+pub struct DeclRef {
+    /// 참조를 소유한 정점 ID — 필드면 그 타입.
+    pub owner: String,
+    /// 경로를 해석할 모듈 — 선언이 사는 모듈이다.
+    pub module: String,
+    /// 경로 세그먼트.
+    pub path: Vec<String>,
+    /// 소유 아이템과 필드·배리언트의 `#[cfg]`를 합친 조건.
+    pub cfg: Option<String>,
+    /// 쓰임이 확정되지 않은 참조인가 — 추정 간선이 된다.
+    pub tentative: bool,
+    /// 소유 아이템의 선언 파일 — 같은 경로의 선언이 여럿이면 소스 인스턴스 ID로 옮길 때 쓴다.
+    pub file: PathBuf,
+    /// 소유 아이템의 파일 안 바이트 시작 위치(syn span, 속성 포함).
+    pub start: usize,
 }
 
 /// 그래프 정점 하나가 소스에서 차지하는 범위다.
@@ -190,6 +216,7 @@ pub(crate) fn decls_with_markers<'a>(
         entry_roots: Vec::new(),
         test_roots: Vec::new(),
         owner_spans: Vec::new(),
+        decl_refs: Vec::new(),
     };
     for (file, items) in groups {
         let generated = is_generated_file(file);
@@ -252,20 +279,27 @@ pub(crate) fn decls_with_markers<'a>(
                     });
                 }
                 syn::Item::Struct(s) => {
-                    out.vertices.push(v(
-                        format!("{module_path}::{}", s.ident),
-                        Kind::Struct,
-                        is_pub(&s.vis),
-                        false,
-                    ));
+                    let id = format!("{module_path}::{}", s.ident);
+                    out.vertices
+                        .push(v(id.clone(), Kind::Struct, is_pub(&s.vis), false));
+                    let owner = DeclOwner::new(&id, module_path, &s.ident, &s.generics, file, item);
+                    owner.push_fields(fields_with_cfg(&s.fields, &cfg), &mut out.decl_refs);
                 }
                 syn::Item::Enum(e) => {
-                    out.vertices.push(v(
-                        format!("{module_path}::{}", e.ident),
-                        Kind::Enum,
-                        is_pub(&e.vis),
-                        false,
-                    ));
+                    let id = format!("{module_path}::{}", e.ident);
+                    out.vertices
+                        .push(v(id.clone(), Kind::Enum, is_pub(&e.vis), false));
+                    let owner = DeclOwner::new(&id, module_path, &e.ident, &e.generics, file, item);
+                    for variant in &e.variants {
+                        let variant_cfg = match cfg_of(&variant.attrs) {
+                            Some(condition) => conjoin(&cfg, &condition),
+                            None => cfg.clone(),
+                        };
+                        owner.push_fields(
+                            fields_with_cfg(&variant.fields, &variant_cfg),
+                            &mut out.decl_refs,
+                        );
+                    }
                 }
                 syn::Item::Trait(t) => {
                     // unsafe trait — 구현·사용이 전부 경계를 넘는다.
@@ -319,12 +353,12 @@ pub(crate) fn decls_with_markers<'a>(
                     }
                 }
                 syn::Item::Union(u) => {
-                    out.vertices.push(v(
-                        format!("{module_path}::{}", u.ident),
-                        Kind::Union,
-                        is_pub(&u.vis),
-                        false,
-                    ));
+                    let id = format!("{module_path}::{}", u.ident);
+                    out.vertices
+                        .push(v(id.clone(), Kind::Union, is_pub(&u.vis), false));
+                    let owner = DeclOwner::new(&id, module_path, &u.ident, &u.generics, file, item);
+                    let fields = u.fields.named.iter().map(|f| (&f.ty, field_cfg(f, &cfg)));
+                    owner.push_fields(fields.collect(), &mut out.decl_refs);
                 }
                 syn::Item::Type(t) => {
                     out.vertices.push(v(
@@ -642,6 +676,111 @@ pub fn attr_edges(
         }
     }
     edges
+}
+
+/// 모은 선언 참조([`DeclRef`])를 references 간선으로 해석한다(2패스).
+///
+/// 본문 방문의 타입 경로처럼 해석 실패를 미해석으로 세지 않는다 — 필드 타입은 대부분 std 타입이라
+/// 세면 외부 참조 카운터가 의미 없이 부푼다.
+/// 같은 (소유자, 목적지, 조건, 추정 여부) 간선은 한 번만 낸다. 소유자 자신을 가리키는 참조
+/// (`Option<Box<Self>>`)는 버린다.
+pub fn decl_edges(refs: &[DeclRef], tree: &ModTree, dep_crates: &DepCrates) -> Vec<Edge> {
+    let mut seen = BTreeSet::new();
+    let mut edges = Vec::new();
+    for r in refs {
+        let Some(to) = tree.resolve(&r.module, &r.path, dep_crates) else {
+            continue;
+        };
+        if to == r.owner || !seen.insert((r.owner.as_str(), to.clone(), &r.cfg, r.tentative)) {
+            continue;
+        }
+        let mut e = if r.tentative {
+            Edge::maybe(r.owner.clone(), to, EdgeKind::References)
+        } else {
+            Edge::new(r.owner.clone(), to, EdgeKind::References)
+        };
+        e.cfg = r.cfg.clone();
+        edges.push(e);
+    }
+    edges
+}
+
+/// 필드 타입 참조를 모으는 소유 타입 — 정점 ID·모듈·제네릭·선언 위치를 한데 묶는다.
+struct DeclOwner<'a> {
+    id: &'a str,
+    module: &'a str,
+    /// 필드 타입의 `Self`가 가리키는 타입 이름.
+    name: String,
+    /// 타입 이름공간을 가리는 제네릭 매개변수 — 필드의 `T`는 경로가 아니다.
+    type_params: BTreeSet<String>,
+    file: &'a PathBuf,
+    start: usize,
+}
+
+impl<'a> DeclOwner<'a> {
+    /// 타입 선언 하나의 소유자.
+    fn new(
+        id: &'a str,
+        module: &'a str,
+        ident: &syn::Ident,
+        generics: &syn::Generics,
+        file: &'a PathBuf,
+        item: &syn::Item,
+    ) -> DeclOwner<'a> {
+        DeclOwner {
+            id,
+            module,
+            name: ident.to_string(),
+            type_params: generics
+                .type_params()
+                .map(|param| param.ident.to_string())
+                .collect(),
+            file,
+            start: item.span().byte_range().start,
+        }
+    }
+
+    /// 필드 (타입, 조건) 목록의 경로를 선언 참조로 넣는다.
+    fn push_fields(&self, fields: Vec<(&syn::Type, Option<String>)>, out: &mut Vec<DeclRef>) {
+        for (ty, cfg) in fields {
+            let mut paths = TypeVisitor { paths: Vec::new() };
+            paths.visit_type(ty);
+            for path in paths.paths {
+                if path
+                    .first()
+                    .is_some_and(|name| self.type_params.contains(name))
+                {
+                    continue;
+                }
+                let path = substitute_self(&path, std::slice::from_ref(&self.name)).unwrap_or(path);
+                out.push(DeclRef {
+                    owner: self.id.to_string(),
+                    module: self.module.to_string(),
+                    path,
+                    cfg: cfg.clone(),
+                    tentative: false,
+                    file: self.file.clone(),
+                    start: self.start,
+                });
+            }
+        }
+    }
+}
+
+/// struct·배리언트 필드마다 (타입, 아이템 조건과 필드 `#[cfg]`를 합친 조건).
+fn fields_with_cfg<'f>(
+    fields: &'f syn::Fields,
+    cfg: &Option<String>,
+) -> Vec<(&'f syn::Type, Option<String>)> {
+    fields.iter().map(|f| (&f.ty, field_cfg(f, cfg))).collect()
+}
+
+/// 필드 하나의 조건 — 필드 자신의 `#[cfg]`가 있으면 아이템 조건과 합친다.
+fn field_cfg(field: &syn::Field, cfg: &Option<String>) -> Option<String> {
+    match cfg_of(&field.attrs) {
+        Some(condition) => conjoin(cfg, &condition),
+        None => cfg.clone(),
+    }
 }
 
 /// 본문을 방문해 call/references/매크로 간선을 만든다(2패스).

@@ -952,6 +952,7 @@ fn harvest(
     let mut bodies: Vec<BodyItem<'_>> = Vec::new();
     let mut impls: Vec<harvest::ImplBlock<'_>> = Vec::new();
     let mut attr_refs: Vec<harvest::AttrRef> = Vec::new();
+    let mut decl_refs: Vec<harvest::DeclRef> = Vec::new();
     let mut test_roots: Vec<String> = Vec::new();
     let mut annotated_roots: Vec<String> = Vec::new();
     // 지역명이 fn owner_spans와 같으면 이름 해석이 함수 정점으로 읽어 거짓 순환이 된다.
@@ -974,6 +975,7 @@ fn harvest(
         test_roots.extend(mh.decls.test_roots);
         bodies.extend(mh.decls.bodies);
         attr_refs.extend(mh.decls.attr_refs);
+        decl_refs.extend(mh.decls.decl_refs);
         impls.extend(mh.decls.impls);
         item_spans.extend(mh.decls.owner_spans);
     }
@@ -1007,6 +1009,9 @@ fn harvest(
         span.id = identities.owner(&span.id, module, &span.file, span.range.start);
     }
     identities.attributes(&mut attr_refs);
+    for r in &mut decl_refs {
+        r.owner = identities.owner(&r.owner, &r.module, &r.file, r.start);
+    }
     identities.roots(&mut entry_roots);
     identities.annotated_roots(&mut annotated_roots, false);
     entry_roots.extend(annotated_roots);
@@ -1136,6 +1141,8 @@ fn harvest(
             harvest::attr_edges(&attr_refs, &tree, &dep_crates, &mut harvest),
             false,
         ));
+        // 필드 타입·`macro_rules!` 본문 경로 — 속성처럼 모드와 무관하게 syn이 권위다.
+        edges.extend(identities.edges(harvest::decl_edges(&decl_refs, &tree, &dep_crates), false));
     }
 
     push_limitations(&harvest, &mut limitations);
