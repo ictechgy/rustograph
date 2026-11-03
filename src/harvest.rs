@@ -908,19 +908,28 @@ fn field_cfg(field: &syn::Field, cfg: &Option<String>) -> Option<String> {
 /// `self::a`, `super::a`)를 모은다. `$crate`는 `crate`로 바꾼다. 메타변수(`$x`)로 시작하는 경로는
 /// 펼친 곳의 토큰이라 건너뛴다. 한 세그먼트 이름은 지역 변수·키워드와 구별할 수 없어 모으지 않는다.
 fn macro_body_paths(tokens: proc_macro2::TokenStream) -> Vec<Vec<String>> {
+    token_paths(tokens, 2)
+}
+
+/// 토큰에서 세그먼트가 `min_segments` 이상인 경로를 모은다 — 규칙은 [`macro_body_paths`]와 같다.
+fn token_paths(tokens: proc_macro2::TokenStream, min_segments: usize) -> Vec<Vec<String>> {
     let mut out = Vec::new();
-    collect_token_paths(tokens, &mut out);
+    collect_token_paths(tokens, min_segments, &mut out);
     out
 }
 
-/// [`macro_body_paths`]의 재귀 — 괄호 묶음 안까지 내려간다.
-fn collect_token_paths(tokens: proc_macro2::TokenStream, out: &mut Vec<Vec<String>>) {
+/// [`token_paths`]의 재귀 — 괄호 묶음 안까지 내려간다.
+fn collect_token_paths(
+    tokens: proc_macro2::TokenStream,
+    min_segments: usize,
+    out: &mut Vec<Vec<String>>,
+) {
     use proc_macro2::TokenTree;
     let trees: Vec<TokenTree> = tokens.into_iter().collect();
     let mut i = 0;
     while i < trees.len() {
         if let TokenTree::Group(g) = &trees[i] {
-            collect_token_paths(g.stream(), out);
+            collect_token_paths(g.stream(), min_segments, out);
             i += 1;
             continue;
         }
@@ -929,7 +938,7 @@ fn collect_token_paths(tokens: proc_macro2::TokenStream, out: &mut Vec<Vec<Strin
             continue;
         }
         let (path, next) = token_path_at(&trees, i);
-        if path.len() >= 2 {
+        if path.len() >= min_segments.max(1) {
             out.push(path);
         }
         i = next.max(i + 1);
@@ -1365,31 +1374,38 @@ impl BodyVisitor<'_> {
     /// 매크로 호출 하나 — 크레이트 안 매크로면 call 간선, std/외부면 실측 생략으로 센다.
     /// 매크로 인자는 토큰 스트림이라 방문자가 못 내린다 — write!·format!·assert_eq! 같은 흔한
     /// 형태는 쉼표로 나뉜 표현식 목록이라 직접 파싱을 시도한다. 파싱이 안 되면 매크로 문법이
-    /// 독자적이라는 뜻이고, 그 안의 호출은 구문 수준에서 영원히 보이지 않는다(ext_macros가 그
-    /// 수를 잰다).
+    /// 독자적이라는 뜻이다(`json!({..})`·`matches!(x, P)`) — 토큰 안의 이름이 지역 묶음이 아닌
+    /// 아이템으로 해석되면 추정 간선만 단다. 문법을 모르니 호출인지 단순 언급인지 가릴 수 없다.
     fn visit_macro_call(&mut self, mac: &syn::Macro) {
         let segs = path_segments(&mac.path);
         match self.resolve(&segs) {
             Some(id) => self.push(id, EdgeKind::Call),
             None => self.ext_macros += 1,
         }
-        if let Ok(exprs) =
-            syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
-                .parse2(mac.tokens.clone())
-        {
-            for ex in &exprs {
-                self.visit_expr(ex);
-                // 포맷 문자열의 `{name}` 캡처 — 토큰이 아니라 문자열 안에 있어
-                // AST에 나타나지 않지만 실제 참조다.
-                if let syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Str(s),
-                    ..
-                }) = ex
-                {
-                    for name in format_captures(&s.value()) {
-                        if let ValueRes::Item(id) = self.resolve_value(&[name]) {
-                            self.push(id, EdgeKind::References);
-                        }
+        let parsed = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
+            .parse2(mac.tokens.clone());
+        let Ok(exprs) = parsed else {
+            // 표현식 목록이 아닌 인자(`json!({"k": f()})`, `matches!(x, P)`) — 토큰 안의 이름이
+            // 아이템으로 해석되면 추정 간선을 단다. 문법을 모르니 확정 사용이 아니다(dead·도달성만).
+            for path in token_paths(mac.tokens.clone(), 1) {
+                if let ValueRes::Item(id) = self.resolve_value(&path) {
+                    self.push_maybe(id, EdgeKind::References);
+                }
+            }
+            return;
+        };
+        for ex in &exprs {
+            self.visit_expr(ex);
+            // 포맷 문자열의 `{name}` 캡처 — 토큰이 아니라 문자열 안에 있어
+            // AST에 나타나지 않지만 실제 참조다.
+            if let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) = ex
+            {
+                for name in format_captures(&s.value()) {
+                    if let ValueRes::Item(id) = self.resolve_value(&[name]) {
+                        self.push(id, EdgeKind::References);
                     }
                 }
             }

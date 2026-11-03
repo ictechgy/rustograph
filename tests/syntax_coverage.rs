@@ -719,3 +719,40 @@ fn main() {
     );
     assert_reported(&report, &["assocvalue::Item::unused_assoc"]);
 }
+
+/// 표현식 목록으로 파싱되지 않는 매크로 인자(`json!({"k": f()})` 같은 독자 문법)의 이름은 아이템으로
+/// 해석되면 추정 간선이 된다 — 예전에는 그 안에서만 쓰는 함수·상수가 unreachable이었다. 지역 묶음과
+/// 같은 이름은 아이템으로 읽지 않는다.
+#[test]
+fn unparsed_macro_arguments_keep_tentative_references() {
+    let ws = Workspace::new(
+        "macro-tokens",
+        &[
+            ("Cargo.toml", &manifest("macrotokens")),
+            (
+                "src/main.rs",
+                r#"
+macro_rules! object { ({ $($k:literal : $v:expr),* }) => { vec![$(($k, $v)),*] }; }
+const BASE: &str = "root";
+fn tool_list() -> &'static str { "tools" }
+fn shadowed() -> &'static str { "item" }
+fn main() {
+    let shadowed = "local";
+    let pairs = object!({ "tools": tool_list(), "base": BASE, "s": shadowed });
+    let _ = pairs;
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    let edge = doc
+        .edges
+        .iter()
+        .find(|e| e.from == "macrotokens::main" && e.to == "macrotokens::tool_list")
+        .expect("name inside unparsed macro arguments becomes an edge");
+    assert!(edge.tentative);
+    let report = analysis::dead(&doc).unwrap();
+    assert_not_reported(&report, &["macrotokens::tool_list", "macrotokens::BASE"]);
+    assert_reported(&report, &["macrotokens::shadowed"]);
+}
