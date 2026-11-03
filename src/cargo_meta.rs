@@ -64,7 +64,8 @@ impl Package {
 pub struct Target {
     /// 타깃 이름(= 루트 모듈 이름).
     pub name: String,
-    /// "lib" | "bin" | "example" | "test" | "bench" ...
+    /// "lib" | "bin" | "example" | "test" | "bench" — cdylib·rlib·staticlib·dylib·proc-macro
+    /// 같은 lib 계열 crate type은 "lib"으로 정규화돼 있다.
     pub kind: String,
     /// 엔트리 소스 파일.
     pub src: PathBuf,
@@ -691,6 +692,24 @@ fn is_executable_file(candidate: &Path) -> bool {
     }
 }
 
+/// cargo metadata 타깃 kind 목록을 수확이 쓰는 종류 하나로 줄인다 — 수확하지 않는 종류(build
+/// 스크립트 등)면 None.
+///
+/// `[lib] crate-type`을 적은 lib의 kind는 `lib`이 아니라 그 crate type 목록(`["cdylib"]`,
+/// `["cdylib", "rlib"]`, `["staticlib"]`)이고, proc-macro lib은 `["proc-macro"]`다. 모두 같은
+/// `src/lib.rs` 모듈 트리를 컴파일하는 lib 타깃이라 `lib` 하나로 본다 — 예전에는 이 kind를 걸러
+/// 크레이트가 통째로 수확에서 빠졌고(정점 없음, limitation 없음), deps는 그 크레이트가 실제로 쓰는
+/// 의존을 unused로 보고했다.
+fn target_kind(kinds: &[String]) -> Option<&'static str> {
+    const LIB_KINDS: &[&str] = &["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
+    if kinds.iter().any(|k| LIB_KINDS.contains(&k.as_str())) {
+        return Some("lib");
+    }
+    ["bin", "example", "test", "bench"]
+        .into_iter()
+        .find(|known| kinds.iter().any(|k| k == known))
+}
+
 fn parse(bytes: &[u8]) -> Result<Metadata, String> {
     let raw: RawMetadata =
         serde_json::from_slice(bytes).map_err(|e| format!("bad cargo metadata JSON: {e}"))?;
@@ -706,7 +725,7 @@ fn parse(bytes: &[u8]) -> Result<Metadata, String> {
     let mut packages = Vec::new();
     for p in raw.packages {
         by_id.insert(p.id.clone(), packages.len());
-        // proc-macro 타깃은 아래 필터에서 버려진다 — 걸러내기 전에
+        // proc-macro 타깃은 아래에서 "lib"으로 정규화된다 — 정규화하기 전에
         // 패키지 수준 플래그로 따로 잡는다.
         let proc_macro = p
             .targets
@@ -727,15 +746,13 @@ fn parse(bytes: &[u8]) -> Result<Metadata, String> {
             targets: p
                 .targets
                 .into_iter()
-                .filter(|t| {
-                    t.kind
-                        .iter()
-                        .any(|k| matches!(k.as_str(), "lib" | "bin" | "example" | "test" | "bench"))
-                })
-                .map(|t| Target {
-                    name: normalize_name(&t.name),
-                    kind: t.kind.first().cloned().unwrap_or_default(),
-                    src: PathBuf::from(t.src_path),
+                .filter_map(|t| {
+                    let kind = target_kind(&t.kind)?;
+                    Some(Target {
+                        name: normalize_name(&t.name),
+                        kind: kind.to_string(),
+                        src: PathBuf::from(t.src_path),
+                    })
                 })
                 .collect(),
         });
@@ -1328,5 +1345,24 @@ mod tests {
         assert!(meta.packages[1].optional_deps.is_empty());
         assert_eq!(meta.dep_edges.len(), 1);
         assert!(meta.limitations.is_empty());
+    }
+
+    /// lib 계열 crate type과 proc-macro는 lib으로, 수확하지 않는 kind는 None으로 줄인다.
+    #[test]
+    fn target_kind_normalizes_lib_crate_types() {
+        let kinds = |ks: &[&str]| ks.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+        for lib in [
+            &["lib"][..],
+            &["cdylib"],
+            &["cdylib", "rlib"],
+            &["staticlib"],
+            &["dylib"],
+            &["proc-macro"],
+        ] {
+            assert_eq!(target_kind(&kinds(lib)), Some("lib"), "{lib:?}");
+        }
+        assert_eq!(target_kind(&kinds(&["bin"])), Some("bin"));
+        assert_eq!(target_kind(&kinds(&["example"])), Some("example"));
+        assert_eq!(target_kind(&kinds(&["custom-build"])), None);
     }
 }

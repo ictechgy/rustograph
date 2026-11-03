@@ -840,8 +840,8 @@ fn harvest(
                 continue;
             };
             let to_pkg = &meta.packages[ti];
-            // 멤버는 lib 루트 정점부터 걷는다 — lib 타깃 이름이 정점 ID다.
-            // lib이 없는 멤버(proc-macro 타깃만 있거나 순수 bin 패키지)는
+            // 멤버는 lib 루트 정점부터 걷는다 — lib 타깃 이름이 정점 ID다(proc-macro·cdylib도
+            // lib으로 정규화돼 있다). lib이 없는 멤버(순수 bin 패키지)는
             // extern crate로 링크할 수 없으니 크레이트 정점으로 붕괴한다 —
             // bin-only면 bin 루트 정점, lib/bin이 전혀 없으면 패키지 정점.
             // 외부 패키지 정점은 항상 패키지 이름이다(emit_crate_level).
@@ -1348,8 +1348,9 @@ fn emit_crate_level(
         // 충돌한다.
         if p.workspace_member {
             let vertex = p.crate_vertex();
-            // lib/bin 타깃이 없는 멤버(proc-macro 크레이트 등)는 겸임할 루트
-            // 모듈이 없다 — depends 간선이 dangling하지 않게 정점을 만든다.
+            // lib/bin 타깃이 없는 멤버(example·test·bench 타깃만 있는 패키지)는 겸임할
+            // 루트 모듈이 없다 — depends 간선이 dangling하지 않게 정점을 만든다. proc-macro·
+            // cdylib 같은 lib 계열 crate type은 cargo_meta가 "lib"으로 정규화해 여기 오지 않는다.
             if p.targets
                 .iter()
                 .all(|t| !matches!(t.kind.as_str(), "lib" | "bin"))

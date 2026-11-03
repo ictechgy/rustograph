@@ -847,8 +847,14 @@ mod cli_tests {
             .iter()
             .filter(|e| e["kind"] != "contains" && inside(&e["from"]) != inside(&e["to"]))
             .count();
-        // fixture_app::main이 포커스 밖 루트이고, 그 main이 fixture_core를 부른다.
-        assert_eq!(dropped_roots, 1);
+        // fixture_app::main과 proc-macro 크레이트 fixture_macros의 진입점(`#[proc_macro*]`)이
+        // 포커스 밖 루트이고, 그 main이 fixture_core를 부른다.
+        let macro_roots = roots
+            .iter()
+            .filter(|r| r.as_str().unwrap().starts_with("fixture_macros::"))
+            .count();
+        assert!(macro_roots > 0, "proc-macro entry points are roots");
+        assert_eq!(dropped_roots, 1 + macro_roots);
         assert!(crossing > 0);
         let head = format!(
             "--focus dropped {dropped_roots} retention roots and {crossing} dependency edges \
