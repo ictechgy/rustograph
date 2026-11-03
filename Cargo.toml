@@ -1,6 +1,6 @@
 [package]
 name = "rustograph"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 # 최소 지원 Rust — semantic feature가 정한다. ra_ap_* 0.0.349는 rust-version 1.95를 선언하지만
 # ra_ap_tt가 1.95에서 불안정한 `std::assert_matches`를 써서(E0658) 1.96부터 빌드된다. 기본 빌드는 더 낮은
