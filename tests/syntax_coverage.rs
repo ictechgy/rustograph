@@ -674,3 +674,48 @@ fn main() {
         ],
     );
 }
+
+/// 연관 함수를 값으로 넘긴 경로(`.map(Item::new)`)는 그 메서드의 참조다 — 타입에만 잇던 때는 그렇게만
+/// 쓰는 연관 함수가 unreachable이었다. 같은 이름 메서드가 없는 배리언트 경로는 타입 참조로 남는다.
+#[test]
+fn associated_functions_passed_as_values_are_references() {
+    let ws = Workspace::new(
+        "assoc-value",
+        &[
+            ("Cargo.toml", &manifest("assocvalue")),
+            (
+                "src/main.rs",
+                r#"
+pub struct Item(i32);
+impl Item {
+    fn new(n: i32) -> Item { Item(only_from_new(n)) }
+    fn unused_assoc() {}
+}
+fn only_from_new(n: i32) -> i32 { n }
+pub enum Mode { A }
+fn main() {
+    let items: Vec<Item> = (0..3).map(Item::new).collect();
+    let _ = (items.len(), Mode::A);
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(has_edge(
+        &doc,
+        "assocvalue::main",
+        "assocvalue::Item::new",
+        EdgeKind::References
+    ));
+    let report = analysis::dead(&doc).unwrap();
+    assert_not_reported(
+        &report,
+        &[
+            "assocvalue::Item::new",
+            "assocvalue::only_from_new",
+            "assocvalue::Mode",
+        ],
+    );
+    assert_reported(&report, &["assocvalue::Item::unused_assoc"]);
+}

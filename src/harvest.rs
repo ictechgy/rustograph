@@ -1264,6 +1264,20 @@ impl BodyVisitor<'_> {
             .is_some_and(|m| m.value_items.contains(name))
     }
 
+    /// 타입 `owner` 범위에서 이름이 `name`인 메서드(고유·트레이트 impl)로 references 간선을 단다 —
+    /// 연관 함수를 값으로 넘긴 경로(`Type::new`)다. 같은 이름 메서드가 없으면(배리언트·연관 상수)
+    /// 아무것도 하지 않는다.
+    fn push_associated(&mut self, owner: &str, name: &str) {
+        let index = self.method_index;
+        let Some(ids) = index.get(name) else {
+            return;
+        };
+        let prefix = owner_prefix(owner);
+        for mid in ids.iter().filter(|mid| mid.starts_with(&prefix)) {
+            self.push(mid.clone(), EdgeKind::References);
+        }
+    }
+
     /// `<T as Tr>::m(..)`·`<T>::m(..)` — self 타입이 적힌 정적 호출이다. `T`가 워크스페이스 타입이면
     /// 그 타입의 메서드로 call 간선을 단다: 트레이트를 적었으면 그 트레이트 impl의 `T::<Tr>::m`(정확히
     /// 없으면 같은 이름 impl 메서드 후보를 추정 간선으로), 적지 않았으면 `T` 범위의 같은 이름 메서드다.
@@ -1696,7 +1710,13 @@ impl Visit<'_> for BodyVisitor<'_> {
                 // 앞부분 타입에의 참조다. 그것도 안 되면 진짜 미해석.
                 if segs.len() >= 2 {
                     match self.resolve(&segs[..segs.len() - 1]) {
-                        Some(ty) => self.push(ty, EdgeKind::References),
+                        Some(ty) => {
+                            // `.map(Type::new)`·`.ok_or_else(Type::err)`처럼 연관 함수를 값으로 넘기면
+                            // 그 메서드의 참조다 — 타입만 잇던 때는 그렇게만 쓰는 연관 함수가
+                            // unreachable이었다. 호출(`Type::assoc()`)과 같은 타입 범위 후보를 쓴다.
+                            self.push_associated(&ty, &segs[segs.len() - 1]);
+                            self.push(ty, EdgeKind::References);
+                        }
                         None => self.unresolved += 1,
                     }
                 }
