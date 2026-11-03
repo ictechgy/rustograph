@@ -1265,6 +1265,51 @@ impl BodyVisitor<'_> {
             .is_some_and(|m| m.value_items.contains(name))
     }
 
+    /// `<T as Tr>::m(..)`·`<T>::m(..)` — self 타입이 적힌 정적 호출이다. `T`가 워크스페이스 타입이면
+    /// 그 타입의 메서드로 call 간선을 단다: 트레이트를 적었으면 그 트레이트 impl의 `T::<Tr>::m`(정확히
+    /// 없으면 같은 이름 impl 메서드 후보를 추정 간선으로), 적지 않았으면 `T` 범위의 같은 이름 메서드다.
+    /// 예전에는 트레이트 선언(`Tr::m`)에만 닿아 impl 메서드와 그 안에서만 부르는 함수가 unreachable이었다.
+    ///
+    /// 반환: 경로 해석을 이것으로 대신했는가 — `<T>::m`은 타입 상대 경로라 값 경로로 해석하면 같은
+    /// 이름의 자유 함수로 오독한다. `<T as Tr>::m`은 트레이트 선언으로 가는 기존 해석도 그대로 둔다.
+    fn qualified_self_call(&mut self, qself: &syn::QSelf, segs: &[String]) -> bool {
+        let type_relative = qself.position == 0;
+        let (Some(method), syn::Type::Path(ty)) = (segs.last(), &*qself.ty) else {
+            return type_relative;
+        };
+        let index = self.method_index;
+        let (Some(owner), Some(ids)) = (self.resolve(&path_segments(&ty.path)), index.get(method))
+        else {
+            self.unresolved += usize::from(type_relative);
+            return type_relative;
+        };
+        if type_relative {
+            let prefix = owner_prefix(&owner);
+            let mut hit = false;
+            for mid in ids.iter().filter(|mid| mid.starts_with(&prefix)) {
+                self.push(mid.clone(), EdgeKind::Call);
+                hit = true;
+            }
+            self.unresolved += usize::from(!hit);
+            return true;
+        }
+        let trait_name = &segs[qself.position - 1];
+        let exact = format!("{owner}::<{trait_name}>::{method}");
+        if ids.contains(&exact) {
+            self.push(exact, EdgeKind::Call);
+        } else {
+            // 별칭·재노출 이름으로 적은 트레이트 — 같은 타입의 같은 이름 impl 메서드 중 하나다.
+            let (prefix, suffix) = (format!("{owner}::<"), format!(">::{method}"));
+            for mid in ids
+                .iter()
+                .filter(|mid| mid.starts_with(&prefix) && mid.ends_with(&suffix))
+            {
+                self.push_maybe(mid.clone(), EdgeKind::Call);
+            }
+        }
+        false
+    }
+
     /// 본문을 아레나에서 바로 방문한다 — 최상위 문장 규칙은 [`body_edges`] 문서에 있다.
     /// 최상위를 [`Visit::visit_block`]으로 돌리면 겹이 하나 더 열리고 최상위 아이템을 방문하며
     /// 문장 매크로 인자를 파싱하지 않아 간선이 달라진다.
@@ -1394,7 +1439,15 @@ impl Visit<'_> for BodyVisitor<'_> {
         // foo::bar() — 경로 호출은 정확히 해석된다.
         if let syn::Expr::Path(p) = &*e.func {
             let segs = path_segments(&p.path);
-            match self.resolve_value(&segs) {
+            let type_relative = p
+                .qself
+                .as_ref()
+                .is_some_and(|qself| self.qualified_self_call(qself, &segs));
+            match if type_relative {
+                ValueRes::Local
+            } else {
+                self.resolve_value(&segs)
+            } {
                 ValueRes::Item(id) => self.push(id, EdgeKind::Call),
                 // 지역 클로저·함수 값 호출 — 아이템 호출이 아니다.
                 ValueRes::Local => {}

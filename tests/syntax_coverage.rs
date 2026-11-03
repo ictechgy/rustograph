@@ -619,3 +619,55 @@ fn main() {
         ],
     );
 }
+
+/// UFCS `<T as Tr>::m(..)`와 `<T>::m(..)`는 self 타입이 적힌 정적 호출이다 — 트레이트 선언만이
+/// 아니라 그 타입의 impl 메서드로 call 간선이 간다.
+#[test]
+fn qualified_self_calls_reach_the_impl_method() {
+    let ws = Workspace::new(
+        "ufcs",
+        &[
+            ("Cargo.toml", &manifest("ufcs")),
+            (
+                "src/main.rs",
+                r#"
+pub trait Shape { fn area(&self) -> u32; }
+pub struct Square(pub u32);
+impl Shape for Square {
+    fn area(&self) -> u32 { only_from_area() }
+}
+fn only_from_area() -> u32 { 1 }
+impl Square { fn side(&self) -> u32 { only_from_side() } }
+fn only_from_side() -> u32 { 2 }
+fn main() {
+    let s = Square(2);
+    let _ = <Square as Shape>::area(&s);
+    let _ = <Square>::side(&s);
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(has_edge(
+        &doc,
+        "ufcs::main",
+        "ufcs::Square::<Shape>::area",
+        EdgeKind::Call
+    ));
+    assert!(has_edge(
+        &doc,
+        "ufcs::main",
+        "ufcs::Square::side",
+        EdgeKind::Call
+    ));
+    let report = analysis::dead(&doc).unwrap();
+    assert_not_reported(
+        &report,
+        &[
+            "ufcs::Square::<Shape>::area",
+            "ufcs::only_from_area",
+            "ufcs::only_from_side",
+        ],
+    );
+}
