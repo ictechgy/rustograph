@@ -1,0 +1,8 @@
+# 자기 분석 dead(`--retain-public --tests --retain-external-trait-impls`)의 알려진 unreachable 목록.
+# scripts/verify-self-dead.sh가 실제 결과와 대조한다. 항목마다 왜 남는지 적는다 — 이유가 사라지면 지운다.
+#
+# source.rs에 함수 `harvest`와 `use crate::harvest::{self, ..}`가 함께 있다. 모듈 트리의 임포트 표는 이름당
+# 이름공간 하나라, `mod tests`의 `use super::*`가 `harvest`를 함수로 묶어 `harvest::owner_prefixes()` 경로가
+# 풀리지 않는다(rustc는 타입·값 이름공간을 따로 둔다). 테스트 전용 계수기 두 개가 그 경로로만 불린다.
+rustograph::harvest::generated_marker_scans
+rustograph::harvest::owner_prefixes
