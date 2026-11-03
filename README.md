@@ -41,7 +41,7 @@ over it, with a deterministic JSON contract meant for coding agents:
 ```bash
 brew install ictechgy/tap/rustograph
 # or
-cargo install --locked --git https://github.com/ictechgy/rustograph --tag v0.7.0
+cargo install --locked --git https://github.com/ictechgy/rustograph --tag v0.7.0 rustograph
 ```
 
 The source-install command is pinned to the
