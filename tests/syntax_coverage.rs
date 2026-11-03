@@ -305,6 +305,91 @@ fn lib_crate_types_and_proc_macros_are_harvested() {
     );
 }
 
+/// self 타입이 워크스페이스 정점이 아닌 impl(`impl Tr for String`, blanket `impl<T> Tr for T`,
+/// `impl Tr for &Local`)의 본문 간선은 버리지 않는다 — 워크스페이스 트레이트의 선언 메서드가 그
+/// 본문을 대신 소유해, 그 메서드를 부르는 곳에서 본문의 호출이 닿고 의존이 규칙·순환에 보인다.
+#[test]
+fn foreign_self_type_impl_bodies_keep_their_edges() {
+    let ws = Workspace::new(
+        "extimpl",
+        &[
+            ("Cargo.toml", &manifest("extimpl")),
+            (
+                "src/main.rs",
+                r#"
+mod ui;
+mod db;
+pub trait Render { fn render(&self) -> String; }
+impl Render for String {
+    fn render(&self) -> String { db::query_from_string_impl() }
+}
+impl Render for Vec<u8> {
+    fn render(&self) -> String { ui::from_vec_impl() }
+}
+pub struct Local;
+impl Render for &Local {
+    fn render(&self) -> String { ui::from_ref_impl() }
+}
+pub trait Greet { fn greet(&self); }
+impl<T: Render> Greet for T {
+    fn greet(&self) { only_from_blanket(); }
+}
+fn only_from_blanket() {}
+impl From<Local> for String {
+    fn from(_: Local) -> String { db::only_from_foreign_trait() }
+}
+fn main() {
+    let s = String::new();
+    println!("{}", s.render());
+    s.greet();
+}
+"#,
+            ),
+            (
+                "src/db.rs",
+                "pub fn query_from_string_impl() -> String { String::new() }\npub fn only_from_foreign_trait() -> String { String::new() }\n",
+            ),
+            (
+                "src/ui.rs",
+                "pub fn from_vec_impl() -> String { String::new() }\npub fn from_ref_impl() -> String { String::new() }\n",
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(has_edge(
+        &doc,
+        "extimpl::Render::render",
+        "extimpl::db::query_from_string_impl",
+        EdgeKind::Call
+    ));
+    // 워크스페이스 밖 트레이트를 워크스페이스 밖 타입에 구현하면 impl 모듈이 본문을 소유한다 —
+    // 의존은 보이고, 모듈은 보존 루트가 아니라 dead 판정은 바뀌지 않는다.
+    assert!(has_edge(
+        &doc,
+        "extimpl",
+        "extimpl::db::only_from_foreign_trait",
+        EdgeKind::Call
+    ));
+    let report = analysis::dead(&doc).unwrap();
+    assert_reported(&report, &["extimpl::db::only_from_foreign_trait"]);
+    assert_not_reported(
+        &report,
+        &[
+            "extimpl::db::query_from_string_impl",
+            "extimpl::ui::from_vec_impl",
+            "extimpl::ui::from_ref_impl",
+            "extimpl::only_from_blanket",
+        ],
+    );
+    assert!(
+        doc.limitations
+            .iter()
+            .any(|l| l.starts_with("5 impl blocks have a self type outside the workspace graph")),
+        "{:?}",
+        doc.limitations
+    );
+}
+
 /// struct·enum 필드의 타입은 그 타입 정점에서 나가는 references 간선이다 — 없으면 DTO 필드로만
 /// 쓰는 타입이 unreachable로 보이고 필드가 다른 모듈을 가리키는 의존이 규칙에서 사라진다.
 #[test]

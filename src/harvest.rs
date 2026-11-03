@@ -39,6 +39,9 @@ pub struct Harvest {
     /// 속성 목록을 Meta로 읽지 못한 cfg_attr 수 — 안쪽 경로가 참조로
     /// 잡히지 않았으니 속성으로만 쓰는 dep이 미사용으로 보일 수 있다.
     pub unparsed_attrs: usize,
+    /// self 타입이 워크스페이스 정점이 아닌 impl 블록 수(`impl Tr for String`, blanket
+    /// `impl<T> Tr for T`, `impl Tr for &Local`) — 메서드 정점이 없어 본문을 대신 소유시킨다.
+    pub foreign_self_impls: usize,
 }
 
 /// 한 모듈의 아이템 목록을 정점으로 만든다(1패스 — 선언만).
@@ -542,13 +545,15 @@ pub fn impls<'a>(
     tree: &ModTree,
     harvest: &mut Harvest,
 ) -> (Vec<Vertex>, Vec<Edge>, Vec<AttrRef>, Vec<BodyItem<'a>>) {
-    let parts = impls_with_identities(
+    let mut parts = impls_with_identities(
         blocks,
         krate,
         tree,
+        &BTreeSet::new(),
         harvest,
         &mut identity::Registry::default(),
     );
+    parts.bodies.append(&mut parts.foreign_bodies);
     (parts.vertices, parts.edges, parts.attr_refs, parts.bodies)
 }
 
@@ -560,13 +565,20 @@ pub(crate) struct ImplParts<'a> {
     pub bodies: Vec<BodyItem<'a>>,
     /// `#[no_mangle]` 같은 진입점 속성이 붙은 impl 메서드 — 항상 보존 루트다.
     pub entry_roots: Vec<String>,
+    /// self 타입이 워크스페이스 정점이 아닌 impl의 메서드 본문 — 소유자는 구현한 워크스페이스
+    /// 트레이트의 선언 메서드나 impl이 선언된 모듈이다([`foreign_impl_bodies`]). 호출자는 소유자가
+    /// 정점으로 남았는지 확인한 뒤 쓴다.
+    pub foreign_bodies: Vec<BodyItem<'a>>,
 }
 
 /// 소스 수확의 전역 충돌 판정에 선언 위치를 넘긴다. 공개 수확 API는 그대로 둔다.
+/// `methods`는 이미 수확한 메서드 정점 ID다 — self 타입이 워크스페이스 밖인 impl의 본문을 구현한
+/// 트레이트의 선언 메서드가 소유하게 할 때 그 정점이 있는지 본다.
 pub(crate) fn impls_with_identities<'a>(
     blocks: &[ImplBlock<'a>],
     krate: &str,
     tree: &ModTree,
+    methods: &BTreeSet<String>,
     harvest: &mut Harvest,
     identities: &mut identity::Registry,
 ) -> ImplParts<'a> {
@@ -575,10 +587,19 @@ pub(crate) fn impls_with_identities<'a>(
     let mut attr_refs = Vec::new();
     let mut bodies = Vec::new();
     let mut entry_roots = Vec::new();
+    let mut foreign_bodies = Vec::new();
     for b in blocks {
         // self 타입을 해석한다 — 모듈 로컬이면 정점이 있다.
         let Some(self_id) = tree.resolve(&b.items_module, &b.self_ty, &DepCrates::new()) else {
             harvest.unresolved_paths += 1;
+            harvest.foreign_self_impls += 1;
+            foreign_bodies.extend(foreign_impl_bodies(
+                b,
+                tree,
+                methods,
+                harvest,
+                &mut attr_refs,
+            ));
             continue;
         };
         if let Some(tp) = &b.trait_path {
@@ -677,7 +698,59 @@ pub(crate) fn impls_with_identities<'a>(
         attr_refs,
         bodies,
         entry_roots,
+        foreign_bodies,
     }
+}
+
+/// self 타입이 워크스페이스 정점이 아닌 impl 블록의 메서드 본문을 대신 소유시킨다.
+///
+/// 그런 impl(`impl Render for String`, blanket `impl<T: Tr> Greet for T`, `impl Tr for &Local`)의
+/// 메서드에는 정점이 없다 — 예전에는 본문을 통째로 버려, 그 안에서만 부르는 함수가 unreachable로
+/// 보였고 본문이 다른 모듈을 부르는 의존이 레이어 규칙에서 사라졌다. 구현한 트레이트가 워크스페이스
+/// 트레이트이고 그 메서드를 선언했으면 선언 메서드(`Trait::m`)가 본문을 소유한다 — 그 메서드를 부르는
+/// 곳(이름 팬아웃 포함)에서 본문의 호출이 닿는다. 아니면 impl이 선언된 모듈이 소유한다 — 의존은
+/// 규칙·순환에 보이지만 모듈은 보존 루트가 아니어서 dead 판정은 바뀌지 않는다. impl 메서드의 `Self`는
+/// 워크스페이스 밖 타입이라 바꾸지 않는다.
+fn foreign_impl_bodies<'a>(
+    b: &ImplBlock<'a>,
+    tree: &ModTree,
+    methods: &BTreeSet<String>,
+    harvest: &mut Harvest,
+    attr_refs: &mut Vec<AttrRef>,
+) -> Vec<BodyItem<'a>> {
+    let trait_id = b
+        .trait_path
+        .as_ref()
+        .and_then(|tp| tree.resolve(&b.items_module, tp, &DepCrates::new()));
+    let mut bodies = Vec::new();
+    for &m in &b.methods {
+        let owner = trait_id
+            .as_ref()
+            .map(|t| format!("{t}::{}", m.sig.ident))
+            .filter(|declared| methods.contains(declared))
+            .unwrap_or_else(|| b.items_module.clone());
+        let own_cfg = cfg_of(&m.attrs);
+        harvest.cfg_items += usize::from(own_cfg.is_some());
+        let mcfg = match own_cfg {
+            Some(ref condition) => conjoin(&b.cfg, condition),
+            None => b.cfg.clone(),
+        };
+        harvest.unparsed_attrs +=
+            collect_attr_refs(&m.attrs, &owner, &b.items_module, false, &mcfg, attr_refs);
+        bodies.push(BodyItem {
+            generic_scopes: generic_scopes([b.generics, &m.sig.generics]),
+            id: owner,
+            module: b.items_module.clone(),
+            self_ty: None,
+            body: Body::Stmts(&m.block.stmts),
+            params: locals::param_bindings(&m.sig),
+            signature_surface: fn_signature_types(&m.sig),
+            cfg: mcfg,
+            file: b.file.clone(),
+            range: m.span().byte_range(),
+        });
+    }
+    bodies
 }
 
 /// 시그니처 표면(파라미터·반환·where)의 타입 목록.

@@ -987,12 +987,21 @@ fn harvest(
         impls.extend(mh.decls.impls);
         item_spans.extend(mh.decls.owner_spans);
     }
+    // 트레이트 선언 메서드는 1패스에서 다 수확됐다 — self 타입이 워크스페이스 밖인 impl의 본문을
+    // 그 선언 메서드가 대신 소유할 수 있는지 이 목록으로 본다.
+    let declared_methods: BTreeSet<String> = vertices
+        .iter()
+        .filter(|v| v.kind == Kind::Method)
+        .map(|v| v.id.clone())
+        .collect();
+    let mut foreign_bodies: Vec<BodyItem<'_>> = Vec::new();
     for block in &impls {
         let krate = modtree::crate_of(&block.items_module);
         let parts = harvest::impls_with_identities(
             std::slice::from_ref(block),
             &krate,
             &tree,
+            &declared_methods,
             &mut harvest,
             &mut identity_registry,
         );
@@ -1001,6 +1010,7 @@ fn harvest(
         attr_refs.extend(parts.attr_refs);
         bodies.extend(parts.bodies);
         annotated_roots.extend(parts.entry_roots);
+        foreign_bodies.extend(parts.foreign_bodies);
     }
     let identities = identity_registry.identify(&mut vertices, &meta.workspace_root);
     drop(identity_registry);
@@ -1008,6 +1018,15 @@ fn harvest(
     edges.extend_from_slice(identities.members());
     for body in &mut bodies {
         body.id = identities.owner(&body.id, &body.module, &body.file, body.range.start);
+    }
+    // 대신 소유시킨 본문은 소유자가 정점으로 남았을 때만 쓴다 — 같은 경로의 트레이트 선언이 여럿이라
+    // 선언 메서드가 소스 인스턴스 ID로 바뀌었으면 impl 모듈이 소유한다(유령 정점 금지).
+    let vertex_ids: BTreeSet<&str> = vertices.iter().map(|v| v.id.as_str()).collect();
+    for mut body in foreign_bodies {
+        if !vertex_ids.contains(body.id.as_str()) {
+            body.id = body.module.clone();
+        }
+        bodies.push(body);
     }
     for span in &mut item_spans {
         let module = span
@@ -1859,6 +1878,15 @@ fn push_skipped_mods(
 
 /// 수확 실측을 limitation 문장으로 옮긴다.
 fn push_limitations(h: &Harvest, limitations: &mut Vec<String>) {
+    if h.foreign_self_impls > 0 {
+        limitations.push(format!(
+            "{} impl blocks have a self type outside the workspace graph (std or external types, \
+             references, or generic parameters); their methods have no vertex, so each body is \
+             attributed to the implemented workspace trait's declared method, or to the enclosing \
+             module when the trait is external or does not declare it",
+            h.foreign_self_impls
+        ));
+    }
     if h.unresolved_paths > 0 {
         limitations.push(format!(
             "{} path references could not be resolved within the workspace (external crates, prelude names, or macro-generated names)",
