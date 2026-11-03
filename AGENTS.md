@@ -9,11 +9,13 @@
 세션을 이어받을 때 먼저 읽으세요.
 
 자매 프로젝트가 바탕화면에 있습니다: [cartograph](../cartograph)(Swift) ·
-[gartograph](../gartograph)(Go) · [kartograph](../kartograph)(Kotlin/Android) ·
-[dartograph](../dartograph)(Dart/Flutter) · [isthmus](../isthmus)(언어 경계 조인) ·
-[schemagraph](../schemagraph)(데이터베이스). `query` 출력 스키마와
-출력 계약 관례(`state`/`edges`/`limitations` 철학)는 계열과 같게 유지합니다.
-여기서 바꾸면 자매 저장소에도 알리세요.
+[kartograph](../kartograph)(Kotlin/Android) · [dartograph](../dartograph)(Dart/Flutter) ·
+[gartograph](../gartograph)(Go) · [pythograph](../pythograph)(Python) ·
+[tsograph](../tsograph)(TypeScript/JavaScript) · [schemagraph](../schemagraph)(데이터베이스) ·
+[isthmus](../isthmus)(언어 경계 조인 — 교환 형식·공유 적합성 벡터의 정본). 출력 계약 관례
+(`state`/`edges`/`limitations` 철학)는 계열과 같게 유지합니다. `query` 출력 스키마는 지금
+cartograph·kartograph·dartograph와 다릅니다(`neighbors[]`·`direction`·`edge_evidence`) — 맞추는 일은
+공개 JSON 계약 변경이라 HANDOFF의 후속 후보로 남아 있습니다. 여기서 계약을 바꾸면 자매 저장소에도 알리세요.
 
 ## 이 프로젝트가 하는 일
 
@@ -52,8 +54,10 @@ cargo run -- dead --explain <id>
 ```bash
 cargo test && scripts/coverage.sh && scripts/verify-cli-contract.sh
 cargo clippy --all-targets
+cargo clippy --all-targets --features semantic   # sem.rs는 기본 빌드에 없다
 cargo run -- rules --strict      # 도그푸딩 — 이 도구로 이 저장소를 분석
 cargo run -- cycles --level symbol --strict
+scripts/verify-self-dead.sh      # dead 자기 분석 — 알려진 목록(scripts/self-dead.expected)과 대조
 ```
 
 **자기 분석은 필수입니다.** 크로스 크레이트 `use` 유실, 구조체 리터럴·

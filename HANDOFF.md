@@ -1,8 +1,37 @@
 # HANDOFF.md
 
-세션을 이어받는 에이전트가 먼저 읽는 문서입니다.
+세션을 이어받는 에이전트가 먼저 읽는 문서입니다. 아래 "현재 상태"만 지금의 지시이고, 그 아래 날짜가 붙은 절은
+당시 기록입니다 — 거기 적힌 "릴리스 준비"·"다음 단계"를 지금 할 일로 되살리지 마세요.
 
-## 릴리스 준비 — v0.6.0 (2026-10-22)
+## 현재 상태 (2026-11-03)
+
+- 발행본은 [v0.7.0](https://github.com/ictechgy/rustograph/releases/tag/v0.7.0)(2026-11-03, 자산 6개)이다.
+  v0.6.0은 2026-10-25, v0.5.0은 2026-10-13에 발행됐다. v0.4.2는 태그 없이 v0.5.0으로 이어졌다.
+- 브랜치 `ccr-37904670-hxdjsx`(계열 9개 저장소 검토 후속): 구문 수확이 놓치던 형태를 메웠다 — lib 계열
+  crate type·proc-macro 크레이트 수확, `Self` 경로, 필드 타입 간선(심볼 레벨 순환은 재귀 데이터 정의를
+  세지 않음), 함수 안 아이템·중첩 블록 문장 매크로·`macro_rules!` 본문·표현식 목록이 아닌 매크로 인자,
+  2024 판 진입점 속성과 static·impl 메서드 루트, 워크스페이스 밖 self 타입 impl 본문 소유, UFCS와 값으로
+  넘긴 연관 함수, 수확하지 않는 example/test/bench 타깃 limitation, deps `(kind: normal)`. isthmus 벡터를
+  `c76e105`로 다시 벤더링하고 `sql-relations.json`을 벡터로 실행한다. 공개 Rust API 변화는
+  [0.8 migration](docs/MIGRATING-0.8.md), 사용자 변화는 CHANGELOG `[Unreleased]`에 있다.
+- 자기 분석 기준: `rules --strict` 0, `cycles --level symbol --strict` 0, `dead`는
+  `scripts/verify-self-dead.sh`가 `scripts/self-dead.expected`(알려진 2건과 이유)와 대조한다. CI의 test 잡이
+  셋 다 돌고, `semantic-lint` 잡이 `--features semantic` clippy를 돈다.
+- persistence `relation-use` 생산자는 7개(cartograph·dartograph·gartograph·kartograph·pythograph·rustograph·
+  tsograph)이고 schemagraph가 `relation-decl` 쪽이다. SQL 관계 이름 규칙은 isthmus
+  `conformance/sql-relations.json`이 정본이다.
+
+### 후속 후보 (사용자가 고른다)
+
+- 모듈 임포트 표가 이름당 이름공간 하나라 `fn harvest`와 `use crate::harvest::{self}`가 함께 있는 모듈을
+  `use super::*`로 들이면 `harvest::x()`가 풀리지 않는다(`scripts/self-dead.expected`의 2건). 타입·값
+  이름공간을 나눈 글롭 바인딩이 필요하다.
+- `query` 출력 스키마가 cartograph·kartograph·dartograph(`usedBy`·`dependsOn`·`reachability`)와 다르다
+  (`neighbors[]`·`direction`·snake_case `edge_evidence`). 맞추면 공개 JSON 계약이 깨지므로 결정이 필요하다.
+- Homebrew tap 자동 갱신은 `HOMEBREW_TAP_TOKEN` 리포 시크릿이 있어야 돈다 — 없으면 Release가 그 단계를
+  건너뛰므로 릴리스마다 로그로 확인하고, 수동 절차는 아래 "다음 단계" 1번을 따른다.
+
+## 릴리스 준비 — v0.6.0 (2026-10-22) — 2026-10-25 발행됨
 
 PR #40은 실제 Git 변경의 독립적인 이전/이후 수확과 CLI/MCP 영향 분석을 추가한다.
 staged 삭제·rename과 로컬 Git clean filter 실행 회귀를 실제 fixture에서 재현하고 수정했다.
@@ -12,7 +41,7 @@ docs/CHANGE-IMPACT-EVALUATION.md에 있다. Cargo.lock은 자기 버전만 바�
 최종 버전 커밋의 독립 리뷰·CI·머지 확인 뒤 기존 태그 workflow를 사용한다. 이 기록 자체는
 태그·Release·바이너리 배포 완료를 뜻하지 않는다. 공개 자산 다운로드·깨끗한 설치 검증이 필요하다.
 
-## 릴리스 준비 — v0.4.2 (2026-10-11)
+## 릴리스 준비 — v0.4.2 (2026-10-11) — 태그 없이 v0.5.0으로 이어짐
 
 PR #28의 실제 머지 커밋 `d7fc6b45f2a94634cc8deec2cdc1627e9adf4302`에서 준비했다.
 이 변경은 버전·설치 태그와 semantic 테스트 fixture의 자원 사용을 보강한다.
@@ -66,7 +95,7 @@ PR #28의 실제 머지 커밋 `d7fc6b45f2a94634cc8deec2cdc1627e9adf4302`에서 
   성공했지만 병렬 fixture 실행이 8개 통과 뒤 SIGKILL로 종료됐다. 공유 환경의
   부하가 내려간 뒤 `--test semantic -- --test-threads=1`로 별도 재검증해야 한다.
 
-## 릴리스 준비 — v0.4.0 (2026-09-30, release/v0.4.0)
+## 릴리스 준비 — v0.4.0 (2026-09-30, release/v0.4.0) — 2026-09-30 발행됨
 
 `Cargo.toml`·`Cargo.lock` 자기 항목(0.4.0, `cargo update` 없이 손으로 — ra_ap 핀 유지, `cargo build --locked` 확인)과
 README 설치 태그를 올렸다. 태그·Release·탭 갱신은 머지 뒤 별도 승인으로 한다. 릴리스 노트(v0.3.0 이후):
@@ -214,7 +243,7 @@ isthmus `trace`가 Rust 백엔드의 핸들러 도달을 관계 사용과 잇도
    unparsed_attrs)을 싣지 않는 것은 기존 설계 — 필요 시 별도 설계.
 3. `HOMEBREW_TAP_TOKEN` 시크릿이 들어오면 탭 갱신이 자동화된다.
 
-## 현재 상태 (2026-09-25)
+## 2026-09-25 당시 상태 (기록)
 
 **feature/schema-facts 머지됨 — PR #15(be116ae).** isthmus persistence
 도메인의 두 번째 코드 생산자로 `rustograph schema`를 추가했다:
@@ -227,7 +256,7 @@ table! 이름으로만 정적화. isthmus 쪽 계약 확장은 PR #110(rust 플�
 relation-use 허용, bridge 구성과 격리)로 머지됐다. `schema`는 v0.3.0부터
 발행본에 들어 있다.
 
-persistence 생산자는 현재 다섯 개 — schemagraph(SQL `relation-decl`
+persistence 생산자는 당시 다섯 개(지금은 위 "현재 상태" 참고) — schemagraph(SQL `relation-decl`
 수신 측), gartograph(Go, #11)·rustograph(Rust)·kartograph(Kotlin,
 #102)·cartograph(Swift, #136)가 `relation-use`를 낸다. isthmus의 도메인
 판정은 `target === 'persistence'` 기준이며 persistence 문서는 bridge
@@ -337,7 +366,9 @@ PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
 - `tests/fixture/` — 세 멤버 워크스페이스(fixture_macros proc 매크로
   포함), 모든 아이템 종류+글롭/별칭/cfg/generated/orphan/build.rs
   OUT_DIR 생성 모듈 커버.
-- `scripts/` — coverage.sh(llvm-cov), verify-cli-contract.sh.
+- `scripts/` — coverage.sh(llvm-cov), verify-cli-contract.sh, verify-self-dead.sh(자기 분석 dead 대조,
+  기대 목록 self-dead.expected), release-build-manifest.sh·publish-release-assets.sh(릴리스 자산)와 그
+  테스트(test-*.sh).
 - `.rustograph.yml` — 자기 계층 규칙(graph 순수 도메인 강제).
 
 ## 알려진 의미론 한계 (설계상, limitation으로 계측됨)
@@ -351,7 +382,8 @@ PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
 ## 다음 단계 (우선순위 순)
 
 1. ~~공개 리포 + 릴리스~~ — 완료. `HOMEBREW_TAP_TOKEN` 리포 시크릿이
-   없어 탭 갱신은 수동으로 했다(0.3.0까지) — 넣으면 다음 릴리스부터 자동.
+   없어 탭 갱신은 수동으로 했다(0.3.0까지 확인) — 이후 릴리스는 Release 로그의 "Update the Homebrew tap"
+   단계가 건너뛰었는지 확인한다. 시크릿을 넣으면 다음 릴리스부터 자동.
    수동 절차: 게시된 checksums.txt를 받아 `shasum -c`로 대조 →
    release.yml의 sed와 같은 치환으로 Formula/rustograph.rb를 렌더 →
    탭 main에 `rustograph X.Y.Z` 커밋(기존 관례) → `brew upgrade` 후
@@ -395,11 +427,11 @@ PR #8(의미 해석) 70ea82e · #10(의미 하드닝) 011c05b · #12(handoff)·
 7. ~~feature/schema-facts~~ — 완료. PR #15 머지됨(be116ae).
    `source/schema.rs` 신규 + `rustograph schema` 명령으로 isthmus
    persistence 도메인의 bridge-facts v1을 낸다. GLM 리뷰 3라운드 반영.
-   상세는 위 "현재 상태" 첫 단락 참고. 후속(fix/schema-contract):
+   상세는 위 "2026-09-25 당시 상태" 첫 단락 참고. 후속(fix/schema-contract):
    schema는 --dir/--out 외 플래그·위치 인자를 허용 목록으로 거부(2)하고,
    verify-cli-contract가 종료 코드와 target null/persistence 계약을 본다.
 8. ~~`split_cfg_attr` 미계수~~ — 완료. PR #21 머지됨.
-9. 다음 우선순위는 사용자가 정한다(위 "직전 세션 요약"의 다음 단계).
+9. 다음 우선순위는 사용자가 정한다(맨 위 "현재 상태"의 후속 후보).
    Codex 3차 리뷰는 사용량 한도로 GLM 리뷰가 역할을 대신했다.
 
 ## 막힌 것 / 주의
