@@ -42,6 +42,8 @@ const SKIPPED: &[&str] = &[
     // 클라이언트 조립 규칙 — tests/client_routes.rs가 실행한다.
     "compose.",
     "wrapper.",
+    // SQL 관계 이름 규칙 — src/source/schema.rs의 단위 테스트가 `sql-relations.json`을 실행한다.
+    "relations.",
 ];
 
 fn cases() -> Vec<Value> {
