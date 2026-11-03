@@ -1045,9 +1045,8 @@ pub(crate) fn bodies_within(
 /// 본문 블록의 최상위 문장은 중첩 블록의 문장과 규칙이 다르다. 최상위에서는 지역 겹을 새로 열지
 /// 않고(`let` 묶음은 매개변수 겹에 들어간다), `let .. else`의 else 블록을 초기식보다 먼저 보며,
 /// 문장 매크로(`;`로 끝나거나 중괄호로 감싼 문장 위치 매크로 호출)는 표현식 매크로처럼 인자를
-/// 파싱한다. 중첩 블록은 syn 기본 순회를 따른다 — 문장 매크로의 인자는 파싱하지 않는다. 함수 안
-/// 아이템(`fn` 안의 `fn`, 지역 `impl`)은 최상위든 중첩 블록이든 본다 — 정점이 없는 그 아이템의
-/// 간선은 바깥 본문이 소유한다.
+/// 파싱한다 — 중첩 블록의 문장 매크로도 같다. 함수 안 아이템(`fn` 안의 `fn`, 지역 `impl`)은
+/// 최상위든 중첩 블록이든 본다 — 정점이 없는 그 아이템의 간선은 바깥 본문이 소유한다.
 pub fn body_edges(
     b: &BodyItem,
     tree: &ModTree,
@@ -1311,8 +1310,8 @@ impl BodyVisitor<'_> {
     }
 
     /// 본문을 아레나에서 바로 방문한다 — 최상위 문장 규칙은 [`body_edges`] 문서에 있다.
-    /// 최상위를 [`Visit::visit_block`]으로 돌리면 겹이 하나 더 열리고 최상위 아이템을 방문하며
-    /// 문장 매크로 인자를 파싱하지 않아 간선이 달라진다.
+    /// 최상위를 [`Visit::visit_block`]으로 돌리면 겹이 하나 더 열리고 `let .. else`의 방문 순서가
+    /// 달라져 간선이 달라진다.
     fn visit_body(&mut self, body: Body<'_>) {
         let stmts = match body {
             Body::Expr(e) => return self.visit_expr(e),
@@ -1528,6 +1527,14 @@ impl Visit<'_> for BodyVisitor<'_> {
         // name!() — 표현식 위치 매크로(최상위 문장 매크로도 같은 처리를 탄다).
         self.visit_macro_call(&e.mac);
         syn::visit::visit_expr_macro(self, e);
+    }
+
+    fn visit_stmt_macro(&mut self, m: &syn::StmtMacro) {
+        // 중첩 블록(`for`·`if`·`match` 팔 본문)의 문장 매크로 — 최상위 문장 매크로와 같이 인자를
+        // 파싱한다. 예전에는 syn 기본 순회만 따라 `for x in xs { println!("{}", f(x)); }`의 `f`가
+        // 간선 없이 사라졌다. 최상위 문장은 [`BodyVisitor::visit_body`]가 따로 처리한다.
+        self.visit_macro_call(&m.mac);
+        syn::visit::visit_stmt_macro(self, m);
     }
 
     fn visit_expr_struct(&mut self, e: &syn::ExprStruct) {

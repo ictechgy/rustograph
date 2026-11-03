@@ -1787,9 +1787,8 @@ pub fn nested_fn() { let _ = { fn go(helper: u32) -> u32 { helper } go(1) }; }
 /// - 함수 안 아이템(`fn` 본문 바로 안의 `fn`, 중첩 블록 안의 `fn`)은 방문한다 — 정점이 없는 그
 ///   아이템의 간선은 바깥 본문이 소유한다. 예전에는 최상위 아이템만 건너뛰어, 그 안에서만 부르는
 ///   함수가 unreachable로 보였다.
-/// - 중첩 블록은 syn 기본 순회를 따른다: `;`로 끝난 문장 매크로의 인자는 파싱하지 않는다. 의도한
-///   의미라기보다 지금의 출력이다 — 바꾸면 간선이 달라지므로 본문 순회를 고칠 때 함께 바뀌지 않게
-///   여기서 고정한다.
+/// - 중첩 블록의 `;`로 끝난 문장 매크로도 인자를 파싱한다 — 예전에는 syn 기본 순회만 따라
+///   `for`·`if` 블록 안 `println!`·`assert_eq!`의 호출이 간선 없이 사라졌다.
 /// - 정점의 unsafe 표시는 간선과 범위가 다르다 — 최상위 아이템·매크로 토큰 안은 보지 않는다.
 #[test]
 fn top_level_body_statements_keep_their_visit_rules() {
@@ -1859,9 +1858,9 @@ pub trait U { fn provided(&self) { unsafe {} } fn required(&self); }
     assert!(has("crate_macro", "mac") && has("crate_macro", "item"));
     assert!(has("Q::method", "item"));
     assert!(has("T::provided", "mac") && has("T::provided", "other"));
-    // 중첩 블록: 아이템은 방문하고, `;`로 끝난 문장 매크로 인자는 파싱하지 않는다.
+    // 중첩 블록: 아이템은 방문하고, `;`로 끝난 문장 매크로 인자도 파싱한다.
     assert!(has("block_item", "other"));
-    assert!(!has("nested_macro", "item"), "nested statement macro");
+    assert!(has("nested_macro", "item"), "nested statement macro");
     // 최상위 아이템도 방문한다 — 간선은 바깥 함수가 소유한다.
     assert!(has("top_item", "helper"), "top-level item");
     let is_unsafe = |id: &str| {
