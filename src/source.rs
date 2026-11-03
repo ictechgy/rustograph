@@ -908,6 +908,14 @@ fn harvest(
             tree.orphan_files.len()
         ));
     }
+    let unharvested = unharvested_targets(meta);
+    if unharvested > 0 {
+        limitations.push(format!(
+            "{unharvested} example/test/bench targets of workspace members are not harvested; \
+             workspace items used only from them are reported unreachable, even with --tests \
+             (which roots #[test] functions inside lib and bin targets only)"
+        ));
+    }
     push_skipped_mods(&tree.skipped_mods, &mut limitations);
     if !oversized.is_empty() {
         limitations.push(format!(
@@ -1464,6 +1472,17 @@ impl InputTree {
             None => Err(error),
         }
     }
+}
+
+/// 수확하지 않는 워크스페이스 멤버 타깃(example·test·bench) 수 — 그 타깃에서만 쓰는 아이템은
+/// 호출자가 그래프에 없어 unreachable로 보이므로 dead의 한계로 센다.
+fn unharvested_targets(meta: &Metadata) -> usize {
+    meta.packages
+        .iter()
+        .filter(|p| p.workspace_member)
+        .flat_map(|p| &p.targets)
+        .filter(|t| matches!(t.kind.as_str(), "example" | "test" | "bench"))
+        .count()
 }
 
 /// 수확 대상 타깃 — 워크스페이스 멤버의 lib·bin이다. example/test/bench 타깃은

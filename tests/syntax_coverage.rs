@@ -442,6 +442,47 @@ pub fn only_from_example() {}
     assert_reported(&report, &["roots::truly_dead", "roots::only_from_example"]);
 }
 
+/// 예제·통합 테스트·벤치 타깃은 수확하지 않는다 — 그 타깃에서만 쓰는 lib 아이템은 `--tests`를 줘도
+/// unreachable이므로, 수확하지 않은 타깃 수를 문서 limitation으로 센다. 그런 타깃이 없으면 조용하다.
+#[test]
+fn unharvested_targets_are_counted_as_a_limitation() {
+    let ws = Workspace::new(
+        "targets",
+        &[
+            ("Cargo.toml", &manifest("targets")),
+            ("src/lib.rs", "pub fn only_from_example() {}\n"),
+            (
+                "examples/demo.rs",
+                "fn main() { targets::only_from_example(); }\n",
+            ),
+            ("tests/it.rs", "#[test]\nfn t() {}\n"),
+            ("benches/b.rs", "fn main() {}\n"),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(
+        doc.limitations.iter().any(|l| l
+            .starts_with("3 example/test/bench targets of workspace members are not harvested")),
+        "{:?}",
+        doc.limitations
+    );
+    let quiet = Workspace::new(
+        "targets-quiet",
+        &[
+            ("Cargo.toml", &manifest("quiet")),
+            ("src/lib.rs", "pub fn f() {}\n"),
+        ],
+    );
+    let doc = symbols(quiet.path());
+    assert!(
+        !doc.limitations
+            .iter()
+            .any(|l| l.contains("targets of workspace members are not harvested")),
+        "{:?}",
+        doc.limitations
+    );
+}
+
 /// 함수 본문 최상위의 아이템(중첩 `fn`, 지역 `impl`)과 `macro_rules!` 정의 본문의 경로도 간선이
 /// 된다. 매크로 본문은 토큰이라 호출 위치를 모르니 추정(tentative) 간선이다.
 #[test]
