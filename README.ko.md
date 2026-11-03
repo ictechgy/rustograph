@@ -38,11 +38,11 @@ Rust에는 `cargo-modules`, `cargo deps`, 그리고 syn/tree-sitter 기반 콜�
 ```bash
 brew install ictechgy/tap/rustograph
 # 또는
-cargo install --locked --git https://github.com/ictechgy/rustograph --tag v0.6.0
+cargo install --locked --git https://github.com/ictechgy/rustograph --tag v0.7.0
 ```
 
 소스 설치 명령은
-[v0.6.0 릴리스](https://github.com/ictechgy/rustograph/releases/tag/v0.6.0)와
+[v0.7.0 릴리스](https://github.com/ictechgy/rustograph/releases/tag/v0.7.0)와
 해당 태그의 의존성 잠금 파일을 사용합니다. Homebrew 배포는 tap formula를 따로 확인합니다.
 실제 Git 변경은 [변경 영향 분석](docs/CHANGE-IMPACT.md), 공개 Rust API의 추가 필드는
 [0.6 이행 안내](docs/MIGRATING-0.6.md)를 참고합니다. 정적 후보는 테스트 실패 예측이나 생략 허가가 아닙니다.
@@ -494,7 +494,7 @@ rustograph가 덮지 않는 두 설정도 마찬가지입니다.
 나머지 git 설정과, 설정한 그대로의 `PATH` 절대 경로 항목(체크아웃 안을 가리키는
 항목이라도)은 평소대로 적용됩니다.
 
-## 미출시(0.7.0) 호환성 노트
+## 0.7.0 호환성 노트
 
 v0.6.0 뒤 `main`의 변경은 공개 Rust 구조체(`harvest::BodyItem`, `harvest::ImplBlock`,
 `modtree::Module`, `modtree::Import`)에 필드를 더하고 경로를 rustc에 더 가깝게 해석하므로

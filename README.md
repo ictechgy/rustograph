@@ -41,11 +41,11 @@ over it, with a deterministic JSON contract meant for coding agents:
 ```bash
 brew install ictechgy/tap/rustograph
 # or
-cargo install --locked --git https://github.com/ictechgy/rustograph --tag v0.6.0
+cargo install --locked --git https://github.com/ictechgy/rustograph --tag v0.7.0
 ```
 
 The source-install command is pinned to the
-[v0.6.0 release](https://github.com/ictechgy/rustograph/releases/tag/v0.6.0)
+[v0.7.0 release](https://github.com/ictechgy/rustograph/releases/tag/v0.7.0)
 and its committed dependency lockfile. Homebrew availability follows the tap
 formula separately; this GitHub release does not establish crates.io publication.
 
@@ -734,7 +734,7 @@ points into the checkout), apply as usual.
 MIT — see [LICENSE](LICENSE).
 
 
-## Unreleased (0.7.0) compatibility notes
+## 0.7.0 compatibility notes
 
 Changes on `main` after v0.6.0 add fields to public Rust structs
 (`harvest::BodyItem`, `harvest::ImplBlock`, `modtree::Module`,
