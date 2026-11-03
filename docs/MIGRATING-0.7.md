@@ -1,8 +1,8 @@
-# Migrating to rustograph 0.7 (unreleased)
+# Migrating to rustograph 0.7
 
 These notes cover changes on `main` after the v0.6.0 release. Several of them
 break Rust library callers, so they ship in v0.7.0 rather than in a 0.6.x
-release; no published release contains them yet. CLI flags and defaults, graph
+release. Confirm the matching tag and assets on GitHub Releases. CLI flags and defaults, graph
 document v1 and language-traversal v1 stay compatible. Saved graphs and
 ID-keyed inputs also follow the
 [source identity correction](MIGRATING-SOURCE-IDENTITY.md).
@@ -46,5 +46,5 @@ every field. Add the new fields, or end such patterns with `..`.
 The same source can produce a different graph than 0.6.0: path prefixes,
 re-exports, glob visibility and unresolved explicit imports now resolve the way
 rustc does, which adds missing edges and removes wrong ones. The
-`## [Unreleased]` section of the [changelog](../CHANGELOG.md) lists each
+`0.7.0` section of the [changelog](../CHANGELOG.md#070---2026-11-03) lists each
 change. Regenerate saved graphs before comparing them with new results.
