@@ -361,3 +361,55 @@ fn make<T>() -> Outer<T> { unimplemented!() }
         ],
     );
 }
+
+/// 함수 본문 최상위의 아이템(중첩 `fn`, 지역 `impl`)과 `macro_rules!` 정의 본문의 경로도 간선이
+/// 된다. 매크로 본문은 토큰이라 호출 위치를 모르니 추정(tentative) 간선이다.
+#[test]
+fn nested_items_and_macro_rules_bodies_are_visited() {
+    let ws = Workspace::new(
+        "nested",
+        &[
+            ("Cargo.toml", &manifest("nested")),
+            (
+                "src/main.rs",
+                r#"
+mod m;
+macro_rules! call_helper {
+    () => { $crate::m::macro_only_helper() };
+}
+fn helper_from_nested_fn() {}
+fn helper_from_local_impl() {}
+fn helper_from_local_macro() {}
+fn main() {
+    fn inner() { helper_from_nested_fn(); }
+    inner();
+    struct L;
+    impl L { fn go(&self) { helper_from_local_impl(); } }
+    L.go();
+    macro_rules! local { () => { crate::helper_from_local_macro() }; }
+    local!();
+    call_helper!();
+}
+"#,
+            ),
+            ("src/m.rs", "pub fn macro_only_helper() {}\n"),
+        ],
+    );
+    let doc = symbols(ws.path());
+    let macro_edge = doc
+        .edges
+        .iter()
+        .find(|e| e.from == "nested::call_helper" && e.to == "nested::m::macro_only_helper")
+        .expect("macro_rules body path becomes an edge");
+    assert!(macro_edge.tentative, "macro body edges are tentative");
+    let report = analysis::dead(&doc).unwrap();
+    assert_not_reported(
+        &report,
+        &[
+            "nested::helper_from_nested_fn",
+            "nested::helper_from_local_impl",
+            "nested::helper_from_local_macro",
+            "nested::m::macro_only_helper",
+        ],
+    );
+}
