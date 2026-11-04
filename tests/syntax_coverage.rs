@@ -756,3 +756,162 @@ fn main() {
     assert_not_reported(&report, &["macrotokens::tool_list", "macrotokens::BASE"]);
     assert_reported(&report, &["macrotokens::shadowed"]);
 }
+
+/// `from`에서 `to`로 가는 간선이 확정(tentative 아님)인가.
+fn has_firm_edge(doc: &Document, from: &str, to: &str, kind: EdgeKind) -> bool {
+    doc.edges
+        .iter()
+        .any(|e| e.from == from && e.to == to && e.kind == kind && !e.tentative)
+}
+
+/// 워크스페이스 트레이트를 워크스페이스 밖 타입에 구현한 impl 본문의 확정 의존은 impl이 선언된
+/// 모듈에서 나간다 — 트레이트 선언 메서드는 그 본문으로 가는 추정 간선만 가져 도달성에만 쓰인다.
+/// 선언 메서드가 확정 간선을 가지면 트레이트 모듈에서 impl 모듈로 가는 거짓 의존이 생겨 레이어
+/// 규칙 위반과 모듈 순환으로 보였다.
+#[test]
+fn foreign_impl_body_dependencies_leave_from_the_impl_module() {
+    let ws = Workspace::new(
+        "foreignowner",
+        &[
+            ("Cargo.toml", &manifest("foreignowner")),
+            (
+                "src/main.rs",
+                "mod core;\nmod adapters;\nfn main() { println!(\"{}\", core::show(&String::new())); }\n",
+            ),
+            (
+                "src/core.rs",
+                "pub trait Render { fn render(&self) -> String; }\npub fn show<R: Render>(r: &R) -> String { r.render() }\n",
+            ),
+            (
+                "src/adapters.rs",
+                "use crate::core::Render;\npub fn wrap(s: &str) -> String { format!(\"[{s}]\") }\nimpl Render for String { fn render(&self) -> String { wrap(self) } }\n",
+            ),
+            (
+                ".rustograph.yml",
+                "components:\n  core: [\"foreignowner::core/**\"]\n  adapters: [\"foreignowner::adapters/**\"]\ndeps:\n  core: []\n  adapters: [core]\n",
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(has_firm_edge(
+        &doc,
+        "foreignowner::adapters",
+        "foreignowner::adapters::wrap",
+        EdgeKind::Call
+    ));
+    assert!(has_edge(
+        &doc,
+        "foreignowner::core::Render::render",
+        "foreignowner::adapters::wrap",
+        EdgeKind::Call
+    ));
+    assert!(!has_firm_edge(
+        &doc,
+        "foreignowner::core::Render::render",
+        "foreignowner::adapters::wrap",
+        EdgeKind::Call
+    ));
+    let cfg = rustograph::config::load(ws.path()).unwrap().unwrap();
+    let rules = rustograph::rules::check(&doc, &cfg);
+    assert!(
+        rules.violations.is_empty(),
+        "{:?}",
+        rules
+            .violations
+            .iter()
+            .map(|v| format!("{} -> {}", v.from, v.to))
+            .collect::<Vec<_>>()
+    );
+    let modules = doc.view(rustograph::graph::Level::Module).unwrap();
+    let module_cycles = analysis::cycles(&modules);
+    assert!(
+        module_cycles.cycles.is_empty(),
+        "{:?}",
+        module_cycles
+            .cycles
+            .iter()
+            .map(|c| c.members.clone())
+            .collect::<Vec<_>>()
+    );
+    // 도달성은 그대로다 — 트레이트 메서드를 부르는 곳에서 본문의 호출이 닿는다.
+    let report = analysis::dead(&doc).unwrap();
+    assert_not_reported(&report, &["foreignowner::adapters::wrap"]);
+}
+
+/// 밖 타입 impl 본문이 부르는 함수가 다시 그 트레이트 메서드를 부르면, 확정 호출만으로는 순환이
+/// 아니다 — 선언 메서드에서 본문으로 가는 간선이 추정이라 심볼 순환 증거가 못 된다.
+#[test]
+fn foreign_impl_body_does_not_close_a_symbol_cycle_through_the_trait_method() {
+    let ws = Workspace::new(
+        "foreignsymcyc",
+        &[
+            ("Cargo.toml", &manifest("foreignsymcyc")),
+            (
+                "src/main.rs",
+                "pub trait Render { fn render(&self) -> String; }\npub struct Local;\nimpl Render for Local { fn render(&self) -> String { \"l\".into() } }\nimpl Render for String { fn render(&self) -> String { wrap(self) } }\npub fn wrap(s: &str) -> String { Render::render(&Local) + s }\nfn main() { println!(\"{}\", wrap(\"x\")); }\n",
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    let cycles = analysis::cycles(&doc);
+    assert!(
+        cycles.cycles.is_empty(),
+        "{:?}",
+        cycles
+            .cycles
+            .iter()
+            .map(|c| c.members.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// 크레이트 경계를 넘어도 같다 — 트레이트 크레이트가 impl 크레이트에 의존하는 것처럼 보이면
+/// Cargo가 금지하는 크레이트 순환이 보고됐다.
+#[test]
+fn foreign_impl_body_does_not_make_a_crate_cycle() {
+    let ws = Workspace::new(
+        "foreigncrates",
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers=['core','adapters','helper']\nresolver='2'\n",
+            ),
+            (
+                "helper/Cargo.toml",
+                "[package]\nname='helper'\nversion='0.1.0'\nedition='2021'\n",
+            ),
+            (
+                "helper/src/lib.rs",
+                "pub fn wrap(s: &str) -> String { s.to_string() }\n",
+            ),
+            (
+                "core/Cargo.toml",
+                "[package]\nname='core_t'\nversion='0.1.0'\nedition='2021'\n",
+            ),
+            (
+                "core/src/lib.rs",
+                "pub trait Render { fn render(&self) -> String; }\npub fn show<R: Render>(r: &R) -> String { r.render() }\n",
+            ),
+            (
+                "adapters/Cargo.toml",
+                "[package]\nname='adapters'\nversion='0.1.0'\nedition='2021'\n[dependencies]\ncore_t={path='../core'}\nhelper={path='../helper'}\n",
+            ),
+            (
+                "adapters/src/lib.rs",
+                "use core_t::Render;\npub fn local_wrap(s: &str) -> String { s.to_string() }\nimpl Render for String {\n    fn render(&self) -> String { helper::wrap(&local_wrap(self)) }\n}\n",
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    let crates = doc.view(rustograph::graph::Level::Crate).unwrap();
+    let cycles = analysis::cycles(&crates);
+    assert!(
+        cycles.cycles.is_empty(),
+        "{:?}",
+        cycles
+            .cycles
+            .iter()
+            .map(|c| c.members.clone())
+            .collect::<Vec<_>>()
+    );
+}

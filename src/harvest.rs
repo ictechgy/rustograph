@@ -159,6 +159,7 @@ pub enum Body<'a> {
 }
 
 /// 본문을 나중에 방문할 항목.
+#[derive(Clone)]
 pub struct BodyItem<'a> {
     /// 본문을 감싸는 impl·trait·함수의 제네릭 스코프다. 전역 아이템과 구분한다.
     pub generic_scopes: Vec<&'a syn::Generics>,
@@ -706,11 +707,14 @@ pub(crate) fn impls_with_identities<'a>(
 ///
 /// 그런 impl(`impl Render for String`, blanket `impl<T: Tr> Greet for T`, `impl Tr for &Local`)의
 /// 메서드에는 정점이 없다 — 예전에는 본문을 통째로 버려, 그 안에서만 부르는 함수가 unreachable로
-/// 보였고 본문이 다른 모듈을 부르는 의존이 레이어 규칙에서 사라졌다. 구현한 트레이트가 워크스페이스
-/// 트레이트이고 그 메서드를 선언했으면 선언 메서드(`Trait::m`)가 본문을 소유한다 — 그 메서드를 부르는
-/// 곳(이름 팬아웃 포함)에서 본문의 호출이 닿는다. 아니면 impl이 선언된 모듈이 소유한다 — 의존은
-/// 규칙·순환에 보이지만 모듈은 보존 루트가 아니어서 dead 판정은 바뀌지 않는다. impl 메서드의 `Self`는
-/// 워크스페이스 밖 타입이라 바꾸지 않는다.
+/// 보였고 본문이 다른 모듈을 부르는 의존이 레이어 규칙에서 사라졌다. 확정 간선은 impl이 선언된
+/// 모듈이 소유한다 — 의존이 실제로 나가는 곳이라 규칙·순환이 그 모듈의 의존으로 본다. 구현한
+/// 트레이트가 워크스페이스 트레이트이고 그 메서드를 선언했으면, 반환하는 항목의 `id`는 선언
+/// 메서드(`Trait::m`)다 — 호출자([`crate::source`])가 그 소유로 같은 본문을 한 번 더 풀어 추정 간선으로
+/// 싣는다. 그 메서드를 부르는 곳(이름 팬아웃 포함)에서 본문의 호출이 닿되, 트레이트 모듈에서 impl
+/// 모듈로 가는 의존은 규칙·순환의 증거가 되지 않는다. 모듈은 `--retain-public`이면 `pub mod`가 보존
+/// 루트라 그때는 모듈이 소유한 간선도 dead 판정을 넓힌다. impl 메서드의 `Self`는 워크스페이스 밖
+/// 타입이라 바꾸지 않는다. 속성 경로 참조는 확정 의존이라 impl 모듈이 소유한다.
 fn foreign_impl_bodies<'a>(
     b: &ImplBlock<'a>,
     tree: &ModTree,
@@ -735,8 +739,14 @@ fn foreign_impl_bodies<'a>(
             Some(ref condition) => conjoin(&b.cfg, condition),
             None => b.cfg.clone(),
         };
-        harvest.unparsed_attrs +=
-            collect_attr_refs(&m.attrs, &owner, &b.items_module, false, &mcfg, attr_refs);
+        harvest.unparsed_attrs += collect_attr_refs(
+            &m.attrs,
+            &b.items_module,
+            &b.items_module,
+            false,
+            &mcfg,
+            attr_refs,
+        );
         bodies.push(BodyItem {
             generic_scopes: generic_scopes([b.generics, &m.sig.generics]),
             id: owner,

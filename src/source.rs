@@ -1022,23 +1022,26 @@ fn harvest(
     // 대신 소유시킨 본문은 소유자가 정점으로 남았을 때만 쓴다 — 같은 경로의 트레이트 선언이 여럿이라
     // 선언 메서드가 소스 인스턴스 ID로 바뀌었으면 impl 모듈이 소유한다(유령 정점 금지).
     let vertex_ids: BTreeSet<&str> = vertices.iter().map(|v| v.id.as_str()).collect();
+    // 선언 메서드가 대신 소유할 본문 — 2패스 뒤에 그 소유로 다시 풀어 추정 간선으로만 싣는다.
+    let mut proxy_bodies: Vec<BodyItem<'_>> = Vec::new();
     for mut body in foreign_bodies {
         let trait_id = (body.id != body.module && vertex_ids.contains(body.id.as_str()))
             .then(|| body.id.rsplit_once("::").map(|(t, _)| t.to_string()))
             .flatten()
             .filter(|t| vertex_ids.contains(t.as_str()));
-        match trait_id {
-            // 선언 메서드가 소유한 본문은 그 트레이트의 impl이다. self 타입 정점이 없어 implements
-            // 간선을 둘 수 없으니 소유 메서드에서 트레이트로 references 간선을 둔다 — 워크스페이스 밖
-            // 타입에만 구현한 확장 트레이트(`impl ItemIdent for syn::Item`)는 이것이 없으면 메서드를
-            // 써도 트레이트 정점이 unreachable이었다.
-            Some(trait_id) => {
-                let mut e = Edge::new(body.id.clone(), trait_id, EdgeKind::References);
-                e.cfg = body.cfg.clone();
-                edges.push(e);
-            }
-            None => body.id = body.module.clone(),
+        // 선언 메서드가 소유한 본문은 그 트레이트의 impl이다. self 타입 정점이 없어 implements
+        // 간선을 둘 수 없으니 소유 메서드에서 트레이트로 references 간선을 둔다 — 워크스페이스 밖
+        // 타입에만 구현한 확장 트레이트(`impl ItemIdent for syn::Item`)는 이것이 없으면 메서드를
+        // 써도 트레이트 정점이 unreachable이었다.
+        if let Some(trait_id) = trait_id {
+            let mut e = Edge::new(body.id.clone(), trait_id, EdgeKind::References);
+            e.cfg = body.cfg.clone();
+            edges.push(e);
+            proxy_bodies.push(body.clone());
         }
+        // 확정 간선은 impl이 선언된 모듈이 소유한다 — 의존이 실제로 나가는 곳이다. 선언 메서드가
+        // 소유하면 트레이트 모듈에서 impl 모듈로 가는 거짓 의존이 규칙 위반·순환으로 보였다.
+        body.id = body.module.clone();
         bodies.push(body);
     }
     for span in &mut item_spans {
@@ -1175,6 +1178,23 @@ fn harvest(
             ),
             false,
         ));
+
+        // 밖 타입 impl 본문을 선언 메서드 소유로 다시 푼 간선 — 그 메서드를 부르는 곳에서 본문의
+        // 호출이 닿게 하되 추정 간선이라 규칙·순환의 증거가 되지 않는다. 확정 간선과 미해석 셈은
+        // impl 모듈 소유 사본이 이미 냈으니 이쪽 셈은 버린다(같은 본문을 두 번 세지 않는다).
+        let mut proxy_harvest = Harvest::default();
+        let mut proxied = harvest::bodies_within(
+            &proxy_bodies,
+            &tree,
+            &dep_crates,
+            &method_index,
+            &fan_out_scope,
+            &mut proxy_harvest,
+        );
+        for e in &mut proxied {
+            e.tentative = true;
+        }
+        edges.extend(identities.edges(proxied, false));
 
         // 속성 경로 참조 — 모드와 무관하게 syn이 권위다. `#[dep::attr]`나
         // `#[derive(dep::X)]`는 의미 해석이 더 잘 아는 것이 없다.
