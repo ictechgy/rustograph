@@ -26,10 +26,14 @@ can have more vertices and edges than before:
   impl methods are retention roots.
 
 Expect `dead` to report fewer unreachable items, `rules` to see dependencies
-that a field type or a foreign-type impl body carried, and module-level
-`cycles` to include field-type references. Symbol-level `cycles` leaves out a
-field-type reference between two data types, so recursive data definitions do
-not become new symbol-level cycles. Saved baselines that list a now-reachable
+that a field type or a foreign-type impl body carried, and module- and
+type-level `cycles` to include field-type references. Two data types that hold
+each other as fields (an AST's `Expr` and `Stmt`) are a type-level dependency
+cycle, so `cycles --level type --strict` (and `--level module --strict` when the
+types live in different modules) can start failing on such definitions; this is
+intended, because at those levels the cycle is a real dependency between the
+types. Symbol-level `cycles` leaves out a field-type reference between two data
+types, so recursive data definitions do not become new symbol-level cycles. Saved baselines that list a now-reachable
 item keep working; the item simply stops matching a finding.
 
 ## Rust library callers
@@ -44,9 +48,12 @@ alike. Add the new fields, or end such patterns with `..`.
 - `harvest::Harvest` adds `foreign_self_impls`, the number of impl blocks whose
   self type is not a workspace vertex. `Harvest::default()` starts it at zero.
 - `harvest::impls` keeps its signature but now also returns the method bodies
-  of such impl blocks, owned by the module that declares the impl (the source
-  harvest, which knows the trait-declared methods, attributes them to the
-  trait's declared method when it can).
+  of such impl blocks, owned by the module that declares the impl. The source
+  harvest, which knows the trait-declared methods, keeps those firm edges on the
+  module and also gives the trait's declared method `tentative` edges to what
+  the body calls, so reachability flows through the trait method without the
+  trait's module appearing to depend on the impl's module.
+- `harvest::BodyItem` derives `Clone` (additive).
 - `deps::UnusedDep::kind_label` is new: the text form of `kind`, with cargo's
   empty normal-dependency kind written as `normal`. JSON keeps `kind` as cargo
   reports it.

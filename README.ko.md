@@ -404,10 +404,12 @@ proc-macro lib도 lib으로 셉니다. 예제·통합 테스트·벤치 타깃�
 목록이 아닌 매크로 인자(`json!({..})`) 안에서 지역 묶음이 아닌 아이템으로 해석되는 이름은 추정
 (tentative) 간선이 되어 도달성에만 쓰입니다. 함수 안 아이템(중첩 `fn`, 지역 `impl`·`macro_rules!`)은
 정점이 없고 그 간선은 바깥 본문이 소유합니다. self 타입이 워크스페이스 정점이 아닌 impl(`impl Tr for
-String`, blanket `impl<T: Tr> Ext for T`, `impl Tr for &Local`)은 메서드 정점이 없어, 본문을 구현한
-워크스페이스 트레이트의 선언 메서드(트레이트로 `references` 간선도 둡니다)나, 트레이트가 외부이거나 그
-메서드를 선언하지 않으면 impl 모듈이 소유합니다. 모듈은 보존 루트가 아니어서 `dead` 판정은 바뀌지 않고,
-`limitations`가 그런 impl 블록 수를 셉니다. 보존 루트에는 `fn main`과 `#[no_mangle]`·
+String`, blanket `impl<T: Tr> Ext for T`, `impl Tr for &Local`)은 메서드 정점이 없어, 본문의 확정 간선을
+impl이 선언된 모듈이 소유합니다 — 의존이 실제로 나가는 곳이라 `rules`·`cycles`가 그 모듈의 의존으로 봅니다.
+구현한 워크스페이스 트레이트가 그 메서드를 선언했으면 선언 메서드도 본문이 부르는 곳으로 가는 추정
+(tentative) 간선(이름 팬아웃처럼 도달성에만 쓰입니다)과 트레이트로 가는 `references` 간선을 가져, 그 메서드를
+부르는 곳에서 본문이 닿습니다. 모듈은 `--retain-public`일 때만(`pub mod`) 보존 루트라 그때는 모듈이 소유한
+간선도 `dead`를 넓힙니다. `limitations`가 그런 impl 블록 수를 셉니다. 보존 루트에는 `fn main`과 `#[no_mangle]`·
 `#[unsafe(no_mangle)]`·`#[export_name]` 함수·impl 메서드, `#[used]`·`#[no_mangle]`·`#[global_allocator]`
 static, `#[proc_macro*]` 진입점이 들어갑니다.
 

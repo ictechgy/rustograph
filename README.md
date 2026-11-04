@@ -202,11 +202,14 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
   `macro_rules!`) have no vertex; their edges belong to the enclosing body.
 - An impl whose self type is not a workspace vertex (`impl Tr for String`,
   blanket `impl<T: Tr> Ext for T`, `impl Tr for &Local`) has no method
-  vertices. Its method bodies are attributed to the implemented workspace
-  trait's declared method, which also gets a `references` edge to the trait,
-  or to the enclosing module when the trait is external or does not declare
-  the method (a module is not a retention root, so that does not change
-  `dead`). `limitations` counts such impl blocks.
+  vertices. The firm edges of its method bodies belong to the module that
+  declares the impl, so `rules` and `cycles` see the dependency where it
+  actually leaves. When the impl implements a workspace trait that declares
+  the method, that declared method also gets `tentative` edges to what the
+  body calls (reachability only, like name fan-out) and a `references` edge
+  to the trait, so callers of the trait method reach the body. A module is a
+  retention root only under `--retain-public` (a `pub mod`); then the
+  module-owned edges widen `dead` too. `limitations` counts such impl blocks.
 - Name fan-out: a method call `x.m()` whose receiver type is unknown gets
   `tentative` call edges to the same-name workspace methods it could reach.
   Inherent (`T::m`) and trait-declared (`Tr::m`) methods come only

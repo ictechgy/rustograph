@@ -362,8 +362,8 @@ fn main() {
         "extimpl::db::query_from_string_impl",
         EdgeKind::Call
     ));
-    // 워크스페이스 밖 트레이트를 워크스페이스 밖 타입에 구현하면 impl 모듈이 본문을 소유한다 —
-    // 의존은 보이고, 모듈은 보존 루트가 아니라 dead 판정은 바뀌지 않는다.
+    // 워크스페이스 밖 트레이트를 워크스페이스 밖 타입에 구현하면 impl 모듈만 본문을 소유한다 —
+    // 의존은 보인다. 모듈은 `--retain-public`일 때만 보존 루트라 기본 dead 판정은 바뀌지 않는다.
     assert!(has_edge(
         &doc,
         "extimpl",
