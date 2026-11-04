@@ -915,3 +915,60 @@ fn foreign_impl_body_does_not_make_a_crate_cycle() {
             .collect::<Vec<_>>()
     );
 }
+
+/// derive·attribute 매크로는 함수 이름이 아니라 등록한 이름으로 쓰인다 — `#[derive(pm::Hello)]`나
+/// `use pm::Hello; #[derive(Hello)]`가 그 크레이트를 쓰는 증거다. proc-macro 크레이트를 수확하면서
+/// 이 이름을 잃으면 deps가 실제로 쓰는 의존을 unused로 보고했다.
+#[test]
+fn derive_names_count_as_uses_of_a_proc_macro_crate() {
+    let ws = Workspace::new(
+        "pmderive",
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers=['app','pm','app2','app3']\nresolver='2'\n",
+            ),
+            (
+                "pm/Cargo.toml",
+                "[package]\nname='pm-derive'\nversion='0.1.0'\nedition='2021'\n[lib]\nproc-macro=true\n",
+            ),
+            (
+                "pm/src/lib.rs",
+                "extern crate proc_macro;\nuse proc_macro::TokenStream;\n#[proc_macro_derive(Hello, attributes(hello))]\npub fn hello_impl(_i: TokenStream) -> TokenStream { helper(); TokenStream::new() }\nfn helper() {}\n#[proc_macro_attribute]\npub fn traced(_a: TokenStream, i: TokenStream) -> TokenStream { i }\n",
+            ),
+            (
+                "app/Cargo.toml",
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\npm-derive={path='../pm'}\n",
+            ),
+            ("app/src/lib.rs", "#[derive(pm_derive::Hello)]\npub struct S;\n"),
+            (
+                "app2/Cargo.toml",
+                "[package]\nname='app2'\nversion='0.1.0'\nedition='2021'\n[dependencies]\npm-derive={path='../pm'}\n",
+            ),
+            (
+                "app2/src/lib.rs",
+                "use pm_derive::Hello;\n#[derive(Hello)]\npub struct S;\n",
+            ),
+            (
+                "app3/Cargo.toml",
+                "[package]\nname='app3'\nversion='0.1.0'\nedition='2021'\n[dependencies]\npm-derive={path='../pm'}\n",
+            ),
+            (
+                "app3/src/lib.rs",
+                "#[pm_derive::traced]\npub fn f() {}\n",
+            ),
+        ],
+    );
+    let deps = deps::report(ws.path()).unwrap();
+    let unused: Vec<String> = deps
+        .unused
+        .iter()
+        .map(|u| format!("{} -> {}", u.package, u.dep))
+        .collect();
+    assert!(
+        !unused
+            .iter()
+            .any(|u| u.ends_with("-> pm_derive") || u.ends_with("-> pm-derive")),
+        "used proc-macro dependency reported unused: {unused:?}"
+    );
+}
