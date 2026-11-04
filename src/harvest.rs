@@ -39,6 +39,9 @@ pub struct Harvest {
     /// 속성 목록을 Meta로 읽지 못한 cfg_attr 수 — 안쪽 경로가 참조로
     /// 잡히지 않았으니 속성으로만 쓰는 dep이 미사용으로 보일 수 있다.
     pub unparsed_attrs: usize,
+    /// self 타입이 워크스페이스 정점이 아닌 impl 블록 수(`impl Tr for String`, blanket
+    /// `impl<T> Tr for T`, `impl Tr for &Local`) — 메서드 정점이 없어 본문을 대신 소유시킨다.
+    pub foreign_self_impls: usize,
 }
 
 /// 한 모듈의 아이템 목록을 정점으로 만든다(1패스 — 선언만).
@@ -59,6 +62,33 @@ pub struct ModuleDecls<'a> {
     /// 범위 — persistence 사실을 감싸는 그래프 정점으로 귀속할 때 쓴다.
     /// 본문 아이템의 범위는 BodyItem이 이미 들고 있다.
     pub owner_spans: Vec<OwnerSpan>,
+    /// 본문 밖 선언이 담은 경로 참조 — 필드 타입과 `macro_rules!` 정의 본문. 해석은 임포트가
+    /// 채워진 뒤 2패스에서 [`decl_edges`]가 한다.
+    pub decl_refs: Vec<DeclRef>,
+}
+
+/// 본문 밖 선언이 담은 경로 참조 하나.
+///
+/// struct·enum·union 필드의 타입은 그 타입이 쓰는 타입이다 — 모으지 않으면 DTO 필드로만 쓰는
+/// 타입이 unreachable로 보이고, 필드가 다른 모듈을 가리키는 의존이 규칙·순환에서 사라진다.
+/// `macro_rules!` 정의 본문의 경로(`$crate::m::f`)는 매크로를 펼친 곳에서 쓰이는 이름이라 확정
+/// 사용이 아니다 — 추정(tentative) 간선으로 dead·도달성에만 쓰인다.
+#[derive(Debug, Clone)]
+pub struct DeclRef {
+    /// 참조를 소유한 정점 ID — 필드면 그 타입, 매크로 본문이면 그 매크로.
+    pub owner: String,
+    /// 경로를 해석할 모듈 — 선언이 사는 모듈이다.
+    pub module: String,
+    /// 경로 세그먼트(`$crate`는 `crate`로 바꿔 둔다).
+    pub path: Vec<String>,
+    /// 소유 아이템과 필드·배리언트의 `#[cfg]`를 합친 조건.
+    pub cfg: Option<String>,
+    /// 쓰임이 확정되지 않은 참조인가 — 매크로 본문이면 true다.
+    pub tentative: bool,
+    /// 소유 아이템의 선언 파일 — 같은 경로의 선언이 여럿이면 소스 인스턴스 ID로 옮길 때 쓴다.
+    pub file: PathBuf,
+    /// 소유 아이템의 파일 안 바이트 시작 위치(syn span, 속성 포함).
+    pub start: usize,
 }
 
 /// 그래프 정점 하나가 소스에서 차지하는 범위다.
@@ -190,6 +220,7 @@ pub(crate) fn decls_with_markers<'a>(
         entry_roots: Vec::new(),
         test_roots: Vec::new(),
         owner_spans: Vec::new(),
+        decl_refs: Vec::new(),
     };
     for (file, items) in groups {
         let generated = is_generated_file(file);
@@ -252,20 +283,27 @@ pub(crate) fn decls_with_markers<'a>(
                     });
                 }
                 syn::Item::Struct(s) => {
-                    out.vertices.push(v(
-                        format!("{module_path}::{}", s.ident),
-                        Kind::Struct,
-                        is_pub(&s.vis),
-                        false,
-                    ));
+                    let id = format!("{module_path}::{}", s.ident);
+                    out.vertices
+                        .push(v(id.clone(), Kind::Struct, is_pub(&s.vis), false));
+                    let owner = DeclOwner::new(&id, module_path, &s.ident, &s.generics, file, item);
+                    owner.push_fields(fields_with_cfg(&s.fields, &cfg), &mut out.decl_refs);
                 }
                 syn::Item::Enum(e) => {
-                    out.vertices.push(v(
-                        format!("{module_path}::{}", e.ident),
-                        Kind::Enum,
-                        is_pub(&e.vis),
-                        false,
-                    ));
+                    let id = format!("{module_path}::{}", e.ident);
+                    out.vertices
+                        .push(v(id.clone(), Kind::Enum, is_pub(&e.vis), false));
+                    let owner = DeclOwner::new(&id, module_path, &e.ident, &e.generics, file, item);
+                    for variant in &e.variants {
+                        let variant_cfg = match cfg_of(&variant.attrs) {
+                            Some(condition) => conjoin(&cfg, &condition),
+                            None => cfg.clone(),
+                        };
+                        owner.push_fields(
+                            fields_with_cfg(&variant.fields, &variant_cfg),
+                            &mut out.decl_refs,
+                        );
+                    }
                 }
                 syn::Item::Trait(t) => {
                     // unsafe trait — 구현·사용이 전부 경계를 넘는다.
@@ -319,12 +357,12 @@ pub(crate) fn decls_with_markers<'a>(
                     }
                 }
                 syn::Item::Union(u) => {
-                    out.vertices.push(v(
-                        format!("{module_path}::{}", u.ident),
-                        Kind::Union,
-                        is_pub(&u.vis),
-                        false,
-                    ));
+                    let id = format!("{module_path}::{}", u.ident);
+                    out.vertices
+                        .push(v(id.clone(), Kind::Union, is_pub(&u.vis), false));
+                    let owner = DeclOwner::new(&id, module_path, &u.ident, &u.generics, file, item);
+                    let fields = u.fields.named.iter().map(|f| (&f.ty, field_cfg(f, &cfg)));
+                    owner.push_fields(fields.collect(), &mut out.decl_refs);
                 }
                 syn::Item::Type(t) => {
                     out.vertices.push(v(
@@ -360,6 +398,18 @@ pub(crate) fn decls_with_markers<'a>(
                     let unsafe_ = body_has_unsafe(body);
                     out.vertices
                         .push(v(id.clone(), Kind::Static, is_pub(&s.vis), unsafe_));
+                    // `#[used]`·`#[no_mangle]`·`#[global_allocator]` static은 링커·런타임이 쓴다 —
+                    // 초기식이 가리키는 함수·타입도 그 루트에서 닿는다.
+                    if is_extern_entry(&s.attrs) {
+                        out.entry_roots.push(id.clone());
+                        identities.note_root(
+                            &id,
+                            module_path,
+                            false,
+                            file,
+                            s.span().byte_range().start,
+                        );
+                    }
                     out.bodies.push(BodyItem {
                         generic_scopes: Vec::new(),
                         id,
@@ -376,12 +426,19 @@ pub(crate) fn decls_with_markers<'a>(
                 syn::Item::Macro(m) => {
                     if let Some(id) = &m.ident {
                         if m.mac.path.is_ident("macro_rules") {
-                            out.vertices.push(v(
-                                format!("{module_path}::{id}"),
-                                Kind::Macro,
-                                true,
-                                false,
-                            ));
+                            let mid = format!("{module_path}::{id}");
+                            out.vertices.push(v(mid.clone(), Kind::Macro, true, false));
+                            for path in macro_body_paths(m.mac.tokens.clone()) {
+                                out.decl_refs.push(DeclRef {
+                                    owner: mid.clone(),
+                                    module: module_path.to_string(),
+                                    path,
+                                    cfg: cfg.clone(),
+                                    tentative: true,
+                                    file: file.clone(),
+                                    start: item.span().byte_range().start,
+                                });
+                            }
                         }
                     }
                 }
@@ -488,31 +545,61 @@ pub fn impls<'a>(
     tree: &ModTree,
     harvest: &mut Harvest,
 ) -> (Vec<Vertex>, Vec<Edge>, Vec<AttrRef>, Vec<BodyItem<'a>>) {
-    impls_with_identities(
+    let mut parts = impls_with_identities(
         blocks,
         krate,
         tree,
+        &BTreeSet::new(),
         harvest,
         &mut identity::Registry::default(),
-    )
+    );
+    parts.bodies.append(&mut parts.foreign_bodies);
+    (parts.vertices, parts.edges, parts.attr_refs, parts.bodies)
+}
+
+/// [`impls_with_identities`]의 산출물 — 공개 [`impls`]의 네 묶음에 impl 메서드 진입점 루트를 더한다.
+pub(crate) struct ImplParts<'a> {
+    pub vertices: Vec<Vertex>,
+    pub edges: Vec<Edge>,
+    pub attr_refs: Vec<AttrRef>,
+    pub bodies: Vec<BodyItem<'a>>,
+    /// `#[no_mangle]` 같은 진입점 속성이 붙은 impl 메서드 — 항상 보존 루트다.
+    pub entry_roots: Vec<String>,
+    /// self 타입이 워크스페이스 정점이 아닌 impl의 메서드 본문 — 소유자는 구현한 워크스페이스
+    /// 트레이트의 선언 메서드나 impl이 선언된 모듈이다([`foreign_impl_bodies`]). 호출자는 소유자가
+    /// 정점으로 남았는지 확인한 뒤 쓴다.
+    pub foreign_bodies: Vec<BodyItem<'a>>,
 }
 
 /// 소스 수확의 전역 충돌 판정에 선언 위치를 넘긴다. 공개 수확 API는 그대로 둔다.
+/// `methods`는 이미 수확한 메서드 정점 ID다 — self 타입이 워크스페이스 밖인 impl의 본문을 구현한
+/// 트레이트의 선언 메서드가 소유하게 할 때 그 정점이 있는지 본다.
 pub(crate) fn impls_with_identities<'a>(
     blocks: &[ImplBlock<'a>],
     krate: &str,
     tree: &ModTree,
+    methods: &BTreeSet<String>,
     harvest: &mut Harvest,
     identities: &mut identity::Registry,
-) -> (Vec<Vertex>, Vec<Edge>, Vec<AttrRef>, Vec<BodyItem<'a>>) {
+) -> ImplParts<'a> {
     let mut vertices = Vec::new();
     let mut edges = Vec::new();
     let mut attr_refs = Vec::new();
     let mut bodies = Vec::new();
+    let mut entry_roots = Vec::new();
+    let mut foreign_bodies = Vec::new();
     for b in blocks {
         // self 타입을 해석한다 — 모듈 로컬이면 정점이 있다.
         let Some(self_id) = tree.resolve(&b.items_module, &b.self_ty, &DepCrates::new()) else {
             harvest.unresolved_paths += 1;
+            harvest.foreign_self_impls += 1;
+            foreign_bodies.extend(foreign_impl_bodies(
+                b,
+                tree,
+                methods,
+                harvest,
+                &mut attr_refs,
+            ));
             continue;
         };
         if let Some(tp) = &b.trait_path {
@@ -560,6 +647,16 @@ pub(crate) fn impls_with_identities<'a>(
                 &b.file,
                 m.span().byte_range().start,
             );
+            if is_extern_entry(&m.attrs) {
+                entry_roots.push(mid.clone());
+                identities.note_root(
+                    &mid,
+                    &b.items_module,
+                    false,
+                    &b.file,
+                    m.span().byte_range().start,
+                );
+            }
             let mut contains = Edge::new(self_id.clone(), mid.clone(), EdgeKind::Contains);
             contains.cfg = mcfg.clone();
             contains.unsafe_ = b.unsafe_;
@@ -595,7 +692,65 @@ pub(crate) fn impls_with_identities<'a>(
             });
         }
     }
-    (vertices, edges, attr_refs, bodies)
+    ImplParts {
+        vertices,
+        edges,
+        attr_refs,
+        bodies,
+        entry_roots,
+        foreign_bodies,
+    }
+}
+
+/// self 타입이 워크스페이스 정점이 아닌 impl 블록의 메서드 본문을 대신 소유시킨다.
+///
+/// 그런 impl(`impl Render for String`, blanket `impl<T: Tr> Greet for T`, `impl Tr for &Local`)의
+/// 메서드에는 정점이 없다 — 예전에는 본문을 통째로 버려, 그 안에서만 부르는 함수가 unreachable로
+/// 보였고 본문이 다른 모듈을 부르는 의존이 레이어 규칙에서 사라졌다. 구현한 트레이트가 워크스페이스
+/// 트레이트이고 그 메서드를 선언했으면 선언 메서드(`Trait::m`)가 본문을 소유한다 — 그 메서드를 부르는
+/// 곳(이름 팬아웃 포함)에서 본문의 호출이 닿는다. 아니면 impl이 선언된 모듈이 소유한다 — 의존은
+/// 규칙·순환에 보이지만 모듈은 보존 루트가 아니어서 dead 판정은 바뀌지 않는다. impl 메서드의 `Self`는
+/// 워크스페이스 밖 타입이라 바꾸지 않는다.
+fn foreign_impl_bodies<'a>(
+    b: &ImplBlock<'a>,
+    tree: &ModTree,
+    methods: &BTreeSet<String>,
+    harvest: &mut Harvest,
+    attr_refs: &mut Vec<AttrRef>,
+) -> Vec<BodyItem<'a>> {
+    let trait_id = b
+        .trait_path
+        .as_ref()
+        .and_then(|tp| tree.resolve(&b.items_module, tp, &DepCrates::new()));
+    let mut bodies = Vec::new();
+    for &m in &b.methods {
+        let owner = trait_id
+            .as_ref()
+            .map(|t| format!("{t}::{}", m.sig.ident))
+            .filter(|declared| methods.contains(declared))
+            .unwrap_or_else(|| b.items_module.clone());
+        let own_cfg = cfg_of(&m.attrs);
+        harvest.cfg_items += usize::from(own_cfg.is_some());
+        let mcfg = match own_cfg {
+            Some(ref condition) => conjoin(&b.cfg, condition),
+            None => b.cfg.clone(),
+        };
+        harvest.unparsed_attrs +=
+            collect_attr_refs(&m.attrs, &owner, &b.items_module, false, &mcfg, attr_refs);
+        bodies.push(BodyItem {
+            generic_scopes: generic_scopes([b.generics, &m.sig.generics]),
+            id: owner,
+            module: b.items_module.clone(),
+            self_ty: None,
+            body: Body::Stmts(&m.block.stmts),
+            params: locals::param_bindings(&m.sig),
+            signature_surface: fn_signature_types(&m.sig),
+            cfg: mcfg,
+            file: b.file.clone(),
+            range: m.span().byte_range(),
+        });
+    }
+    bodies
 }
 
 /// 시그니처 표면(파라미터·반환·where)의 타입 목록.
@@ -642,6 +797,207 @@ pub fn attr_edges(
         }
     }
     edges
+}
+
+/// 모은 선언 참조([`DeclRef`])를 references 간선으로 해석한다(2패스).
+///
+/// 본문 방문의 타입 경로처럼 해석 실패를 미해석으로 세지 않는다 — 필드 타입은 대부분 std 타입이고
+/// 매크로 본문의 경로는 메타변수·외부 경로가 섞여 있어, 세면 외부 참조 카운터가 의미 없이 부푼다.
+/// 같은 (소유자, 목적지, 조건, 추정 여부) 간선은 한 번만 낸다. 소유자 자신을 가리키는 참조
+/// (`Option<Box<Self>>`)는 버린다.
+pub fn decl_edges(refs: &[DeclRef], tree: &ModTree, dep_crates: &DepCrates) -> Vec<Edge> {
+    let mut seen = BTreeSet::new();
+    let mut edges = Vec::new();
+    for r in refs {
+        let Some(to) = tree.resolve(&r.module, &r.path, dep_crates) else {
+            continue;
+        };
+        if to == r.owner || !seen.insert((r.owner.as_str(), to.clone(), &r.cfg, r.tentative)) {
+            continue;
+        }
+        let mut e = if r.tentative {
+            Edge::maybe(r.owner.clone(), to, EdgeKind::References)
+        } else {
+            Edge::new(r.owner.clone(), to, EdgeKind::References)
+        };
+        e.cfg = r.cfg.clone();
+        edges.push(e);
+    }
+    edges
+}
+
+/// 필드 타입 참조를 모으는 소유 타입 — 정점 ID·모듈·제네릭·선언 위치를 한데 묶는다.
+struct DeclOwner<'a> {
+    id: &'a str,
+    module: &'a str,
+    /// 필드 타입의 `Self`가 가리키는 타입 이름.
+    name: String,
+    /// 타입 이름공간을 가리는 제네릭 매개변수 — 필드의 `T`는 경로가 아니다.
+    type_params: BTreeSet<String>,
+    file: &'a PathBuf,
+    start: usize,
+}
+
+impl<'a> DeclOwner<'a> {
+    /// 타입 선언 하나의 소유자.
+    fn new(
+        id: &'a str,
+        module: &'a str,
+        ident: &syn::Ident,
+        generics: &syn::Generics,
+        file: &'a PathBuf,
+        item: &syn::Item,
+    ) -> DeclOwner<'a> {
+        DeclOwner {
+            id,
+            module,
+            name: ident.to_string(),
+            type_params: generics
+                .type_params()
+                .map(|param| param.ident.to_string())
+                .collect(),
+            file,
+            start: item.span().byte_range().start,
+        }
+    }
+
+    /// 필드 (타입, 조건) 목록의 경로를 선언 참조로 넣는다.
+    fn push_fields(&self, fields: Vec<(&syn::Type, Option<String>)>, out: &mut Vec<DeclRef>) {
+        for (ty, cfg) in fields {
+            let mut paths = TypeVisitor { paths: Vec::new() };
+            paths.visit_type(ty);
+            for path in paths.paths {
+                if path
+                    .first()
+                    .is_some_and(|name| self.type_params.contains(name))
+                {
+                    continue;
+                }
+                let path = substitute_self(&path, std::slice::from_ref(&self.name)).unwrap_or(path);
+                out.push(DeclRef {
+                    owner: self.id.to_string(),
+                    module: self.module.to_string(),
+                    path,
+                    cfg: cfg.clone(),
+                    tentative: false,
+                    file: self.file.clone(),
+                    start: self.start,
+                });
+            }
+        }
+    }
+}
+
+/// struct·배리언트 필드마다 (타입, 아이템 조건과 필드 `#[cfg]`를 합친 조건).
+fn fields_with_cfg<'f>(
+    fields: &'f syn::Fields,
+    cfg: &Option<String>,
+) -> Vec<(&'f syn::Type, Option<String>)> {
+    fields.iter().map(|f| (&f.ty, field_cfg(f, cfg))).collect()
+}
+
+/// 필드 하나의 조건 — 필드 자신의 `#[cfg]`가 있으면 아이템 조건과 합친다.
+fn field_cfg(field: &syn::Field, cfg: &Option<String>) -> Option<String> {
+    match cfg_of(&field.attrs) {
+        Some(condition) => conjoin(cfg, &condition),
+        None => cfg.clone(),
+    }
+}
+
+/// `macro_rules!` 정의 본문의 토큰에서 두 세그먼트 이상의 경로(`a::b`, `crate::a`, `$crate::a`,
+/// `self::a`, `super::a`)를 모은다. `$crate`는 `crate`로 바꾼다. 메타변수(`$x`)로 시작하는 경로는
+/// 펼친 곳의 토큰이라 건너뛴다. 한 세그먼트 이름은 지역 변수·키워드와 구별할 수 없어 모으지 않는다.
+fn macro_body_paths(tokens: proc_macro2::TokenStream) -> Vec<Vec<String>> {
+    token_paths(tokens, 2)
+}
+
+/// 토큰에서 세그먼트가 `min_segments` 이상인 경로를 모은다 — 규칙은 [`macro_body_paths`]와 같다.
+fn token_paths(tokens: proc_macro2::TokenStream, min_segments: usize) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    collect_token_paths(tokens, min_segments, &mut out);
+    out
+}
+
+/// [`token_paths`]의 재귀 — 괄호 묶음 안까지 내려간다.
+fn collect_token_paths(
+    tokens: proc_macro2::TokenStream,
+    min_segments: usize,
+    out: &mut Vec<Vec<String>>,
+) {
+    use proc_macro2::TokenTree;
+    let trees: Vec<TokenTree> = tokens.into_iter().collect();
+    let mut i = 0;
+    while i < trees.len() {
+        if let TokenTree::Group(g) = &trees[i] {
+            collect_token_paths(g.stream(), min_segments, out);
+            i += 1;
+            continue;
+        }
+        if is_metavariable(&trees, i) {
+            i = skip_path_tail(&trees, i + 2);
+            continue;
+        }
+        let (path, next) = token_path_at(&trees, i);
+        if path.len() >= min_segments.max(1) {
+            out.push(path);
+        }
+        i = next.max(i + 1);
+    }
+}
+
+/// `i`가 `$crate`가 아닌 메타변수(`$x`)의 시작인가.
+fn is_metavariable(trees: &[proc_macro2::TokenTree], i: usize) -> bool {
+    use proc_macro2::TokenTree;
+    matches!(
+        (trees.get(i), trees.get(i + 1)),
+        (Some(TokenTree::Punct(p)), Some(TokenTree::Ident(id))) if p.as_char() == '$' && id != "crate"
+    )
+}
+
+/// 메타변수 뒤에 이어진 `::이름` 꼬리를 건너뛴 위치.
+fn skip_path_tail(trees: &[proc_macro2::TokenTree], mut i: usize) -> usize {
+    while is_path_separator(trees, i)
+        && matches!(trees.get(i + 2), Some(proc_macro2::TokenTree::Ident(_)))
+    {
+        i += 3;
+    }
+    i
+}
+
+/// `i`에서 시작하는 경로의 세그먼트와 경로 다음 위치 — 경로가 아니면 빈 목록과 `i`.
+fn token_path_at(trees: &[proc_macro2::TokenTree], mut i: usize) -> (Vec<String>, usize) {
+    use proc_macro2::TokenTree;
+    let mut segs = Vec::new();
+    loop {
+        match (trees.get(i), trees.get(i + 1)) {
+            (Some(TokenTree::Punct(p)), Some(TokenTree::Ident(id)))
+                if p.as_char() == '$' && id == "crate" =>
+            {
+                segs.push("crate".to_string());
+                i += 2;
+            }
+            (Some(TokenTree::Ident(id)), _) => {
+                segs.push(id.to_string());
+                i += 1;
+            }
+            _ => break,
+        }
+        if !is_path_separator(trees, i) {
+            break;
+        }
+        i += 2;
+    }
+    (segs, i)
+}
+
+/// `i`와 `i + 1`이 경로 구분자 `::`인가.
+fn is_path_separator(trees: &[proc_macro2::TokenTree], i: usize) -> bool {
+    use proc_macro2::{Spacing, TokenTree};
+    matches!(
+        (trees.get(i), trees.get(i + 1)),
+        (Some(TokenTree::Punct(a)), Some(TokenTree::Punct(b)))
+            if a.as_char() == ':' && a.spacing() == Spacing::Joint && b.as_char() == ':'
+    )
 }
 
 /// 본문을 방문해 call/references/매크로 간선을 만든다(2패스).
@@ -698,9 +1054,8 @@ pub(crate) fn bodies_within(
 /// 본문 블록의 최상위 문장은 중첩 블록의 문장과 규칙이 다르다. 최상위에서는 지역 겹을 새로 열지
 /// 않고(`let` 묶음은 매개변수 겹에 들어간다), `let .. else`의 else 블록을 초기식보다 먼저 보며,
 /// 문장 매크로(`;`로 끝나거나 중괄호로 감싼 문장 위치 매크로 호출)는 표현식 매크로처럼 인자를
-/// 파싱하고, 아이템(`fn` 안의 `fn`)은 보지 않는다. 중첩 블록은 syn 기본 순회를 따른다 — 블록 안
-/// 아이템은 보고, 문장 매크로의 인자는 파싱하지 않는다. 본문을 표현식 목록으로 복제해 방문하던
-/// 때의 규칙 그대로다.
+/// 파싱한다 — 중첩 블록의 문장 매크로도 같다. 함수 안 아이템(`fn` 안의 `fn`, 지역 `impl`)은
+/// 최상위든 중첩 블록이든 본다 — 정점이 없는 그 아이템의 간선은 바깥 본문이 소유한다.
 pub fn body_edges(
     b: &BodyItem,
     tree: &ModTree,
@@ -772,6 +1127,12 @@ pub fn signature_edges(b: &BodyItem, tree: &ModTree, dep_crates: &DepCrates) -> 
             if p.first().is_some_and(|name| type_params.contains(name)) {
                 continue;
             }
+            // `-> Self`·`other: &Self`는 impl self 타입이다.
+            let p = b
+                .self_ty
+                .as_deref()
+                .and_then(|ty| substitute_self(&p, ty))
+                .unwrap_or(p);
             if let Some(id) = tree.resolve(&b.module, &p, dep_crates) {
                 if id != b.id {
                     let mut e = Edge::new(b.id.clone(), id, EdgeKind::Signature);
@@ -861,8 +1222,13 @@ impl BodyVisitor<'_> {
         }
     }
 
+    /// 경로를 이 본문의 모듈에서 해석한다. impl 본문의 `Self`는 impl self 타입 경로로 바꿔 해석한다
+    /// ([`substitute_self`]) — `Self::f()`·`Self(..)`·`Self { .. }`·`Self::CONST`가 모두 그 타입을 가리킨다.
     fn resolve(&mut self, segs: &[String]) -> Option<String> {
-        self.tree.resolve(self.module, segs, self.dep_crates)
+        match self.self_ty.and_then(|ty| substitute_self(segs, ty)) {
+            Some(path) => self.tree.resolve(self.module, &path, self.dep_crates),
+            None => self.tree.resolve(self.module, segs, self.dep_crates),
+        }
     }
 
     /// 값 자리(표현식 경로·호출 대상·포맷 캡처)의 경로를 해석한다.
@@ -907,9 +1273,68 @@ impl BodyVisitor<'_> {
             .is_some_and(|m| m.value_items.contains(name))
     }
 
+    /// 타입 `owner` 범위에서 이름이 `name`인 메서드(고유·트레이트 impl)로 references 간선을 단다 —
+    /// 연관 함수를 값으로 넘긴 경로(`Type::new`)다. 같은 이름 메서드가 없으면(배리언트·연관 상수)
+    /// 아무것도 하지 않는다.
+    fn push_associated(&mut self, owner: &str, name: &str) {
+        let index = self.method_index;
+        let Some(ids) = index.get(name) else {
+            return;
+        };
+        let prefix = owner_prefix(owner);
+        for mid in ids.iter().filter(|mid| mid.starts_with(&prefix)) {
+            self.push(mid.clone(), EdgeKind::References);
+        }
+    }
+
+    /// `<T as Tr>::m(..)`·`<T>::m(..)` — self 타입이 적힌 정적 호출이다. `T`가 워크스페이스 타입이면
+    /// 그 타입의 메서드로 call 간선을 단다: 트레이트를 적었으면 그 트레이트 impl의 `T::<Tr>::m`(정확히
+    /// 없으면 같은 이름 impl 메서드 후보를 추정 간선으로), 적지 않았으면 `T` 범위의 같은 이름 메서드다.
+    /// 예전에는 트레이트 선언(`Tr::m`)에만 닿아 impl 메서드와 그 안에서만 부르는 함수가 unreachable이었다.
+    ///
+    /// 반환: 경로 해석을 이것으로 대신했는가 — `<T>::m`은 타입 상대 경로라 값 경로로 해석하면 같은
+    /// 이름의 자유 함수로 오독한다. `<T as Tr>::m`은 트레이트 선언으로 가는 기존 해석도 그대로 둔다.
+    fn qualified_self_call(&mut self, qself: &syn::QSelf, segs: &[String]) -> bool {
+        let type_relative = qself.position == 0;
+        let (Some(method), syn::Type::Path(ty)) = (segs.last(), &*qself.ty) else {
+            return type_relative;
+        };
+        let index = self.method_index;
+        let (Some(owner), Some(ids)) = (self.resolve(&path_segments(&ty.path)), index.get(method))
+        else {
+            self.unresolved += usize::from(type_relative);
+            return type_relative;
+        };
+        if type_relative {
+            let prefix = owner_prefix(&owner);
+            let mut hit = false;
+            for mid in ids.iter().filter(|mid| mid.starts_with(&prefix)) {
+                self.push(mid.clone(), EdgeKind::Call);
+                hit = true;
+            }
+            self.unresolved += usize::from(!hit);
+            return true;
+        }
+        let trait_name = &segs[qself.position - 1];
+        let exact = format!("{owner}::<{trait_name}>::{method}");
+        if ids.contains(&exact) {
+            self.push(exact, EdgeKind::Call);
+        } else {
+            // 별칭·재노출 이름으로 적은 트레이트 — 같은 타입의 같은 이름 impl 메서드 중 하나다.
+            let (prefix, suffix) = (format!("{owner}::<"), format!(">::{method}"));
+            for mid in ids
+                .iter()
+                .filter(|mid| mid.starts_with(&prefix) && mid.ends_with(&suffix))
+            {
+                self.push_maybe(mid.clone(), EdgeKind::Call);
+            }
+        }
+        false
+    }
+
     /// 본문을 아레나에서 바로 방문한다 — 최상위 문장 규칙은 [`body_edges`] 문서에 있다.
-    /// 최상위를 [`Visit::visit_block`]으로 돌리면 겹이 하나 더 열리고 최상위 아이템을 방문하며
-    /// 문장 매크로 인자를 파싱하지 않아 간선이 달라진다.
+    /// 최상위를 [`Visit::visit_block`]으로 돌리면 겹이 하나 더 열리고 `let .. else`의 방문 순서가
+    /// 달라져 간선이 달라진다.
     fn visit_body(&mut self, body: Body<'_>) {
         let stmts = match body {
             Body::Expr(e) => return self.visit_expr(e),
@@ -924,8 +1349,10 @@ impl BodyVisitor<'_> {
                     self.visit_macro_call(&m.mac);
                     syn::visit::visit_stmt_macro(self, m);
                 }
-                // 최상위 아이템은 보지 않는다(중첩 블록 안의 아이템은 visit_item이 본다).
-                syn::Stmt::Item(_) => {}
+                // 함수 안 아이템(`fn inner`, 지역 `impl`, 지역 `macro_rules!`)은 바깥 함수가 소유한
+                // 것으로 본다 — 그 아이템에는 정점이 없어, 보지 않으면 그 본문에서만 부르는
+                // 함수가 unreachable로 보였다. 규칙은 중첩 블록의 아이템과 같다([`Visit::visit_item`]).
+                syn::Stmt::Item(i) => self.visit_item(i),
             }
         }
     }
@@ -947,31 +1374,38 @@ impl BodyVisitor<'_> {
     /// 매크로 호출 하나 — 크레이트 안 매크로면 call 간선, std/외부면 실측 생략으로 센다.
     /// 매크로 인자는 토큰 스트림이라 방문자가 못 내린다 — write!·format!·assert_eq! 같은 흔한
     /// 형태는 쉼표로 나뉜 표현식 목록이라 직접 파싱을 시도한다. 파싱이 안 되면 매크로 문법이
-    /// 독자적이라는 뜻이고, 그 안의 호출은 구문 수준에서 영원히 보이지 않는다(ext_macros가 그
-    /// 수를 잰다).
+    /// 독자적이라는 뜻이다(`json!({..})`·`matches!(x, P)`) — 토큰 안의 이름이 지역 묶음이 아닌
+    /// 아이템으로 해석되면 추정 간선만 단다. 문법을 모르니 호출인지 단순 언급인지 가릴 수 없다.
     fn visit_macro_call(&mut self, mac: &syn::Macro) {
         let segs = path_segments(&mac.path);
         match self.resolve(&segs) {
             Some(id) => self.push(id, EdgeKind::Call),
             None => self.ext_macros += 1,
         }
-        if let Ok(exprs) =
-            syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
-                .parse2(mac.tokens.clone())
-        {
-            for ex in &exprs {
-                self.visit_expr(ex);
-                // 포맷 문자열의 `{name}` 캡처 — 토큰이 아니라 문자열 안에 있어
-                // AST에 나타나지 않지만 실제 참조다.
-                if let syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Str(s),
-                    ..
-                }) = ex
-                {
-                    for name in format_captures(&s.value()) {
-                        if let ValueRes::Item(id) = self.resolve_value(&[name]) {
-                            self.push(id, EdgeKind::References);
-                        }
+        let parsed = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
+            .parse2(mac.tokens.clone());
+        let Ok(exprs) = parsed else {
+            // 표현식 목록이 아닌 인자(`json!({"k": f()})`, `matches!(x, P)`) — 토큰 안의 이름이
+            // 아이템으로 해석되면 추정 간선을 단다. 문법을 모르니 확정 사용이 아니다(dead·도달성만).
+            for path in token_paths(mac.tokens.clone(), 1) {
+                if let ValueRes::Item(id) = self.resolve_value(&path) {
+                    self.push_maybe(id, EdgeKind::References);
+                }
+            }
+            return;
+        };
+        for ex in &exprs {
+            self.visit_expr(ex);
+            // 포맷 문자열의 `{name}` 캡처 — 토큰이 아니라 문자열 안에 있어
+            // AST에 나타나지 않지만 실제 참조다.
+            if let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) = ex
+            {
+                for name in format_captures(&s.value()) {
+                    if let ValueRes::Item(id) = self.resolve_value(&[name]) {
+                        self.push(id, EdgeKind::References);
                     }
                 }
             }
@@ -1034,7 +1468,15 @@ impl Visit<'_> for BodyVisitor<'_> {
         // foo::bar() — 경로 호출은 정확히 해석된다.
         if let syn::Expr::Path(p) = &*e.func {
             let segs = path_segments(&p.path);
-            match self.resolve_value(&segs) {
+            let type_relative = p
+                .qself
+                .as_ref()
+                .is_some_and(|qself| self.qualified_self_call(qself, &segs));
+            match if type_relative {
+                ValueRes::Local
+            } else {
+                self.resolve_value(&segs)
+            } {
                 ValueRes::Item(id) => self.push(id, EdgeKind::Call),
                 // 지역 클로저·함수 값 호출 — 아이템 호출이 아니다.
                 ValueRes::Local => {}
@@ -1117,6 +1559,14 @@ impl Visit<'_> for BodyVisitor<'_> {
         syn::visit::visit_expr_macro(self, e);
     }
 
+    fn visit_stmt_macro(&mut self, m: &syn::StmtMacro) {
+        // 중첩 블록(`for`·`if`·`match` 팔 본문)의 문장 매크로 — 최상위 문장 매크로와 같이 인자를
+        // 파싱한다. 예전에는 syn 기본 순회만 따라 `for x in xs { println!("{}", f(x)); }`의 `f`가
+        // 간선 없이 사라졌다. 최상위 문장은 [`BodyVisitor::visit_body`]가 따로 처리한다.
+        self.visit_macro_call(&m.mac);
+        syn::visit::visit_stmt_macro(self, m);
+    }
+
     fn visit_expr_struct(&mut self, e: &syn::ExprStruct) {
         // S{..} 구조체 리터럴 — 생성자 호출과 같은 의미의 참조다.
         let segs = path_segments(&e.path);
@@ -1170,6 +1620,9 @@ impl Visit<'_> for BodyVisitor<'_> {
         // 매개변수를 첫 겹으로 가진다.
         let saved = self.scopes.take();
         let saved_types = self.type_params.clone();
+        // 안쪽 아이템은 바깥 impl의 `Self`를 쓸 수 없다(rustc E0401) — 안쪽 `impl`의 `Self`는
+        // 그 impl의 타입이라, 바깥 self 타입으로 바꾸면 거짓 간선이 된다. 안쪽에서는 바꾸지 않는다.
+        let saved_self = self.self_ty.take();
         let generics = match i {
             syn::Item::Fn(item) => Some(&item.sig.generics),
             syn::Item::Struct(item) => Some(&item.generics),
@@ -1191,9 +1644,20 @@ impl Visit<'_> for BodyVisitor<'_> {
             params.extend(generics.const_params().map(|param| param.ident.to_string()));
         }
         self.scopes = locals::Scopes::with_params(&params);
+        if let syn::Item::Macro(m) = i {
+            if m.ident.is_some() && m.mac.path.is_ident("macro_rules") {
+                // 지역 `macro_rules!` 정의 본문의 경로 — 펼친 곳에서 쓰이는 이름이라 추정 간선이다.
+                for path in macro_body_paths(m.mac.tokens.clone()) {
+                    if let Some(id) = self.resolve(&path) {
+                        self.push_maybe(id, EdgeKind::References);
+                    }
+                }
+            }
+        }
         syn::visit::visit_item(self, i);
         self.scopes.restore(saved);
         self.type_params = saved_types;
+        self.self_ty = saved_self;
     }
 
     fn visit_expr_if(&mut self, e: &syn::ExprIf) {
@@ -1262,7 +1726,13 @@ impl Visit<'_> for BodyVisitor<'_> {
                 // 앞부분 타입에의 참조다. 그것도 안 되면 진짜 미해석.
                 if segs.len() >= 2 {
                     match self.resolve(&segs[..segs.len() - 1]) {
-                        Some(ty) => self.push(ty, EdgeKind::References),
+                        Some(ty) => {
+                            // `.map(Type::new)`·`.ok_or_else(Type::err)`처럼 연관 함수를 값으로 넘기면
+                            // 그 메서드의 참조다 — 타입만 잇던 때는 그렇게만 쓰는 연관 함수가
+                            // unreachable이었다. 호출(`Type::assoc()`)과 같은 타입 범위 후보를 쓴다.
+                            self.push_associated(&ty, &segs[segs.len() - 1]);
+                            self.push(ty, EdgeKind::References);
+                        }
                         None => self.unresolved += 1,
                     }
                 }
@@ -1301,6 +1771,17 @@ impl Visit<'_> for TypeVisitor {
         self.paths.push(path_segments(p));
         syn::visit::visit_path(self, p);
     }
+}
+
+/// `Self`로 시작하는 경로를 impl self 타입 경로로 바꾼다 — `Self`로 시작하지 않거나 self 타입
+/// 경로가 비었으면(참조·튜플 같은 이름 없는 타입) None이다. `Self`는 본문이 속한 impl 모듈에서
+/// self 타입과 같은 이름이므로, 바꾼 경로도 같은 모듈에서 해석한다.
+fn substitute_self(segs: &[String], self_ty: &[String]) -> Option<Vec<String>> {
+    let (first, rest) = segs.split_first()?;
+    if first != "Self" || self_ty.is_empty() {
+        return None;
+    }
+    Some(self_ty.iter().chain(rest).cloned().collect())
 }
 
 /// `a::b::C` 경로를 세그먼트 목록으로 — 제네릭 인자는 버린다.
@@ -1657,26 +2138,69 @@ pub fn is_test_entry(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
-/// no_mangle/export_name/used/proc_macro 계열 — 링커·매크로가 부르는 진입점.
+/// 링커·런타임·매크로 확장기가 부르는 진입점 속성 — 이 속성이 붙은 fn·static·impl 메서드는 그래프
+/// 밖에서 불리므로 보존 루트다.
+const ENTRY_ATTRIBUTES: &[&str] = &[
+    "no_mangle",
+    "export_name",
+    "used",
+    "proc_macro",
+    "proc_macro_derive",
+    "proc_macro_attribute",
+    "global_allocator",
+    "panic_handler",
+];
+
+/// no_mangle/export_name/used/proc_macro/global_allocator 계열 — 링커·런타임·매크로가 부르는 진입점.
+///
+/// Rust 2024가 요구하는 `#[unsafe(no_mangle)]`·`#[unsafe(export_name = "..")]`와
+/// `#[cfg_attr(pred, no_mangle)]`의 안쪽 속성도 본다. 속성 경로의 마지막 세그먼트만 보면 앞의 둘은
+/// `unsafe`·`cfg_attr`로 읽혀 2024 판 FFI export 전부가 unreachable로 보였다. cfg_attr 술어는
+/// 평가하지 않는다 — 거짓일 수 있지만 보존하는 쪽으로 기운다.
 pub fn is_extern_entry(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|a| {
-        a.path().segments.last().is_some_and(|s| {
-            matches!(
-                s.ident.to_string().as_str(),
-                "no_mangle"
-                    | "export_name"
-                    | "used"
-                    | "proc_macro"
-                    | "proc_macro_derive"
-                    | "proc_macro_attribute"
-            )
-        })
-    })
+    attrs.iter().any(|a| meta_is_entry(&a.meta))
+}
+
+/// 속성 메타 하나가 진입점 속성인가 — `unsafe(..)`·`cfg_attr(pred, ..)` 안쪽까지 내려간다.
+fn meta_is_entry(meta: &syn::Meta) -> bool {
+    let Some(name) = meta.path().segments.last().map(|s| s.ident.to_string()) else {
+        return false;
+    };
+    if ENTRY_ATTRIBUTES.contains(&name.as_str()) {
+        return true;
+    }
+    let syn::Meta::List(list) = meta else {
+        return false;
+    };
+    match name.as_str() {
+        "unsafe" => syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+            .parse2(list.tokens.clone())
+            .is_ok_and(|inner| inner.iter().any(meta_is_entry)),
+        "cfg_attr" => matches!(
+            split_cfg_attr(&list.tokens),
+            Some((_, Ok(inner))) if inner.iter().any(meta_is_entry)
+        ),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `macro_rules!` 본문의 경로 — `$crate`는 `crate`로 바꾸고, 메타변수로 시작하는 경로와 한
+    /// 세그먼트 이름은 버린다. 괄호 묶음 안까지 내려간다.
+    #[test]
+    fn macro_body_paths_keep_crate_paths_and_skip_metavariables() {
+        let tokens: proc_macro2::TokenStream = syn::parse_str(
+            "($t:ty, $e:expr) => { $crate::m::helper($e); <$t>::new(); $t::make(); \
+             crate::a::b(); local(); { super::up::f() } }",
+        )
+        .unwrap();
+        let paths = macro_body_paths(tokens);
+        let paths: Vec<String> = paths.iter().map(|p| p.join("::")).collect();
+        assert_eq!(paths, ["crate::m::helper", "crate::a::b", "super::up::f"]);
+    }
 
     /// cfg_attr 술어의 문자열 리터럴은 이스케이프 원문 그대로 보존된다 —
     /// `feature = "a\x62c"`를 Meta로 재파싱해 value()를 다시 감싸면

@@ -65,6 +65,23 @@ jobs:
       # 도그푸딩 — 이 도구로 이 저장소를 분석한다
       - run: cargo run --locked --quiet -- rules --strict
       - run: cargo run --locked --quiet -- cycles --level symbol --strict
+      # dead는 0이 아니라 알려진 목록(scripts/self-dead.expected)과 같은지 본다 — 새 unreachable은
+      # 수확 회귀이거나 진짜 미사용이고, 사라진 항목은 목록을 줄여야 한다.
+      - run: scripts/verify-self-dead.sh
+
+  # semantic feature의 코드(sem.rs)는 기본 clippy가 컴파일하지 않는다 — 따로 lint한다. test 잡과 디스크를
+  # 나누지 않도록 별도 러너에서 돈다.
+  semantic-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          components: clippy
+      - run: cargo clippy --locked --all-targets --features semantic -- -D warnings
 
   # Cargo.toml의 rust-version과 같은 최소 툴체인 — 선언한 MSRV가 실제로 빌드되는지 본다. 1.96을 정하는
   # 것은 semantic feature다(ra_ap_tt의 std::assert_matches). clippy·테스트는 test 잡이 stable에서 돌린다.

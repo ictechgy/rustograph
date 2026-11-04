@@ -3,7 +3,7 @@
 //! 여기서도 판정은 보수적이다: unreachable은 "보존 루트에서 도달 불가"라는
 //! 그래프 사실이지 삭제 권고가 아니다.
 
-use crate::graph::{Document, Edge, EdgeKind, Kind};
+use crate::graph::{Document, Edge, EdgeKind, Kind, Level};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::OnceLock;
@@ -918,12 +918,11 @@ impl<'a> FirmGraph<'a> {
         let roots = names.len();
         let mut numbers: HashMap<&str, usize> =
             names.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        let data_types = symbol_level_data_types(doc);
         let mut edges = Vec::new();
-        for e in doc
-            .edges
-            .iter()
-            .filter(|e| e.kind.is_dependency() && !e.tentative)
-        {
+        for e in doc.edges.iter().filter(|e| {
+            e.kind.is_dependency() && !e.tentative && !is_data_recursion(e, &data_types)
+        }) {
             let from = number_of(&mut numbers, &mut names, &e.from);
             let to = number_of(&mut numbers, &mut names, &e.to);
             edges.push((from, to, e));
@@ -1092,6 +1091,29 @@ pub fn cycles(doc: &Document) -> CycleReport {
         cycles: result,
         excluded_tentative: excluded,
     }
+}
+
+/// 심볼 레벨 문서의 데이터 타입(struct·enum·union) 정점 ID — 다른 레벨이면 비어 있다.
+fn symbol_level_data_types(doc: &Document) -> BTreeSet<&str> {
+    if doc.level != Level::Symbol {
+        return BTreeSet::new();
+    }
+    doc.vertices
+        .iter()
+        .filter(|v| matches!(v.kind, Kind::Struct | Kind::Enum | Kind::Union))
+        .map(|v| v.id.as_str())
+        .collect()
+}
+
+/// 데이터 타입에서 데이터 타입으로 가는 references 간선인가 — 필드 타입 참조다(본문 참조는
+/// 함수·메서드·상수가 소유한다). 심볼 레벨 순환은 호출·사용의 재귀를 찾는 질의라, 서로를 필드로
+/// 담는 재귀 데이터 정의(`enum Expr { Block(Box<Stmt>) }`·`struct Stmt { e: Expr }`)는 순환으로
+/// 세지 않는다 — 직접 재귀를 세지 않는 것과 같은 판단이다. 같은 간선은 dead·rules와 type·module
+/// 레벨 순환에는 그대로 쓰인다.
+fn is_data_recursion(e: &Edge, data_types: &BTreeSet<&str>) -> bool {
+    e.kind == EdgeKind::References
+        && data_types.contains(e.from.as_str())
+        && data_types.contains(e.to.as_str())
 }
 
 /// 순환 SCC마다 증거 간선(양 끝이 같은 SCC인 확정 의존 간선)을 doc.edges 순서로

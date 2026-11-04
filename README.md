@@ -88,7 +88,8 @@ rustograph cycles --graph .rustograph/graph.json --strict
 rustograph cycles --level symbol --strict
 rustograph cycles --level module --exclude-nested-modules  # leave out parent/child-only module cycles
 
-# Report symbols unreachable from retention roots (fn main, #[no_mangle])
+# Report symbols unreachable from retention roots (fn main, #[no_mangle]/#[unsafe(no_mangle)],
+# #[export_name], #[used] and #[global_allocator] statics, #[proc_macro*] entry points)
 rustograph dead                           # symbol level, always
 rustograph dead --retain-public           # libraries: keep exported API
 rustograph dead --tests                   # also retain #[test]/#[bench]
@@ -183,6 +184,29 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
   is not reported by `cycles --level symbol`, while mutual recursion between
   two symbols is. Reachability is unaffected — a recursive function is reached
   through its callers.
+- A struct, enum, or union has a `references` edge to each workspace type its
+  fields name (generic parameters and `Self` excluded). At symbol level,
+  `cycles` leaves out such an edge between two data types: mutually recursive
+  data definitions (`enum Expr { Block(Box<Stmt>) }` with
+  `struct Stmt { e: Expr }`) are one type family, not a dependency to break.
+  Type- and module-level cycles, `dead`, and `rules` still use the edge.
+- `Self` in an impl body or signature resolves to the impl's self type.
+  `<T as Tr>::m()` calls `T`'s impl method, `<T>::m()` and an associated
+  function passed as a value (`.map(T::new)`) reach `T`'s same-name method.
+- A `macro_rules!` definition gets tentative `references` edges to the
+  multi-segment paths in its body (`$crate::m::f`); a macro call whose
+  arguments are not a comma-separated expression list (`json!({..})`) gets
+  tentative edges to the names in its tokens that resolve to workspace items
+  and are not local bindings. Like name fan-out, they feed reachability only.
+- Items inside a function body (a nested `fn`, a local `impl` or
+  `macro_rules!`) have no vertex; their edges belong to the enclosing body.
+- An impl whose self type is not a workspace vertex (`impl Tr for String`,
+  blanket `impl<T: Tr> Ext for T`, `impl Tr for &Local`) has no method
+  vertices. Its method bodies are attributed to the implemented workspace
+  trait's declared method, which also gets a `references` edge to the trait,
+  or to the enclosing module when the trait is external or does not declare
+  the method (a module is not a retention root, so that does not change
+  `dead`). `limitations` counts such impl blocks.
 - Name fan-out: a method call `x.m()` whose receiver type is unknown gets
   `tentative` call edges to the same-name workspace methods it could reach.
   Inherent (`T::m`) and trait-declared (`Tr::m`) methods come only
@@ -599,6 +623,13 @@ the crates, and points at `--retain-public` for libraries used outside the
 workspace. For a library used only inside the workspace these items really
 have no caller, and `--retain-public` would hide them. Exported items of
 crates that have a root, such as `pub` items of a binary, are not counted.
+
+Only lib and bin targets of workspace members are harvested — a `[lib]
+crate-type` such as `cdylib`, `staticlib`, or `rlib`, and a proc-macro lib,
+count as lib. Example, integration-test, and bench targets are not harvested,
+so workspace items used only from them are unreachable, even with `--tests`
+(which roots `#[test]` functions inside lib and bin targets); `limitations`
+counts such targets.
 
 The syntactic harvest does not read a module file — a `mod` file or a crate
 root — larger than 64 MiB. Its module or crate vertex stays, but the items and

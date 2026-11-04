@@ -207,13 +207,26 @@ jobs:
           bash scripts/publish-release-assets.sh "$TAG" "$RELEASE_COMMIT" notes.md
 
       # tap 저장소는 다른 저장소라 기본 GITHUB_TOKEN으로는 쓸 수 없다.
-      # HOMEBREW_TAP_TOKEN 시크릿이 있을 때만 formula를 갱신하고, 없으면 조용히 건너뛴다.
+      # HOMEBREW_TAP_TOKEN 시크릿이 있을 때만 formula를 갱신한다. 없으면 건너뛰되, 실행 요약과 경고 주석으로
+      # 남긴다 — 단계가 성공으로 끝나 로그를 열지 않으면 tap이 낡은 채 남는 것을 놓쳤다.
       - name: Update the Homebrew tap
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           sha() { grep "rustograph-${VERSION}-$1" checksums.txt | cut -d' ' -f1; }
           if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "::warning title=Homebrew tap not updated::HOMEBREW_TAP_TOKEN is not configured; update ictechgy/homebrew-tap Formula/rustograph.rb by hand (values in the job summary)."
+            {
+              echo "### Homebrew tap not updated"
+              echo "HOMEBREW_TAP_TOKEN is not configured. Update the tap by hand with:"
+              echo ""
+              echo "| field | value |"
+              echo "|---|---|"
+              echo "| version | ${VERSION} |"
+              for t in darwin-arm64 darwin-amd64 linux-arm64 linux-amd64; do
+                echo "| $t | $(sha "$t.tar.gz") |"
+              done
+            } >> "$GITHUB_STEP_SUMMARY"
             echo "HOMEBREW_TAP_TOKEN is not configured; update the tap with these values:"
             echo "  version   ${VERSION}"
             for t in darwin-arm64 darwin-amd64 linux-arm64 linux-amd64; do

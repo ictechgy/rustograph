@@ -840,8 +840,8 @@ fn harvest(
                 continue;
             };
             let to_pkg = &meta.packages[ti];
-            // 멤버는 lib 루트 정점부터 걷는다 — lib 타깃 이름이 정점 ID다.
-            // lib이 없는 멤버(proc-macro 타깃만 있거나 순수 bin 패키지)는
+            // 멤버는 lib 루트 정점부터 걷는다 — lib 타깃 이름이 정점 ID다(proc-macro·cdylib도
+            // lib으로 정규화돼 있다). lib이 없는 멤버(순수 bin 패키지)는
             // extern crate로 링크할 수 없으니 크레이트 정점으로 붕괴한다 —
             // bin-only면 bin 루트 정점, lib/bin이 전혀 없으면 패키지 정점.
             // 외부 패키지 정점은 항상 패키지 이름이다(emit_crate_level).
@@ -908,6 +908,14 @@ fn harvest(
             tree.orphan_files.len()
         ));
     }
+    let unharvested = unharvested_targets(meta);
+    if unharvested > 0 {
+        limitations.push(format!(
+            "{unharvested} example/test/bench targets of workspace members are not harvested; \
+             workspace items used only from them are reported unreachable, even with --tests \
+             (which roots #[test] functions inside lib and bin targets only)"
+        ));
+    }
     push_skipped_mods(&tree.skipped_mods, &mut limitations);
     if !oversized.is_empty() {
         limitations.push(format!(
@@ -952,6 +960,7 @@ fn harvest(
     let mut bodies: Vec<BodyItem<'_>> = Vec::new();
     let mut impls: Vec<harvest::ImplBlock<'_>> = Vec::new();
     let mut attr_refs: Vec<harvest::AttrRef> = Vec::new();
+    let mut decl_refs: Vec<harvest::DeclRef> = Vec::new();
     let mut test_roots: Vec<String> = Vec::new();
     let mut annotated_roots: Vec<String> = Vec::new();
     // 지역명이 fn owner_spans와 같으면 이름 해석이 함수 정점으로 읽어 거짓 순환이 된다.
@@ -974,22 +983,34 @@ fn harvest(
         test_roots.extend(mh.decls.test_roots);
         bodies.extend(mh.decls.bodies);
         attr_refs.extend(mh.decls.attr_refs);
+        decl_refs.extend(mh.decls.decl_refs);
         impls.extend(mh.decls.impls);
         item_spans.extend(mh.decls.owner_spans);
     }
+    // 트레이트 선언 메서드는 1패스에서 다 수확됐다 — self 타입이 워크스페이스 밖인 impl의 본문을
+    // 그 선언 메서드가 대신 소유할 수 있는지 이 목록으로 본다.
+    let declared_methods: BTreeSet<String> = vertices
+        .iter()
+        .filter(|v| v.kind == Kind::Method)
+        .map(|v| v.id.clone())
+        .collect();
+    let mut foreign_bodies: Vec<BodyItem<'_>> = Vec::new();
     for block in &impls {
         let krate = modtree::crate_of(&block.items_module);
-        let (vs, es, ar, bs) = harvest::impls_with_identities(
+        let parts = harvest::impls_with_identities(
             std::slice::from_ref(block),
             &krate,
             &tree,
+            &declared_methods,
             &mut harvest,
             &mut identity_registry,
         );
-        vertices.extend(vs);
-        edges.extend(es);
-        attr_refs.extend(ar);
-        bodies.extend(bs);
+        vertices.extend(parts.vertices);
+        edges.extend(parts.edges);
+        attr_refs.extend(parts.attr_refs);
+        bodies.extend(parts.bodies);
+        annotated_roots.extend(parts.entry_roots);
+        foreign_bodies.extend(parts.foreign_bodies);
     }
     let identities = identity_registry.identify(&mut vertices, &meta.workspace_root);
     drop(identity_registry);
@@ -997,6 +1018,28 @@ fn harvest(
     edges.extend_from_slice(identities.members());
     for body in &mut bodies {
         body.id = identities.owner(&body.id, &body.module, &body.file, body.range.start);
+    }
+    // 대신 소유시킨 본문은 소유자가 정점으로 남았을 때만 쓴다 — 같은 경로의 트레이트 선언이 여럿이라
+    // 선언 메서드가 소스 인스턴스 ID로 바뀌었으면 impl 모듈이 소유한다(유령 정점 금지).
+    let vertex_ids: BTreeSet<&str> = vertices.iter().map(|v| v.id.as_str()).collect();
+    for mut body in foreign_bodies {
+        let trait_id = (body.id != body.module && vertex_ids.contains(body.id.as_str()))
+            .then(|| body.id.rsplit_once("::").map(|(t, _)| t.to_string()))
+            .flatten()
+            .filter(|t| vertex_ids.contains(t.as_str()));
+        match trait_id {
+            // 선언 메서드가 소유한 본문은 그 트레이트의 impl이다. self 타입 정점이 없어 implements
+            // 간선을 둘 수 없으니 소유 메서드에서 트레이트로 references 간선을 둔다 — 워크스페이스 밖
+            // 타입에만 구현한 확장 트레이트(`impl ItemIdent for syn::Item`)는 이것이 없으면 메서드를
+            // 써도 트레이트 정점이 unreachable이었다.
+            Some(trait_id) => {
+                let mut e = Edge::new(body.id.clone(), trait_id, EdgeKind::References);
+                e.cfg = body.cfg.clone();
+                edges.push(e);
+            }
+            None => body.id = body.module.clone(),
+        }
+        bodies.push(body);
     }
     for span in &mut item_spans {
         let module = span
@@ -1007,6 +1050,9 @@ fn harvest(
         span.id = identities.owner(&span.id, module, &span.file, span.range.start);
     }
     identities.attributes(&mut attr_refs);
+    for r in &mut decl_refs {
+        r.owner = identities.owner(&r.owner, &r.module, &r.file, r.start);
+    }
     identities.roots(&mut entry_roots);
     identities.annotated_roots(&mut annotated_roots, false);
     entry_roots.extend(annotated_roots);
@@ -1136,6 +1182,8 @@ fn harvest(
             harvest::attr_edges(&attr_refs, &tree, &dep_crates, &mut harvest),
             false,
         ));
+        // 필드 타입·`macro_rules!` 본문 경로 — 속성처럼 모드와 무관하게 syn이 권위다.
+        edges.extend(identities.edges(harvest::decl_edges(&decl_refs, &tree, &dep_crates), false));
     }
 
     push_limitations(&harvest, &mut limitations);
@@ -1348,8 +1396,9 @@ fn emit_crate_level(
         // 충돌한다.
         if p.workspace_member {
             let vertex = p.crate_vertex();
-            // lib/bin 타깃이 없는 멤버(proc-macro 크레이트 등)는 겸임할 루트
-            // 모듈이 없다 — depends 간선이 dangling하지 않게 정점을 만든다.
+            // lib/bin 타깃이 없는 멤버(example·test·bench 타깃만 있는 패키지)는 겸임할
+            // 루트 모듈이 없다 — depends 간선이 dangling하지 않게 정점을 만든다. proc-macro·
+            // cdylib 같은 lib 계열 crate type은 cargo_meta가 "lib"으로 정규화해 여기 오지 않는다.
             if p.targets
                 .iter()
                 .all(|t| !matches!(t.kind.as_str(), "lib" | "bin"))
@@ -1455,6 +1504,17 @@ impl InputTree {
             None => Err(error),
         }
     }
+}
+
+/// 수확하지 않는 워크스페이스 멤버 타깃(example·test·bench) 수 — 그 타깃에서만 쓰는 아이템은
+/// 호출자가 그래프에 없어 unreachable로 보이므로 dead의 한계로 센다.
+fn unharvested_targets(meta: &Metadata) -> usize {
+    meta.packages
+        .iter()
+        .filter(|p| p.workspace_member)
+        .flat_map(|p| &p.targets)
+        .filter(|t| matches!(t.kind.as_str(), "example" | "test" | "bench"))
+        .count()
 }
 
 /// 수확 대상 타깃 — 워크스페이스 멤버의 lib·bin이다. example/test/bench 타깃은
@@ -1831,6 +1891,15 @@ fn push_skipped_mods(
 
 /// 수확 실측을 limitation 문장으로 옮긴다.
 fn push_limitations(h: &Harvest, limitations: &mut Vec<String>) {
+    if h.foreign_self_impls > 0 {
+        limitations.push(format!(
+            "{} impl blocks have a self type outside the workspace graph (std or external types, \
+             references, or generic parameters); their methods have no vertex, so each body is \
+             attributed to the implemented workspace trait's declared method, or to the enclosing \
+             module when the trait is external or does not declare it",
+            h.foreign_self_impls
+        ));
+    }
     if h.unresolved_paths > 0 {
         limitations.push(format!(
             "{} path references could not be resolved within the workspace (external crates, prelude names, or macro-generated names)",
