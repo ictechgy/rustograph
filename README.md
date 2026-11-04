@@ -631,8 +631,9 @@ Only lib and bin targets of workspace members are harvested — a `[lib]
 crate-type` such as `cdylib`, `staticlib`, or `rlib`, and a proc-macro lib,
 count as lib. Example, integration-test, and bench targets are not harvested,
 so workspace items used only from them are unreachable, even with `--tests`
-(which roots `#[test]` functions inside lib and bin targets); `limitations`
-counts such targets.
+(which roots `#[test]` functions inside lib and bin targets), and their own
+modules are not checked by `cycles` or `rules`; `limitations` counts such
+targets.
 
 The syntactic harvest does not read a module file — a `mod` file or a crate
 root — larger than 64 MiB. Its module or crate vertex stays, but the items and

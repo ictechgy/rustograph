@@ -392,8 +392,8 @@ unreachable로 보고할 수 있습니다. `schema`는 그런 파일을 `unparse
 
 수확은 워크스페이스 멤버의 lib·bin 타깃만 돕니다 — `cdylib`·`staticlib`·`rlib` 같은 `[lib] crate-type`과
 proc-macro lib도 lib으로 셉니다. 예제·통합 테스트·벤치 타깃은 수확하지 않아 그 타깃에서만 쓰는 아이템은
-`--tests`를 줘도(lib·bin 안의 `#[test]` 함수만 루트로 삼습니다) unreachable이고, `limitations`가 그런 타깃
-수를 셉니다.
+`--tests`를 줘도(lib·bin 안의 `#[test]` 함수만 루트로 삼습니다) unreachable이고, 그 타깃 자신의 모듈은
+`cycles`·`rules`가 검사하지 않습니다. `limitations`가 그런 타깃 수를 셉니다.
 
 구문 그래프의 규칙 몇 가지입니다. struct·enum·union은 필드가 가리키는 워크스페이스 타입마다 `references`
 간선을 가집니다(제네릭 매개변수·`Self` 제외). 심볼 레벨 `cycles`는 두 데이터 타입 사이의 이 간선을 빼고

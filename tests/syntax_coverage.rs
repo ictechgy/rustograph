@@ -548,9 +548,11 @@ fn unharvested_targets_are_counted_as_a_limitation() {
         ],
     );
     let doc = symbols(ws.path());
+    // 그 타깃 자신의 모듈도 그래프에 없다 — cycles·rules 출력에서 이 문구가 무엇을 못 봤는지 말한다.
     assert!(
         doc.limitations.iter().any(|l| l
-            .starts_with("3 example/test/bench targets of workspace members are not harvested")),
+            .starts_with("3 example/test/bench targets of workspace members are not harvested")
+            && l.ends_with("their own modules are not checked by cycles or rules")),
         "{:?}",
         doc.limitations
     );

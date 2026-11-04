@@ -913,7 +913,8 @@ fn harvest(
         limitations.push(format!(
             "{unharvested} example/test/bench targets of workspace members are not harvested; \
              workspace items used only from them are reported unreachable, even with --tests \
-             (which roots #[test] functions inside lib and bin targets only)"
+             (which roots #[test] functions inside lib and bin targets only), and their own \
+             modules are not checked by cycles or rules"
         ));
     }
     push_skipped_mods(&tree.skipped_mods, &mut limitations);
