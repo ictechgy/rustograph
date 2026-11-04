@@ -1013,3 +1013,55 @@ fn local_impl_method_parameters_shadow_module_items() {
             .collect::<Vec<_>>()
     );
 }
+
+/// `<T>::X`·`<T as Tr>::X`를 호출이 아니라 값으로 쓴 경로도 T의 연관 아이템이다 — 값 경로가 qself를
+/// 버리고 `X`만 해석해 `<T>::C`가 같은 이름의 모듈 상수로 읽혔고, 값으로만 넘긴 `<T as Tr>::m`의
+/// impl 메서드는 unreachable이었다.
+#[test]
+fn qualified_self_value_paths_point_at_the_type() {
+    let ws = Workspace::new(
+        "qselfvalue",
+        &[
+            ("Cargo.toml", &manifest("qselfvalue")),
+            (
+                "src/main.rs",
+                "pub trait Tr { fn m(&self) -> u32; }\npub struct T;\nimpl T { pub fn make() -> T { T } }\nimpl Tr for T { fn m(&self) -> u32 { only_from_impl() } }\nfn only_from_impl() -> u32 { 2 }\npub fn make() -> T { T }\npub fn m(_: &T) -> u32 { 9 }\nfn main() {\n    let f = <T as Tr>::m;\n    let g = <T>::make;\n    println!(\"{}\", f(&g()));\n}\n",
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(!has_edge(
+        &doc,
+        "qselfvalue::main",
+        "qselfvalue::make",
+        EdgeKind::References
+    ));
+    assert!(!has_edge(
+        &doc,
+        "qselfvalue::main",
+        "qselfvalue::m",
+        EdgeKind::References
+    ));
+    assert!(has_edge(
+        &doc,
+        "qselfvalue::main",
+        "qselfvalue::T::make",
+        EdgeKind::References
+    ));
+    assert!(has_edge(
+        &doc,
+        "qselfvalue::main",
+        "qselfvalue::T::<Tr>::m",
+        EdgeKind::References
+    ));
+    let report = analysis::dead(&doc).unwrap();
+    assert_not_reported(
+        &report,
+        &[
+            "qselfvalue::T::make",
+            "qselfvalue::T::<Tr>::m",
+            "qselfvalue::only_from_impl",
+        ],
+    );
+    assert_reported(&report, &["qselfvalue::make", "qselfvalue::m"]);
+}

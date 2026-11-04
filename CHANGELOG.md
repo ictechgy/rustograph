@@ -30,7 +30,8 @@ CLI 플래그·기본값, 그래프 문서 v1, 순회 문서 v1은 그대로다.
   references 간선을 갖는다 — 트레이트 모듈이 impl 모듈에 의존하는 것처럼 보이지 않는다. 그런 impl 블록 수를
   limitation으로 싣는다.
 - `<T as Tr>::m()`은 `T`의 impl 메서드로, `<T>::m()`과 값으로 넘긴 연관 함수(`.map(T::new)`)는 `T`의 같은 이름
-  메서드로 간선을 잇는다.
+  메서드로 간선을 잇는다. 호출이 아니라 값으로 쓴 `<T>::X`·`<T as Tr>::m`(`let f = <T as Tr>::m;`)도 같은 규칙이다 —
+  `<T>::X`가 같은 이름의 모듈 아이템으로 읽히지 않는다.
 - 수확하지 않는 example·test·bench 타깃 수를 limitation으로 싣는다.
 - `deps` 텍스트 출력이 normal 의존의 종류를 `(kind: )` 대신 `(kind: normal)`로 쓴다. JSON은 그대로다.
 - isthmus 공유 적합성 벡터를 `c76e105`로 다시 벤더링하고 `sql-relations.json`을 더했다. SQL 관계 이름 단위 테스트는

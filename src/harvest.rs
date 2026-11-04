@@ -1201,6 +1201,48 @@ impl BodyVisitor<'_> {
         self.scopes.pop();
     }
 
+    /// `<T>::X`·`<T as Tr>::X`를 호출이 아니라 값으로 쓴 경로 — `.map(<T>::new)`나 `let f = <T as Tr>::m;`.
+    /// `<T>::X`는 타입 상대 경로라 `T::X`처럼 T의 연관 아이템을 가리킨다(`X`만 값 경로로 해석하면 같은
+    /// 이름의 자유 아이템으로 오독한다). `<T as Tr>::m`은 트레이트 선언으로 가는 기존 해석에 더해, T가
+    /// 그 트레이트를 구현한 `T::<Tr>::m`이 있으면 그것을 가리킨다 — 호출 위치와 같은 규칙이다. qself
+    /// 타입과 경로의 타입 인자는 참조다.
+    fn visit_qualified_value_path(&mut self, qself: &syn::QSelf, path: &syn::Path) {
+        let segs = path_segments(path);
+        let owner = match &*qself.ty {
+            syn::Type::Path(ty) => self.resolve(&path_segments(&ty.path)),
+            _ => None,
+        };
+        if qself.position == 0 {
+            match (&owner, segs.last()) {
+                (Some(ty), Some(name)) => self.push_associated(ty, name),
+                _ => self.unresolved += 1,
+            }
+        } else {
+            if let Some(id) = self.resolve(&segs[..qself.position]) {
+                self.push(id, EdgeKind::References);
+            }
+            match self.resolve_value(&segs) {
+                ValueRes::Item(id) => self.push(id, EdgeKind::References),
+                ValueRes::Local => {}
+                ValueRes::Unresolved => self.unresolved += 1,
+            }
+            if let (Some(ty), Some(name)) = (&owner, segs.last()) {
+                let exact = format!("{ty}::<{}>::{name}", segs[qself.position - 1]);
+                if self
+                    .method_index
+                    .get(name)
+                    .is_some_and(|ids| ids.contains(&exact))
+                {
+                    self.push(exact, EdgeKind::References);
+                }
+            }
+        }
+        self.visit_type(&qself.ty);
+        for segment in &path.segments {
+            syn::visit::visit_path_arguments(self, &segment.arguments);
+        }
+    }
+
     fn push(&mut self, to: String, kind: EdgeKind) {
         // 외부 크레이트 정점으로의 간선 — 크레이트 안은 안 보이니
         // `dep::f()`의 call도 실은 "크레이트 경계 참조"다. 멤버 크레이트
@@ -1756,6 +1798,9 @@ impl Visit<'_> for BodyVisitor<'_> {
     }
 
     fn visit_expr_path(&mut self, e: &syn::ExprPath) {
+        if let Some(qself) = &e.qself {
+            return self.visit_qualified_value_path(qself, &e.path);
+        }
         // 호출이 아닌 경로 참조 — filter_map(f) 같은 함수 값 포함.
         // 단일 식별자는 모듈 아이템이면 잡고 지역 변수면 조용히 넘긴다.
         let segs = path_segments(&e.path);
