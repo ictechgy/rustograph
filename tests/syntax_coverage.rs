@@ -972,3 +972,42 @@ fn derive_names_count_as_uses_of_a_proc_macro_crate() {
         "used proc-macro dependency reported unused: {unused:?}"
     );
 }
+
+/// 함수 안 `impl`·`trait`의 메서드 매개변수는 그 본문에서 같은 이름의 아이템을 가린다 — 묶지 않으면
+/// 매개변수 `log("x")` 호출이 모듈 함수 `log`로 읽혀 거짓 순환이 생겼다.
+#[test]
+fn local_impl_method_parameters_shadow_module_items() {
+    let ws = Workspace::new(
+        "localimplparams",
+        &[
+            ("Cargo.toml", &manifest("localimplparams")),
+            (
+                "src/main.rs",
+                "pub fn log(_: &str) { run() }\npub fn trace(_: &str) { run2() }\npub fn run() {\n    struct L;\n    impl L {\n        fn m(&self, log: &dyn Fn(&str)) { log(\"x\") }\n    }\n    L.m(&|_| {});\n}\npub fn run2() {\n    trait T { fn t(&self, trace: &dyn Fn(&str)) { trace(\"y\") } }\n    struct M;\n    impl T for M {}\n    M.t(&|_| {});\n}\nfn main() { log(\"a\"); trace(\"b\"); }\n",
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(!has_edge(
+        &doc,
+        "localimplparams::run",
+        "localimplparams::log",
+        EdgeKind::Call
+    ));
+    assert!(!has_edge(
+        &doc,
+        "localimplparams::run2",
+        "localimplparams::trace",
+        EdgeKind::Call
+    ));
+    let cycles = analysis::cycles(&doc);
+    assert!(
+        cycles.cycles.is_empty(),
+        "{:?}",
+        cycles
+            .cycles
+            .iter()
+            .map(|c| c.members.clone())
+            .collect::<Vec<_>>()
+    );
+}

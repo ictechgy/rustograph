@@ -1184,6 +1184,23 @@ struct BodyVisitor<'a> {
 }
 
 impl BodyVisitor<'_> {
+    /// 함수 안 `impl`·`trait`의 메서드 — 정점이 없어 바깥 본문이 소유한다. 매개변수는 그 본문에서
+    /// 같은 이름의 아이템을 가리므로 `Item::Fn`처럼 묶는다(묶지 않으면 매개변수 호출이 모듈 함수로
+    /// 읽혀 거짓 간선·순환이 생겼다). 시그니처의 타입 경로는 그대로 방문한다.
+    fn visit_local_method(&mut self, sig: &syn::Signature, body: Option<&syn::Block>) {
+        self.scopes.push();
+        for input in &sig.inputs {
+            if let syn::FnArg::Typed(t) = input {
+                self.scopes.bind(&t.pat);
+            }
+        }
+        self.visit_signature(sig);
+        if let Some(block) = body {
+            self.visit_block(block);
+        }
+        self.scopes.pop();
+    }
+
     fn push(&mut self, to: String, kind: EdgeKind) {
         // 외부 크레이트 정점으로의 간선 — 크레이트 안은 안 보이니
         // `dep::f()`의 call도 실은 "크레이트 경계 참조"다. 멤버 크레이트
@@ -1709,6 +1726,20 @@ impl Visit<'_> for BodyVisitor<'_> {
             self.visit_expr(&arm.body);
             self.scopes.pop();
         }
+    }
+
+    fn visit_impl_item_fn(&mut self, f: &syn::ImplItemFn) {
+        for attr in &f.attrs {
+            self.visit_attribute(attr);
+        }
+        self.visit_local_method(&f.sig, Some(&f.block));
+    }
+
+    fn visit_trait_item_fn(&mut self, f: &syn::TraitItemFn) {
+        for attr in &f.attrs {
+            self.visit_attribute(attr);
+        }
+        self.visit_local_method(&f.sig, f.default.as_ref());
     }
 
     fn visit_expr_closure(&mut self, e: &syn::ExprClosure) {
