@@ -26,8 +26,6 @@
 - 모듈 임포트 표가 이름당 이름공간 하나라 `fn harvest`와 `use crate::harvest::{self}`가 함께 있는 모듈을
   `use super::*`로 들이면 `harvest::x()`가 풀리지 않는다(`scripts/self-dead.expected`의 2건). 타입·값
   이름공간을 나눈 글롭 바인딩이 필요하다.
-- `query` 출력 스키마가 cartograph·kartograph·dartograph(`usedBy`·`dependsOn`·`reachability`)와 다르다
-  (`neighbors[]`·`direction`·snake_case `edge_evidence`). 맞추면 공개 JSON 계약이 깨지므로 결정이 필요하다.
 - Homebrew tap 자동 갱신은 `HOMEBREW_TAP_TOKEN` 리포 시크릿이 있어야 돈다 — 없으면 Release가 그 단계를
   건너뛰므로 릴리스마다 로그로 확인하고, 수동 절차는 아래 "다음 단계" 1번을 따른다.
 
