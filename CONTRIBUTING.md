@@ -11,8 +11,10 @@ cargo test --locked
 cargo test --locked --features semantic
 cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --check
+cargo clippy --locked --all-targets --features semantic -- -D warnings
 scripts/coverage.sh
 scripts/verify-cli-contract.sh
+scripts/verify-self-dead.sh                                    # self-analysis dead vs scripts/self-dead.expected
 cargo +1.96.0 check --locked --all-targets                     # MSRV (`rust-version` in Cargo.toml)
 cargo +1.96.0 check --locked --all-targets --features semantic
 ```

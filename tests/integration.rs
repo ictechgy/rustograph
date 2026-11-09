@@ -847,8 +847,14 @@ mod cli_tests {
             .iter()
             .filter(|e| e["kind"] != "contains" && inside(&e["from"]) != inside(&e["to"]))
             .count();
-        // fixture_app::main이 포커스 밖 루트이고, 그 main이 fixture_core를 부른다.
-        assert_eq!(dropped_roots, 1);
+        // fixture_app::main과 proc-macro 크레이트 fixture_macros의 진입점(`#[proc_macro*]`)이
+        // 포커스 밖 루트이고, 그 main이 fixture_core를 부른다.
+        let macro_roots = roots
+            .iter()
+            .filter(|r| r.as_str().unwrap().starts_with("fixture_macros::"))
+            .count();
+        assert!(macro_roots > 0, "proc-macro entry points are roots");
+        assert_eq!(dropped_roots, 1 + macro_roots);
         assert!(crossing > 0);
         let head = format!(
             "--focus dropped {dropped_roots} retention roots and {crossing} dependency edges \
@@ -1778,11 +1784,12 @@ pub fn nested_fn() { let _ = { fn go(helper: u32) -> u32 { helper } go(1) }; }
 /// 아레나의 문장을 직접 돌아도 이 규칙이 그대로여야 그래프가 바뀌지 않는다.
 /// - `let .. else`의 else 블록은 묶음보다 먼저 본다 — 그 안의 같은 이름은 아이템이다.
 /// - `;`로 끝난 문장 위치 매크로는 표현식 매크로처럼 인자를 파싱해 호출을 잡는다.
-/// - 최상위 아이템(`fn` 본문 바로 안의 `fn`)은 방문하지 않는다.
-/// - 중첩 블록은 syn 기본 순회를 따른다: 블록 안 아이템은 방문하고, `;`로 끝난 문장 매크로의
-///   인자는 파싱하지 않는다. 의도한 의미라기보다 지금의 출력이다 — 바꾸면 간선이 달라지므로
-///   본문 순회를 고칠 때 함께 바뀌지 않게 여기서 고정한다.
-/// - 정점의 unsafe 표시도 같은 범위를 본다(최상위 아이템·매크로 토큰 안은 보지 않는다).
+/// - 함수 안 아이템(`fn` 본문 바로 안의 `fn`, 중첩 블록 안의 `fn`)은 방문한다 — 정점이 없는 그
+///   아이템의 간선은 바깥 본문이 소유한다. 예전에는 최상위 아이템만 건너뛰어, 그 안에서만 부르는
+///   함수가 unreachable로 보였다.
+/// - 중첩 블록의 `;`로 끝난 문장 매크로도 인자를 파싱한다 — 예전에는 syn 기본 순회만 따라
+///   `for`·`if` 블록 안 `println!`·`assert_eq!`의 호출이 간선 없이 사라졌다.
+/// - 정점의 unsafe 표시는 간선과 범위가 다르다 — 최상위 아이템·매크로 토큰 안은 보지 않는다.
 #[test]
 fn top_level_body_statements_keep_their_visit_rules() {
     let tmp = std::env::temp_dir().join(format!("rg-top-stmts-{}", std::process::id()));
@@ -1851,11 +1858,11 @@ pub trait U { fn provided(&self) { unsafe {} } fn required(&self); }
     assert!(has("crate_macro", "mac") && has("crate_macro", "item"));
     assert!(has("Q::method", "item"));
     assert!(has("T::provided", "mac") && has("T::provided", "other"));
-    // 중첩 블록: 아이템은 방문하고, `;`로 끝난 문장 매크로 인자는 파싱하지 않는다.
+    // 중첩 블록: 아이템은 방문하고, `;`로 끝난 문장 매크로 인자도 파싱한다.
     assert!(has("block_item", "other"));
-    assert!(!has("nested_macro", "item"), "nested statement macro");
-    // 최상위 아이템은 방문하지 않는다.
-    assert!(!has("top_item", "helper"), "top-level item");
+    assert!(has("nested_macro", "item"), "nested statement macro");
+    // 최상위 아이템도 방문한다 — 간선은 바깥 함수가 소유한다.
+    assert!(has("top_item", "helper"), "top-level item");
     let is_unsafe = |id: &str| {
         let id = format!("topstmt::{id}");
         d.vertices

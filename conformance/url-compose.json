@@ -1913,6 +1913,7 @@
       "ruleId": "compose.base-join",
       "provenance": "contract",
       "source": "docs/HTTP-WRAPPERS.md#go-rust-python-클라이언트",
+      "versionRange": ">=3.8",
       "appliesTo": [
         "producer:pythograph"
       ],
@@ -1924,13 +1925,15 @@
       "expect": {
         "template": "/users",
         "pathAnchor": "root"
-      }
+      },
+      "note": "A rooted path works on every base_url form since aiohttp 3.8 (origin-only base in 3.8-3.10, a base path is replaced from 3.11)."
     },
     {
       "id": "base-join/aiohttp-unknown-base-relative",
       "ruleId": "compose.base-join",
       "provenance": "contract",
       "source": "docs/HTTP-WRAPPERS.md#go-rust-python-클라이언트",
+      "versionRange": ">=3.11",
       "appliesTo": [
         "producer:pythograph"
       ],
@@ -1942,7 +1945,973 @@
       "expect": {
         "template": "/users",
         "pathAnchor": "base"
+      },
+      "note": "Relative paths without a leading / are accepted since aiohttp 3.11; a producer that cannot prove 3.11+ emits dynamic + ambiguous-base-join:."
+    },
+    {
+      "id": "base-join/js-axios-root",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "axios-base-url",
+        "base": "https://api.example.com/v1/",
+        "path": "/items"
+      },
+      "expect": {
+        "template": "/v1/items",
+        "pathAnchor": "root",
+        "authority": "api.example.com"
       }
+    },
+    {
+      "id": "base-join/js-axios-relative",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "axios-base-url",
+        "base": "https://api.example.com/v1",
+        "path": "items"
+      },
+      "expect": {
+        "template": "/v1/items",
+        "pathAnchor": "root",
+        "authority": "api.example.com"
+      }
+    },
+    {
+      "id": "base-join/js-axios-empty",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "axios-base-url",
+        "base": "https://api.example.com/v1",
+        "path": ""
+      },
+      "expect": {
+        "template": "/v1",
+        "pathAnchor": "root",
+        "authority": "api.example.com"
+      }
+    },
+    {
+      "id": "base-join/js-axios-absolute",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "axios-base-url",
+        "base": "https://api.example.com/v1",
+        "path": "https://other.example.com/items"
+      },
+      "expect": {
+        "template": "/items",
+        "pathAnchor": "root",
+        "authority": "other.example.com"
+      }
+    },
+    {
+      "id": "base-join/js-axios-authority",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "axios-base-url",
+        "base": "https://api.example.com/v1",
+        "path": "//other.example.com/items"
+      },
+      "expect": {
+        "template": "/items",
+        "pathAnchor": "root",
+        "authority": "other.example.com"
+      }
+    },
+    {
+      "id": "base-join/js-axios-boundary",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "axios-base-url",
+        "base": "https://api.example.com/v1///",
+        "path": "items"
+      },
+      "expect": {
+        "template": "/v1/items",
+        "pathAnchor": "root",
+        "authority": "api.example.com"
+      }
+    },
+    {
+      "id": "base-join/js-axios-dot",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "axios-base-url",
+        "base": "https://api.example.com/v1",
+        "path": "/items/../users"
+      },
+      "expect": {
+        "template": "/v1/users",
+        "pathAnchor": "root",
+        "authority": "api.example.com"
+      }
+    },
+    {
+      "id": "base-join/js-axios-unknown",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "axios-base-url",
+        "base": null,
+        "path": "/items"
+      },
+      "expect": {
+        "template": "/items",
+        "pathAnchor": "base"
+      }
+    },
+    {
+      "id": "base-join/js-ky1-relative",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-prefix-url",
+        "base": "https://api.example.com/v1",
+        "path": "items"
+      },
+      "expect": {
+        "template": "/v1/items",
+        "pathAnchor": "root",
+        "authority": "api.example.com"
+      }
+    },
+    {
+      "id": "base-join/js-ky1-double-slash",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-prefix-url",
+        "base": "https://api.example.com/v1//",
+        "path": "items"
+      },
+      "expect": {
+        "template": "/v1//items",
+        "pathAnchor": "root",
+        "authority": "api.example.com"
+      }
+    },
+    {
+      "id": "base-join/js-ky1-absolute-prefix",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-prefix-url",
+        "base": "https://api.example.com/v1",
+        "path": "https://other.example.com/items"
+      },
+      "expect": {
+        "template": "/v1/https://other.example.com/items",
+        "pathAnchor": "root",
+        "authority": "api.example.com"
+      }
+    },
+    {
+      "id": "base-join/js-ky2-prefix-root",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-prefix",
+        "base": "https://api.example.com/v1///",
+        "path": "/items"
+      },
+      "expect": {
+        "template": "/v1/items",
+        "pathAnchor": "root",
+        "authority": "api.example.com"
+      }
+    },
+    {
+      "id": "base-join/js-ky2-prefix-relative",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-prefix",
+        "base": "https://api.example.com/v1",
+        "path": "items"
+      },
+      "expect": {
+        "template": "/v1/items",
+        "pathAnchor": "root",
+        "authority": "api.example.com"
+      }
+    },
+    {
+      "id": "base-join/js-ky2-prefix-absolute",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-prefix",
+        "base": "https://api.example.com/v1",
+        "path": "https://other.example.com/items"
+      },
+      "expect": {
+        "template": "/v1/https://other.example.com/items",
+        "pathAnchor": "root",
+        "authority": "api.example.com"
+      }
+    },
+    {
+      "id": "base-join/js-ky2-prefix-unknown",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-prefix",
+        "base": null,
+        "path": "/items"
+      },
+      "expect": {
+        "template": "/items",
+        "pathAnchor": "base"
+      }
+    },
+    {
+      "id": "base-join/js-ky2-base-file",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-base-url",
+        "base": "https://api.example.com/v1",
+        "path": "items"
+      },
+      "expect": {
+        "template": "/items",
+        "pathAnchor": "root",
+        "authority": "api.example.com"
+      }
+    },
+    {
+      "id": "base-join/js-ky2-base-dir",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-base-url",
+        "base": "https://api.example.com/v1/",
+        "path": "items"
+      },
+      "expect": {
+        "template": "/v1/items",
+        "pathAnchor": "root",
+        "authority": "api.example.com"
+      }
+    },
+    {
+      "id": "base-join/js-ky2-base-root",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-base-url",
+        "base": "https://api.example.com/v1/",
+        "path": "/items"
+      },
+      "expect": {
+        "template": "/items",
+        "pathAnchor": "root",
+        "authority": "api.example.com"
+      }
+    },
+    {
+      "id": "base-join/js-ky2-base-absolute",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-base-url",
+        "base": "https://api.example.com/v1/",
+        "path": "https://other.example.com/items"
+      },
+      "expect": {
+        "template": "/items",
+        "pathAnchor": "root",
+        "authority": "other.example.com"
+      }
+    },
+    {
+      "id": "base-join/js-ky2-base-unknown-root",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-base-url",
+        "base": null,
+        "path": "/items"
+      },
+      "expect": {
+        "template": "/items",
+        "pathAnchor": "root"
+      }
+    },
+    {
+      "id": "base-join/js-ky2-base-unknown-relative",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-base-url",
+        "base": null,
+        "path": "items"
+      },
+      "expect": {
+        "template": "/items",
+        "pathAnchor": "base"
+      }
+    },
+    {
+      "id": "base-join/js-ky1-root-invalid",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-prefix-url",
+        "base": "https://api.example.com/v1",
+        "path": "/items"
+      },
+      "expectDynamic": true
+    },
+    {
+      "id": "base-join/js-axios-unknown-dot",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "axios-base-url",
+        "base": null,
+        "path": "../items"
+      },
+      "expectDynamic": true
+    },
+    {
+      "id": "base-join/js-ky2-prefix-unknown-dot",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-prefix",
+        "base": null,
+        "path": "../items"
+      },
+      "expectDynamic": true
+    },
+    {
+      "id": "base-join/js-axios-base-url-unknown-protocol-0",
+      "ruleId": "compose.base-join",
+      "provenance": "contract",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "axios-base-url",
+        "base": null,
+        "path": "data:payload"
+      },
+      "expectDynamic": true
+    },
+    {
+      "id": "base-join/js-axios-base-url-unknown-protocol-1",
+      "ruleId": "compose.base-join",
+      "provenance": "contract",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "axios-base-url",
+        "base": null,
+        "path": "http:/missing-host"
+      },
+      "expectDynamic": true
+    },
+    {
+      "id": "base-join/js-axios-base-url-unknown-protocol-2",
+      "ruleId": "compose.base-join",
+      "provenance": "contract",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "axios-base-url",
+        "base": null,
+        "path": "ftp://other.example.com/items"
+      },
+      "expectDynamic": true
+    },
+    {
+      "id": "base-join/js-ky-prefix-url-unknown-protocol-0",
+      "ruleId": "compose.base-join",
+      "provenance": "contract",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-prefix-url",
+        "base": null,
+        "path": "data:payload"
+      },
+      "expectDynamic": true
+    },
+    {
+      "id": "base-join/js-ky-prefix-url-unknown-protocol-1",
+      "ruleId": "compose.base-join",
+      "provenance": "contract",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-prefix-url",
+        "base": null,
+        "path": "http:/missing-host"
+      },
+      "expectDynamic": true
+    },
+    {
+      "id": "base-join/js-ky-prefix-url-unknown-protocol-2",
+      "ruleId": "compose.base-join",
+      "provenance": "contract",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-prefix-url",
+        "base": null,
+        "path": "ftp://other.example.com/items"
+      },
+      "expectDynamic": true
+    },
+    {
+      "id": "base-join/js-ky-prefix-unknown-protocol-0",
+      "ruleId": "compose.base-join",
+      "provenance": "contract",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-prefix",
+        "base": null,
+        "path": "data:payload"
+      },
+      "expectDynamic": true
+    },
+    {
+      "id": "base-join/js-ky-prefix-unknown-protocol-1",
+      "ruleId": "compose.base-join",
+      "provenance": "contract",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-prefix",
+        "base": null,
+        "path": "http:/missing-host"
+      },
+      "expectDynamic": true
+    },
+    {
+      "id": "base-join/js-ky-prefix-unknown-protocol-2",
+      "ruleId": "compose.base-join",
+      "provenance": "contract",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-prefix",
+        "base": null,
+        "path": "ftp://other.example.com/items"
+      },
+      "expectDynamic": true
+    },
+    {
+      "id": "base-join/js-ky-base-url-unknown-protocol-0",
+      "ruleId": "compose.base-join",
+      "provenance": "contract",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-base-url",
+        "base": null,
+        "path": "data:payload"
+      },
+      "expectDynamic": true
+    },
+    {
+      "id": "base-join/js-ky-base-url-unknown-protocol-1",
+      "ruleId": "compose.base-join",
+      "provenance": "contract",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-base-url",
+        "base": null,
+        "path": "http:/missing-host"
+      },
+      "expectDynamic": true
+    },
+    {
+      "id": "base-join/js-ky-base-url-unknown-protocol-2",
+      "ruleId": "compose.base-join",
+      "provenance": "contract",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "ky-base-url",
+        "base": null,
+        "path": "ftp://other.example.com/items"
+      },
+      "expectDynamic": true
+    },
+    {
+      "id": "base-join/js-axios-invalid-protocol-0",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "axios-base-url",
+        "base": "https://api.example.com/v1",
+        "path": "http:/missing-host"
+      },
+      "expectDynamic": true
+    },
+    {
+      "id": "base-join/js-axios-invalid-protocol-1",
+      "ruleId": "compose.base-join",
+      "provenance": "verified-source",
+      "source": "docs/HTTP-WRAPPERS.md#javascript-웹react-native-클라이언트",
+      "appliesTo": [
+        "producer:tsograph"
+      ],
+      "input": {
+        "join": "axios-base-url",
+        "base": "https://api.example.com/v1",
+        "path": "ftp://other.example.com/items"
+      },
+      "expectDynamic": true
+    },
+    {
+      "ruleId": "compose.wrapper-suffix",
+      "provenance": "contract",
+      "source": "docs/HTTP-WRAPPERS.md#v2의-선택적-경로-suffix",
+      "appliesTo": [
+        "producer:cartograph"
+      ],
+      "id": "wrapper-suffix/decoded-segments",
+      "input": {
+        "main": "/v2/items",
+        "segments": [
+          {
+            "literal": "a/b"
+          },
+          {
+            "value": "slug"
+          },
+          {
+            "literal": "%?{}é"
+          }
+        ]
+      },
+      "expect": {
+        "template": "/v2/items/a%2Fb/{}/%25%3F%7B%7D%C3%A9"
+      }
+    },
+    {
+      "ruleId": "compose.wrapper-suffix",
+      "provenance": "contract",
+      "source": "docs/HTTP-WRAPPERS.md#v2의-선택적-경로-suffix",
+      "appliesTo": [
+        "producer:cartograph"
+      ],
+      "id": "wrapper-suffix/empty-array",
+      "input": {
+        "main": "/v2/items",
+        "segments": []
+      },
+      "expect": {
+        "template": "/v2/items"
+      }
+    },
+    {
+      "ruleId": "compose.wrapper-suffix",
+      "provenance": "contract",
+      "source": "docs/HTTP-WRAPPERS.md#v2의-선택적-경로-suffix",
+      "appliesTo": [
+        "producer:cartograph"
+      ],
+      "id": "wrapper-suffix/unresolved",
+      "input": {
+        "main": "/v2/items",
+        "unresolved": true
+      },
+      "expect": {
+        "channelPrefix": "/v2/items"
+      },
+      "expectDynamic": true
+    },
+    {
+      "ruleId": "compose.wrapper-suffix",
+      "provenance": "contract",
+      "source": "docs/HTTP-WRAPPERS.md#v2의-선택적-경로-suffix",
+      "appliesTo": [
+        "producer:cartograph"
+      ],
+      "id": "wrapper-suffix/dot-segment",
+      "input": {
+        "main": "/v2/items",
+        "segments": [
+          {
+            "literal": ".."
+          }
+        ]
+      },
+      "expect": {
+        "channelPrefix": "/v2/items"
+      },
+      "expectDynamic": true
+    },
+    {
+      "ruleId": "compose.wrapper-suffix",
+      "provenance": "contract",
+      "source": "docs/HTTP-WRAPPERS.md#v2의-선택적-경로-suffix",
+      "appliesTo": [
+        "producer:cartograph"
+      ],
+      "id": "wrapper-suffix/main-dynamic",
+      "input": {
+        "main": null,
+        "channelPrefix": "/v2",
+        "segments": [
+          {
+            "literal": "detail"
+          }
+        ]
+      },
+      "expect": {
+        "channelPrefix": "/v2"
+      },
+      "expectDynamic": true
+    },
+    {
+      "ruleId": "compose.wrapper-suffix",
+      "provenance": "contract",
+      "source": "docs/HTTP-WRAPPERS.md#v2의-선택적-경로-suffix",
+      "appliesTo": [
+        "producer:cartograph"
+      ],
+      "id": "wrapper-suffix/expanded-limit",
+      "input": {
+        "main": "/v2/items",
+        "segments": [
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          },
+          {
+            "value": "id"
+          }
+        ]
+      },
+      "expect": {
+        "channelPrefix": "/v2/items"
+      },
+      "expectDynamic": true
     }
   ]
 }

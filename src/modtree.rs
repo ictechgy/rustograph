@@ -725,12 +725,53 @@ fn restricted_scope(segs: &[String], module: &str) -> Option<String> {
     Some(cur)
 }
 
+/// `#[proc_macro_derive(Name, ..)]`를 단 함수가 등록한 derive 이름 → 그 함수를 가리키는 공개 임포트.
+///
+/// proc-macro 크레이트는 매크로 말고는 공개 아이템을 내보낼 수 없어, 등록 이름이 같은 모듈의 타입·값
+/// 이름과 겹칠 일이 없다. 인자를 파싱하지 못한 속성은 건너뛴다(이름을 지어내지 않는다).
+fn derive_macro_names(path: &str, items: &[&syn::Item]) -> Vec<(String, Import)> {
+    let mut names = Vec::new();
+    for item in items {
+        let syn::Item::Fn(f) = item else {
+            continue;
+        };
+        for attr in &f.attrs {
+            if !attr.path().is_ident("proc_macro_derive") {
+                continue;
+            }
+            if let Some(name) = derive_name(attr) {
+                names.push((
+                    name,
+                    Import {
+                        target: format!("{path}::{}", f.sig.ident),
+                        cfg: cfg_of(&f.attrs),
+                        scope: Scope::Public,
+                    },
+                ));
+            }
+        }
+    }
+    names
+}
+
+/// `proc_macro_derive(Name, attributes(..))`의 첫 인자 `Name`.
+fn derive_name(attr: &syn::Attribute) -> Option<String> {
+    let args = attr
+        .parse_args_with(syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+        .ok()?;
+    match args.first()? {
+        syn::Meta::Path(p) => p.get_ident().map(|id| id.to_string()),
+        _ => None,
+    }
+}
+
 /// 모듈의 `use` 임포트 맵을 해석해 채운다(2단계 — 전 모듈의 fill_items 이후).
 ///
 /// 이 모듈의 임포트 표([`Module::imports`]·[`Module::unresolved_imports`])는 부를 때마다 그 모듈의 `use`로
 /// 새로 만든다 — 해석은 다른 모듈과 이 모듈의 지난 표를 읽고, 다 만든 표로 바꾼다. 그래서 글롭 대상이
 /// 바뀌면 지난번에 펼친 이름이 남지 않는다.
 pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_crates: &DepCrates) {
+    let derive_names = derive_macro_names(path, items);
     let mut uses: Vec<(Vec<String>, Option<String>, Scope)> = Vec::new();
     for item in items {
         if let syn::Item::Use(u) = item {
@@ -792,6 +833,12 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
             None => Binding::Unresolved(scope.clone()),
         };
         explicit.insert(alias, binding);
+    }
+    // derive 매크로는 함수 이름이 아니라 등록한 이름으로 쓰인다 — `pub use self::hello_impl as Hello;`
+    // 재노출처럼 그 이름을 함수 정점으로 잇는다. 없으면 `#[derive(pm::Hello)]`가 미해석이라 deps가
+    // 실제로 쓰는 proc-macro 의존을 unused로 보고했다. 명시 `use`가 같은 이름을 들이면 그쪽이 이긴다.
+    for (name, import) in derive_names {
+        explicit.entry(name).or_insert(Binding::Resolved(import));
     }
     let mut imports = BTreeMap::new();
     let mut unresolved = BTreeMap::new();

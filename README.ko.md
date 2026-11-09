@@ -390,6 +390,29 @@ unreachable로 보고할 수 있습니다. `schema`는 그런 파일을 `unparse
 출력을 교체하지 않습니다 — 새 경로나 표준 출력에 쓰세요. 상한은 실제 소스보다 훨씬
 큽니다(crates.io 패키지 610개의 `.rs` 18,080개 가운데 가장 큰 파일이 2.5 MiB).
 
+수확은 워크스페이스 멤버의 lib·bin 타깃만 돕니다 — `cdylib`·`staticlib`·`rlib` 같은 `[lib] crate-type`과
+proc-macro lib도 lib으로 셉니다. 예제·통합 테스트·벤치 타깃은 수확하지 않아 그 타깃에서만 쓰는 아이템은
+`--tests`를 줘도(lib·bin 안의 `#[test]` 함수만 루트로 삼습니다) unreachable이고, 그 타깃 자신의 모듈은
+`cycles`·`rules`가 검사하지 않습니다. `limitations`가 그런 타깃 수를 셉니다.
+
+구문 그래프의 규칙 몇 가지입니다. struct·enum·union은 필드가 가리키는 워크스페이스 타입마다 `references`
+간선을 가집니다(제네릭 매개변수·`Self` 제외). 심볼 레벨 `cycles`는 두 데이터 타입 사이의 이 간선을 빼고
+봅니다 — 서로를 필드로 담는 재귀 데이터 정의는 끊을 의존이 아니라 한 타입 묶음입니다. type·module 레벨
+순환과 `dead`·`rules`는 이 간선을 씁니다. impl 본문·시그니처의 `Self`는 impl self 타입이고,
+`<T as Tr>::m()`은 `T`의 impl 메서드를, `<T>::m()`과 값으로 넘긴 연관 함수(`.map(T::new)`)는 `T`의 같은
+이름 메서드를 가리킵니다. `macro_rules!` 정의 본문의 두 세그먼트 이상 경로(`$crate::m::f`)와, 표현식
+목록이 아닌 매크로 인자(`json!({..})`) 안에서 지역 묶음이 아닌 아이템으로 해석되는 이름은 추정
+(tentative) 간선이 되어 도달성에만 쓰입니다. 함수 안 아이템(중첩 `fn`, 지역 `impl`·`macro_rules!`)은
+정점이 없고 그 간선은 바깥 본문이 소유합니다. self 타입이 워크스페이스 정점이 아닌 impl(`impl Tr for
+String`, blanket `impl<T: Tr> Ext for T`, `impl Tr for &Local`)은 메서드 정점이 없어, 본문의 확정 간선을
+impl이 선언된 모듈이 소유합니다 — 의존이 실제로 나가는 곳이라 `rules`·`cycles`가 그 모듈의 의존으로 봅니다.
+구현한 워크스페이스 트레이트가 그 메서드를 선언했으면 선언 메서드도 본문이 부르는 곳으로 가는 추정
+(tentative) 간선(이름 팬아웃처럼 도달성에만 쓰입니다)과 트레이트로 가는 `references` 간선을 가져, 그 메서드를
+부르는 곳에서 본문이 닿습니다. 모듈은 `--retain-public`일 때만(`pub mod`) 보존 루트라 그때는 모듈이 소유한
+간선도 `dead`를 넓힙니다. `limitations`가 그런 impl 블록 수를 셉니다. 보존 루트에는 `fn main`과 `#[no_mangle]`·
+`#[unsafe(no_mangle)]`·`#[export_name]` 함수·impl 메서드, `#[used]`·`#[no_mangle]`·`#[global_allocator]`
+static, `#[proc_macro*]` 진입점이 들어갑니다.
+
 ## 보안: 신뢰 경계
 
 rustograph는 소스를 syn으로 파싱하지만 Rust 툴체인도 실행합니다. 워크스페이스

@@ -722,7 +722,7 @@ fn cmd_deps(a: &Args, out: &mut dyn Write) -> Result<i32, String> {
                     "unused: {} -> {} (kind: {}{})",
                     u.package,
                     u.dep,
-                    u.kind,
+                    u.kind_label(),
                     if u.proc_macro { ", proc-macro" } else { "" }
                 )
                 .ok();

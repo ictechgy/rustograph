@@ -2605,85 +2605,41 @@ mod tests {
     }
 
     /// 계열 공통 사례(D2 — R1 함수 인자 안의 FROM, R2 같은 문장의 CTE 이름, R3
-    /// IS [NOT] DISTINCT FROM)다. 7개 persistence 생산자와 isthmus conformance 벡터가 같은
-    /// SQL·같은 기대값을 쓰므로 사례 파일의 id·sql·relations를 그대로 옮긴다. 자리표시자·
-    /// 테이블 값 함수가 없는 SQL이라 미해석 근거(dynamic 사실)도 없어야 한다.
+    /// IS [NOT] DISTINCT FROM)다. 7개 persistence 생산자와 isthmus가 같은 SQL·같은 기대값을 쓰도록
+    /// 벤더링한 isthmus 공유 벡터 `conformance/sql-relations.json`을 그대로 읽는다 — 손으로 옮긴
+    /// 사본은 벡터가 바뀌어도 드리프트 감시(`conformance.lock`)에 걸리지 않았다. relations는 순서·중복
+    /// 없는 집합으로 대조한다. 자리표시자·테이블 값 함수가 없는 SQL이라 미해석 근거(dynamic 사실)도
+    /// 없어야 한다 — 이것은 벡터 밖의 rustograph 기대다.
     #[test]
     fn sql_relations_follow_shared_family_cases() {
-        let cases: &[(&str, &str, &[&str])] = &[
-            (
-                "cte/simple",
-                "WITH recent AS (SELECT * FROM orders) SELECT * FROM recent",
-                &["orders"],
-            ),
-            (
-                "cte/recursive-with-columns",
-                "WITH RECURSIVE tree(id, parent_id) AS (SELECT id, parent_id FROM nodes UNION ALL SELECT n.id, n.parent_id FROM nodes n JOIN tree t ON n.parent_id = t.id) SELECT * FROM tree",
-                &["nodes"],
-            ),
-            (
-                "cte/multiple-materialized",
-                "WITH a AS (SELECT 1), b AS MATERIALIZED (SELECT * FROM orders) SELECT * FROM a JOIN b ON true",
-                &["orders"],
-            ),
-            (
-                "cte/not-materialized",
-                "WITH c AS NOT MATERIALIZED (SELECT * FROM orders) SELECT * FROM c",
-                &["orders"],
-            ),
-            (
-                "cte/insert-select",
-                "WITH staged AS (SELECT * FROM imports) INSERT INTO orders SELECT * FROM staged",
-                &["imports", "orders"],
-            ),
-            (
-                "cte/scope-is-one-statement",
-                "WITH recent AS (SELECT 1) SELECT * FROM recent; SELECT * FROM recent",
-                &["recent"],
-            ),
-            (
-                "function-from/extract",
-                "SELECT EXTRACT(YEAR FROM created_at) FROM orders",
-                &["orders"],
-            ),
-            (
-                "function-from/trim",
-                "SELECT TRIM(BOTH ' ' FROM name) FROM users",
-                &["users"],
-            ),
-            (
-                "function-from/substring",
-                "SELECT SUBSTRING(name FROM 2 FOR 3) FROM users",
-                &["users"],
-            ),
-            (
-                "subquery/derived-table-still-fires",
-                "SELECT * FROM (SELECT * FROM orders) AS sub",
-                &["orders"],
-            ),
-            (
-                "subquery/scalar-still-fires",
-                "SELECT (SELECT max(id) FROM users) FROM orders",
-                &["users", "orders"],
-            ),
-            (
-                "subquery/in-select-still-fires",
-                "SELECT * FROM orders WHERE id IN (SELECT order_id FROM payments)",
-                &["orders", "payments"],
-            ),
-            (
-                "distinct-from/is",
-                "SELECT * FROM events WHERE a IS DISTINCT FROM b",
-                &["events"],
-            ),
-            (
-                "distinct-from/is-not",
-                "SELECT * FROM events WHERE a IS NOT DISTINCT FROM b",
-                &["events"],
-            ),
-        ];
-        for (id, sql, want) in cases {
-            assert_relation_set(id, sql, want, false);
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/conformance/sql-relations.json"
+        );
+        let suite: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("vendored vector"))
+                .expect("vector json");
+        let cases = suite["cases"].as_array().expect("cases");
+        let producer: Vec<&serde_json::Value> = cases
+            .iter()
+            .filter(|c| {
+                c["appliesTo"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|t| t == "producer"))
+            })
+            .collect();
+        // 조용히 줄지 않게 — 재벤더링 때 수를 확인한다.
+        assert_eq!(producer.len(), 14);
+        for c in producer {
+            let id = c["id"].as_str().expect("case id");
+            let sql = c["input"]["sql"].as_str().expect("case sql");
+            let want: Vec<&str> = c["expect"]["relations"]
+                .as_array()
+                .expect("relations")
+                .iter()
+                .map(|r| r.as_str().expect("relation name"))
+                .collect();
+            assert_relation_set(id, sql, &want, false);
         }
     }
 

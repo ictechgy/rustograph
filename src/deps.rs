@@ -42,6 +42,18 @@ pub struct DepsReport {
     pub limitations: Vec<String>,
 }
 
+impl UnusedDep {
+    /// 사람이 읽는 의존 종류 이름 — cargo가 normal 의존의 kind를 빈 문자열로 주므로 텍스트
+    /// 출력에서는 `normal`로 쓴다. JSON의 `kind`는 cargo 값 그대로다(계약).
+    pub fn kind_label(&self) -> &str {
+        if self.kind.is_empty() {
+            "normal"
+        } else {
+            &self.kind
+        }
+    }
+}
+
 /// `dir`의 deps 보고서를 만든다 — 메타데이터와 문서를 직접 수확한다.
 /// 사용 증거는 syn 문서가 완전하다 — semantic 문서는 외부 경로를
 /// `external` 카운터로만 세서 미사용 오탐이 생기고, 호출자 문서를
@@ -838,5 +850,19 @@ mod tests {
             .limitations
             .iter()
             .any(|l| l.contains("no external crate vertices")));
+    }
+
+    /// normal 의존은 cargo가 빈 kind로 준다 — 텍스트 출력은 `normal`로, dev·build는 그대로 쓴다.
+    #[test]
+    fn kind_label_names_normal_dependencies() {
+        let dep = |kind: &str| UnusedDep {
+            package: "app".into(),
+            dep: "util".into(),
+            kind: kind.into(),
+            proc_macro: false,
+        };
+        assert_eq!(dep("").kind_label(), "normal");
+        assert_eq!(dep("dev").kind_label(), "dev");
+        assert_eq!(dep("build").kind_label(), "build");
     }
 }

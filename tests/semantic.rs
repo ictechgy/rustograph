@@ -337,10 +337,14 @@ fn derived_method_call_targets_type() {
 #[test]
 fn proc_macro_call_keeps_crate_use() {
     let d = sem_doc();
-    // proc 매크로 크레이트는 정점이 없는 타깃 종류라 선언 대신
-    // 크레이트(루트 모듈) 정점으로 귀속한다.
-    let e = call(&d, "fixture_core::proc_call", "fixture_macros")
-        .expect("proc-macro use edge to the crate vertex");
+    // proc 매크로 크레이트도 lib 타깃으로 수확하므로 호출은 그 진입점 fn 정점으로
+    // 간다(예전에는 정점이 없어 크레이트 정점으로 귀속했다).
+    let e = call(
+        &d,
+        "fixture_core::proc_call",
+        "fixture_macros::emit_helper_call",
+    )
+    .expect("proc-macro call edge to its entry point");
     assert!(!e.tentative);
     // 확장은 proc 매크로 서버가 있을 때만 — 서버가 붙으면 확장 안의
     // 호출이 확정 간선으로, 없으면 proc-macro 전용 limitation이 실측한다.

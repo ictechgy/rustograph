@@ -4,6 +4,41 @@
 
 ## [Unreleased]
 
+아래 변경은 같은 소스에서 더 많은 정점·간선·보존 루트를 수확해 dead·rules·cycles·schema·deps 결과를
+바꾼다. 일부는 Rust 라이브러리 호출자를 깨는 공개 구조체 필드 추가다([0.8 migration](docs/MIGRATING-0.8.md)).
+CLI 플래그·기본값, 그래프 문서 v1, 순회 문서 v1은 그대로다.
+
+- `[lib] crate-type`을 적은 lib(`cdylib`·`staticlib`·`rlib`·`dylib`)과 proc-macro lib을 수확한다. 이전에는 cargo
+  metadata kind가 `lib`이 아니라는 이유로 크레이트가 정점도 limitation도 없이 빠졌고, deps가 그 크레이트가 쓰는
+  의존을 unused로 보고했다. derive 매크로는 등록 이름(`#[derive(pm::Hello)]`, `use pm::Hello`)으로도 그 함수 정점에
+  닿는다 — 이 이름을 잃으면 deps가 쓰는 proc-macro 의존을 unused로 보고한다.
+- impl 본문·시그니처의 `Self` 경로(`Self::f()`·`Self(..)`·`Self { .. }`·`-> Self`)를 self 타입으로 해석한다. 함수 안
+  아이템은 바깥 impl의 `Self`를 쓰지 않는다.
+- struct·enum·union 필드 타입을 references 간선으로 수확한다. 심볼 레벨 `cycles`는 두 데이터 타입 사이의 필드 참조를
+  빼고 본다 — 재귀 데이터 정의는 순환으로 세지 않는다. type·module 레벨 순환과 dead·rules는 그 간선을 쓴다. 서로를
+  필드로 담는 데이터 타입 쌍은 type 레벨(타입이 다른 모듈이면 module 레벨) 순환이라 `cycles --level type --strict`가
+  새로 실패할 수 있다 — 그 수준에서는 타입 사이의 실제 의존이다.
+- 함수 안 아이템(최상위 문장의 중첩 `fn`·지역 `impl`)과 중첩 블록 문장 매크로의 인자를 방문한다. `macro_rules!` 정의
+  본문의 경로와 표현식 목록이 아닌 매크로 인자(`json!({..})`) 안의 이름은 추정 간선이 된다. 함수 안 `impl`·`trait`
+  메서드의 매개변수는 그 본문에서 같은 이름의 아이템을 가린다.
+- 보존 루트: `#[unsafe(no_mangle)]`·`#[unsafe(export_name = "..")]`·`#[cfg_attr(pred, no_mangle)]`, `#[used]`·
+  `#[no_mangle]`·`#[global_allocator]` static, impl 메서드의 `#[no_mangle]`, `#[panic_handler]`. 이전에는 Rust 2024
+  판 FFI export가 전부 unreachable이었다.
+- self 타입이 워크스페이스 밖인 impl(`impl Tr for String`, blanket impl, `impl Tr for &Local`)의 본문을 버리지 않는다.
+  확정 간선은 impl이 선언된 모듈이 소유해 rules·cycles가 그 모듈의 의존으로 본다. 구현한 워크스페이스 트레이트가
+  그 메서드를 선언했으면 선언 메서드가 본문이 부르는 곳으로 가는 추정 간선(도달성 전용)과 트레이트로 가는
+  references 간선을 갖는다 — 트레이트 모듈이 impl 모듈에 의존하는 것처럼 보이지 않는다. 그런 impl 블록 수를
+  limitation으로 싣는다.
+- `<T as Tr>::m()`은 `T`의 impl 메서드로, `<T>::m()`과 값으로 넘긴 연관 함수(`.map(T::new)`)는 `T`의 같은 이름
+  메서드로 간선을 잇는다. 호출이 아니라 값으로 쓴 `<T>::X`·`<T as Tr>::m`(`let f = <T as Tr>::m;`)도 같은 규칙이다 —
+  `<T>::X`가 같은 이름의 모듈 아이템으로 읽히지 않는다.
+- 수확하지 않는 example·test·bench 타깃 수를 limitation으로 싣는다.
+- `deps` 텍스트 출력이 normal 의존의 종류를 `(kind: )` 대신 `(kind: normal)`로 쓴다. JSON은 그대로다.
+- isthmus 공유 적합성 벡터를 `c76e105`로 다시 벤더링하고 `sql-relations.json`을 더했다. SQL 관계 이름 단위 테스트는
+  손으로 옮긴 사본 대신 벤더링한 벡터를 읽는다.
+- CI: `semantic-lint` 잡이 `--features semantic`으로 clippy를 돌리고, test 잡이 자기 분석 dead 결과를 알려진 목록
+  (`scripts/self-dead.expected`)과 대조한다(`scripts/verify-self-dead.sh`).
+
 ## [0.7.0] - 2026-11-03
 
 v0.7.0의 아래 변경에는 Rust 라이브러리 호출자를 깨는 공개 구조체 필드 추가가 있다
@@ -67,7 +102,7 @@ v0.7.0의 아래 변경에는 Rust 라이브러리 호출자를 깨는 공개 �
   `retainPublic`)을 쓰라고 조건부로 알린다(워크스페이스 안에서만 쓰는 lib이면 그 아이템은 정말 호출자가 없다). 판정과
   종료 코드는 그대로다. 이전에는 lib 크레이트의 첫 `dead`가 공개 API 전부를 unreachable로 내면서 아무 안내가 없었다.
 
-## [0.6.0]
+## [0.6.0] - 2026-10-25
 
 ### Change analysis
 
@@ -228,3 +263,17 @@ v0.7.0의 아래 변경에는 Rust 라이브러리 호출자를 깨는 공개 �
   만들거나 전 필드를 분해하거나 `exprs`를 읽던 코드는 `docs/MIGRATING-0.5.md`의 "Rust library callers"를 따른다.
   `config::load_file`·`config::load`는 위 `rules` 설정 검증을 함께 하고, `Config` 역직렬화가 모르는 키를 거부한다.
   `config::resolve_baseline`이 새로 생겼다.
+
+## 0.5.0 이하
+
+이 파일은 v0.5.0 발행(2026-10-13) 뒤에 생겼다. 그 전 릴리스의 변경 내용은 GitHub Release 노트에 있다
+(날짜는 발행 시각의 UTC 날짜).
+
+- [0.5.0](https://github.com/ictechgy/rustograph/releases/tag/v0.5.0) - 2026-10-13 — Rust 라이브러리 호출자를 깨는
+  변경(`Document::view`·`analysis::dead`가 `Result`를 돌려준다, [0.5 migration](docs/MIGRATING-0.5.md))
+- [0.4.1](https://github.com/ictechgy/rustograph/releases/tag/v0.4.1) - 2026-10-01
+- [0.4.0](https://github.com/ictechgy/rustograph/releases/tag/v0.4.0) - 2026-09-30
+- [0.3.0](https://github.com/ictechgy/rustograph/releases/tag/v0.3.0) - 2026-09-25
+- [0.2.1](https://github.com/ictechgy/rustograph/releases/tag/v0.2.1),
+  [0.2.0](https://github.com/ictechgy/rustograph/releases/tag/v0.2.0),
+  [0.1.0](https://github.com/ictechgy/rustograph/releases/tag/v0.1.0) - 2026-09-22

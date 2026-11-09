@@ -9,11 +9,16 @@
 세션을 이어받을 때 먼저 읽으세요.
 
 자매 프로젝트가 바탕화면에 있습니다: [cartograph](../cartograph)(Swift) ·
-[gartograph](../gartograph)(Go) · [kartograph](../kartograph)(Kotlin/Android) ·
-[dartograph](../dartograph)(Dart/Flutter) · [isthmus](../isthmus)(언어 경계 조인) ·
-[schemagraph](../schemagraph)(데이터베이스). `query` 출력 스키마와
-출력 계약 관례(`state`/`edges`/`limitations` 철학)는 계열과 같게 유지합니다.
-여기서 바꾸면 자매 저장소에도 알리세요.
+[kartograph](../kartograph)(Kotlin/Android) · [dartograph](../dartograph)(Dart/Flutter) ·
+[gartograph](../gartograph)(Go) · [pythograph](../pythograph)(Python) ·
+[tsograph](../tsograph)(TypeScript/JavaScript) · [schemagraph](../schemagraph)(데이터베이스) ·
+[isthmus](../isthmus)(언어 경계 조인 — 교환 형식·공유 적합성 벡터의 정본). 출력 계약 관례
+(`state`/`edges`/`limitations` 철학)는 계열과 같게 유지합니다. `query` 출력 스키마는 이 저장소 고유의
+공개 계약이며 cartograph·kartograph·dartograph와 맞추지 않습니다. 최상위는
+`id`·`found`·`depth`·`truncated`·`neighbors[]`·`limitations`이고, 이웃은 `id`·`edges`·`direction`·`depth`·
+`evidence`·`edge_evidence`입니다(`edge_evidence`만 snake_case인 것도 발행된 계약이라 유지합니다). 키 이름·구조를
+바꾸면 소비자가 깨지므로 CHANGELOG Breaking 항목과 `docs/MIGRATING-*` 안내가 필요합니다. 새 필드는 camelCase로,
+계열에 같은 의미의 이름이 있으면 그 이름으로 더합니다. 여기서 계약을 바꾸면 자매 저장소에도 알리세요.
 
 ## 이 프로젝트가 하는 일
 
@@ -52,8 +57,10 @@ cargo run -- dead --explain <id>
 ```bash
 cargo test && scripts/coverage.sh && scripts/verify-cli-contract.sh
 cargo clippy --all-targets
+cargo clippy --all-targets --features semantic   # sem.rs는 기본 빌드에 없다
 cargo run -- rules --strict      # 도그푸딩 — 이 도구로 이 저장소를 분석
 cargo run -- cycles --level symbol --strict
+scripts/verify-self-dead.sh      # dead 자기 분석 — 알려진 목록(scripts/self-dead.expected)과 대조
 ```
 
 **자기 분석은 필수입니다.** 크로스 크레이트 `use` 유실, 구조체 리터럴·
