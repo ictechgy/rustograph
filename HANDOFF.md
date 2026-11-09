@@ -3,23 +3,47 @@
 세션을 이어받는 에이전트가 먼저 읽는 문서입니다. 아래 "현재 상태"만 지금의 지시이고, 그 아래 날짜가 붙은 절은
 당시 기록입니다 — 거기 적힌 "릴리스 준비"·"다음 단계"를 지금 할 일로 되살리지 마세요.
 
-## 현재 상태 (2026-11-03)
+## 현재 상태 (2026-11-09) — PR #52 (`ccr-37904670-hxdjsx`)
 
 - 발행본은 [v0.7.0](https://github.com/ictechgy/rustograph/releases/tag/v0.7.0)(2026-11-03, 자산 6개)이다.
   v0.6.0은 2026-10-25, v0.5.0은 2026-10-13에 발행됐다. v0.4.2는 태그 없이 v0.5.0으로 이어졌다.
-- 브랜치 `ccr-37904670-hxdjsx`(계열 9개 저장소 검토 후속): 구문 수확이 놓치던 형태를 메웠다 — lib 계열
-  crate type·proc-macro 크레이트 수확, `Self` 경로, 필드 타입 간선(심볼 레벨 순환은 재귀 데이터 정의를
-  세지 않음), 함수 안 아이템·중첩 블록 문장 매크로·`macro_rules!` 본문·표현식 목록이 아닌 매크로 인자,
-  2024 판 진입점 속성과 static·impl 메서드 루트, 워크스페이스 밖 self 타입 impl 본문 소유, UFCS와 값으로
-  넘긴 연관 함수, 수확하지 않는 example/test/bench 타깃 limitation, deps `(kind: normal)`. isthmus 벡터를
-  `c76e105`로 다시 벤더링하고 `sql-relations.json`을 벡터로 실행한다. 공개 Rust API 변화는
-  [0.8 migration](docs/MIGRATING-0.8.md), 사용자 변화는 CHANGELOG `[Unreleased]`에 있다.
+- [PR #52](https://github.com/ictechgy/rustograph/pull/52)는 계열 9개 저장소 검토의 후속이다. 구문 수확이 조용히
+  놓치던 형태를 메웠다.
+  - lib 계열 crate type(cdylib·rlib·staticlib·dylib)과 proc-macro 크레이트 수확. derive 등록 이름
+    (`#[derive(pm::Hello)]`)은 그 함수 정점으로 잇는다.
+  - `Self` 경로, 필드 타입 간선(심볼 레벨 순환은 재귀 데이터 정의를 세지 않는다. type·module 레벨은 센다),
+    함수 안 아이템(지역 impl·trait 메서드 매개변수는 지역 이름), 중첩 블록 문장 매크로, `macro_rules!` 본문,
+    표현식 목록이 아닌 매크로 인자.
+  - 2024 판 진입점 속성(`#[unsafe(no_mangle)]` 등)과 static·impl 메서드 루트.
+  - 워크스페이스 밖 self 타입 impl 본문: 확정 간선은 impl 모듈, 구현한 워크스페이스 트레이트의 선언 메서드는
+    본문으로 가는 추정 간선만(도달성 전용 — rules·cycles에 거짓 의존이 생기지 않는다).
+  - UFCS(호출과 값 경로 모두), 값으로 넘긴 연관 함수.
+  - 수확하지 않는 example/test/bench 타깃 limitation, deps `(kind: normal)`.
+  - isthmus 벡터를 `c76e105`로 다시 벤더링하고 `sql-relations.json`을 벡터로 실행한다.
+  - 공개 Rust API 변화는 [0.8 migration](docs/MIGRATING-0.8.md), 사용자 변화는 CHANGELOG `[Unreleased]`에 있다.
+- **리뷰**: AGENTS의 GLM(`packet-ask`) 리뷰는 이 세션에서 쓸 수 없어, 맥락을 물려받지 않은 **독립 Claude 리뷰**로
+  대체했다. 판정은 "수정 후 머지"였고 지적 B1·B2(blocker), S1, N1·N2·N4는 고쳤다. S2(type 레벨 순환이 재귀
+  데이터를 센다)는 의도로 판단해 문서화했다. N3(미수확 타깃 한계가 cycles에도 붙는다)은 그 타깃의 모듈이
+  실제로 검사되지 않으므로 빼지 않고 문구를 정확히 했다. 처리 근거는 PR #52 본문 "독립 리뷰 반영"에 있다.
+- **이 PR에서 제외한 것**
+  - `query` 스키마를 cartograph·kartograph·dartograph와 맞추기, `edge_evidence` 이름 바꾸기: 하지 않기로
+    결정했다(2026-11-04). 공개 JSON 계약을 깨기 때문이다. AGENTS.md 규칙을 실제 계약에 맞췄다.
+  - 모듈 임포트 표의 타입·값 이름공간 분리(아래 후속 후보).
+  - Homebrew 토큰 설정, 릴리스·태그(비밀값·발행은 범위 밖).
 - 자기 분석 기준: `rules --strict` 0, `cycles --level symbol --strict` 0, `dead`는
-  `scripts/verify-self-dead.sh`가 `scripts/self-dead.expected`(알려진 2건과 이유)와 대조한다. CI의 test 잡이
-  셋 다 돌고, `semantic-lint` 잡이 `--features semantic` clippy를 돈다.
+  `scripts/verify-self-dead.sh`가 `scripts/self-dead.expected`(알려진 2건과 이유)와 대조한다. type 레벨 순환은
+  23개(대부분 서로를 필드로 담는 데이터 타입 — 의도된 보고)다. CI의 test 잡이 셋 다 돌고, `semantic-lint` 잡이
+  `--features semantic` clippy를 돈다.
 - persistence `relation-use` 생산자는 7개(cartograph·dartograph·gartograph·kartograph·pythograph·rustograph·
   tsograph)이고 schemagraph가 `relation-decl` 쪽이다. SQL 관계 이름 규칙은 isthmus
   `conformance/sql-relations.json`이 정본이다.
+
+### 머지 뒤 다음 할 일
+
+1. **0.8.0 릴리스**: `[Unreleased]`가 Rust 라이브러리 호출자를 깨는 필드 추가를 담으므로 마이너 버전이다.
+   버전 커밋 → PR CI → 머지 → 태그 → Release 자산 확인 → (토큰이 없으면) 수동 tap 갱신(아래 "다음 단계" 1번)
+   → 설치 바이너리로 CLI 계약·자기 분석.
+2. isthmus `compatibility.json`의 rustograph 핀(현재 0.4.1) 갱신을 isthmus 쪽에 알린다.
 
 ### 후속 후보 (사용자가 고른다)
 
