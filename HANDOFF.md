@@ -3,12 +3,13 @@
 세션을 이어받는 에이전트가 먼저 읽는 문서입니다. 아래 "현재 상태"만 지금의 지시이고, 그 아래 날짜가 붙은 절은
 당시 기록입니다 — 거기 적힌 "릴리스 준비"·"다음 단계"를 지금 할 일로 되살리지 마세요.
 
-## 현재 상태 (2026-11-09) — PR #52 (`ccr-37904670-hxdjsx`)
+## 현재 상태 (2026-11-10) — PR #52 머지 이후
 
 - 발행본은 [v0.7.0](https://github.com/ictechgy/rustograph/releases/tag/v0.7.0)(2026-11-03, 자산 6개)이다.
   v0.6.0은 2026-10-25, v0.5.0은 2026-10-13에 발행됐다. v0.4.2는 태그 없이 v0.5.0으로 이어졌다.
-- [PR #52](https://github.com/ictechgy/rustograph/pull/52)는 계열 9개 저장소 검토의 후속이다. 구문 수확이 조용히
-  놓치던 형태를 메웠다.
+- [PR #52](https://github.com/ictechgy/rustograph/pull/52)는 2026-11-09에 `main`으로 스쿼시 머지됐다(`9f9217e`).
+  CHANGELOG `[Unreleased]`에 있고 아직 발행하지 않았다. `main` `9f9217e`의 CI 체크 7개가 모두 성공했다
+  (2026-11-10 확인). 계열 9개 저장소 검토의 후속으로, 구문 수확이 조용히 놓치던 형태를 메웠다.
   - lib 계열 crate type(cdylib·rlib·staticlib·dylib)과 proc-macro 크레이트 수확. derive 등록 이름
     (`#[derive(pm::Hello)]`)은 그 함수 정점으로 잇는다.
   - `Self` 경로, 필드 타입 간선(심볼 레벨 순환은 재귀 데이터 정의를 세지 않는다. type·module 레벨은 센다),
@@ -25,6 +26,7 @@
   대체했다. 판정은 "수정 후 머지"였고 지적 B1·B2(blocker), S1, N1·N2·N4는 고쳤다. S2(type 레벨 순환이 재귀
   데이터를 센다)는 의도로 판단해 문서화했다. N3(미수확 타깃 한계가 cycles에도 붙는다)은 그 타깃의 모듈이
   실제로 검사되지 않으므로 빼지 않고 문구를 정확히 했다. 처리 근거는 PR #52 본문 "독립 리뷰 반영"에 있다.
+  PR #52는 GLM 리뷰 없이 머지됐다.
 - **이 PR에서 제외한 것**
   - `query` 스키마를 cartograph·kartograph·dartograph와 맞추기, `edge_evidence` 이름 바꾸기: 하지 않기로
     결정했다(2026-11-04). 공개 JSON 계약을 깨기 때문이다. AGENTS.md 규칙을 실제 계약에 맞췄다.
@@ -38,7 +40,7 @@
   tsograph)이고 schemagraph가 `relation-decl` 쪽이다. SQL 관계 이름 규칙은 isthmus
   `conformance/sql-relations.json`이 정본이다.
 
-### 머지 뒤 다음 할 일
+### 다음 할 일 (PR #52 머지 이후)
 
 1. **0.8.0 릴리스**: `[Unreleased]`가 Rust 라이브러리 호출자를 깨는 필드 추가를 담으므로 마이너 버전이다.
    버전 커밋 → PR CI → 머지 → 태그 → Release 자산 확인 → (토큰이 없으면) 수동 tap 갱신(아래 "다음 단계" 1번)
@@ -50,6 +52,11 @@
 - 모듈 임포트 표가 이름당 이름공간 하나라 `fn harvest`와 `use crate::harvest::{self}`가 함께 있는 모듈을
   `use super::*`로 들이면 `harvest::x()`가 풀리지 않는다(`scripts/self-dead.expected`의 2건). 타입·값
   이름공간을 나눈 글롭 바인딩이 필요하다.
+- 다른 크레이트의 `#[derive(pm_derive::Hello)]`가, proc-macro 크레이트에 같은 이름의 비공개 struct가 있으면
+  그 struct로 이어진다(독립 리뷰가 확인). 보존이 넓어지는 방향이라 결과가 사라질 수는 있어도 새 오탐은 생기지 않는다.
+- 문서가 심볼 레벨에서 재귀 데이터 정의를 순환으로 세지 않는 이유는 설명하지만, type 레벨에서는 같은 필드
+  간선을 순환으로 세는 이유를 나란히 설명하지 않는다(README·README.ko는 "type·module 레벨은 이 간선을 쓴다"만
+  적는다). 두 판단의 근거를 함께 적는다.
 - Homebrew tap 자동 갱신은 `HOMEBREW_TAP_TOKEN` 리포 시크릿이 있어야 돈다 — 없으면 Release가 그 단계를
   건너뛰므로 릴리스마다 로그로 확인하고, 수동 절차는 아래 "다음 단계" 1번을 따른다.
 
