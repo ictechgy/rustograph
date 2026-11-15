@@ -7,7 +7,7 @@
 
 use crate::fanout::{self, Fanned};
 use crate::graph::{Edge, EdgeKind, Kind, Vertex};
-use crate::modtree::{cfg_of, crate_of, DepCrates, ModTree};
+use crate::modtree::{cfg_of, crate_of, DepCrates, ModTree, Ns};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use syn::parse::Parser;
@@ -591,7 +591,9 @@ pub(crate) fn impls_with_identities<'a>(
     let mut foreign_bodies = Vec::new();
     for b in blocks {
         // self 타입을 해석한다 — 모듈 로컬이면 정점이 있다.
-        let Some(self_id) = tree.resolve(&b.items_module, &b.self_ty, &DepCrates::new()) else {
+        let Some(self_id) =
+            tree.resolve_in(&b.items_module, &b.self_ty, &DepCrates::new(), Ns::Type)
+        else {
             harvest.unresolved_paths += 1;
             harvest.foreign_self_impls += 1;
             foreign_bodies.extend(foreign_impl_bodies(
@@ -604,7 +606,9 @@ pub(crate) fn impls_with_identities<'a>(
             continue;
         };
         if let Some(tp) = &b.trait_path {
-            if let Some(trait_id) = tree.resolve(&b.items_module, tp, &DepCrates::new()) {
+            if let Some(trait_id) =
+                tree.resolve_in(&b.items_module, tp, &DepCrates::new(), Ns::Type)
+            {
                 // unsafe impl의 implements는 경계의 일부다.
                 let mut e = Edge::new(self_id.clone(), trait_id.clone(), EdgeKind::Implements);
                 e.cfg = b.cfg.clone();
@@ -725,7 +729,7 @@ fn foreign_impl_bodies<'a>(
     let trait_id = b
         .trait_path
         .as_ref()
-        .and_then(|tp| tree.resolve(&b.items_module, tp, &DepCrates::new()));
+        .and_then(|tp| tree.resolve_in(&b.items_module, tp, &DepCrates::new(), Ns::Type));
     let mut bodies = Vec::new();
     for &m in &b.methods {
         let owner = trait_id
@@ -819,7 +823,13 @@ pub fn decl_edges(refs: &[DeclRef], tree: &ModTree, dep_crates: &DepCrates) -> V
     let mut seen = BTreeSet::new();
     let mut edges = Vec::new();
     for r in refs {
-        let Some(to) = tree.resolve(&r.module, &r.path, dep_crates) else {
+        // 필드 타입은 타입 이름공간이고, 매크로 본문의 경로(추정)는 자리를 모른다.
+        let to = if r.tentative {
+            tree.resolve(&r.module, &r.path, dep_crates)
+        } else {
+            tree.resolve_in(&r.module, &r.path, dep_crates, Ns::Type)
+        };
+        let Some(to) = to else {
             continue;
         };
         if to == r.owner || !seen.insert((r.owner.as_str(), to.clone(), &r.cfg, r.tentative)) {
@@ -1143,7 +1153,7 @@ pub fn signature_edges(b: &BodyItem, tree: &ModTree, dep_crates: &DepCrates) -> 
                 .as_deref()
                 .and_then(|ty| substitute_self(&p, ty))
                 .unwrap_or(p);
-            if let Some(id) = tree.resolve(&b.module, &p, dep_crates) {
+            if let Some(id) = tree.resolve_in(&b.module, &p, dep_crates, Ns::Type) {
                 if id != b.id {
                     let mut e = Edge::new(b.id.clone(), id, EdgeKind::Signature);
                     e.cfg = b.cfg.clone();
@@ -1209,7 +1219,7 @@ impl BodyVisitor<'_> {
     fn visit_qualified_value_path(&mut self, qself: &syn::QSelf, path: &syn::Path) {
         let segs = path_segments(path);
         let owner = match &*qself.ty {
-            syn::Type::Path(ty) => self.resolve(&path_segments(&ty.path)),
+            syn::Type::Path(ty) => self.resolve_in(&path_segments(&ty.path), Ns::Type),
             _ => None,
         };
         if qself.position == 0 {
@@ -1218,7 +1228,7 @@ impl BodyVisitor<'_> {
                 _ => self.unresolved += 1,
             }
         } else {
-            if let Some(id) = self.resolve(&segs[..qself.position]) {
+            if let Some(id) = self.resolve_in(&segs[..qself.position], Ns::Type) {
                 self.push(id, EdgeKind::References);
             }
             match self.resolve_value(&segs) {
@@ -1293,9 +1303,22 @@ impl BodyVisitor<'_> {
 
     /// 경로를 이 본문의 모듈에서 해석한다. impl 본문의 `Self`는 impl self 타입 경로로 바꿔 해석한다
     /// ([`substitute_self`]) — `Self::f()`·`Self(..)`·`Self { .. }`·`Self::CONST`가 모두 그 타입을 가리킨다.
+    /// 마지막 세그먼트의 이름공간을 모르는 자리(`macro_rules!` 본문)용이다 — 자리를 알면 [`Self::resolve_in`].
     fn resolve(&mut self, segs: &[String]) -> Option<String> {
-        match self.self_ty.and_then(|ty| substitute_self(segs, ty)) {
-            Some(path) => self.tree.resolve(self.module, &path, self.dep_crates),
+        self.resolve_at(segs, None)
+    }
+
+    /// [`Self::resolve`]와 같되 마지막 세그먼트를 이름공간 `ns`에서 먼저 찾는다 — 타입 자리·구조체 리터럴·
+    /// 연관 아이템의 타입 접두사는 타입, 호출·값 경로는 값, 매크로 호출은 매크로 이름공간이다.
+    fn resolve_in(&mut self, segs: &[String], ns: Ns) -> Option<String> {
+        self.resolve_at(segs, Some(ns))
+    }
+
+    fn resolve_at(&mut self, segs: &[String], ns: Option<Ns>) -> Option<String> {
+        let substituted = self.self_ty.and_then(|ty| substitute_self(segs, ty));
+        let segs = substituted.as_deref().unwrap_or(segs);
+        match ns {
+            Some(ns) => self.tree.resolve_in(self.module, segs, self.dep_crates, ns),
             None => self.tree.resolve(self.module, segs, self.dep_crates),
         }
     }
@@ -1321,7 +1344,7 @@ impl BodyVisitor<'_> {
                 return ValueRes::Local;
             }
         }
-        match self.resolve(segs) {
+        match self.resolve_in(segs, Ns::Value) {
             Some(id) if self.tree.modules.contains_key(&id) && !self.value_item(&id) => {
                 ValueRes::Local
             }
@@ -1369,8 +1392,10 @@ impl BodyVisitor<'_> {
             return type_relative;
         };
         let index = self.method_index;
-        let (Some(owner), Some(ids)) = (self.resolve(&path_segments(&ty.path)), index.get(method))
-        else {
+        let (Some(owner), Some(ids)) = (
+            self.resolve_in(&path_segments(&ty.path), Ns::Type),
+            index.get(method),
+        ) else {
             self.unresolved += usize::from(type_relative);
             return type_relative;
         };
@@ -1447,7 +1472,7 @@ impl BodyVisitor<'_> {
     /// 아이템으로 해석되면 추정 간선만 단다. 문법을 모르니 호출인지 단순 언급인지 가릴 수 없다.
     fn visit_macro_call(&mut self, mac: &syn::Macro) {
         let segs = path_segments(&mac.path);
-        match self.resolve(&segs) {
+        match self.resolve_in(&segs, Ns::Macro) {
             Some(id) => self.push(id, EdgeKind::Call),
             None => self.ext_macros += 1,
         }
@@ -1522,7 +1547,7 @@ impl Visit<'_> for BodyVisitor<'_> {
             .first()
             .is_some_and(|name| self.type_params.contains(name))
         {
-            if let Some(id) = self.resolve(&path) {
+            if let Some(id) = self.resolve_in(&path, Ns::Type) {
                 self.push(id, EdgeKind::References);
             }
         }
@@ -1555,7 +1580,7 @@ impl Visit<'_> for BodyVisitor<'_> {
                     let n = segs.len();
                     let mut hit = false;
                     if n >= 2 {
-                        if let Some(ty) = self.resolve(&segs[..n - 1]) {
+                        if let Some(ty) = self.resolve_in(&segs[..n - 1], Ns::Type) {
                             if let Some(ids) = self.method_index.get(&segs[n - 1]) {
                                 // 접두사는 호출마다 한 번 — 후보마다 만들면 같은 이름 정의가
                                 // 수천 개일 때 할당이 (호출 수 × 정의 수)다.
@@ -1579,7 +1604,7 @@ impl Visit<'_> for BodyVisitor<'_> {
                 self.visit_type(&qself.ty);
                 let path = path_segments(&p.path);
                 if qself.position > 0 {
-                    if let Some(id) = self.resolve(&path[..qself.position]) {
+                    if let Some(id) = self.resolve_in(&path[..qself.position], Ns::Type) {
                         self.push(id, EdgeKind::References);
                     }
                 }
@@ -1603,7 +1628,7 @@ impl Visit<'_> for BodyVisitor<'_> {
         let mut scoped = false;
         if let Some(self_ty) = self.self_ty {
             if matches!(&*e.receiver, syn::Expr::Path(p) if p.path.is_ident("self")) {
-                if let Some(sid) = self.resolve(self_ty) {
+                if let Some(sid) = self.resolve_in(self_ty, Ns::Type) {
                     if let Some(ids) = self.method_index.get(&name) {
                         let prefix = owner_prefix(&sid);
                         for mid in ids {
@@ -1639,7 +1664,7 @@ impl Visit<'_> for BodyVisitor<'_> {
     fn visit_expr_struct(&mut self, e: &syn::ExprStruct) {
         // S{..} 구조체 리터럴 — 생성자 호출과 같은 의미의 참조다.
         let segs = path_segments(&e.path);
-        match self.resolve(&segs) {
+        match self.resolve_in(&segs, Ns::Type) {
             Some(id) => self.push(id, EdgeKind::References),
             None if segs.len() >= 2 => self.unresolved += 1,
             None => {}
@@ -1811,7 +1836,7 @@ impl Visit<'_> for BodyVisitor<'_> {
                 // E::V 형태 — 마지막 세그먼트가 열거형 배리언트/상수면
                 // 앞부분 타입에의 참조다. 그것도 안 되면 진짜 미해석.
                 if segs.len() >= 2 {
-                    match self.resolve(&segs[..segs.len() - 1]) {
+                    match self.resolve_in(&segs[..segs.len() - 1], Ns::Type) {
                         Some(ty) => {
                             // `.map(Type::new)`·`.ok_or_else(Type::err)`처럼 연관 함수를 값으로 넘기면
                             // 그 메서드의 참조다 — 타입만 잇던 때는 그렇게만 쓰는 연관 함수가

@@ -4,7 +4,9 @@ These notes cover changes on `main` after the v0.7.0 release. They have not
 shipped in a release yet; confirm the matching tag and assets on GitHub
 Releases before relying on them. CLI flags and defaults, graph document v1 and
 language-traversal v1 stay compatible: the changes add edges, retention roots
-and limitation lines, and no field is renamed or removed.
+and limitation lines, and no document field is renamed or removed. The Rust
+library's `modtree::Module` import table changes shape (see
+[Rust library callers](#rust-library-callers)).
 
 ## Graph and analysis results
 
@@ -24,6 +26,16 @@ can have more vertices and edges than before:
 - `#[unsafe(no_mangle)]`, `#[unsafe(export_name = "…")]`, `#[cfg_attr(…, no_mangle)]`,
   `#[used]` / `#[no_mangle]` / `#[global_allocator]` statics and `#[no_mangle]`
   impl methods are retention roots.
+- A module's imports keep the type, value and macro namespaces apart, as rustc
+  does. A glob import brings in a name in every namespace it has in the target
+  module, and an explicit `use` or a local item shadows a glob only in its own
+  namespace. An explicit `use a::x` brings in every namespace `x` has in `a`.
+  Before, a name held one binding, so in a module with both `fn harvest` and
+  `use crate::harvest::{self}`, a child's `use super::*` dropped the module
+  and `harvest::f()` did not resolve; `use crate::other as shared` beside a
+  glob that also brought `fn shared` dropped that function. Calls through
+  those paths now have edges, and items reached only through them stop being
+  reported by `dead`.
 
 Expect `dead` to report fewer unreachable items, `rules` to see dependencies
 that a field type or a foreign-type impl body carried, and module- and
@@ -57,3 +69,20 @@ alike. Add the new fields, or end such patterns with `..`.
 - `deps::UnusedDep::kind_label` is new: the text form of `kind`, with cargo's
   empty normal-dependency kind written as `normal`. JSON keeps `kind` as cargo
   reports it.
+- `modtree::Module::imports` changes type from `BTreeMap<String, Import>` to
+  `BTreeMap<String, PerNs<Binding>>`: each name maps to one binding per
+  namespace (`types`, `values`, `macros`), and a binding is either
+  `Binding::Resolved(Import)` or `Binding::Unresolved(Scope)`.
+  `modtree::Module::unresolved_imports` is removed; its entries are the
+  `Binding::Unresolved` slots. Read a name's binding with
+  `module.imports.get(name).and_then(|b| b.get(Ns::Value))`, or iterate
+  `PerNs::iter` for every namespace. `modtree::Ns`, `modtree::PerNs` and
+  `modtree::Binding` are new public types.
+- `modtree::Module` adds `macro_items` (named `macro_rules!` items), and
+  `value_items` now also holds tuple and unit structs, whose constructors live
+  in the value namespace. Build modules with `Module::new`.
+- `modtree::ModTree::resolve_in` is new: `resolve` with the namespace of the
+  last segment given (`Ns::Type` for type positions and struct literals,
+  `Ns::Value` for calls and value paths, `Ns::Macro` for macro calls and
+  attributes). `resolve` keeps its signature and resolves without knowing the
+  position.

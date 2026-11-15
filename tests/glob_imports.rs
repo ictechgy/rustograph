@@ -1012,3 +1012,135 @@ fn main() { let _ = m::child::f(); }
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["unused"], serde_json::json!([]), "{report}");
 }
+
+/// 글롭은 대상 모듈의 이름을 타입·값 이름공간마다 따로 들인다 — `source`에 값 아이템 `fn harvest`와 타입 이름공간
+/// 임포트 `use crate::harvest::{self}`가 함께 있으면, `use super::*`로 들인 `inner`에서 `harvest::owner_prefixes()`는
+/// 모듈 `crate::harvest`의 함수이고 `harvest()`는 `source::harvest`다. 이름당 바인딩 하나인 표는 선언 아이템(fn)만
+/// 남겨 접두사 자리가 풀리지 않았고, 그 경로로만 불리는 함수가 unreachable로 나왔다(자기 분석의
+/// `scripts/self-dead.expected` 2건). (rustc 실행 결과: 둘 다 쓰임)
+#[test]
+fn glob_brings_type_and_value_namespaces_of_the_same_name() {
+    let ws = Workspace::package(
+        "globns",
+        r#"
+mod harvest {
+    pub fn owner_prefixes() -> usize { 0 }
+    pub fn scans() -> usize { 1 }
+}
+mod source {
+    use crate::harvest::{self};
+    fn harvest() -> usize { harvest::scans() }
+    pub fn run() -> usize { harvest() }
+    pub mod inner {
+        use super::*;
+        pub fn check() -> usize { harvest::owner_prefixes() + harvest() }
+    }
+}
+fn main() { source::run(); source::inner::check(); }
+"#,
+    );
+    let doc = ws.symbols();
+    let check = "globns::source::inner::check";
+    assert!(has_edge(
+        &doc,
+        check,
+        "globns::harvest::owner_prefixes",
+        EdgeKind::Call
+    ));
+    assert!(has_edge(
+        &doc,
+        check,
+        "globns::source::harvest",
+        EdgeKind::Call
+    ));
+    assert!(!dead_ids(&doc).contains(&"globns::harvest::owner_prefixes".to_string()));
+}
+
+/// 명시 임포트는 자기가 들인 이름공간에서만 글롭을 가린다 — `use crate::lib_a::other_tool as shared`(모듈, 타입
+/// 이름공간)는 글롭이 들인 모듈 `shared`(= `tool`)를 가리지만 글롭이 들인 값 `fn shared`는 남긴다. 반대로
+/// `use crate::c::pick`(fn, 값 이름공간)은 글롭의 `fn pick`만 가리고 글롭의 모듈 `pick`은 남긴다. 이름 하나를
+/// 통째로 가리던 표는 `shared()`·`pick::deep()`을 놓쳐 `lib_a::shared`·`values::pick::deep`이 unreachable이었다.
+/// (rustc 실행 결과: `other_tool::run`·`lib_a::shared`·`c::pick`·`values::pick::deep`, `tool::run`은 미사용 경고)
+#[test]
+fn explicit_import_shadows_a_glob_only_in_its_own_namespace() {
+    let ws = Workspace::package(
+        "nsshadow",
+        r#"
+mod lib_a {
+    pub mod tool { pub fn run() {} }
+    pub mod other_tool { pub fn run() {} }
+    #[allow(unused_imports)]
+    pub use self::tool as shared;
+    pub fn shared() {}
+}
+mod user {
+    use crate::lib_a::*;
+    use crate::lib_a::other_tool as shared;
+    pub fn go() { shared::run(); shared(); }
+}
+pub mod values { pub fn pick() {} pub mod pick { pub fn deep() {} } }
+mod c { pub fn pick() {} }
+mod d {
+    use crate::values::*;
+    use crate::c::pick;
+    pub fn go() { pick(); pick::deep(); }
+}
+fn main() { user::go(); d::go(); values::pick(); }
+"#,
+    );
+    let doc = ws.symbols();
+    let go = "nsshadow::user::go";
+    assert!(has_edge(
+        &doc,
+        go,
+        "nsshadow::lib_a::other_tool::run",
+        EdgeKind::Call
+    ));
+    assert!(has_edge(
+        &doc,
+        go,
+        "nsshadow::lib_a::shared",
+        EdgeKind::Call
+    ));
+    assert!(!any_edge(&doc, go, "nsshadow::lib_a::tool::run"));
+    let go = "nsshadow::d::go";
+    assert!(has_edge(&doc, go, "nsshadow::c::pick", EdgeKind::Call));
+    assert!(has_edge(
+        &doc,
+        go,
+        "nsshadow::values::pick::deep",
+        EdgeKind::Call
+    ));
+    let dead = dead_ids(&doc);
+    for id in ["nsshadow::lib_a::shared", "nsshadow::values::pick::deep"] {
+        assert!(!dead.contains(&id.to_string()), "{id} reported: {dead:?}");
+    }
+    assert!(dead.contains(&"nsshadow::lib_a::tool::run".to_string()));
+}
+
+/// 명시 `use a::x`는 `a`에서 `x`가 차지한 이름공간을 모두 들인다 — `a`에 값 아이템 `fn x`와 타입 이름공간 재노출
+/// `pub use crate::m as x`가 있으면 `x()`는 그 fn이고 `x::inner()`는 `m::inner`다. 이전에는 선언 아이템(fn)만
+/// 들여 `x::inner()`가 풀리지 않았다. (rustc 실행 결과: 둘 다 쓰임)
+#[test]
+fn explicit_import_brings_every_namespace_the_name_has() {
+    let ws = Workspace::package(
+        "nsexplicit",
+        r#"
+pub mod m { pub fn inner() {} }
+mod a {
+    pub use crate::m as x;
+    pub fn x() {}
+}
+mod b {
+    use crate::a::x;
+    pub fn go() { x::inner(); x(); }
+}
+fn main() { b::go(); }
+"#,
+    );
+    let doc = ws.symbols();
+    let go = "nsexplicit::b::go";
+    assert!(has_edge(&doc, go, "nsexplicit::m::inner", EdgeKind::Call));
+    assert!(has_edge(&doc, go, "nsexplicit::a::x", EdgeKind::Call));
+    assert!(!dead_ids(&doc).contains(&"nsexplicit::m::inner".to_string()));
+}

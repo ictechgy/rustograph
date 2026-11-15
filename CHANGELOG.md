@@ -36,6 +36,15 @@ CLI 플래그·기본값, 그래프 문서 v1, 순회 문서 v1은 그대로다.
 - `deps` 텍스트 출력이 normal 의존의 종류를 `(kind: )` 대신 `(kind: normal)`로 쓴다. JSON은 그대로다.
 - isthmus 공유 적합성 벡터를 `c76e105`로 다시 벤더링하고 `sql-relations.json`을 더했다. SQL 관계 이름 단위 테스트는
   손으로 옮긴 사본 대신 벤더링한 벡터를 읽는다.
+- 모듈 임포트 표가 타입·값·매크로 이름공간을 rustc처럼 나눈다. 글롭(`use m::*`)은 대상 모듈의 이름을 이름공간마다
+  따로 들이고, 명시 `use`와 로컬 아이템은 같은 이름공간의 글롭만 가린다. 명시 `use a::x`는 `a`에서 `x`가 차지한
+  이름공간을 모두 들인다. 이전에는 이름당 바인딩이 하나라, `fn harvest`와 `use crate::harvest::{self}`가 함께 있는
+  모듈을 자식이 `use super::*`로 들이면 모듈이 빠져 `harvest::f()`가 풀리지 않았고, 글롭이 들인 `fn shared` 옆의
+  `use crate::other as shared`가 그 함수까지 가렸다 — 그 경로로만 쓰는 아이템이 `dead`에 unreachable로 나왔다.
+  자기 분석 dead의 알려진 2건이 사라져 `scripts/self-dead.expected`가 비었다. 호출·값 경로는 값, 타입 자리·구조체
+  리터럴은 타입, 매크로 호출은 매크로 이름공간을 먼저 보고, 그 이름공간에 묶인 것이 없으면 예전처럼 찾는다.
+  라이브러리 호출자용 `modtree::Module::imports`의 타입이 바뀌고 `unresolved_imports`가 빠졌다
+  ([0.8 migration](docs/MIGRATING-0.8.md)).
 - CI: `semantic-lint` 잡이 `--features semantic`으로 clippy를 돌리고, test 잡이 자기 분석 dead 결과를 알려진 목록
   (`scripts/self-dead.expected`)과 대조한다(`scripts/verify-self-dead.sh`).
 
