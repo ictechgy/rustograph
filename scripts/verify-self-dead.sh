@@ -21,7 +21,9 @@ trap 'rm -f "$ACTUAL"' EXIT
 	| sed -n 's/^unreachable [a-z]*: //p' | LC_ALL=C sort > "$ACTUAL"
 
 EXPECTED="scripts/self-dead.expected"
-# 주석·빈 줄을 뺀다 — 항목이 없어도 실패하지 않게 grep 대신 sed로 거른다(grep -v는 남는 줄이 없으면 1이다).
+# 주석·빈 줄을 sed 하나로 뺀다. 프로세스 치환(<(..)) 안의 종료 코드는 set -e·pipefail이 보지 않으므로 예전
+# grep -v도 목록이 비었을 때(남는 줄이 없어 1) 이 검사를 실패시키지 않았다 — sed는 남는 줄이 없어도 0이라, 이
+# 줄을 프로세스 치환 밖으로 옮겨도 빈 목록에서 그대로 동작한다.
 if ! diff -u <(sed -e '/^#/d' -e '/^$/d' "$EXPECTED" | LC_ALL=C sort) "$ACTUAL"; then
 	echo "self-analysis dead differs from $EXPECTED (- expected, + actual)." >&2
 	echo "A new finding is a harvest regression or real dead code; a vanished one means the" >&2
