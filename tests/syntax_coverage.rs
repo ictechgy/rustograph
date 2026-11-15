@@ -975,6 +975,60 @@ fn derive_names_count_as_uses_of_a_proc_macro_crate() {
     );
 }
 
+/// derive 속성 자리의 경로는 매크로 이름공간이다 — 다른 크레이트의 `#[derive(pm_derive::Hello)]`는 proc-macro
+/// 크레이트에 같은 이름의 비공개 `struct Hello`가 있어도 `#[proc_macro_derive(Hello)]` 함수를 가리킨다(proc-macro
+/// 크레이트는 매크로 말고는 내보낼 수 없어 그 struct는 밖에서 보이지도 않는다). 이전에는 로컬 아이템을 먼저 보는
+/// 해석이 struct로 이어 derive 함수 대신 struct에 거짓 사용 간선을 달았다. 크레이트 안의 `Hello { .. }`·`-> Hello`는
+/// 타입 이름공간이라 그대로 struct다. (cargo check 통과 — 미사용 경고 없음)
+#[test]
+fn derive_attribute_paths_resolve_in_the_macro_namespace() {
+    let ws = Workspace::new(
+        "pmderivens",
+        &[
+            ("Cargo.toml", "[workspace]\nmembers=['app','pm']\nresolver='2'\n"),
+            (
+                "pm/Cargo.toml",
+                "[package]\nname='pm-derive'\nversion='0.1.0'\nedition='2021'\n[lib]\nproc-macro=true\n",
+            ),
+            (
+                "pm/src/lib.rs",
+                "extern crate proc_macro;\nuse proc_macro::TokenStream;\nstruct Hello { n: u8 }\nfn make() -> Hello { Hello { n: 0 } }\n#[proc_macro_derive(Hello)]\npub fn hello_impl(_i: TokenStream) -> TokenStream { let h = make(); let _ = h.n; TokenStream::new() }\n",
+            ),
+            (
+                "app/Cargo.toml",
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\npm-derive={path='../pm'}\n",
+            ),
+            ("app/src/lib.rs", "#[derive(pm_derive::Hello)]\npub struct S;\n"),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(has_edge(
+        &doc,
+        "app::S",
+        "pm_derive::hello_impl",
+        EdgeKind::References
+    ));
+    assert!(
+        !doc.edges
+            .iter()
+            .any(|e| e.from == "app::S" && e.to == "pm_derive::Hello"),
+        "derive path linked to the private struct"
+    );
+    // 크레이트 안의 구조체 리터럴과 반환 타입은 타입 이름공간 — struct다.
+    assert!(has_edge(
+        &doc,
+        "pm_derive::make",
+        "pm_derive::Hello",
+        EdgeKind::References
+    ));
+    assert!(has_edge(
+        &doc,
+        "pm_derive::make",
+        "pm_derive::Hello",
+        EdgeKind::Signature
+    ));
+}
+
 /// 함수 안 `impl`·`trait`의 메서드 매개변수는 그 본문에서 같은 이름의 아이템을 가린다 — 묶지 않으면
 /// 매개변수 `log("x")` 호출이 모듈 함수 `log`로 읽혀 거짓 순환이 생겼다.
 #[test]

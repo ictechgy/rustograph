@@ -800,7 +800,9 @@ pub fn attr_edges(
         } else {
             r.owner.as_str()
         };
-        match tree.resolve(&r.module, &r.path, dep_crates) {
+        // 속성·derive 인자·아이템 위치 매크로 호출의 경로는 매크로 이름공간이다 — proc-macro 크레이트의 같은
+        // 이름 비공개 struct가 아니라 derive 등록 이름으로 간다.
+        match tree.resolve_in(&r.module, &r.path, dep_crates, Ns::Macro) {
             Some(to) if to != owner => {
                 let mut e = Edge::new(owner.to_string(), to, EdgeKind::References);
                 e.cfg = r.cfg.clone();

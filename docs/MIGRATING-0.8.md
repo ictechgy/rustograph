@@ -4,8 +4,9 @@ These notes cover changes on `main` after the v0.7.0 release. They have not
 shipped in a release yet; confirm the matching tag and assets on GitHub
 Releases before relying on them. CLI flags and defaults, graph document v1 and
 language-traversal v1 stay compatible: the changes add edges, retention roots
-and limitation lines, and no document field is renamed or removed. The Rust
-library's `modtree::Module` import table changes shape (see
+and limitation lines, and no document field is renamed or removed. One kind of
+edge changes its target (a cross-crate `#[derive(..)]` path, below), and the
+Rust library's `modtree::Module` import table changes shape (see
 [Rust library callers](#rust-library-callers)).
 
 ## Graph and analysis results
@@ -36,6 +37,13 @@ can have more vertices and edges than before:
   glob that also brought `fn shared` dropped that function. Calls through
   those paths now have edges, and items reached only through them stop being
   reported by `dead`.
+- A path in an attribute, a derive list or an item-position macro call
+  resolves in the macro namespace. A cross-crate `#[derive(pm::Hello)]` now
+  points at the `#[proc_macro_derive(Hello)]` function even when the
+  proc-macro crate also has a struct named `Hello`; before, the edge went to
+  that struct, which a proc-macro crate cannot export. Inside the proc-macro
+  crate, `Hello { .. }` and `-> Hello` still resolve to the struct. Such a
+  struct used only by the derive path can now be reported by `dead`.
 
 Expect `dead` to report fewer unreachable items, `rules` to see dependencies
 that a field type or a foreign-type impl body carried, and module- and

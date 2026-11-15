@@ -45,6 +45,11 @@ CLI 플래그·기본값, 그래프 문서 v1, 순회 문서 v1은 그대로다.
   리터럴은 타입, 매크로 호출은 매크로 이름공간을 먼저 보고, 그 이름공간에 묶인 것이 없으면 예전처럼 찾는다.
   라이브러리 호출자용 `modtree::Module::imports`의 타입이 바뀌고 `unresolved_imports`가 빠졌다
   ([0.8 migration](docs/MIGRATING-0.8.md)).
+- 속성·derive 인자·아이템 위치 매크로 호출의 경로를 매크로 이름공간에서 해석한다. 다른 크레이트의
+  `#[derive(pm::Hello)]`는 proc-macro 크레이트에 같은 이름의 struct가 있어도 `#[proc_macro_derive(Hello)]` 함수로
+  간다. 이전에는 그 struct(proc-macro 크레이트는 매크로 말고는 내보낼 수 없다)로 이어져 derive 함수 대신 struct에
+  거짓 사용 간선이 붙었다 — 그 경로로만 살아 있던 struct는 이제 `dead`에 나올 수 있다. 크레이트 안의
+  `Hello { .. }`·`-> Hello`는 그대로 struct다.
 - CI: `semantic-lint` 잡이 `--features semantic`으로 clippy를 돌리고, test 잡이 자기 분석 dead 결과를 알려진 목록
   (`scripts/self-dead.expected`)과 대조한다(`scripts/verify-self-dead.sh`).
 
