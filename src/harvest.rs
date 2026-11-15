@@ -801,18 +801,41 @@ pub fn attr_edges(
             r.owner.as_str()
         };
         // 속성·derive 인자·아이템 위치 매크로 호출의 경로는 매크로 이름공간이다 — proc-macro 크레이트의 같은
-        // 이름 비공개 struct가 아니라 derive 등록 이름으로 간다.
-        match tree.resolve_in(&r.module, &r.path, dep_crates, Ns::Macro) {
-            Some(to) if to != owner => {
-                let mut e = Edge::new(owner.to_string(), to, EdgeKind::References);
-                e.cfg = r.cfg.clone();
-                edges.push(e);
-            }
-            Some(_) => {}
-            None => harvest.unresolved_paths += 1,
+        // 이름 비공개 struct가 아니라 derive 등록 이름으로 간다. 자리를 모르는 해석이 다른 정점이면 그쪽은
+        // 추정 간선으로 남긴다([`macro_hedge`]).
+        let firm = tree.resolve_in(&r.module, &r.path, dep_crates, Ns::Macro);
+        let any = tree.resolve(&r.module, &r.path, dep_crates);
+        if firm.is_none() && any.is_none() {
+            harvest.unresolved_paths += 1;
+        }
+        let hedge = macro_hedge(tree, &r.module, any, firm.as_deref()).filter(|to| to != owner);
+        let firm = firm
+            .filter(|to| to != owner)
+            .map(|to| Edge::new(owner.to_string(), to, EdgeKind::References));
+        let hedge = hedge.map(|to| Edge::maybe(owner.to_string(), to, EdgeKind::References));
+        for mut e in firm.into_iter().chain(hedge) {
+            e.cfg = r.cfg.clone();
+            edges.push(e);
         }
     }
     edges
+}
+
+/// 모듈 `module`의 매크로 경로에서 매크로 이름공간 해석 `firm`과 자리를 모르는 해석 `any`가 다르면 `any` —
+/// 이름공간을 나누기 전에는 매크로 경로(속성·derive 인자·매크로 호출)가 그쪽으로 갔다. derive 매크로는 대개 같은
+/// 이름의 trait을 구현하는 코드를 만들고(`#[derive(mylib::Hello)]` → `impl mylib::Hello for S`), 그 펼침은 구문
+/// 분석에 보이지 않는다. 매크로 이름공간의 대상이 rustc가 고르는 것이라 확정 간선은 그쪽이고, 예전 대상은 추정
+/// 간선(dead·도달성 전용 — cycles·rules는 제외하고 센다)으로 남겨 보존을 좁히지 않는다.
+///
+/// `module`에서 보이지 않는 `any`(다른 크레이트의 비공개 아이템 — proc-macro 크레이트의 같은 이름 struct)는
+/// 남기지 않는다. 그 모듈의 코드도, 거기서 펼친 매크로 출력도 그 이름을 쓸 수 없다.
+fn macro_hedge(
+    tree: &ModTree,
+    module: &str,
+    any: Option<String>,
+    firm: Option<&str>,
+) -> Option<String> {
+    any.filter(|to| Some(to.as_str()) != firm && tree.visible_from(to, module))
 }
 
 /// 모은 선언 참조([`DeclRef`])를 references 간선으로 해석한다(2패스).
@@ -1488,9 +1511,16 @@ impl BodyVisitor<'_> {
     /// 아이템으로 해석되면 추정 간선만 단다. 문법을 모르니 호출인지 단순 언급인지 가릴 수 없다.
     fn visit_macro_call(&mut self, mac: &syn::Macro) {
         let segs = path_segments(&mac.path);
-        match self.resolve_in(&segs, Ns::Macro) {
+        let firm = self.resolve_in(&segs, Ns::Macro);
+        let any = self.resolve(&segs);
+        let hedge = macro_hedge(self.tree, self.module, any, firm.as_deref());
+        match firm {
             Some(id) => self.push(id, EdgeKind::Call),
-            None => self.ext_macros += 1,
+            None if hedge.is_none() => self.ext_macros += 1,
+            None => {}
+        }
+        if let Some(id) = hedge {
+            self.push_maybe(id, EdgeKind::Call);
         }
         let parsed = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
             .parse2(mac.tokens.clone());

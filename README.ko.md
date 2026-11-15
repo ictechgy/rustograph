@@ -412,7 +412,12 @@ proc-macro lib도 lib으로 셉니다. 예제·통합 테스트·벤치 타깃�
 impl 본문·시그니처의 `Self`는 impl self 타입이고, `<T as Tr>::m()`은 `T`의 impl 메서드를, `<T>::m()`과
 값으로 넘긴 연관 함수(`.map(T::new)`)는 `T`의 같은 이름 메서드를 가리킵니다. `macro_rules!` 정의 본문의 두 세그먼트 이상 경로(`$crate::m::f`)와, 표현식
 목록이 아닌 매크로 인자(`json!({..})`) 안에서 지역 묶음이 아닌 아이템으로 해석되는 이름은 추정
-(tentative) 간선이 되어 도달성에만 쓰입니다. 함수 안 아이템(중첩 `fn`, 지역 `impl`·`macro_rules!`)은
+(tentative) 간선이 되어 도달성에만 쓰입니다. 속성·derive 인자·매크로 호출의 경로는 rustc처럼 매크로 이름공간에서
+해석합니다 — `mylib`이 trait `Hello`도 내보내도 `#[derive(mylib::Hello)]`는 `#[proc_macro_derive(Hello)]` 함수를
+가리킵니다. 같은 경로를 이름공간 없이 해석한 결과가 그 모듈에서 보이는 다른 정점(그 trait, 들인 `info!` 매크로 옆의
+로컬 `fn info`)이면 그 정점에도 추정 간선을 둡니다 — 이름공간을 나누기 전에는 경로가 그쪽을 가리켰고, 구문 분석이
+보지 못하는 derive 펼침은 대개 같은 이름의 trait을 구현합니다. 이 추정 간선은 `dead`에서 그 아이템을 살려 두고
+`cycles`·`rules`에는 들어가지 않습니다. 함수 안 아이템(중첩 `fn`, 지역 `impl`·`macro_rules!`)은
 정점이 없고 그 간선은 바깥 본문이 소유합니다. self 타입이 워크스페이스 정점이 아닌 impl(`impl Tr for
 String`, blanket `impl<T: Tr> Ext for T`, `impl Tr for &Local`)은 메서드 정점이 없어, 본문의 확정 간선을
 impl이 선언된 모듈이 소유합니다 — 의존이 실제로 나가는 곳이라 `rules`·`cycles`가 그 모듈의 의존으로 봅니다.

@@ -623,6 +623,20 @@ impl ModTree {
         }
     }
 
+    /// 정점 `path`(모듈, 또는 모듈의 선언 아이템)가 모듈 `from`에서 보이는가 — 그 아이템이 선언한 가시성만 본다
+    /// (경로가 지나는 모듈의 가시성과 재노출은 보지 않는다). 아이템 표에 없는 정점(크레이트 루트, 외부 크레이트
+    /// 정점)은 보인다고 본다. 확정 해석은 컴파일되는 코드를 전제로 관대하게 하므로 이것을 쓰지 않는다 — 대신
+    /// 해석하지 않은 후보(추정 간선)가 그 자리에서 쓸 수 없는 이름인지 거르는 데 쓴다.
+    pub fn visible_from(&self, path: &str, from: &str) -> bool {
+        let Some((owner, name)) = path.rsplit_once("::") else {
+            return true;
+        };
+        self.modules
+            .get(owner)
+            .and_then(|m| m.item_scopes.get(name))
+            .is_none_or(|scope| scope.includes(from))
+    }
+
     /// 경로의 마지막 세그먼트가 어떤 모듈의 선언 아이템인지 확인한다.
     /// 아이템 표는 전 모듈에 대해 먼저 채워지므로 이 판정은 순서 무관하다.
     pub fn item_exists(&self, path: &str) -> bool {

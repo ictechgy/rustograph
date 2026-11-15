@@ -211,6 +211,16 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
   arguments are not a comma-separated expression list (`json!({..})`) gets
   tentative edges to the names in its tokens that resolve to workspace items
   and are not local bindings. Like name fan-out, they feed reachability only.
+- A path in an attribute, a derive list, or a macro call resolves in the macro
+  namespace, as rustc does: `#[derive(mylib::Hello)]` points at the
+  `#[proc_macro_derive(Hello)]` function even when `mylib` also exports a
+  trait `Hello`. When resolving the same path without a namespace reaches a
+  different vertex visible from that module (that trait, or a local `fn info`
+  beside an imported `info!` macro), the vertex also gets a tentative edge:
+  the path pointed there before namespaces were kept apart, and a derive's
+  expansion, which syntax cannot see, usually implements the trait it is
+  named after. The tentative edge keeps such items alive in `dead` and stays
+  out of `cycles` and `rules`.
 - Items inside a function body (a nested `fn`, a local `impl` or
   `macro_rules!`) have no vertex; their edges belong to the enclosing body.
 - An impl whose self type is not a workspace vertex (`impl Tr for String`,
