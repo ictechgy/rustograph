@@ -1846,8 +1846,8 @@ fn harvest_module<'a>(
     let imports: BTreeSet<(&String, &Option<String>)> = module
         .imports
         .values()
-        .flat_map(|bindings| bindings.iter())
-        .filter_map(|(_, binding)| match binding {
+        .flat_map(modtree::PerNs::bound)
+        .filter_map(|binding| match binding {
             modtree::Binding::Resolved(imp) => Some((&imp.target, &imp.cfg)),
             modtree::Binding::Unresolved(_) => None,
         })

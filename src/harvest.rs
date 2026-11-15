@@ -1316,6 +1316,7 @@ impl BodyVisitor<'_> {
         self.resolve_at(segs, Some(ns))
     }
 
+    /// [`Self::resolve`]·[`Self::resolve_in`]의 본체 — `ns`가 없으면 자리를 모른다.
     fn resolve_at(&mut self, segs: &[String], ns: Option<Ns>) -> Option<String> {
         let substituted = self.self_ty.and_then(|ty| substitute_self(segs, ty));
         let segs = substituted.as_deref().unwrap_or(segs);
@@ -1334,6 +1335,19 @@ impl BodyVisitor<'_> {
     /// 모듈로 오독한 것이다. 외부 크레이트로 붕괴한 정점은 모듈 표에 없어
     /// 그대로 남는다(`dep::f()`는 크레이트 경계 증거다).
     fn resolve_value(&mut self, segs: &[String]) -> ValueRes {
+        self.resolve_value_at(segs, Some(Ns::Value))
+    }
+
+    /// 문법을 모르는 매크로 인자 토큰 안의 경로를 해석한다 — 값인지 타입인지 모르니 이름공간을 가리지 않고
+    /// 찾는다(로컬 아이템이 먼저). `unsafe_impl!(T: Unaligned => Unaligned for [T])`의 `Unaligned`는 trait인데,
+    /// 값 이름공간에서 찾으면 같은 이름의 derive 재노출로 가 trait 간선을 잃었다. 지역 묶음·모듈을 버리는 규칙은
+    /// [`Self::resolve_value`]와 같다.
+    fn resolve_mention(&mut self, segs: &[String]) -> ValueRes {
+        self.resolve_value_at(segs, None)
+    }
+
+    /// [`Self::resolve_value`]·[`Self::resolve_mention`]의 본체 — `ns`가 없으면 자리를 모른다.
+    fn resolve_value_at(&mut self, segs: &[String], ns: Option<Ns>) -> ValueRes {
         if segs.len() > 1
             && segs
                 .first()
@@ -1346,7 +1360,7 @@ impl BodyVisitor<'_> {
                 return ValueRes::Local;
             }
         }
-        match self.resolve_in(segs, Ns::Value) {
+        match self.resolve_at(segs, ns) {
             Some(id) if self.tree.modules.contains_key(&id) && !self.value_item(&id) => {
                 ValueRes::Local
             }
@@ -1484,7 +1498,7 @@ impl BodyVisitor<'_> {
             // 표현식 목록이 아닌 인자(`json!({"k": f()})`, `matches!(x, P)`) — 토큰 안의 이름이
             // 아이템으로 해석되면 추정 간선을 단다. 문법을 모르니 확정 사용이 아니다(dead·도달성만).
             for path in token_paths(mac.tokens.clone(), 1) {
-                if let ValueRes::Item(id) = self.resolve_value(&path) {
+                if let ValueRes::Item(id) = self.resolve_mention(&path) {
                     self.push_maybe(id, EdgeKind::References);
                 }
             }

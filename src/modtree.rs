@@ -137,6 +137,10 @@ impl Ns {
 }
 
 /// 이름 하나가 이름공간마다 묶인 것 — 비어 있는 칸은 그 이름공간에 그 이름이 없다는 뜻이다.
+///
+/// 이름공간을 정하지 못한 것은 세 칸이 아니라 [`PerNs::undetermined`]에 둔다. 세 칸에 똑같이 두면 그 이름공간에
+/// 정말 묶인 것과 구별되지 않아, 같은 이름의 로컬 trait 옆에 둔 `pub use derive_crate::Foo`(실제로는 매크로
+/// 이름공간뿐이다)가 값 자리의 `Foo`까지 차지했다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PerNs<T> {
     /// 타입 이름공간.
@@ -145,6 +149,11 @@ pub struct PerNs<T> {
     pub values: Option<T>,
     /// 매크로 이름공간.
     pub macros: Option<T>,
+    /// 어느 이름공간인지 정하지 못한 것 — 아이템 표가 이름공간을 모르는 명시 `use`(외부 크레이트로 붕괴한 경로,
+    /// std 경로, 매크로가 만든 이름)와 그것을 글롭·재노출로 다시 들인 것이다. 해석은 같은 이름의 로컬 아이템이나
+    /// 이름공간이 정해진 칸이 없을 때만 이것을 쓴다([`lookup`]). rustc에서 명시 `use`는 같은 이름공간의 로컬
+    /// 아이템·다른 명시 `use`와 공존하지 못하므로(E0255·E0252) 그런 것이 있으면 이 `use`는 다른 이름공간에 있다.
+    pub undetermined: Option<T>,
 }
 
 impl<T> Default for PerNs<T> {
@@ -153,21 +162,17 @@ impl<T> Default for PerNs<T> {
             types: None,
             values: None,
             macros: None,
+            undetermined: None,
         }
     }
 }
 
 impl<T> PerNs<T> {
-    /// 모든 이름공간에 같은 것을 묶는다 — 어느 이름공간인지 가릴 수 없는 대상(외부 크레이트로 붕괴한 경로,
-    /// 해석되지 않는 `use`)이다.
-    pub fn all(value: T) -> PerNs<T>
-    where
-        T: Clone,
-    {
+    /// 이름공간을 정하지 못한 것 하나만 묶는다 — [`PerNs::undetermined`].
+    pub fn undetermined_only(value: T) -> PerNs<T> {
         PerNs {
-            types: Some(value.clone()),
-            values: Some(value.clone()),
-            macros: Some(value),
+            undetermined: Some(value),
+            ..PerNs::default()
         }
     }
 
@@ -189,16 +194,29 @@ impl<T> PerNs<T> {
         }
     }
 
-    /// 채워진 칸을 [`Ns::ALL`] 순서로.
+    /// 이름공간이 정해진 칸을 [`Ns::ALL`] 순서로 — [`PerNs::undetermined`]는 빠진다.
     pub fn iter(&self) -> impl Iterator<Item = (Ns, &T)> {
         Ns::ALL
             .into_iter()
             .filter_map(move |ns| self.get(ns).map(|v| (ns, v)))
     }
 
-    /// 채워진 칸이 없는가.
+    /// 묶인 것 전부 — 이름공간이 정해진 칸([`Ns::ALL`] 순서) 다음에 [`PerNs::undetermined`]다. 이름공간을
+    /// 묻지 않는 소비자(모듈 `uses` 의존 증거)용이다.
+    pub fn bound(&self) -> impl Iterator<Item = &T> {
+        self.iter()
+            .map(|(_, v)| v)
+            .chain(self.undetermined.as_ref())
+    }
+
+    /// 이름공간이 정해진 칸에 묶인 것이 있는가.
+    pub fn has_determined(&self) -> bool {
+        self.iter().next().is_some()
+    }
+
+    /// 아무것도 묶이지 않았는가([`PerNs::undetermined`] 포함).
     pub fn is_empty(&self) -> bool {
-        self.types.is_none() && self.values.is_none() && self.macros.is_none()
+        !self.has_determined() && self.undetermined.is_none()
     }
 }
 
@@ -216,7 +234,8 @@ pub enum Binding {
 /// 경로의 마지막 세그먼트를 어느 이름공간에서 찾는가. 접두사 세그먼트는 늘 타입 이름공간이다.
 #[derive(Debug, Clone, Copy)]
 enum Want {
-    /// 자리를 모른다 — 로컬 아이템이 먼저고, 임포트는 해석된 것 가운데 값 → 타입 → 매크로 순이다.
+    /// 자리를 모른다 — 로컬 아이템이 먼저고, 임포트는 이름공간이 정해진 해석된 것(값 → 타입 → 매크로), 이름공간을
+    /// 정하지 못한 해석된 것 순이다.
     Any,
     /// 그 이름공간이 먼저다. 그 이름공간에 묶인 것이 없으면 [`Want::Any`]로 넘어간다 — 아이템 표가 모르는
     /// 이름공간(매크로가 만든 아이템, 배리언트 등)에서도 예전처럼 찾아 보존을 좁히지 않는다.
@@ -272,7 +291,9 @@ pub struct Module {
     pub item_scopes: BTreeMap<String, Scope>,
     /// `use` 임포트 맵: 마지막 세그먼트(또는 as 이름) → 이름공간마다 묶인 것. 명시 `use`는 대상이 차지한
     /// 이름공간에만 묶이고, 글롭은 대상 모듈의 이름을 이름공간마다 따로 들인다. 명시 임포트는 같은
-    /// 이름공간의 글롭만 가린다(rustc와 같다). derive 등록 이름은 매크로 이름공간에 있다.
+    /// 이름공간의 글롭만 가린다(rustc와 같다). derive 등록 이름은 매크로 이름공간에 있다. 이름공간을 정하지
+    /// 못한 명시 `use`는 [`PerNs::undetermined`]에 있고, 어느 이름공간을 차지하는지 모르니 같은 이름의 글롭을
+    /// 모두 가린다.
     pub imports: BTreeMap<String, PerNs<Binding>>,
     /// 이 모듈이 글롭으로 들이는 모듈·외부 크레이트 정점(`use m::*`의 `m`) → 그 `use`의 `#[cfg]`. 그 글롭의
     /// 의존 증거(uses 간선, deps의 사용 증거)일 뿐 이름이 아니다 — 이름 해석과 다른 모듈의 글롭에 쓰지 않는다.
@@ -547,9 +568,10 @@ impl ModTree {
     /// `use` 경로 하나를 이름공간마다 해석한다 — 명시 `use a::x`는 `a`에서 `x`가 차지한 이름공간을 모두 들인다
     /// (`a`에 `fn x`와 `pub use crate::m as x`가 함께 있으면 값은 그 fn, 타입은 `m`). 앞 세그먼트는 타입
     /// 이름공간으로 걷고, 마지막 세그먼트를 그 모듈에서 이름공간마다 찾는다. 칸의 `Some(None)`은 그 이름공간에서
-    /// 그래프 밖 이름으로 묶였다는 뜻이다. 어느 이름공간에서도 정점을 정하지 못하면 이름공간을 가리지 않는
-    /// 해석([`ModTree::resolve`])을 모든 칸에 둔다 — 외부 크레이트로 붕괴한 경로, 멤버 루트, 아이템 표가
-    /// 이름공간을 모르는 이름이 그렇다. 그래서 이름공간을 나누기 전에 묶이던 대상은 늘 어느 칸엔가 있다.
+    /// 그래프 밖 이름으로 묶였다는 뜻이다. 그 모듈에서 이름공간을 정하지 못한 칸([`PerNs::undetermined`])은 그대로
+    /// 이름공간을 정하지 못한 칸으로 물려받는다. 어디서도 정점을 정하지 못하면 이름공간을 가리지 않는
+    /// 해석([`ModTree::resolve`])을 이름공간을 정하지 못한 칸에 둔다 — 외부 크레이트로 붕괴한 경로, 멤버 루트, 아이템
+    /// 표가 이름공간을 모르는 이름이 그렇다. 그래서 이름공간을 나누기 전에 묶이던 대상은 늘 어느 칸엔가 있다.
     fn resolve_use(
         &self,
         from: &str,
@@ -568,23 +590,36 @@ impl ModTree {
                 for ns in Ns::ALL {
                     *out.slot(ns) = match strict_lookup(module, last, ns) {
                         Found::Local => Some(Some(format!("{owner}::{last}"))),
-                        // 따라간 대상이 정점이 아니면(트리에 없는 멤버 루트 등) 이 칸은 정하지 않는다.
-                        Found::Import(imp) => (dep_crates.external.contains(imp.target.as_str())
-                            || self.modules.contains_key(&imp.target)
-                            || self.item_exists(&imp.target))
-                        .then(|| Some(imp.target.clone())),
-                        Found::Unresolved => Some(None),
-                        Found::Unbound => None,
+                        found => self.use_target(found, dep_crates),
                     };
                 }
+                out.undetermined = module
+                    .imports
+                    .get(last)
+                    .and_then(|b| b.undetermined.as_ref())
+                    .and_then(|binding| self.use_target(found_of(binding), dep_crates));
             }
         }
-        if out.iter().any(|(_, target)| target.is_some()) {
+        if out.bound().any(Option::is_some) {
             return out;
         }
         match self.resolve(from, segs, dep_crates) {
-            Some(target) => PerNs::all(Some(target)),
+            Some(target) => PerNs::undetermined_only(Some(target)),
             None => out,
+        }
+    }
+
+    /// [`ModTree::resolve_use`]가 대상 모듈에서 찾은 임포트 하나를 칸 값으로 — `Some(None)`은 그래프 밖 이름이다.
+    /// 따라간 대상이 정점이 아니면(트리에 없는 멤버 루트 등) 칸을 정하지 않는다(`None`).
+    fn use_target(&self, found: Found<'_>, dep_crates: &DepCrates) -> Option<Option<String>> {
+        match found {
+            Found::Import(imp) => (dep_crates.external.contains(imp.target.as_str())
+                || self.modules.contains_key(&imp.target)
+                || self.item_exists(&imp.target))
+            .then(|| Some(imp.target.clone())),
+            Found::Unresolved => Some(None),
+            // 로컬 아이템은 호출자가 정규 ID로 바꾼다 — 여기 오는 것은 임포트 칸뿐이다.
+            Found::Local | Found::Unbound => None,
         }
     }
 
@@ -611,15 +646,23 @@ fn local_in(module: &Module, name: &str, ns: Ns) -> bool {
 }
 
 /// 모듈 `module`에서 `name`을 이름공간 `ns`에서만 찾는다 — 그 이름공간의 로컬 아이템이 같은 이름공간의
-/// 임포트(글롭)를 이긴다. 명시 임포트와는 컴파일되는 코드에서 공존하지 못한다.
+/// 임포트(글롭)를 이긴다. 명시 임포트와는 컴파일되는 코드에서 공존하지 못한다. 이름공간을 정하지 못한 칸
+/// ([`PerNs::undetermined`])은 보지 않는다.
 fn strict_lookup<'a>(module: &'a Module, name: &str, ns: Ns) -> Found<'a> {
     if local_in(module, name, ns) {
         return Found::Local;
     }
     match module.imports.get(name).and_then(|b| b.get(ns)) {
-        Some(Binding::Resolved(imp)) => Found::Import(imp),
-        Some(Binding::Unresolved(_)) => Found::Unresolved,
+        Some(binding) => found_of(binding),
         None => Found::Unbound,
+    }
+}
+
+/// 임포트 칸 하나를 찾은 결과로.
+fn found_of(binding: &Binding) -> Found<'_> {
+    match binding {
+        Binding::Resolved(imp) => Found::Import(imp),
+        Binding::Unresolved(_) => Found::Unresolved,
     }
 }
 
@@ -628,25 +671,59 @@ fn strict_lookup<'a>(module: &'a Module, name: &str, ns: Ns) -> Found<'a> {
 /// 접두사 자리(`name::item`)는 [`Want::Prefer`]`(Ns::Type)`다. 로컬 타입 이름공간 아이템(자식 모듈·struct·enum·
 /// union·trait·type)은 같은 이름의 타입 이름공간 임포트(글롭)를 이기고, 로컬 이름이 값·매크로 아이템뿐이면
 /// 타입 이름공간에 묶인 임포트를 따른다 — `fn harvest`가 있는 모듈의 `harvest::f()`는 `use crate::harvest`다.
-/// 그 이름공간에 아무것도 없으면 [`Want::Any`]다: 로컬 아이템이 먼저고(매크로가 만든 로컬 아이템은 아이템 표에
-/// 없어 이 판단에 들어오지 않는다), 다음은 해석된 임포트를 값 → 타입 → 매크로 순으로, 그다음이 해석되지 않는
-/// 임포트다. 값이 먼저인 것은 이름공간을 나누기 전 글롭 표가 같은 이름의 선언 아이템(대개 fn)을 고르던 결과를
-/// 자리를 모르는 해석에서 유지하기 위해서다.
+/// 그 이름공간에 아무것도 없으면 이름공간을 정하지 못한 임포트를 보되, 같은 이름의 로컬 아이템이나 이름공간이
+/// 정해진 임포트가 있으면 보지 않는다([`undetermined_lookup`]). 그래도 없으면 [`Want::Any`]다([`any_lookup`]).
 fn lookup<'a>(module: &'a Module, name: &str, want: Want) -> Found<'a> {
     if let Want::Prefer(ns) = want {
         match strict_lookup(module, name, ns) {
             Found::Unbound => {}
             found => return found,
         }
+        match undetermined_lookup(module, name) {
+            Found::Unbound => {}
+            found => return found,
+        }
     }
+    any_lookup(module, name)
+}
+
+/// 자리의 이름공간에 묶인 것이 없을 때 이름공간을 정하지 못한 임포트([`PerNs::undetermined`])를 쓸 것인가.
+///
+/// 같은 이름의 로컬 아이템이나 이름공간이 정해진 임포트가 있으면 쓰지 않는다(`Unbound`) — rustc에서 명시 `use`는
+/// 같은 이름공간의 로컬 아이템·다른 명시 `use`와 공존하지 못하므로(E0255·E0252), 컴파일되는 코드라면 그 `use`는
+/// 그것들과 다른 이름공간에 있다. `pub trait Foo`와 `pub use foo_derive::Foo`(derive 매크로)가 함께 있는 모듈에서
+/// 매크로 인자·값 자리의 `Foo`가 그 `use`로 가 trait 간선을 잃던 문제다. 쓰지 않으면 [`any_lookup`]이 로컬
+/// 아이템이나 정해진 임포트를 고른다. 아무것도 없으면 그 `use`가 유일한 후보다.
+fn undetermined_lookup<'a>(module: &'a Module, name: &str) -> Found<'a> {
+    let Some(bindings) = module.imports.get(name) else {
+        return Found::Unbound;
+    };
+    let claimed = module.items.contains(name)
+        || module.children.contains_key(name)
+        || bindings.has_determined();
+    match &bindings.undetermined {
+        Some(binding) if !claimed => found_of(binding),
+        _ => Found::Unbound,
+    }
+}
+
+/// 자리를 모르는 해석 — 로컬 아이템이 먼저고(매크로가 만든 로컬 아이템은 아이템 표에 없어 이 판단에 들어오지
+/// 않는다), 다음은 이름공간이 정해진 해석된 임포트를 값 → 타입 → 매크로 순으로, 이름공간을 정하지 못한 해석된
+/// 임포트, 그다음이 해석되지 않는 임포트다. 값이 먼저인 것은 이름공간을 나누기 전 글롭 표가 같은 이름의 선언
+/// 아이템(대개 fn)을 고르던 결과를 자리를 모르는 해석에서 유지하기 위해서고, 정해진 것이 먼저인 것은 글롭이
+/// 들인 trait(타입 이름공간)이 같은 이름의 derive 재노출(이름공간을 모름)에 가려지지 않게 하기 위해서다.
+fn any_lookup<'a>(module: &'a Module, name: &str) -> Found<'a> {
     if module.items.contains(name) || module.children.contains_key(name) {
         return Found::Local;
     }
     let Some(bindings) = module.imports.get(name) else {
         return Found::Unbound;
     };
-    for ns in [Ns::Value, Ns::Type, Ns::Macro] {
-        if let Some(Binding::Resolved(imp)) = bindings.get(ns) {
+    let determined = [Ns::Value, Ns::Type, Ns::Macro]
+        .into_iter()
+        .filter_map(|ns| bindings.get(ns));
+    for binding in determined.chain(bindings.undetermined.as_ref()) {
+        if let Binding::Resolved(imp) = binding {
             return Found::Import(imp);
         }
     }
@@ -1065,24 +1142,19 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
             .map(|s| s[3..].to_string())
             .unwrap_or_else(|| segs.last().unwrap().clone());
         let targets = tree.resolve_use(path, &clean, dep_crates);
-        // 어느 이름공간에도 묶이지 않는 `use`(std 경로 등)는 모든 이름공간에서 해석되지 않는 이름이다.
+        // 어디에도 묶이지 않는 `use`(std 경로 등)는 이름공간을 정하지 못한, 해석되지 않는 이름이다.
         let targets = if targets.is_empty() {
-            PerNs::all(None)
+            PerNs::undetermined_only(None)
         } else {
             targets
         };
         let slots = explicit.entry(alias).or_default();
         for (ns, target) in targets.iter() {
-            let binding = match target {
-                Some(full) => Binding::Resolved(Import {
-                    target: full.clone(),
-                    cfg: cfg.clone(),
-                    scope: scope.clone(),
-                }),
-                None => Binding::Unresolved(scope.clone()),
-            };
             // 같은 이름공간에 같은 이름을 들이는 `use`가 둘이면 지금처럼 뒤의 것이다.
-            *slots.slot(ns) = Some(binding);
+            *slots.slot(ns) = Some(use_binding(target, cfg, scope));
+        }
+        if let Some(target) = &targets.undetermined {
+            slots.undetermined = Some(use_binding(target, cfg, scope));
         }
     }
     // derive 매크로는 함수 이름이 아니라 등록한 이름으로 쓰인다 — `pub use self::hello_impl as Hello;`
@@ -1098,22 +1170,57 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
     }
     let mut imports = globbed;
     for (name, bindings) in explicit {
-        let slots = imports.entry(name).or_default();
-        for ns in Ns::ALL {
-            if let Some(binding) = bindings.get(ns) {
-                *slots.slot(ns) = Some(binding.clone());
-            }
-        }
+        shadow_globs(imports.entry(name).or_default(), bindings);
     }
     let module = tree.modules.get_mut(path).expect("module must exist");
     module.imports = imports;
     module.glob_targets = glob_targets;
 }
 
+/// 명시 `use` 하나의 칸 값 — `None` 대상은 그래프 밖 이름이다.
+fn use_binding(target: &Option<String>, cfg: &Option<String>, scope: &Scope) -> Binding {
+    match target {
+        Some(full) => Binding::Resolved(Import {
+            target: full.clone(),
+            cfg: cfg.clone(),
+            scope: scope.clone(),
+        }),
+        None => Binding::Unresolved(scope.clone()),
+    }
+}
+
+/// 한 이름의 글롭 칸 `slots` 위에 명시 임포트 `explicit`을 얹는다 — 명시 임포트는 자기 이름공간의 글롭만 가린다.
+/// 이름공간을 정하지 못한 명시 임포트는 어느 이름공간을 차지하는지 모르니 그 이름의 글롭을 모두 가린다 —
+/// `use std::fmt::Result`가 글롭이 들인 로컬 `Result`를 가리는 것(이름공간을 나누기 전과 같다).
+fn shadow_globs(slots: &mut PerNs<Binding>, explicit: PerNs<Binding>) {
+    let PerNs {
+        types,
+        values,
+        macros,
+        undetermined,
+    } = explicit;
+    if undetermined.is_some() {
+        *slots = PerNs {
+            undetermined,
+            ..PerNs::default()
+        };
+    }
+    for (slot, binding) in [
+        (&mut slots.types, types),
+        (&mut slots.values, values),
+        (&mut slots.macros, macros),
+    ] {
+        if binding.is_some() {
+            *slot = binding;
+        }
+    }
+}
+
 /// 모듈 `importer`의 글롭 `use full::*`(조건 `cfg`, 가시성 `scope`)이 `full`(=`target`)에서 들이는 이름 —
 /// `importer`에서 보이는 재노출·해석되지 않는 임포트·선언 아이템을 이름공간마다 따로 들인다. 같은 이름공간이면
-/// 선언 아이템이 이긴다. 펼친 이름은 글롭과 원래 것 가운데 좁은 가시성으로 보이고, 두 `#[cfg]` 조건을 함께
-/// 싣는다.
+/// 선언 아이템이 이긴다. 이름공간을 정하지 못한 임포트([`PerNs::undetermined`])는 그대로 이름공간을 정하지 못한
+/// 칸으로 들인다 — 같은 이름의 선언 아이템이 있어도 남는다(그 아이템과 다른 이름공간에 있다). 펼친 이름은 글롭과
+/// 원래 것 가운데 좁은 가시성으로 보이고, 두 `#[cfg]` 조건을 함께 싣는다.
 fn glob_bindings(
     target: &Module,
     full: &str,
@@ -1123,21 +1230,16 @@ fn glob_bindings(
 ) -> BTreeMap<String, PerNs<Binding>> {
     let mut out: BTreeMap<String, PerNs<Binding>> = BTreeMap::new();
     for (name, bindings) in &target.imports {
+        let mut slots = PerNs::default();
         for (ns, binding) in bindings.iter() {
-            let binding = match binding {
-                Binding::Resolved(imp) if imp.scope.includes(importer) => {
-                    Binding::Resolved(Import {
-                        target: imp.target.clone(),
-                        cfg: conjoin_cfg(cfg, &imp.cfg),
-                        scope: scope.narrower(&imp.scope),
-                    })
-                }
-                Binding::Unresolved(seen) if seen.includes(importer) => {
-                    Binding::Unresolved(scope.narrower(seen))
-                }
-                _ => continue,
-            };
-            *out.entry(name.clone()).or_default().slot(ns) = Some(binding);
+            *slots.slot(ns) = reexported(binding, importer, cfg, scope);
+        }
+        slots.undetermined = bindings
+            .undetermined
+            .as_ref()
+            .and_then(|binding| reexported(binding, importer, cfg, scope));
+        if !slots.is_empty() {
+            out.insert(name.clone(), slots);
         }
     }
     for name in target.items.iter().chain(target.children.keys()) {
@@ -1150,17 +1252,17 @@ fn glob_bindings(
             cfg: cfg.clone(),
             scope: scope.narrower(&seen),
         });
-        // 아이템 표가 이름공간을 모르는 이름은 모든 이름공간을 차지한 것으로 둔다(관대하게).
+        let slots = out.entry(name.clone()).or_default();
         let spaces: Vec<Ns> = Ns::ALL
             .into_iter()
             .filter(|ns| local_in(target, name, *ns))
             .collect();
-        let spaces = if spaces.is_empty() {
-            Ns::ALL.to_vec()
-        } else {
-            spaces
-        };
-        let slots = out.entry(name.clone()).or_default();
+        if spaces.is_empty() {
+            // 아이템 표가 이름공간을 모르는 이름(이름공간 표 없이 `items`만 채운 모듈)은 이름공간을 정하지 못한
+            // 칸에 둔다(관대하게 — 같은 이름의 다른 후보가 없으면 어느 자리에서든 찾는다).
+            slots.undetermined = Some(binding);
+            continue;
+        }
         for ns in spaces {
             *slots.slot(ns) = Some(binding.clone());
         }
@@ -1168,32 +1270,65 @@ fn glob_bindings(
     out
 }
 
-/// 글롭이 펼친 이름 하나를 이름공간마다 심는다. 여러 글롭이 같은 대상을 들이면 하나로 합친다 — 가시성은 넓은
-/// 쪽, 조건은 둘 중 약한 쪽(어느 글롭으로든 들어오면 임포트가 있다). 대상이 다르면 지금처럼 뒤의 글롭이
-/// 이긴다(rustc에서는 쓰면 모호성 오류다).
-fn merge_glob(globbed: &mut PerNs<Binding>, bindings: PerNs<Binding>) {
-    for ns in Ns::ALL {
-        let Some(binding) = bindings.get(ns).cloned() else {
-            continue;
-        };
-        let slot = globbed.slot(ns);
-        let merged = match (slot.take(), binding) {
-            (Some(Binding::Resolved(seen)), Binding::Resolved(imp))
-                if seen.target == imp.target =>
-            {
-                Binding::Resolved(Import {
-                    cfg: weaker_cfg(&seen.cfg, &imp.cfg),
-                    scope: seen.scope.wider(&imp.scope),
-                    target: imp.target,
-                })
-            }
-            (Some(Binding::Unresolved(seen)), Binding::Unresolved(scope)) => {
-                Binding::Unresolved(seen.wider(&scope))
-            }
-            (_, binding) => binding,
-        };
-        *slot = Some(merged);
+/// `importer`의 글롭이 다른 모듈의 임포트 칸 `binding`을 다시 들인 것 — `importer`에서 보이지 않으면 `None`이다.
+/// 가시성은 글롭과 원래 것 가운데 좁은 쪽, 조건은 둘을 함께 싣는다.
+fn reexported(
+    binding: &Binding,
+    importer: &str,
+    cfg: &Option<String>,
+    scope: &Scope,
+) -> Option<Binding> {
+    match binding {
+        Binding::Resolved(imp) if imp.scope.includes(importer) => Some(Binding::Resolved(Import {
+            target: imp.target.clone(),
+            cfg: conjoin_cfg(cfg, &imp.cfg),
+            scope: scope.narrower(&imp.scope),
+        })),
+        Binding::Unresolved(seen) if seen.includes(importer) => {
+            Some(Binding::Unresolved(scope.narrower(seen)))
+        }
+        _ => None,
     }
+}
+
+/// 글롭이 펼친 이름 하나를 이름공간마다(이름공간을 정하지 못한 칸 포함) 심는다([`merge_glob_slot`]).
+fn merge_glob(globbed: &mut PerNs<Binding>, bindings: PerNs<Binding>) {
+    let PerNs {
+        types,
+        values,
+        macros,
+        undetermined,
+    } = bindings;
+    for (slot, binding) in [
+        (&mut globbed.types, types),
+        (&mut globbed.values, values),
+        (&mut globbed.macros, macros),
+        (&mut globbed.undetermined, undetermined),
+    ] {
+        if let Some(binding) = binding {
+            merge_glob_slot(slot, binding);
+        }
+    }
+}
+
+/// 글롭이 펼친 칸 하나를 심는다. 여러 글롭이 같은 대상을 들이면 하나로 합친다 — 가시성은 넓은 쪽, 조건은 둘 중
+/// 약한 쪽(어느 글롭으로든 들어오면 임포트가 있다). 대상이 다르면 지금처럼 뒤의 글롭이 이긴다(rustc에서는 쓰면
+/// 모호성 오류다).
+fn merge_glob_slot(slot: &mut Option<Binding>, binding: Binding) {
+    let merged = match (slot.take(), binding) {
+        (Some(Binding::Resolved(seen)), Binding::Resolved(imp)) if seen.target == imp.target => {
+            Binding::Resolved(Import {
+                cfg: weaker_cfg(&seen.cfg, &imp.cfg),
+                scope: seen.scope.wider(&imp.scope),
+                target: imp.target,
+            })
+        }
+        (Some(Binding::Unresolved(seen)), Binding::Unresolved(scope)) => {
+            Binding::Unresolved(seen.wider(&scope))
+        }
+        (_, binding) => binding,
+    };
+    *slot = Some(merged);
 }
 
 /// [`fill_imports_settled`]가 돌리는 해석 바퀴의 상한.
@@ -1539,11 +1674,11 @@ mod tests {
         let items: Vec<&syn::Item> = file.items.iter().collect();
         fill_imports(&mut t, "c::m", &items, &none);
         let imports = &t.modules["c::m"].imports;
-        // 이 fixture의 아이템 표는 이름공간을 모른다 — 대상마다 한 번씩 센다.
+        // 이 fixture의 아이템 표는 이름공간을 모른다(이름공간을 정하지 못한 칸에 있다) — 대상마다 한 번씩 센다.
         let targets: BTreeSet<(&str, &str)> = imports
             .iter()
             .flat_map(|(alias, bindings)| {
-                bindings.iter().filter_map(move |(_, b)| match b {
+                bindings.bound().filter_map(move |b| match b {
                     Binding::Resolved(imp) => Some((alias.as_str(), imp.target.as_str())),
                     Binding::Unresolved(_) => None,
                 })
@@ -1613,6 +1748,93 @@ mod tests {
             t.resolve("c::m", &["util".into()], &none),
             Some("c::m::util".to_string())
         );
+    }
+
+    /// 이름공간을 정하지 못한 임포트(`pub use ext_derive::Foo`가 해석되지 않은 것)는 같은 이름의 로컬 아이템이나
+    /// 이름공간이 정해진 임포트가 있으면 어느 자리에서도 이기지 못한다 — rustc에서 그 `use`는 그것들과 다른
+    /// 이름공간에 있다(E0255·E0252). 다른 후보가 없으면 그 `use`가 이름의 해석을 멈춘다(크레이트 루트로 넘어가지
+    /// 않는다). 자리를 모르는 해석은 정해진 임포트를 먼저 고른다.
+    #[test]
+    fn undetermined_import_yields_to_local_items_and_determined_imports() {
+        let mut t = tree();
+        let none = DepCrates::new();
+        let undetermined = || PerNs::undetermined_only(Binding::Unresolved(Scope::Public));
+        let m = t.modules.get_mut("c::m").expect("fixture module");
+        // 로컬 trait `Foo`(타입) 옆의 이름공간 모르는 `Foo`.
+        m.items.insert("Foo".to_string());
+        m.type_items.insert("Foo".to_string());
+        m.imports.insert("Foo".to_string(), undetermined());
+        // 글롭이 들인 trait `Bar`(타입, 정해짐) 옆의 이름공간 모르는 `Bar` — 해석된 쪽은 외부 크레이트로 붕괴한 것.
+        let mut bar = bound("c::util::h", &[Ns::Type]);
+        bar.undetermined = Some(Binding::Resolved(Import {
+            target: "ext".to_string(),
+            cfg: None,
+            scope: Scope::Public,
+        }));
+        m.imports.insert("Bar".to_string(), bar);
+        // 다른 후보가 없는 `f` — 크레이트 루트에 `f`가 있어도 넘어가지 않는다.
+        m.imports.insert("f".to_string(), undetermined());
+        for ns in Ns::ALL {
+            assert_eq!(
+                t.resolve_in("c::m", &["Foo".into()], &none, ns),
+                Some("c::m::Foo".to_string()),
+                "{ns:?}"
+            );
+            assert_eq!(
+                t.resolve_in("c::m", &["Bar".into()], &none, ns),
+                Some("c::util::h".to_string()),
+                "{ns:?}"
+            );
+            assert_eq!(t.resolve_in("c::m", &["f".into()], &none, ns), None);
+        }
+        assert_eq!(
+            t.resolve("c::m", &["Bar".into()], &none),
+            Some("c::util::h".to_string())
+        );
+        assert_eq!(t.resolve("c::m", &["f".into()], &none), None);
+    }
+
+    /// 같은 이름을 들이는 명시 `use` 둘 가운데 하나만 이름공간이 정해지면(`pub use crate::split_at::SplitAt`과
+    /// derive 재노출 `pub use ext_derive::SplitAt`) 정해진 칸은 소스 순서와 무관하게 남는다. 이름공간을 모르는
+    /// 명시 `use`는 같은 이름의 글롭을 모두 가린다.
+    #[test]
+    fn determined_explicit_import_survives_an_undetermined_one_in_either_order() {
+        for order in [
+            "use crate::util::h as x; use std::x;",
+            "use std::x; use crate::util::h as x;",
+        ] {
+            let mut t = tree();
+            let none = DepCrates::new();
+            t.modules
+                .get_mut("c::util")
+                .expect("fixture module")
+                .value_items
+                .insert("h".to_string());
+            let file: syn::File = syn::parse_str(&format!("use crate::*; use std::f; {order}"))
+                .expect("valid use items");
+            let items: Vec<&syn::Item> = file.items.iter().collect();
+            fill_imports(&mut t, "c::m", &items, &none);
+            let imports = &t.modules["c::m"].imports;
+            assert_eq!(
+                import_in(&t, "c::m", "x", Ns::Value).map(|i| i.target.as_str()),
+                Some("c::util::h"),
+                "{order}"
+            );
+            assert!(matches!(
+                imports["x"].undetermined,
+                Some(Binding::Unresolved(_))
+            ));
+            // 글롭 `use crate::*`가 들인 `f`는 이름공간 모르는 `use std::f`에 통째로 가려지고, `S`는 남는다.
+            assert!(!imports["f"].has_determined());
+            assert!(matches!(
+                imports["f"].undetermined,
+                Some(Binding::Unresolved(_))
+            ));
+            assert!(matches!(
+                imports["S"].undetermined,
+                Some(Binding::Resolved(_))
+            ));
+        }
     }
 
     #[test]
