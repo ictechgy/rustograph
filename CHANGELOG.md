@@ -54,7 +54,8 @@ CLI 플래그·기본값, 그래프 문서 v1, 순회 문서 v1은 그대로다.
   레벨은 세는 근거를 나란히 적는다 — 심볼 레벨은 어느 코드가 재귀하는지, type·module 레벨은 그 단위를 계층으로
   나눌 수 있는지를 묻는다.
 - CI: `semantic-lint` 잡이 `--features semantic`으로 clippy를 돌리고, test 잡이 자기 분석 dead 결과를 알려진 목록
-  (`scripts/self-dead.expected`)과 대조한다(`scripts/verify-self-dead.sh`).
+  (`scripts/self-dead.expected`)과 대조한다(`scripts/verify-self-dead.sh`). 커버리지 잡의 `taiki-e/install-action`을
+  v2.90.3(`cfdb7ed`)으로 올렸다(dependabot PR #55와 같은 핀).
 
 ## [0.7.0] - 2026-11-03
 
