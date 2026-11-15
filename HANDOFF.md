@@ -8,8 +8,9 @@
 - 발행본은 [v0.7.0](https://github.com/ictechgy/rustograph/releases/tag/v0.7.0)(2026-11-03, 자산 6개)이다.
   v0.6.0은 2026-10-25, v0.5.0은 2026-10-13에 발행됐다. v0.4.2는 태그 없이 v0.5.0으로 이어졌다.
 - **브랜치 `ccr-37904670-hxdjsx`**(`origin/main` `e12ef90` 위)에 지난 HANDOFF(2026-11-10)의 후속 후보 셋과
-  dependabot PR #55를 처리한 커밋 4개와 이 HANDOFF 커밋이 있다. push·PR·머지는 하지 않았다(2026-11-15). 사용자
-  변화는 CHANGELOG `[Unreleased]`, 공개 Rust API 변화는 [0.8 migration](docs/MIGRATING-0.8.md)에 있다.
+  dependabot PR #55를 처리한 커밋 4개, 첫 HANDOFF 커밋(`51eb85a`), 독립 리뷰(r2) 반영 커밋 5개와 이 HANDOFF 커밋이
+  있다. push·PR·머지는 하지 않았다(2026-11-15). 사용자 변화는 CHANGELOG `[Unreleased]`, 공개 Rust API 변화는
+  [0.8 migration](docs/MIGRATING-0.8.md)에 있다.
   - `a3c01a6` fix(modtree): 모듈 임포트 표가 이름 → 이름공간(타입·값·매크로)별 바인딩(`PerNs<Binding>`)이다. 글롭은
     대상 모듈의 이름을 이름공간마다 따로 들이고, 명시 `use`·로컬 아이템은 같은 이름공간의 글롭만 가린다. 명시
     `use a::x`는 `x`가 `a`에서 차지한 이름공간을 모두 들인다. 해석은 자리의 이름공간이 먼저고(`ModTree::resolve_in` —
@@ -25,19 +26,51 @@
     레벨 특성 테스트를 더했다.
   - `25b3163` ci: `taiki-e/install-action` v2.87.30 → v2.90.3(`cfdb7ed4ccc7c7dce37759eae89dc5674b469b39`, 경량 태그 —
     `git ls-remote`·`cat-file -t`로 확인). PR #55의 diff와 같은 줄이라 이 브랜치가 머지되면 #55를 닫는다.
+  - **독립 리뷰 r2**(맥락을 물려받지 않은 Claude 리뷰, `51eb85a` 대상): 판정 "수정 후 머지" — B1(blocker), S1·S3·S4는
+    고쳤고, S2는 후속 후보로, N1·N4는 고쳤고, N2·N3은 후속 후보로 남겼다. 지적마다 리뷰어 fixture로 이전(`e12ef90`)·
+    PR(`51eb85a`)·수정 후 바이너리를 돌려 재현한 뒤 고쳤다.
+    - `abea95b` fix(modtree) — B1: 이름공간을 정하지 못한 명시 `use`(외부 크레이트·std 경로, zerocopy처럼 매크로로
+      등록한 derive 이름)가 `PerNs::all`로 세 칸을 다 차지해, 같은 모듈의 `pub trait Foo` 옆 `pub use foo_derive::Foo`가
+      값 자리·매크로 토큰의 `Foo`를 가져갔다(`check → Foo` 간선 소실, `--deps`면 외부 크레이트로 가는 확정 간선).
+      이제 `PerNs::undetermined` 칸에 두고, 같은 이름의 로컬 아이템이나 이름공간이 정해진 바인딩이 있으면 어느 자리에서도
+      이기지 않는다(rustc E0255·E0252 — 그런 `use`는 다른 이름공간에 있다). 자리를 모르는 해석은 정해진 임포트를 먼저
+      고르고, 문법을 모르는 매크로 인자 토큰은 값 이름공간이 아니라 자리를 모르는 해석이다(리뷰 제안 3가지 그대로).
+      그런 `use`는 지금처럼 같은 이름의 글롭을 모두 가린다(`use std::fmt::Result` 규칙 유지). 덤으로 같은 이름의 정해진
+      명시 `use`가 뒤의 미정 `use`에 가려지지 않는다(zerocopy `SplitAt`, syn·tokio의 `uses` 6개).
+    - `c9f6951` fix(modtree) — N1: 글롭 대상 경로를 타입 이름공간에서 해석한다(`fn harvest` 옆 `use crate::harvest`가
+      있는 모듈의 `use super::harvest::*`가 fn을 잡아 아무것도 들이지 않았다).
+    - `229a0a0` fix(harvest) — S1: 매크로 경로(속성·derive 인자·매크로 호출)의 매크로 이름공간 대상이 자리를 모르는
+      해석과 다르면 그 예전 대상에 추정 간선을 더한다(dead·도달성 전용). `mylib`이 trait `Hello`와 `pub use
+      mylib_derive::Hello`를 함께 내보내는 모양에서 trait이 새로 unreachable로 나오던 것을 막는다. 그 모듈에서 보이지
+      않는 대상(proc-macro 크레이트의 비공개 struct)은 남기지 않는다(`ModTree::visible_from`) — 1d3eb68의 근거 있는 축소는
+      그대로다. README·README.ko 그래프 모델에 적었다.
+    - `a108a5d` docs — N4: `verify-self-dead.sh`의 "grep -v는 남는 줄이 없으면 1"이라는 주석이 틀렸다(프로세스 치환의
+      종료 코드는 `set -e`가 보지 않는다). 주석만 고쳤다.
+    - `09c227c` docs — S3·S4: AGENTS.md 글롭 절을 이름공간별 의미론으로, CHANGELOG 머리말과 0.8 migration을 실제 변화
+      (타입 변경·필드 제거, 두 세그먼트 이상의 모든 속성·derive 경로·아이템 위치 매크로 호출·로컬 아이템과 이름이 같은
+      본문 매크로 호출의 대상 변경, 남은 보존 축소 둘)로 고쳤다.
   - **반례 말뭉치**: 크레이트 10개(syn 2.0.119·tokio 1.53.1·regex-syntax 0.8.11·ra_ap_hir_def/hir_ty 0.0.349·rowan
-    0.17.0·serde·serde_derive 1.0.229·clap 4.6.7과 이 저장소 `e12ef90` 사본)의 심볼 그래프를 이전·이후 바이너리로
-    대조했다(`graph --level symbol --tests`). 사라진 간선 0, 더해진 간선 5개(이 저장소 4, ra_ap_hir_def 1 — 모두
-    글롭이 들인 다른 이름공간의 같은 이름), `dead --tests --retain-public` 차이는 이 저장소의 알려진 2건뿐이다. 저장소
-    fixture 6곳(tests/fixture 등)의 간선도 그대로다. ra_ap_hir_ty 수확 시간은 차이가 없었다(약 6초 → 5.5초, 잡음 범위).
-  - **검증**(2026-11-15, 로컬 cargo 1.97): `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`,
-    `cargo test --locked`(25개 실행 단위 526개 통과), `rules --strict` 0, `cycles --level symbol --strict` 0,
-    `scripts/verify-self-dead.sh`(0건 일치), `scripts/verify-cli-contract.sh` OK, `scripts/coverage.sh` 94.61%(게이트 90%).
-    변이 검사 4개(글롭 아이템이 모든 이름공간 차지, 명시 임포트가 글롭의 모든 이름공간을 가림, 명시 `use`를
-    이름공간 없이 해석, 속성 경로를 매크로 이름공간 없이 해석)는 모두 새 테스트가 잡았다. 새 회귀 테스트 4개는 수정
-    전 코드에서 실패하는 것을 확인했다. **실행하지 않음**: `--features semantic` test·clippy(sem.rs·semantic 경로를
-    바꾸지 않았고 ra_ap 빌드가 공유 디스크에 크다), MSRV 1.96 check(로컬 툴체인 없음 — CI `msrv` 잡), GLM 리뷰
-    (`packet-ask` 없음), 독립 리뷰.
+    0.17.0·serde·serde_derive 1.0.229·clap 4.6.7과 이 저장소 `e12ef90` 사본)의 심볼 그래프를 이름공간 분리 전(`e12ef90`)·
+    후(최종 트리) 바이너리로 대조했다(`graph --level symbol --tests`, 간선 키는 from·to·kind·tentative·cfg). 사라진 간선
+    0, 더해진 간선 11개(이 저장소 4·ra_ap_hir_def 1 — 글롭이 들인 다른 이름공간의 같은 이름, syn 2·tokio 4 — 정해진
+    명시 `use`가 같은 이름의 미정 `use`에 가려지지 않음), `dead --tests`·`dead --tests --retain-public` 차이는 이
+    저장소의 알려진 2건이 사라진 것뿐이다. 리뷰 r2가 더한 zerocopy 0.8.50 + zerocopy-derive 워크스페이스: PR 머리
+    `51eb85a`는 `e12ef90` 대비 간선 99개(리뷰어 집계 97 — 키 차이)를 잃고(`unsafe_impl!`·`assert_impls!` 토큰 → trait
+    추정 간선) `dead --tests`에 `unreachable trait: zerocopy::Unaligned`를 새로 냈다. 최종 트리는 `e12ef90` 대비
+    사라진 간선 0, 더해진 간선 69개(`SplitAt` uses 33, `_` 이름 바인딩으로 들어온 `NumExt` uses 29·`const _` uses 7 —
+    N3), `dead --tests`가 `e12ef90`과 같다. 리뷰어 fixture(sp2·sp3·sp4·serdepat·nsmisc·globsrc·extws)의 dead 결과는
+    `e12ef90`과 같거나 적다.
+  - **검증**(2026-11-15, 로컬 cargo 1.97, 최종 트리): `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`,
+    `cargo test --locked`(25개 실행 단위 535개 통과 — 리뷰 r2 반영 9개 추가), `rules --strict` 0, `cycles --level symbol
+    --strict` 0(type 레벨 23·module 레벨 2 — 변경 전과 같음), `scripts/verify-self-dead.sh`(0건 일치),
+    `scripts/verify-cli-contract.sh` OK, `scripts/coverage.sh` 94.64%(게이트 90%, 그 안의 테스트 실패 0). 리뷰 r2 회귀
+    테스트 7개(통합)는 `51eb85a` 코드에서 실패하는 것을 확인했고, 변이 검사 4개(미정 칸을 로컬·정해진 바인딩이 있어도
+    사용, Any에서 미정 칸 먼저, 토큰을 값 이름공간으로, 추정 간선의 가시성 필터 제거)는 모두 테스트가 잡았다. 새
+    fixture는 모두 `cargo check`를 통과한다. 첫 커밋 묶음의 회귀 테스트 4개도 그대로 통과한다(그 변이 검사는 다시 돌리지
+    않았다).
+    **실행하지 않음**: `--features semantic` test·clippy(sem.rs·semantic 경로를 바꾸지 않았고 ra_ap 빌드가 공유 디스크에
+    크다), MSRV 1.96 check(로컬 툴체인 없음 — CI `msrv` 잡. 새 API 중 가장 새 것은 1.82의 `Option::is_none_or`), GLM
+    리뷰(`packet-ask` 없음 — 독립 Claude 리뷰 r2로 대체).
 - [PR #52](https://github.com/ictechgy/rustograph/pull/52)는 2026-11-09에 `main`으로 스쿼시 머지됐다(`9f9217e`).
   CHANGELOG `[Unreleased]`에 있고 아직 발행하지 않았다. `main` `9f9217e`의 CI 체크 7개가 모두 성공했다
   (2026-11-10 확인). 계열 9개 저장소 검토의 후속으로, 구문 수확이 조용히 놓치던 형태를 메웠다.
@@ -70,19 +103,33 @@
 
 ### 다음 할 일
 
-1. 이 브랜치를 push하고 PR을 연다(템플릿 제목 Change / Verification / Contract and policy). CI(특히 `msrv`·
-   `semantic-lint`·coverage)를 확인하고, 독립 리뷰 뒤 머지하면 dependabot PR #55를 닫는다.
+1. 이 브랜치를 push하고 PR을 연다(템플릿 제목 Change / Verification / Contract and policy — 본문 초안은 이 세션의
+   스크래치 `pr/rustograph-r2.md`). CI(특히 `msrv`·`semantic-lint`·coverage)를 확인하고, 리뷰 r2 반영분을 다시 본 뒤
+   머지하면 dependabot PR #55를 닫는다.
 2. **0.8.0 릴리스**: `[Unreleased]`가 Rust 라이브러리 호출자를 깨는 변경(필드 추가, `modtree::Module::imports` 타입
-   변경)을 담으므로 마이너 버전이다. 버전 커밋 → PR CI → 머지 → 태그 → Release 자산 확인 → (토큰이 없으면) 수동 tap
+   변경, `unresolved_imports` 제거)을 담으므로 마이너 버전이다. 버전 커밋 → PR CI → 머지 → 태그 → Release 자산 확인 → (토큰이 없으면) 수동 tap
    갱신(아래 "다음 단계" 1번) → 설치 바이너리로 CLI 계약·자기 분석.
 3. isthmus `compatibility.json`의 rustograph 핀(현재 0.4.1) 갱신을 isthmus 쪽에 알린다.
 
 ### 후속 후보 (사용자가 고른다)
 
-- 같은 이름공간에 같은 이름을 들이는 명시 `use`가 둘이면(`#[cfg]`로 갈린 대안 임포트, `use X as _`) 지금처럼 뒤의
-  것만 남아, 소스 순서에 따라 해석된 임포트와 그 `uses` 간선을 잃는다. 해석된 쪽을 남기게 바꿔 보면 syn·tokio에서
-  `uses` 간선 6개가 더해졌다(이번 브랜치 범위 밖이라 되돌렸다). `as _`는 rustc에서 이름을 묶지 않으므로 표에 넣지
-  않고 의존 증거로만 남기는 쪽이 맞다.
+- 같은 이름공간에 같은 이름을 들이는 명시 `use` 둘이 모두 이름공간이 정해지면(`#[cfg]`로 갈린 두 워크스페이스
+  대안) 지금처럼 뒤의 것만 남는다. 정해진 것과 정해지지 않은 것(std 대안)이 갈리는 경우는 `abea95b`로 둘 다 남아
+  syn·tokio의 `uses` 6개가 더해졌다. 남은 경우는 cfg 조건별로 둘 다 남기는 쪽이 맞다.
+- `_` 이름(리뷰 r2 N3): `use X as _`와 `const _: () = ..`가 `_`라는 이름으로 표에 묶이고, 이름공간을 나눈 뒤로는
+  글롭이 그것을 더 많은 이름공간으로 퍼뜨린다(zerocopy의 `NumExt` uses 29·`const _` uses 7). 보존을 넓히는 쪽뿐이지만
+  rustc에서 `_`는 이름을 묶지 않으므로, `as _`는 의존 증거(uses 간선)로만 남기고 `const _`는 표에 넣지 않는 쪽이 맞다.
+  바꾸면 간선이 줄어드니 반례 말뭉치 대조가 필요하다.
+- 이름공간 폴백이 이름공간이 정해진 바인딩으로 넘어간다(리뷰 r2 S2, 회귀 아님): 자리의 이름공간에 묶인 것이 없으면
+  자리를 모르는 해석으로 넘어가, `use super::*`가 `pub mod vec`을 들인 모듈의 `vec![..]`가 모듈 `vec`으로 가는 확정
+  call 간선이 된다. 폴백이 정말 필요한 것은 아이템 표가 값 이름공간에만 둔 `#[proc_macro]`·`#[proc_macro_attribute]`
+  함수 정도다. 폴백을 좁히면 보존이 줄 수 있어 반례 말뭉치 근거가 필요하다.
+- 그룹 안 `{self}`(리뷰 r2 N2): `use a::b::{self}`는 rustc에서 타입 이름공간만 묶지만 `self` 표시를 버린 뒤 `a::b`로
+  해석해 `b`가 차지한 모든 이름공간에 묶는다(드물고 이번 브랜치 전과 같다).
+- 매크로 자리에서 이름공간을 정하지 못한 `use`와 다른 이름공간의 로컬 아이템이 겹치면(`fn info` 옆 `use log::info`의
+  `info!()`) `abea95b` 규칙대로 로컬 아이템이 확정 대상이다(이름공간 분리 전과 같다). 매크로 자리에서 로컬 fn·trait은
+  rustc상 후보가 될 수 없으니 확정 대상을 그 `use`로, 로컬 아이템을 추정 간선으로 바꾸는 쪽이 더 정확하다 — cycles·
+  rules 결과가 바뀌니 말뭉치 대조와 함께 한다.
 - routes(`source/routes`)의 경로 해석과 `macro_rules!` 본문 경로는 아직 이름공간을 넘기지 않는다(`ModTree::resolve`).
   같은 이름이 이름공간마다 다른 정점에 묶인 드문 경우에만 차이가 난다.
 - Homebrew tap 자동 갱신은 `HOMEBREW_TAP_TOKEN` 리포 시크릿이 있어야 돈다 — 없으면 Release가 그 단계를
