@@ -1116,8 +1116,10 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
             .cloned()
             .collect();
         if glob {
-            // 해석되지 않는 글롭(외부 크레이트)은 무슨 이름을 들이는지 모른다 — 가릴 것도 없다.
-            let Some(full) = tree.resolve(path, &clean, dep_crates) else {
+            // 해석되지 않는 글롭(외부 크레이트)은 무슨 이름을 들이는지 모른다 — 가릴 것도 없다. 글롭 대상은 모듈·
+            // 열거형이라 타입 이름공간에서 찾는다 — `fn harvest`와 `use crate::harvest`가 함께 있는 모듈의
+            // `use super::harvest::*`가 그 fn을 대상으로 잡아 아무것도 들이지 않던 문제다.
+            let Some(full) = tree.resolve_in(path, &clean, dep_crates, Ns::Type) else {
                 continue;
             };
             if let Some(target) = tree.modules.get(&full) {

@@ -1339,3 +1339,43 @@ fn main() { m::marks(); let _ = other::Marker; }
         "nstoken::other::Marker"
     ));
 }
+
+/// 글롭 대상은 모듈·열거형이라 타입 이름공간에서 찾는다 — `fn harvest`와 `use crate::harvest`가 함께 있는 `source`의
+/// 자식이 `use super::harvest::*`를 쓰면 대상은 모듈 `crate::harvest`다. 자리를 모르고 찾으면 로컬 fn이 잡혀 글롭이
+/// 아무것도 들이지 않았고 `owner_prefixes()`가 풀리지 않았다. (cargo check 통과)
+#[test]
+fn glob_target_resolves_in_the_type_namespace() {
+    let ws = Workspace::package(
+        "nsglobtarget",
+        r#"
+mod harvest {
+    pub fn owner_prefixes() -> usize { 0 }
+}
+mod source {
+    #[allow(unused_imports)]
+    use crate::harvest;
+    pub fn harvest() -> usize { 1 }
+    pub mod inner {
+        use super::harvest::*;
+        pub fn check() -> usize { owner_prefixes() + super::harvest() }
+    }
+}
+fn main() { source::inner::check(); }
+"#,
+    );
+    let doc = ws.symbols();
+    let check = "nsglobtarget::source::inner::check";
+    assert!(has_edge(
+        &doc,
+        check,
+        "nsglobtarget::harvest::owner_prefixes",
+        EdgeKind::Call
+    ));
+    assert!(has_edge(
+        &doc,
+        "nsglobtarget::source::inner",
+        "nsglobtarget::harvest",
+        EdgeKind::Uses
+    ));
+    assert!(!dead_ids(&doc).contains(&"nsglobtarget::harvest::owner_prefixes".to_string()));
+}
