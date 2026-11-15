@@ -185,11 +185,24 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
   two symbols is. Reachability is unaffected — a recursive function is reached
   through its callers.
 - A struct, enum, or union has a `references` edge to each workspace type its
-  fields name (generic parameters and `Self` excluded). At symbol level,
-  `cycles` leaves out such an edge between two data types: mutually recursive
-  data definitions (`enum Expr { Block(Box<Stmt>) }` with
-  `struct Stmt { e: Expr }`) are one type family, not a dependency to break.
-  Type- and module-level cycles, `dead`, and `rules` still use the edge.
+  fields name (generic parameters and `Self` excluded). Whether `cycles`
+  counts that edge between two data types depends on the question each level
+  asks; `dead` and `rules` always use it.
+  - Symbol level asks which code recurses — which calls and uses loop back to
+    themselves. Mutually recursive data definitions
+    (`enum Expr { Block(Box<Stmt>) }` with `struct Stmt { e: Expr }`) are one
+    type family, not recursion to break, so the edge between the two data
+    types is left out, as direct recursion is. Code that walks such types is
+    still a symbol-level cycle when it recurses (`walk_expr` calling
+    `walk_stmt` and back), because those are call edges.
+  - Type and module levels ask whether the units can be layered — whether
+    one can be built, read, or moved without the other. Functions and
+    methods fold into their module or type there, and a field is the most
+    direct dependency one type can have on another: neither `Expr` nor `Stmt`
+    exists without the other. So `cycles --level type` reports the pair, and
+    `--level module` reports their modules when the two types live in
+    different modules. Leaving the edge out there would hide a coupling that
+    any split into layers or crates has to resolve.
 - `Self` in an impl body or signature resolves to the impl's self type.
   `<T as Tr>::m()` calls `T`'s impl method, `<T>::m()` and an associated
   function passed as a value (`.map(T::new)`) reach `T`'s same-name method.

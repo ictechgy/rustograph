@@ -50,10 +50,13 @@ that a field type or a foreign-type impl body carried, and module- and
 type-level `cycles` to include field-type references. Two data types that hold
 each other as fields (an AST's `Expr` and `Stmt`) are a type-level dependency
 cycle, so `cycles --level type --strict` (and `--level module --strict` when the
-types live in different modules) can start failing on such definitions; this is
-intended, because at those levels the cycle is a real dependency between the
-types. Symbol-level `cycles` leaves out a field-type reference between two data
-types, so recursive data definitions do not become new symbol-level cycles. Saved baselines that list a now-reachable
+types live in different modules) can start failing on such definitions. This is
+intended: those levels ask whether types and modules can be layered, and a
+field is a dependency neither type can exist without. Symbol-level `cycles`
+asks which code recurses, so it leaves out a field-type reference between two
+data types, as it leaves out direct recursion; recursive data definitions do
+not become new symbol-level cycles, while code that recurses over them still
+is one. The README graph model gives both rationales. Saved baselines that list a now-reachable
 item keep working; the item simply stops matching a finding.
 
 ## Rust library callers

@@ -92,3 +92,48 @@ fn recursive_data_types_are_not_symbol_level_cycles() {
         "type-level cycles keep field recursion"
     );
 }
+
+/// 같은 재귀 데이터 정의라도 두 타입이 다른 모듈에 살면 module 레벨 순환이다 — 심볼 레벨은 필드 간선을 빼고
+/// 보지만(위 테스트), module 레벨은 모듈이 서로의 타입 없이 서지 못하는 계층 결합을 묻는 질의라 그 간선을 쓴다.
+/// README의 레벨별 근거가 말하는 동작을 고정한다.
+#[test]
+fn recursive_data_types_across_modules_are_module_level_cycles() {
+    let root = std::env::temp_dir().join(format!("rustograph-mod-rec-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='modrec'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/main.rs"),
+        "mod expr { pub enum Expr { Lit(u8), Block(Box<crate::stmt::Stmt>) } }\n\
+         mod stmt { pub struct Stmt { pub e: crate::expr::Expr } }\n\
+         fn main() { let _ = stmt::Stmt { e: expr::Expr::Lit(1) }; }\n",
+    )
+    .unwrap();
+    let doc = source::load(
+        &root,
+        &source::Options {
+            symbol_level: true,
+            ..Default::default()
+        },
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+    let doc = doc.unwrap();
+    let members = |doc: &rustograph::graph::Document| -> Vec<Vec<String>> {
+        analysis::cycles(doc)
+            .cycles
+            .into_iter()
+            .map(|c| c.members)
+            .collect()
+    };
+    assert!(members(&doc).is_empty(), "{:?}", members(&doc));
+    let types = doc.view(rustograph::graph::Level::Type).unwrap();
+    assert_eq!(
+        members(&types),
+        [["modrec::expr::Expr", "modrec::stmt::Stmt"]]
+    );
+    let modules = doc.view(rustograph::graph::Level::Module).unwrap();
+    assert_eq!(members(&modules), [["modrec::expr", "modrec::stmt"]]);
+}

@@ -50,6 +50,9 @@ CLI 플래그·기본값, 그래프 문서 v1, 순회 문서 v1은 그대로다.
   간다. 이전에는 그 struct(proc-macro 크레이트는 매크로 말고는 내보낼 수 없다)로 이어져 derive 함수 대신 struct에
   거짓 사용 간선이 붙었다 — 그 경로로만 살아 있던 struct는 이제 `dead`에 나올 수 있다. 크레이트 안의
   `Hello { .. }`·`-> Hello`는 그대로 struct다.
+- 문서: README·README.ko 그래프 모델이 두 데이터 타입 사이의 필드 간선을 심볼 레벨 `cycles`는 빼고 type·module
+  레벨은 세는 근거를 나란히 적는다 — 심볼 레벨은 어느 코드가 재귀하는지, type·module 레벨은 그 단위를 계층으로
+  나눌 수 있는지를 묻는다.
 - CI: `semantic-lint` 잡이 `--features semantic`으로 clippy를 돌리고, test 잡이 자기 분석 dead 결과를 알려진 목록
   (`scripts/self-dead.expected`)과 대조한다(`scripts/verify-self-dead.sh`).
 
