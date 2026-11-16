@@ -1,10 +1,10 @@
 #!/bin/bash
 # verify-self-dead.sh — 자기 분석 dead 결과를 기대 목록(scripts/self-dead.expected)과 대조한다.
 #
-# rules·cycles 자기 분석은 위반 0이 기준이지만, dead는 구문 분석이 끝내 보지 못하는 사용이 남는다
-# (기대 목록의 주석이 이유를 적는다). 그래서 0 대신 "알려진 것만 남았는가"를 본다 — 새 unreachable이
+# rules·cycles 자기 분석은 위반 0이 기준이지만, dead에는 구문 분석이 끝내 보지 못하는 사용이 남을 수
+# 있다(기대 목록의 주석이 이유를 적는다). 그래서 0 대신 "알려진 것만 남았는가"를 본다 — 새 unreachable이
 # 생기면(수확 회귀이거나 진짜 미사용) 실패하고, 기대 목록의 항목이 사라지면(수확이 좋아졌다) 목록을
-# 줄이라고 실패한다. 공개 API·테스트·외부 트레이트 impl 보존을 켠다: 라이브러리 크레이트라 공개
+# 줄이라고 실패한다. 지금 기대 목록은 비어 있어 0건이 기준이다. 공개 API·테스트·외부 트레이트 impl 보존을 켠다: 라이브러리 크레이트라 공개
 # 아이템의 호출자가 저장소 밖에 있고, 테스트 도우미는 테스트에서만 쓰인다.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -21,7 +21,10 @@ trap 'rm -f "$ACTUAL"' EXIT
 	| sed -n 's/^unreachable [a-z]*: //p' | LC_ALL=C sort > "$ACTUAL"
 
 EXPECTED="scripts/self-dead.expected"
-if ! diff -u <(grep -v '^#' "$EXPECTED" | sed '/^$/d' | LC_ALL=C sort) "$ACTUAL"; then
+# 주석·빈 줄을 sed 하나로 뺀다. 프로세스 치환(<(..)) 안의 종료 코드는 set -e·pipefail이 보지 않으므로 예전
+# grep -v도 목록이 비었을 때(남는 줄이 없어 1) 이 검사를 실패시키지 않았다 — sed는 남는 줄이 없어도 0이라, 이
+# 줄을 프로세스 치환 밖으로 옮겨도 빈 목록에서 그대로 동작한다.
+if ! diff -u <(sed -e '/^#/d' -e '/^$/d' "$EXPECTED" | LC_ALL=C sort) "$ACTUAL"; then
 	echo "self-analysis dead differs from $EXPECTED (- expected, + actual)." >&2
 	echo "A new finding is a harvest regression or real dead code; a vanished one means the" >&2
 	echo "harvest improved — update $EXPECTED with the reason either way." >&2

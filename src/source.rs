@@ -1291,10 +1291,11 @@ fn collect_owner_spans(
     out: &mut Vec<harvest::OwnerSpan>,
 ) {
     for block in impls {
-        if let Some(self_id) = tree.resolve(
+        if let Some(self_id) = tree.resolve_in(
             &block.items_module,
             &block.self_ty,
             &modtree::DepCrates::new(),
+            modtree::Ns::Type,
         ) {
             spans.push(harvest::OwnerSpan {
                 id: self_id,
@@ -1840,10 +1841,18 @@ fn harvest_module<'a>(
     // 아니면 소유 모듈로. 아이템 표는 1단계에서 전 모듈에 채워졌으므로
     // 모듈 처리 순서와 무관하게 같은 결과가 나온다. 임포트에 cfg가 있으면
     // 간선도 그 조건 아래서만 성립한다. 글롭이 들이는 모듈·외부 크레이트 자신(`use m::*`의 `m`)도
-    // 같은 의존 증거다.
+    // 같은 의존 증거다. 한 이름이 이름공간마다 다른 정점에 묶이면 각각이 증거이고, 같은 정점이면 한 번이다.
     let module = &tree.modules[mp];
-    let imports = module.imports.values().map(|imp| (&imp.target, &imp.cfg));
-    for (target, cfg) in imports.chain(&module.glob_targets) {
+    let imports: BTreeSet<(&String, &Option<String>)> = module
+        .imports
+        .values()
+        .flat_map(modtree::PerNs::bound)
+        .filter_map(|binding| match binding {
+            modtree::Binding::Resolved(imp) => Some((&imp.target, &imp.cfg)),
+            modtree::Binding::Unresolved(_) => None,
+        })
+        .collect();
+    for (target, cfg) in imports.into_iter().chain(&module.glob_targets) {
         let to = if tree.item_exists(target) {
             target.clone()
         } else if dep_vertices.contains(target.as_str()) {

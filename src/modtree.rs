@@ -118,6 +118,146 @@ pub struct Import {
     pub scope: Scope,
 }
 
+/// 이름공간 — rustc는 같은 이름을 타입(모듈·struct·enum·union·trait·type·크레이트), 값(fn·const·static·
+/// 튜플·유닛 struct 생성자), 매크로(`macro_rules!`·derive 등록 이름)에 따로 둔다. `fn harvest`와
+/// `use crate::harvest`가 한 모듈에 함께 있을 수 있는 이유다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Ns {
+    /// 타입 이름공간 — 경로 접두사(`name::item`)와 타입 자리, 구조체 리터럴.
+    Type,
+    /// 값 이름공간 — 호출·값 경로.
+    Value,
+    /// 매크로 이름공간 — 매크로 호출·속성·derive 인자.
+    Macro,
+}
+
+impl Ns {
+    /// 모든 이름공간 — 순회 순서이기도 하다.
+    pub const ALL: [Ns; 3] = [Ns::Type, Ns::Value, Ns::Macro];
+}
+
+/// 이름 하나가 이름공간마다 묶인 것 — 비어 있는 칸은 그 이름공간에 그 이름이 없다는 뜻이다.
+///
+/// 이름공간을 정하지 못한 것은 세 칸이 아니라 [`PerNs::undetermined`]에 둔다. 세 칸에 똑같이 두면 그 이름공간에
+/// 정말 묶인 것과 구별되지 않아, 같은 이름의 로컬 trait 옆에 둔 `pub use derive_crate::Foo`(실제로는 매크로
+/// 이름공간뿐이다)가 값 자리의 `Foo`까지 차지했다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PerNs<T> {
+    /// 타입 이름공간.
+    pub types: Option<T>,
+    /// 값 이름공간.
+    pub values: Option<T>,
+    /// 매크로 이름공간.
+    pub macros: Option<T>,
+    /// 어느 이름공간인지 정하지 못한 것 — 아이템 표가 이름공간을 모르는 명시 `use`(외부 크레이트로 붕괴한 경로,
+    /// std 경로, 매크로가 만든 이름)와 그것을 글롭·재노출로 다시 들인 것이다. 해석은 같은 이름의 로컬 아이템이나
+    /// 이름공간이 정해진 칸이 없을 때만 이것을 쓴다([`lookup`]). rustc에서 명시 `use`는 같은 이름공간의 로컬
+    /// 아이템·다른 명시 `use`와 공존하지 못하므로(E0255·E0252) 그런 것이 있으면 이 `use`는 다른 이름공간에 있다.
+    /// `#[cfg]`로 갈린 대안 임포트(`#[cfg(feature = "pl")] use crate::pl::Condvar;`와 `#[cfg(not(..))] use
+    /// std::sync::Condvar;`)는 같은 이름공간인데 rustc가 둘을 한 빌드에서 보지 않을 뿐이라 이 근거가 닿지 않는다 —
+    /// 그때도 소스 순서와 무관하게 정해진 쪽(워크스페이스)이 이긴다. 본문 간선은 임포트의 cfg를 물려받지 않으므로
+    /// (이 표가 생기기 전부터) 그 이름을 쓰는 본문 간선은 조건 없는 확정 간선이고, `uses` 간선만 cfg를 싣는다.
+    pub undetermined: Option<T>,
+}
+
+impl<T> Default for PerNs<T> {
+    fn default() -> Self {
+        PerNs {
+            types: None,
+            values: None,
+            macros: None,
+            undetermined: None,
+        }
+    }
+}
+
+impl<T> PerNs<T> {
+    /// 이름공간을 정하지 못한 것 하나만 묶는다 — [`PerNs::undetermined`].
+    pub fn undetermined_only(value: T) -> PerNs<T> {
+        PerNs {
+            undetermined: Some(value),
+            ..PerNs::default()
+        }
+    }
+
+    /// 이름공간 `ns`의 칸.
+    pub fn get(&self, ns: Ns) -> Option<&T> {
+        match ns {
+            Ns::Type => self.types.as_ref(),
+            Ns::Value => self.values.as_ref(),
+            Ns::Macro => self.macros.as_ref(),
+        }
+    }
+
+    /// 이름공간 `ns`의 칸(쓰기).
+    pub fn slot(&mut self, ns: Ns) -> &mut Option<T> {
+        match ns {
+            Ns::Type => &mut self.types,
+            Ns::Value => &mut self.values,
+            Ns::Macro => &mut self.macros,
+        }
+    }
+
+    /// 이름공간이 정해진 칸을 [`Ns::ALL`] 순서로 — [`PerNs::undetermined`]는 빠진다.
+    pub fn iter(&self) -> impl Iterator<Item = (Ns, &T)> {
+        Ns::ALL
+            .into_iter()
+            .filter_map(move |ns| self.get(ns).map(|v| (ns, v)))
+    }
+
+    /// 묶인 것 전부 — 이름공간이 정해진 칸([`Ns::ALL`] 순서) 다음에 [`PerNs::undetermined`]다. 이름공간을
+    /// 묻지 않는 소비자(모듈 `uses` 의존 증거)용이다.
+    pub fn bound(&self) -> impl Iterator<Item = &T> {
+        self.iter()
+            .map(|(_, v)| v)
+            .chain(self.undetermined.as_ref())
+    }
+
+    /// 이름공간이 정해진 칸에 묶인 것이 있는가.
+    pub fn has_determined(&self) -> bool {
+        self.iter().next().is_some()
+    }
+
+    /// 아무것도 묶이지 않았는가([`PerNs::undetermined`] 포함).
+    pub fn is_empty(&self) -> bool {
+        !self.has_determined() && self.undetermined.is_none()
+    }
+}
+
+/// 한 `use` 이름이 한 이름공간에서 묶이는 것 — 그래프 정점으로 해석된 임포트, 또는 그래프 밖(std·core·alloc,
+/// `--deps` 없는 외부 크레이트 등)이라 해석되지 않는 이름과 그 가시 범위. 해석되지 않는 이름도 같은 이름공간의
+/// 글롭 임포트를 가리고, 그 이름의 해석을 크레이트 루트 같은 다른 후보로 넘기지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Binding {
+    /// 정점으로 해석된 임포트.
+    Resolved(Import),
+    /// 해석되지 않는 임포트의 가시 범위.
+    Unresolved(Scope),
+}
+
+/// 경로의 마지막 세그먼트를 어느 이름공간에서 찾는가. 접두사 세그먼트는 늘 타입 이름공간이다.
+#[derive(Debug, Clone, Copy)]
+enum Want {
+    /// 자리를 모른다 — 로컬 아이템이 먼저고, 임포트는 이름공간이 정해진 해석된 것(값 → 타입 → 매크로), 이름공간을
+    /// 정하지 못한 해석된 것 순이다.
+    Any,
+    /// 그 이름공간이 먼저다. 그 이름공간에 묶인 것이 없으면 [`Want::Any`]로 넘어간다 — 아이템 표가 모르는
+    /// 이름공간(매크로가 만든 아이템, 배리언트 등)에서도 예전처럼 찾아 보존을 좁히지 않는다.
+    Prefer(Ns),
+}
+
+/// 모듈 하나에서 이름 하나를 찾은 결과.
+enum Found<'a> {
+    /// 그 모듈이 선언한 아이템(자식 모듈 포함) — `모듈::이름`이다.
+    Local,
+    /// `use`로 들인 정점.
+    Import(&'a Import),
+    /// 그래프 밖에서 들인 이름 — 해석을 멈춘다.
+    Unresolved,
+    /// 그 모듈에 없는 이름.
+    Unbound,
+}
+
 /// 모듈 하나 — 파일 단위든 인라인 `mod x {}`든 동일하게 표현한다.
 /// 경로는 트리의 맵 키이므로 필드로 중복 저장하지 않는다.
 #[derive(Debug)]
@@ -142,21 +282,23 @@ pub struct Module {
     pub dir: PathBuf,
     /// 직접 선언된 아이템 이름들(모듈 스코프 해석용).
     pub items: BTreeSet<String>,
-    /// 그중 값 이름공간의 아이템(fn·const·static) — `mod util`과 `fn util`처럼
-    /// 이름공간이 다른 두 아이템이 한 경로를 공유할 때 값 자리 해석이 fn을 고른다.
+    /// 그중 값 이름공간의 아이템(fn·const·static, 생성자를 겸하는 튜플·유닛 struct) — `mod util`과
+    /// `fn util`처럼 이름공간이 다른 두 아이템이 한 경로를 공유할 때 값 자리 해석이 fn을 고른다.
     pub value_items: BTreeSet<String>,
     /// 그중 타입 이름공간의 아이템(mod·struct·enum·union·trait·type) — 경로 접두사 자리
     /// (`name::item`)에서 같은 이름의 임포트를 가리는 로컬 아이템이다.
     pub type_items: BTreeSet<String>,
+    /// 그중 매크로 이름공간의 아이템(이름 있는 `macro_rules!`).
+    pub macro_items: BTreeSet<String>,
     /// 선언 아이템(자식 모듈 포함)이 보이는 범위 — 이름 → 같은 이름 아이템 가운데 가장 넓은 범위.
-    /// 없는 이름은 `pub`으로 본다.
+    /// 없는 이름은 `pub`으로 본다. 같은 모듈의 같은 이름 아이템은 이름공간이 달라도 정점 ID가 같다.
     pub item_scopes: BTreeMap<String, Scope>,
-    /// `use` 임포트 맵: 마지막 세그먼트(또는 as 이름) → 임포트.
-    pub imports: BTreeMap<String, Import>,
-    /// 그래프 밖(std·core·alloc, `--deps` 없는 외부 크레이트 등)을 가리켜 해석되지 않은 `use` 이름 →
-    /// 그 가시 범위. 같은 이름의 글롭 임포트를 가리고, 그 이름의 해석을 크레이트 루트 같은 다른
-    /// 후보로 넘기지 않는다.
-    pub unresolved_imports: BTreeMap<String, Scope>,
+    /// `use` 임포트 맵: 마지막 세그먼트(또는 as 이름) → 이름공간마다 묶인 것. 명시 `use`는 대상이 차지한
+    /// 이름공간에만 묶이고, 글롭은 대상 모듈의 이름을 이름공간마다 따로 들인다. 명시 임포트는 같은
+    /// 이름공간의 글롭만 가린다(rustc와 같다). derive 등록 이름은 매크로 이름공간에 있다. 이름공간을 정하지
+    /// 못한 명시 `use`는 [`PerNs::undetermined`]에 있고, 어느 이름공간을 차지하는지 모르니 같은 이름의 글롭을
+    /// 모두 가린다.
+    pub imports: BTreeMap<String, PerNs<Binding>>,
     /// 이 모듈이 글롭으로 들이는 모듈·외부 크레이트 정점(`use m::*`의 `m`) → 그 `use`의 `#[cfg]`. 그 글롭의
     /// 의존 증거(uses 간선, deps의 사용 증거)일 뿐 이름이 아니다 — 이름 해석과 다른 모듈의 글롭에 쓰지 않는다.
     pub glob_targets: BTreeMap<String, Option<String>>,
@@ -177,9 +319,9 @@ impl Module {
             items: BTreeSet::new(),
             value_items: BTreeSet::new(),
             type_items: BTreeSet::new(),
+            macro_items: BTreeSet::new(),
             item_scopes: BTreeMap::new(),
             imports: BTreeMap::new(),
-            unresolved_imports: BTreeMap::new(),
             glob_targets: BTreeMap::new(),
             children: BTreeMap::new(),
         }
@@ -268,7 +410,36 @@ impl ModTree {
     /// `serde::de::X`는 `serde`다. 크레이트 안은 못 보지만 경계까지는
     /// 사실이다. 워크스페이스 멤버 별칭은 붕괴하지 않고 그 멤버의
     /// 실제 루트부터 걷는다 — 나머지 세그먼트가 진짜 정점이다.
+    ///
+    /// 마지막 세그먼트의 이름공간을 모르는 자리다 — 로컬 아이템이 먼저다. 자리를 알면
+    /// [`ModTree::resolve_in`]을 쓴다.
     pub fn resolve(&self, from: &str, segs: &[String], dep_crates: &DepCrates) -> Option<String> {
+        self.resolve_want(from, segs, dep_crates, Want::Any)
+    }
+
+    /// [`ModTree::resolve`]와 같되 마지막 세그먼트를 이름공간 `ns`에서 먼저 찾는다 — 값 자리(호출·값 경로)는
+    /// [`Ns::Value`], 타입 자리·구조체 리터럴은 [`Ns::Type`], 매크로 호출·속성·derive 인자는 [`Ns::Macro`]다.
+    /// 같은 이름이 이름공간마다 다른 정점에 묶였을 때(`fn harvest`와 `use crate::harvest`) 자리에 맞는 쪽을
+    /// 고른다. 그 이름공간에 묶인 것이 없으면 [`ModTree::resolve`]처럼 찾는다 — 아이템 표가 모르는 이름공간
+    /// (매크로가 만든 아이템·배리언트)에서 해석을 잃지 않는다.
+    pub fn resolve_in(
+        &self,
+        from: &str,
+        segs: &[String],
+        dep_crates: &DepCrates,
+        ns: Ns,
+    ) -> Option<String> {
+        self.resolve_want(from, segs, dep_crates, Want::Prefer(ns))
+    }
+
+    /// 경로 해석의 본체 — `want`는 마지막 세그먼트를 찾는 이름공간이다. 접두사 세그먼트는 늘 타입 이름공간이다.
+    fn resolve_want(
+        &self,
+        from: &str,
+        segs: &[String],
+        dep_crates: &DepCrates,
+        want: Want,
+    ) -> Option<String> {
         if segs.is_empty() {
             return None;
         }
@@ -286,47 +457,51 @@ impl ModTree {
             }
             first => {
                 let module = self.modules.get(from)?;
-                if prefers_local(module, first, segs.len() > 1) {
-                    format!("{from}::{first}")
-                } else if let Some(imp) = module.imports.get(first) {
-                    imp.target.clone()
-                } else if module.unresolved_imports.contains_key(first) {
-                    // 그래프 밖(std 등)에서 들인 이름이다 — 크레이트 루트의 같은 이름으로 넘어가지 않는다.
-                    return None;
+                let first_want = if segs.len() > 1 {
+                    Want::Prefer(Ns::Type)
                 } else {
-                    let root = crate_of(from);
-                    let root_mod = self.modules.get(&root)?;
-                    if root_mod.items.contains(first) || root_mod.children.contains_key(first) {
-                        format!("{root}::{first}")
-                    } else if let Some(t) = dep_crates.lookup(from, first) {
-                        // 선언된 의존 별칭이 워크스페이스 루트보다 우선한다 —
-                        // 같은 이름의 멤버가 있어도 `app`의 `foo`는 선언된
-                        // 패키지다. 외부는 크레이트 정점으로 붕괴하고 멤버
-                        // 별칭은 그 멤버의 루트 정점으로 재작성해 계속 걷는다
-                        // — 패키지 이름과 타깃(루트) 이름이 다를 수 있다.
-                        return if t.member {
-                            match self.walk(&t.vertex, &segs[1..], dep_crates) {
-                                Some(x) => Some(x),
-                                // 루트 모듈이 트리에 없는 멤버(proc-macro
-                                // 크레이트 등)는 내부를 모른다 — 외부처럼
-                                // 크레이트 정점으로 붕괴한다. 안 그러면
-                                // `use member_lib;`·`use member::x`가
-                                // 미해석이 돼 dep 사용 증거가 새 나간다.
-                                None if !self.modules.contains_key(&t.vertex) => {
-                                    Some(t.vertex.clone())
+                    want
+                };
+                match lookup(module, first, first_want) {
+                    Found::Local => format!("{from}::{first}"),
+                    Found::Import(imp) => imp.target.clone(),
+                    // 그래프 밖(std 등)에서 들인 이름이다 — 크레이트 루트의 같은 이름으로 넘어가지 않는다.
+                    Found::Unresolved => return None,
+                    Found::Unbound => {
+                        let root = crate_of(from);
+                        let root_mod = self.modules.get(&root)?;
+                        if root_mod.items.contains(first) || root_mod.children.contains_key(first) {
+                            format!("{root}::{first}")
+                        } else if let Some(t) = dep_crates.lookup(from, first) {
+                            // 선언된 의존 별칭이 워크스페이스 루트보다 우선한다 —
+                            // 같은 이름의 멤버가 있어도 `app`의 `foo`는 선언된
+                            // 패키지다. 외부는 크레이트 정점으로 붕괴하고 멤버
+                            // 별칭은 그 멤버의 루트 정점으로 재작성해 계속 걷는다
+                            // — 패키지 이름과 타깃(루트) 이름이 다를 수 있다.
+                            return if t.member {
+                                match self.walk(&t.vertex, &segs[1..], dep_crates, want) {
+                                    Some(x) => Some(x),
+                                    // 루트 모듈이 트리에 없는 멤버(proc-macro
+                                    // 크레이트 등)는 내부를 모른다 — 외부처럼
+                                    // 크레이트 정점으로 붕괴한다. 안 그러면
+                                    // `use member_lib;`·`use member::x`가
+                                    // 미해석이 돼 dep 사용 증거가 새 나간다.
+                                    None if !self.modules.contains_key(&t.vertex) => {
+                                        Some(t.vertex.clone())
+                                    }
+                                    None => None,
                                 }
-                                None => None,
-                            }
+                            } else {
+                                Some(t.vertex.clone())
+                            };
+                        } else if self.modules.contains_key(first) {
+                            // 같은 워크스페이스의 다른 크레이트 루트 모듈 —
+                            // 선언 없는 직접 참조는 컴파일되지 않지만, 관대하게
+                            // 해석하는 쪽이 잃는 것보다 낫다.
+                            return self.walk(first, &segs[1..], dep_crates, want);
                         } else {
-                            Some(t.vertex.clone())
-                        };
-                    } else if self.modules.contains_key(first) {
-                        // 같은 워크스페이스의 다른 크레이트 루트 모듈 —
-                        // 선언 없는 직접 참조는 컴파일되지 않지만, 관대하게
-                        // 해석하는 쪽이 잃는 것보다 낫다.
-                        return self.walk(first, &segs[1..], dep_crates);
-                    } else {
-                        return None;
+                            return None;
+                        }
                     }
                 }
             }
@@ -337,7 +512,7 @@ impl ModTree {
         if dep_crates.external.contains(start.as_str()) {
             return Some(start);
         }
-        self.walk(&start, &segs[i..], dep_crates)
+        self.walk(&start, &segs[i..], dep_crates, want)
     }
 
     /// 시작 경로에서 나머지 세그먼트를 따라 걷는다.
@@ -346,22 +521,40 @@ impl ModTree {
     /// `pub use inner::*`가 펼친 이름, 모듈 별칭) 그 임포트의 대상에서 이어 걷는다 — 정규 ID는
     /// 정의 위치다. 따라갈 때마다 세그먼트를 하나 소비하므로 재노출이 서로를 가리켜도 끝난다.
     /// 대상이 외부 크레이트 정점이면 그 정점으로 붕괴한다([`ModTree::resolve`]와 같다).
-    fn walk(&self, start: &str, rest: &[String], dep_crates: &DepCrates) -> Option<String> {
+    /// 중간 세그먼트는 타입 이름공간에서, 마지막 세그먼트는 `want`로 찾는다 — 로컬 아이템이 먼저인 것은
+    /// 첫 세그먼트와 같은 규칙이다([`lookup`]). 비공개 `use`도 따른다 — 크레이트 안에서는 자손 모듈이 볼 수
+    /// 있고, 보이지 않는 경로는 컴파일되지 않으니 관대하게 해석해 잃는 것이 없다.
+    fn walk(
+        &self,
+        start: &str,
+        rest: &[String],
+        dep_crates: &DepCrates,
+        want: Want,
+    ) -> Option<String> {
         let mut cur = start.to_string();
         let mut j = 0;
         while j < rest.len() {
             let seg = &rest[j];
-            let next = format!("{cur}::{seg}");
-            if self.modules.contains_key(&next) {
-                cur = next;
+            let here = if j + 1 < rest.len() {
+                Want::Prefer(Ns::Type)
+            } else {
+                want
+            };
+            let found = self
+                .modules
+                .get(&cur)
+                .map_or(Found::Unbound, |m| lookup(m, seg, here));
+            if let Found::Import(imp) = found {
+                if dep_crates.external.contains(imp.target.as_str()) {
+                    return Some(imp.target.clone());
+                }
+                cur = imp.target.clone();
                 j += 1;
                 continue;
             }
-            if let Some(target) = self.reexport(&cur, seg, j + 1 < rest.len()) {
-                if dep_crates.external.contains(target) {
-                    return Some(target.to_string());
-                }
-                cur = target.to_string();
+            let next = format!("{cur}::{seg}");
+            if self.modules.contains_key(&next) {
+                cur = next;
                 j += 1;
                 continue;
             }
@@ -376,16 +569,76 @@ impl ModTree {
         self.item_exists(&cur).then_some(cur)
     }
 
-    /// 모듈 `module`이 `name`을 로컬 아이템으로 해석하지 않고 `use`로 들였으면(재노출) 그 임포트의
-    /// 대상 — 로컬 아이템 우선은 첫 세그먼트와 같은 규칙이다([`prefers_local`]). 비공개 `use`도
-    /// 따른다 — 크레이트 안에서는 자손 모듈이 볼 수 있고, 보이지 않는 경로는 컴파일되지 않으니 관대하게
-    /// 해석해 잃는 것이 없다.
-    fn reexport(&self, module: &str, name: &str, prefix: bool) -> Option<&str> {
-        let module = self.modules.get(module)?;
-        if prefers_local(module, name, prefix) {
-            return None;
+    /// `use` 경로 하나를 이름공간마다 해석한다 — 명시 `use a::x`는 `a`에서 `x`가 차지한 이름공간을 모두 들인다
+    /// (`a`에 `fn x`와 `pub use crate::m as x`가 함께 있으면 값은 그 fn, 타입은 `m`). 앞 세그먼트는 타입
+    /// 이름공간으로 걷고, 마지막 세그먼트를 그 모듈에서 이름공간마다 찾는다. 칸의 `Some(None)`은 그 이름공간에서
+    /// 그래프 밖 이름으로 묶였다는 뜻이다. 그 모듈에서 이름공간을 정하지 못한 칸([`PerNs::undetermined`])은 그대로
+    /// 이름공간을 정하지 못한 칸으로 물려받는다. 어디서도 정점을 정하지 못하면 이름공간을 가리지 않는
+    /// 해석([`ModTree::resolve`])을 이름공간을 정하지 못한 칸에 둔다 — 외부 크레이트로 붕괴한 경로, 멤버 루트, 아이템
+    /// 표가 이름공간을 모르는 이름이 그렇다. 그래서 이름공간을 나누기 전에 묶이던 대상은 늘 어느 칸엔가 있다.
+    fn resolve_use(
+        &self,
+        from: &str,
+        segs: &[String],
+        dep_crates: &DepCrates,
+    ) -> PerNs<Option<String>> {
+        let mut out = PerNs::default();
+        if let Some((last, prefix)) = segs.split_last().filter(|(_, p)| !p.is_empty()) {
+            let owner = self
+                .resolve_want(from, prefix, dep_crates, Want::Prefer(Ns::Type))
+                .filter(|o| !dep_crates.external.contains(o.as_str()));
+            if let Some((owner, module)) = owner
+                .as_deref()
+                .and_then(|o| self.modules.get(o).map(|m| (o, m)))
+            {
+                for ns in Ns::ALL {
+                    *out.slot(ns) = match strict_lookup(module, last, ns) {
+                        Found::Local => Some(Some(format!("{owner}::{last}"))),
+                        found => self.use_target(found, dep_crates),
+                    };
+                }
+                out.undetermined = module
+                    .imports
+                    .get(last)
+                    .and_then(|b| b.undetermined.as_ref())
+                    .and_then(|binding| self.use_target(found_of(binding), dep_crates));
+            }
         }
-        module.imports.get(name).map(|imp| imp.target.as_str())
+        if out.bound().any(Option::is_some) {
+            return out;
+        }
+        match self.resolve(from, segs, dep_crates) {
+            Some(target) => PerNs::undetermined_only(Some(target)),
+            None => out,
+        }
+    }
+
+    /// [`ModTree::resolve_use`]가 대상 모듈에서 찾은 임포트 하나를 칸 값으로 — `Some(None)`은 그래프 밖 이름이다.
+    /// 따라간 대상이 정점이 아니면(트리에 없는 멤버 루트 등) 칸을 정하지 않는다(`None`).
+    fn use_target(&self, found: Found<'_>, dep_crates: &DepCrates) -> Option<Option<String>> {
+        match found {
+            Found::Import(imp) => (dep_crates.external.contains(imp.target.as_str())
+                || self.modules.contains_key(&imp.target)
+                || self.item_exists(&imp.target))
+            .then(|| Some(imp.target.clone())),
+            Found::Unresolved => Some(None),
+            // 로컬 아이템은 호출자가 정규 ID로 바꾼다 — 여기 오는 것은 임포트 칸뿐이다.
+            Found::Local | Found::Unbound => None,
+        }
+    }
+
+    /// 정점 `path`(모듈, 또는 모듈의 선언 아이템)가 모듈 `from`에서 보이는가 — 그 아이템이 선언한 가시성만 본다
+    /// (경로가 지나는 모듈의 가시성과 재노출은 보지 않는다). 아이템 표에 없는 정점(크레이트 루트, 외부 크레이트
+    /// 정점)은 보인다고 본다. 확정 해석은 컴파일되는 코드를 전제로 관대하게 하므로 이것을 쓰지 않는다 — 대신
+    /// 해석하지 않은 후보(추정 간선)가 그 자리에서 쓸 수 없는 이름인지 거르는 데 쓴다.
+    pub fn visible_from(&self, path: &str, from: &str) -> bool {
+        let Some((owner, name)) = path.rsplit_once("::") else {
+            return true;
+        };
+        self.modules
+            .get(owner)
+            .and_then(|m| m.item_scopes.get(name))
+            .is_none_or(|scope| scope.includes(from))
     }
 
     /// 경로의 마지막 세그먼트가 어떤 모듈의 선언 아이템인지 확인한다.
@@ -401,24 +654,104 @@ impl ModTree {
     }
 }
 
-/// `first`를 모듈 `module`의 로컬 아이템으로 해석할 것인가 — 아니면 임포트를 본다.
-///
-/// 뒤에 세그먼트가 이어지는 접두사 자리(`prefix`)는 타입 이름공간이다. 로컬 타입 이름공간
-/// 아이템(자식 모듈·struct·enum·union·trait·type)은 같은 이름의 임포트를 이긴다 — 같은 이름공간의
-/// 글롭(`use super::*`)을 가리고, 명시 임포트와는 컴파일되는 코드에서 공존하지 못한다. 로컬 이름이
-/// 값·매크로 아이템뿐이면 접두사가 될 수 없으므로 그 이름의 임포트(명시·글롭)를 따른다 —
-/// `fn harvest`가 있는 모듈의 `harvest::f()`는 `use crate::harvest`다. 임포트도 없으면 지금처럼
-/// 로컬로 본다. 한 세그먼트 자리는 이름공간을 가리지 않고 지금처럼 로컬이 먼저다. 매크로가 만든
-/// 로컬 아이템은 아이템 표에 없어 이 판단에 들어오지 않는다.
-fn prefers_local(module: &Module, first: &str, prefix: bool) -> bool {
-    let typed = module.children.contains_key(first) || module.type_items.contains(first);
-    let local = typed || module.items.contains(first);
-    let imported =
-        module.imports.contains_key(first) || module.unresolved_imports.contains_key(first);
-    if prefix && !typed && imported {
-        return false;
+/// 모듈 `module`의 로컬 아이템 가운데 이름공간 `ns`에 `name`이 있는가 — 자식 모듈은 타입 이름공간이다.
+fn local_in(module: &Module, name: &str, ns: Ns) -> bool {
+    match ns {
+        Ns::Type => module.children.contains_key(name) || module.type_items.contains(name),
+        Ns::Value => module.value_items.contains(name),
+        Ns::Macro => module.macro_items.contains(name),
     }
-    local
+}
+
+/// 모듈 `module`에서 `name`을 이름공간 `ns`에서만 찾는다 — 그 이름공간의 로컬 아이템이 같은 이름공간의
+/// 임포트(글롭)를 이긴다. 명시 임포트와는 컴파일되는 코드에서 공존하지 못한다. 이름공간을 정하지 못한 칸
+/// ([`PerNs::undetermined`])은 보지 않는다.
+fn strict_lookup<'a>(module: &'a Module, name: &str, ns: Ns) -> Found<'a> {
+    if local_in(module, name, ns) {
+        return Found::Local;
+    }
+    match module.imports.get(name).and_then(|b| b.get(ns)) {
+        Some(binding) => found_of(binding),
+        None => Found::Unbound,
+    }
+}
+
+/// 임포트 칸 하나를 찾은 결과로.
+fn found_of(binding: &Binding) -> Found<'_> {
+    match binding {
+        Binding::Resolved(imp) => Found::Import(imp),
+        Binding::Unresolved(_) => Found::Unresolved,
+    }
+}
+
+/// 모듈 `module`에서 `name`을 찾는다 — 무엇을 먼저 보는지는 [`Want`]가 정한다.
+///
+/// 접두사 자리(`name::item`)는 [`Want::Prefer`]`(Ns::Type)`다. 로컬 타입 이름공간 아이템(자식 모듈·struct·enum·
+/// union·trait·type)은 같은 이름의 타입 이름공간 임포트(글롭)를 이기고, 로컬 이름이 값·매크로 아이템뿐이면
+/// 타입 이름공간에 묶인 임포트를 따른다 — `fn harvest`가 있는 모듈의 `harvest::f()`는 `use crate::harvest`다.
+/// 그 이름공간에 아무것도 없으면 이름공간을 정하지 못한 임포트를 보되, 같은 이름의 로컬 아이템이나 이름공간이
+/// 정해진 임포트가 있으면 보지 않는다([`undetermined_lookup`]). 그래도 없으면 [`Want::Any`]다([`any_lookup`]).
+fn lookup<'a>(module: &'a Module, name: &str, want: Want) -> Found<'a> {
+    if let Want::Prefer(ns) = want {
+        match strict_lookup(module, name, ns) {
+            Found::Unbound => {}
+            found => return found,
+        }
+        match undetermined_lookup(module, name) {
+            Found::Unbound => {}
+            found => return found,
+        }
+    }
+    any_lookup(module, name)
+}
+
+/// 자리의 이름공간에 묶인 것이 없을 때 이름공간을 정하지 못한 임포트([`PerNs::undetermined`])를 쓸 것인가.
+///
+/// 같은 이름의 로컬 아이템이나 이름공간이 정해진 임포트가 있으면 쓰지 않는다(`Unbound`) — rustc에서 명시 `use`는
+/// 같은 이름공간의 로컬 아이템·다른 명시 `use`와 공존하지 못하므로(E0255·E0252), 컴파일되는 코드라면 그 `use`는
+/// 그것들과 다른 이름공간에 있다. `pub trait Foo`와 `pub use foo_derive::Foo`(derive 매크로)가 함께 있는 모듈에서
+/// 매크로 인자·값 자리의 `Foo`가 그 `use`로 가 trait 간선을 잃던 문제다. 쓰지 않으면 [`any_lookup`]이 로컬
+/// 아이템이나 정해진 임포트를 고른다. 아무것도 없으면 그 `use`가 유일한 후보다. `#[cfg]`로 갈린 같은 이름공간의
+/// 대안 임포트(워크스페이스 쪽·std 쪽)에는 위 근거가 닿지 않지만 결과는 같다 — 소스 순서와 무관하게 정해진
+/// 워크스페이스 쪽이고, 본문 간선은 그 임포트의 cfg를 싣지 않는다([`PerNs::undetermined`]).
+fn undetermined_lookup<'a>(module: &'a Module, name: &str) -> Found<'a> {
+    let Some(bindings) = module.imports.get(name) else {
+        return Found::Unbound;
+    };
+    let claimed = module.items.contains(name)
+        || module.children.contains_key(name)
+        || bindings.has_determined();
+    match &bindings.undetermined {
+        Some(binding) if !claimed => found_of(binding),
+        _ => Found::Unbound,
+    }
+}
+
+/// 자리를 모르는 해석 — 로컬 아이템이 먼저고(매크로가 만든 로컬 아이템은 아이템 표에 없어 이 판단에 들어오지
+/// 않는다), 다음은 이름공간이 정해진 해석된 임포트를 값 → 타입 → 매크로 순으로, 이름공간을 정하지 못한 해석된
+/// 임포트, 그다음이 해석되지 않는 임포트다. 값이 먼저인 것은 이름공간을 나누기 전 글롭 표가 같은 이름의 선언
+/// 아이템(대개 fn)을 고르던 결과를 자리를 모르는 해석에서 유지하기 위해서고, 정해진 것이 먼저인 것은 글롭이
+/// 들인 trait(타입 이름공간)이 같은 이름의 derive 재노출(이름공간을 모름)에 가려지지 않게 하기 위해서다.
+fn any_lookup<'a>(module: &'a Module, name: &str) -> Found<'a> {
+    if module.items.contains(name) || module.children.contains_key(name) {
+        return Found::Local;
+    }
+    let Some(bindings) = module.imports.get(name) else {
+        return Found::Unbound;
+    };
+    let determined = [Ns::Value, Ns::Type, Ns::Macro]
+        .into_iter()
+        .filter_map(|ns| bindings.get(ns));
+    for binding in determined.chain(bindings.undetermined.as_ref()) {
+        if let Binding::Resolved(imp) = binding {
+            return Found::Import(imp);
+        }
+    }
+    if bindings.is_empty() {
+        Found::Unbound
+    } else {
+        Found::Unresolved
+    }
 }
 
 /// ast 아이템들에서 `mod` 선언을 찾아 트리에 심는다.
@@ -636,24 +969,26 @@ pub fn cfg_of(attrs: &[syn::Attribute]) -> Option<String> {
 /// 따라 크로스 크레이트 임포트가 조용히 유실된다.
 pub fn fill_items(tree: &mut ModTree, path: &str, items: &[&syn::Item]) {
     let mut names = BTreeSet::new();
-    let mut values = BTreeSet::new();
-    let mut types = BTreeSet::new();
+    let (mut types, mut values, mut macros) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
     let mut scopes: BTreeMap<String, Scope> = BTreeMap::new();
     for item in items {
-        // (이름, 가시성, 값 이름공간인가, 타입 이름공간인가). `macro_rules!`은 경로 가시성이
-        // 없어 지금처럼 어디서나 보이는 것으로 둔다.
-        let (ident, vis, value, typed) = match item {
-            syn::Item::Fn(f) => (&f.sig.ident, Some(&f.vis), true, false),
-            syn::Item::Struct(s) => (&s.ident, Some(&s.vis), false, true),
-            syn::Item::Enum(e) => (&e.ident, Some(&e.vis), false, true),
-            syn::Item::Trait(t) => (&t.ident, Some(&t.vis), false, true),
-            syn::Item::Union(u) => (&u.ident, Some(&u.vis), false, true),
-            syn::Item::Type(t) => (&t.ident, Some(&t.vis), false, true),
-            syn::Item::Const(c) => (&c.ident, Some(&c.vis), true, false),
-            syn::Item::Static(s) => (&s.ident, Some(&s.vis), true, false),
-            syn::Item::Mod(m) => (&m.ident, Some(&m.vis), false, true),
+        // (이름, 가시성, 차지하는 이름공간). 튜플·유닛 struct는 생성자로 값 이름공간도 차지한다.
+        // `macro_rules!`은 경로 가시성이 없어 지금처럼 어디서나 보이는 것으로 둔다.
+        let (ident, vis, namespaces): (_, _, &[Ns]) = match item {
+            syn::Item::Fn(f) => (&f.sig.ident, Some(&f.vis), &[Ns::Value]),
+            syn::Item::Struct(s) => match s.fields {
+                syn::Fields::Named(_) => (&s.ident, Some(&s.vis), &[Ns::Type]),
+                _ => (&s.ident, Some(&s.vis), &[Ns::Type, Ns::Value]),
+            },
+            syn::Item::Enum(e) => (&e.ident, Some(&e.vis), &[Ns::Type]),
+            syn::Item::Trait(t) => (&t.ident, Some(&t.vis), &[Ns::Type]),
+            syn::Item::Union(u) => (&u.ident, Some(&u.vis), &[Ns::Type]),
+            syn::Item::Type(t) => (&t.ident, Some(&t.vis), &[Ns::Type]),
+            syn::Item::Const(c) => (&c.ident, Some(&c.vis), &[Ns::Value]),
+            syn::Item::Static(s) => (&s.ident, Some(&s.vis), &[Ns::Value]),
+            syn::Item::Mod(m) => (&m.ident, Some(&m.vis), &[Ns::Type]),
             syn::Item::Macro(m) => match &m.ident {
-                Some(id) => (id, None, false, false),
+                Some(id) => (id, None, &[Ns::Macro]),
                 None => continue,
             },
             _ => continue,
@@ -665,18 +1000,21 @@ pub fn fill_items(tree: &mut ModTree, path: &str, items: &[&syn::Item]) {
             None => scope,
         };
         scopes.insert(name.clone(), scope);
-        if value {
-            values.insert(name.clone());
-        }
-        if typed {
-            types.insert(name.clone());
+        for ns in namespaces {
+            match ns {
+                Ns::Type => &mut types,
+                Ns::Value => &mut values,
+                Ns::Macro => &mut macros,
+            }
+            .insert(name.clone());
         }
         names.insert(name);
     }
     let module = tree.modules.get_mut(path).expect("module must exist");
     module.items.extend(names);
-    module.value_items.extend(values);
     module.type_items.extend(types);
+    module.value_items.extend(values);
+    module.macro_items.extend(macros);
     for (name, scope) in scopes {
         let scope = match module.item_scopes.get(&name) {
             Some(seen) => seen.wider(&scope),
@@ -727,8 +1065,9 @@ fn restricted_scope(segs: &[String], module: &str) -> Option<String> {
 
 /// `#[proc_macro_derive(Name, ..)]`를 단 함수가 등록한 derive 이름 → 그 함수를 가리키는 공개 임포트.
 ///
-/// proc-macro 크레이트는 매크로 말고는 공개 아이템을 내보낼 수 없어, 등록 이름이 같은 모듈의 타입·값
-/// 이름과 겹칠 일이 없다. 인자를 파싱하지 못한 속성은 건너뛴다(이름을 지어내지 않는다).
+/// 등록 이름은 매크로 이름공간에 묶인다 — 같은 모듈에 같은 이름의 struct가 있어도(proc-macro 크레이트는
+/// 매크로 말고는 내보낼 수 없어 그런 struct는 크레이트 밖에서 보이지 않는다) 서로 가리지 않는다. 인자를
+/// 파싱하지 못한 속성은 건너뛴다(이름을 지어내지 않는다).
 fn derive_macro_names(path: &str, items: &[&syn::Item]) -> Vec<(String, Import)> {
     let mut names = Vec::new();
     for item in items {
@@ -767,9 +1106,8 @@ fn derive_name(attr: &syn::Attribute) -> Option<String> {
 
 /// 모듈의 `use` 임포트 맵을 해석해 채운다(2단계 — 전 모듈의 fill_items 이후).
 ///
-/// 이 모듈의 임포트 표([`Module::imports`]·[`Module::unresolved_imports`])는 부를 때마다 그 모듈의 `use`로
-/// 새로 만든다 — 해석은 다른 모듈과 이 모듈의 지난 표를 읽고, 다 만든 표로 바꾼다. 그래서 글롭 대상이
-/// 바뀌면 지난번에 펼친 이름이 남지 않는다.
+/// 이 모듈의 임포트 표([`Module::imports`])는 부를 때마다 그 모듈의 `use`로 새로 만든다 — 해석은 다른 모듈과
+/// 이 모듈의 지난 표를 읽고, 다 만든 표로 바꾼다. 그래서 글롭 대상이 바뀌면 지난번에 펼친 이름이 남지 않는다.
 pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_crates: &DepCrates) {
     let derive_names = derive_macro_names(path, items);
     let mut uses: Vec<(Vec<String>, Option<String>, Scope)> = Vec::new();
@@ -785,10 +1123,10 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
     // 해석은 불변 참조가 필요하니 먼저 모으고 그 다음 심는다.
     // 글롭(`use m::*`)은 대상 모듈의 아이템과 자식 모듈, 그리고 그 모듈이 `use`로 들인 이름(재노출)
     // 가운데 이 모듈에서 보이는 것만 임포트한다(rustc와 같다) — `m` 자체만 매핑하면 `f()` 호출이
-    // 미해석으로 새니 아이템별로 임포트 맵을 펼친다. 명시 임포트는 해석되지 않는 std 경로여도 같은
-    // 이름의 글롭 임포트를 소스 순서와 무관하게 가린다.
-    let mut globbed: BTreeMap<String, Binding> = BTreeMap::new();
-    let mut explicit: BTreeMap<String, Binding> = BTreeMap::new();
+    // 미해석으로 새니 아이템별로 임포트 맵을 펼친다. 이름공간마다 따로 들이고, 명시 임포트는 해석되지 않는
+    // std 경로여도 같은 이름공간의 글롭 임포트를 소스 순서와 무관하게 가린다.
+    let mut globbed: BTreeMap<String, PerNs<Binding>> = BTreeMap::new();
+    let mut explicit: BTreeMap<String, PerNs<Binding>> = BTreeMap::new();
     let mut glob_targets: BTreeMap<String, Option<String>> = BTreeMap::new();
     for (segs, cfg, scope) in &uses {
         let glob = segs.last().is_some_and(|s| s == "*");
@@ -797,15 +1135,16 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
             .filter(|s| !s.starts_with("as ") && *s != "*")
             .cloned()
             .collect();
-        let resolved = tree.resolve(path, &clean, dep_crates);
         if glob {
-            // 해석되지 않는 글롭(외부 크레이트)은 무슨 이름을 들이는지 모른다 — 가릴 것도 없다.
-            let Some(full) = resolved else {
+            // 해석되지 않는 글롭(외부 크레이트)은 무슨 이름을 들이는지 모른다 — 가릴 것도 없다. 글롭 대상은 모듈·
+            // 열거형이라 타입 이름공간에서 찾는다 — `fn harvest`와 `use crate::harvest`가 함께 있는 모듈의
+            // `use super::harvest::*`가 그 fn을 대상으로 잡아 아무것도 들이지 않던 문제다.
+            let Some(full) = tree.resolve_in(path, &clean, dep_crates, Ns::Type) else {
                 continue;
             };
             if let Some(target) = tree.modules.get(&full) {
-                for (name, binding) in glob_bindings(target, &full, path, cfg, scope) {
-                    merge_glob(&mut globbed, name, binding);
+                for (name, bindings) in glob_bindings(target, &full, path, cfg, scope) {
+                    merge_glob(globbed.entry(name).or_default(), bindings);
                 }
             }
             // 글롭한 모듈 자신은 이름으로 묶지 않는다(`use m::*`는 `m`을 들이지 않는다) — 그 글롭의 의존
@@ -824,93 +1163,181 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
             .find(|s| s.starts_with("as "))
             .map(|s| s[3..].to_string())
             .unwrap_or_else(|| segs.last().unwrap().clone());
-        let binding = match resolved {
-            Some(full) => Binding::Resolved(Import {
-                target: full,
-                cfg: cfg.clone(),
-                scope: scope.clone(),
-            }),
-            None => Binding::Unresolved(scope.clone()),
+        let targets = tree.resolve_use(path, &clean, dep_crates);
+        // 어디에도 묶이지 않는 `use`(std 경로 등)는 이름공간을 정하지 못한, 해석되지 않는 이름이다.
+        let targets = if targets.is_empty() {
+            PerNs::undetermined_only(None)
+        } else {
+            targets
         };
-        explicit.insert(alias, binding);
+        let slots = explicit.entry(alias).or_default();
+        for (ns, target) in targets.iter() {
+            // 같은 이름공간에 같은 이름을 들이는 `use`가 둘이면 지금처럼 뒤의 것이다.
+            *slots.slot(ns) = Some(use_binding(target, cfg, scope));
+        }
+        if let Some(target) = &targets.undetermined {
+            slots.undetermined = Some(use_binding(target, cfg, scope));
+        }
     }
     // derive 매크로는 함수 이름이 아니라 등록한 이름으로 쓰인다 — `pub use self::hello_impl as Hello;`
-    // 재노출처럼 그 이름을 함수 정점으로 잇는다. 없으면 `#[derive(pm::Hello)]`가 미해석이라 deps가
-    // 실제로 쓰는 proc-macro 의존을 unused로 보고했다. 명시 `use`가 같은 이름을 들이면 그쪽이 이긴다.
+    // 재노출처럼 그 이름을 매크로 이름공간에서 함수 정점으로 잇는다. 없으면 `#[derive(pm::Hello)]`가 미해석이라
+    // deps가 실제로 쓰는 proc-macro 의존을 unused로 보고했다. 명시 `use`가 같은 이름을 매크로 이름공간에
+    // 들이면 그쪽이 이긴다.
     for (name, import) in derive_names {
-        explicit.entry(name).or_insert(Binding::Resolved(import));
+        explicit
+            .entry(name)
+            .or_default()
+            .macros
+            .get_or_insert(Binding::Resolved(import));
     }
-    let mut imports = BTreeMap::new();
-    let mut unresolved = BTreeMap::new();
-    globbed.retain(|name, _| !explicit.contains_key(name));
-    for (name, binding) in globbed.into_iter().chain(explicit) {
-        match binding {
-            Binding::Resolved(imp) => {
-                imports.insert(name, imp);
-            }
-            Binding::Unresolved(scope) => {
-                unresolved.insert(name, scope);
-            }
-        }
+    let mut imports = globbed;
+    for (name, bindings) in explicit {
+        shadow_globs(imports.entry(name).or_default(), bindings);
     }
     let module = tree.modules.get_mut(path).expect("module must exist");
     module.imports = imports;
-    module.unresolved_imports = unresolved;
     module.glob_targets = glob_targets;
 }
 
-/// 한 `use` 이름이 묶이는 것 — 그래프 정점으로 해석된 임포트, 또는 그래프 밖이라 해석되지 않는 이름과
-/// 그 가시 범위.
-enum Binding {
-    Resolved(Import),
-    Unresolved(Scope),
+/// 명시 `use` 하나의 칸 값 — `None` 대상은 그래프 밖 이름이다.
+fn use_binding(target: &Option<String>, cfg: &Option<String>, scope: &Scope) -> Binding {
+    match target {
+        Some(full) => Binding::Resolved(Import {
+            target: full.clone(),
+            cfg: cfg.clone(),
+            scope: scope.clone(),
+        }),
+        None => Binding::Unresolved(scope.clone()),
+    }
+}
+
+/// 한 이름의 글롭 칸 `slots` 위에 명시 임포트 `explicit`을 얹는다 — 명시 임포트는 자기 이름공간의 글롭만 가린다.
+/// 이름공간을 정하지 못한 명시 임포트는 어느 이름공간을 차지하는지 모르니 그 이름의 글롭을 모두 가린다 —
+/// `use std::fmt::Result`가 글롭이 들인 로컬 `Result`를 가리는 것(이름공간을 나누기 전과 같다).
+fn shadow_globs(slots: &mut PerNs<Binding>, explicit: PerNs<Binding>) {
+    let PerNs {
+        types,
+        values,
+        macros,
+        undetermined,
+    } = explicit;
+    if undetermined.is_some() {
+        *slots = PerNs {
+            undetermined,
+            ..PerNs::default()
+        };
+    }
+    for (slot, binding) in [
+        (&mut slots.types, types),
+        (&mut slots.values, values),
+        (&mut slots.macros, macros),
+    ] {
+        if binding.is_some() {
+            *slot = binding;
+        }
+    }
 }
 
 /// 모듈 `importer`의 글롭 `use full::*`(조건 `cfg`, 가시성 `scope`)이 `full`(=`target`)에서 들이는 이름 —
-/// `importer`에서 보이는 재노출·해석되지 않는 임포트·선언 아이템이다. 같은 이름이면 선언 아이템이
-/// 이긴다. 펼친 이름은 글롭과 원래 것 가운데 좁은 가시성으로 보이고, 두 `#[cfg]` 조건을 함께 싣는다.
+/// `importer`에서 보이는 재노출·해석되지 않는 임포트·선언 아이템을 이름공간마다 따로 들인다. 같은 이름공간이면
+/// 선언 아이템이 이긴다. 이름공간을 정하지 못한 임포트([`PerNs::undetermined`])는 그대로 이름공간을 정하지 못한
+/// 칸으로 들인다 — 같은 이름의 선언 아이템이 있어도 남는다(그 아이템과 다른 이름공간에 있다). 펼친 이름은 글롭과
+/// 원래 것 가운데 좁은 가시성으로 보이고, 두 `#[cfg]` 조건을 함께 싣는다.
 fn glob_bindings(
     target: &Module,
     full: &str,
     importer: &str,
     cfg: &Option<String>,
     scope: &Scope,
-) -> BTreeMap<String, Binding> {
-    let mut out = BTreeMap::new();
-    for (name, imp) in &target.imports {
-        if imp.scope.includes(importer) {
-            let binding = Binding::Resolved(Import {
-                target: imp.target.clone(),
-                cfg: conjoin_cfg(cfg, &imp.cfg),
-                scope: scope.narrower(&imp.scope),
-            });
-            out.insert(name.clone(), binding);
+) -> BTreeMap<String, PerNs<Binding>> {
+    let mut out: BTreeMap<String, PerNs<Binding>> = BTreeMap::new();
+    for (name, bindings) in &target.imports {
+        let mut slots = PerNs::default();
+        for (ns, binding) in bindings.iter() {
+            *slots.slot(ns) = reexported(binding, importer, cfg, scope);
         }
-    }
-    for (name, seen) in &target.unresolved_imports {
-        if seen.includes(importer) {
-            out.insert(name.clone(), Binding::Unresolved(scope.narrower(seen)));
+        slots.undetermined = bindings
+            .undetermined
+            .as_ref()
+            .and_then(|binding| reexported(binding, importer, cfg, scope));
+        if !slots.is_empty() {
+            out.insert(name.clone(), slots);
         }
     }
     for name in target.items.iter().chain(target.children.keys()) {
         let seen = target.item_scopes.get(name).cloned().unwrap_or_default();
-        if seen.includes(importer) {
-            let binding = Binding::Resolved(Import {
-                target: format!("{full}::{name}"),
-                cfg: cfg.clone(),
-                scope: scope.narrower(&seen),
-            });
-            out.insert(name.clone(), binding);
+        if !seen.includes(importer) {
+            continue;
+        }
+        let binding = Binding::Resolved(Import {
+            target: format!("{full}::{name}"),
+            cfg: cfg.clone(),
+            scope: scope.narrower(&seen),
+        });
+        let slots = out.entry(name.clone()).or_default();
+        let spaces: Vec<Ns> = Ns::ALL
+            .into_iter()
+            .filter(|ns| local_in(target, name, *ns))
+            .collect();
+        if spaces.is_empty() {
+            // 아이템 표가 이름공간을 모르는 이름(이름공간 표 없이 `items`만 채운 모듈)은 이름공간을 정하지 못한
+            // 칸에 둔다(관대하게 — 같은 이름의 다른 후보가 없으면 어느 자리에서든 찾는다).
+            slots.undetermined = Some(binding);
+            continue;
+        }
+        for ns in spaces {
+            *slots.slot(ns) = Some(binding.clone());
         }
     }
     out
 }
 
-/// 글롭이 펼친 이름 하나를 심는다. 여러 글롭이 같은 대상을 들이면 하나로 합친다 — 가시성은 넓은 쪽,
-/// 조건은 둘 중 약한 쪽(어느 글롭으로든 들어오면 임포트가 있다). 대상이 다르면 지금처럼 뒤의 글롭이
-/// 이긴다(rustc에서는 쓰면 모호성 오류다).
-fn merge_glob(globbed: &mut BTreeMap<String, Binding>, name: String, binding: Binding) {
-    let merged = match (globbed.remove(&name), binding) {
+/// `importer`의 글롭이 다른 모듈의 임포트 칸 `binding`을 다시 들인 것 — `importer`에서 보이지 않으면 `None`이다.
+/// 가시성은 글롭과 원래 것 가운데 좁은 쪽, 조건은 둘을 함께 싣는다.
+fn reexported(
+    binding: &Binding,
+    importer: &str,
+    cfg: &Option<String>,
+    scope: &Scope,
+) -> Option<Binding> {
+    match binding {
+        Binding::Resolved(imp) if imp.scope.includes(importer) => Some(Binding::Resolved(Import {
+            target: imp.target.clone(),
+            cfg: conjoin_cfg(cfg, &imp.cfg),
+            scope: scope.narrower(&imp.scope),
+        })),
+        Binding::Unresolved(seen) if seen.includes(importer) => {
+            Some(Binding::Unresolved(scope.narrower(seen)))
+        }
+        _ => None,
+    }
+}
+
+/// 글롭이 펼친 이름 하나를 이름공간마다(이름공간을 정하지 못한 칸 포함) 심는다([`merge_glob_slot`]).
+fn merge_glob(globbed: &mut PerNs<Binding>, bindings: PerNs<Binding>) {
+    let PerNs {
+        types,
+        values,
+        macros,
+        undetermined,
+    } = bindings;
+    for (slot, binding) in [
+        (&mut globbed.types, types),
+        (&mut globbed.values, values),
+        (&mut globbed.macros, macros),
+        (&mut globbed.undetermined, undetermined),
+    ] {
+        if let Some(binding) = binding {
+            merge_glob_slot(slot, binding);
+        }
+    }
+}
+
+/// 글롭이 펼친 칸 하나를 심는다. 여러 글롭이 같은 대상을 들이면 하나로 합친다 — 가시성은 넓은 쪽, 조건은 둘 중
+/// 약한 쪽(어느 글롭으로든 들어오면 임포트가 있다). 대상이 다르면 지금처럼 뒤의 글롭이 이긴다(rustc에서는 쓰면
+/// 모호성 오류다).
+fn merge_glob_slot(slot: &mut Option<Binding>, binding: Binding) {
+    let merged = match (slot.take(), binding) {
         (Some(Binding::Resolved(seen)), Binding::Resolved(imp)) if seen.target == imp.target => {
             Binding::Resolved(Import {
                 cfg: weaker_cfg(&seen.cfg, &imp.cfg),
@@ -923,7 +1350,7 @@ fn merge_glob(globbed: &mut BTreeMap<String, Binding>, name: String, binding: Bi
         }
         (_, binding) => binding,
     };
-    globbed.insert(name, merged);
+    *slot = Some(merged);
 }
 
 /// [`fill_imports_settled`]가 돌리는 해석 바퀴의 상한.
@@ -940,13 +1367,9 @@ pub fn fill_imports_settled(
     dep_crates: &DepCrates,
 ) -> usize {
     let tables = |tree: &ModTree, path: &str| {
-        tree.modules.get(path).map(|m| {
-            (
-                m.imports.clone(),
-                m.unresolved_imports.clone(),
-                m.glob_targets.clone(),
-            )
-        })
+        tree.modules
+            .get(path)
+            .map(|m| (m.imports.clone(), m.glob_targets.clone()))
     };
     let mut changed = 0;
     for _ in 0..MAX_IMPORT_PASSES {
@@ -1126,6 +1549,27 @@ fn flatten_use(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut dyn FnMu
 mod tests {
     use super::*;
 
+    /// 이름공간 `spaces`에 `target`으로 묶인 임포트 — 조건 없고 공개다.
+    fn bound(target: &str, spaces: &[Ns]) -> PerNs<Binding> {
+        let mut bindings = PerNs::default();
+        for ns in spaces {
+            *bindings.slot(*ns) = Some(Binding::Resolved(Import {
+                target: target.to_string(),
+                cfg: None,
+                scope: Scope::Public,
+            }));
+        }
+        bindings
+    }
+
+    /// 모듈 `module`이 이름공간 `ns`에서 `name`으로 들인 해석된 임포트.
+    fn import_in<'a>(t: &'a ModTree, module: &str, name: &str, ns: Ns) -> Option<&'a Import> {
+        match t.modules[module].imports.get(name)?.get(ns)? {
+            Binding::Resolved(imp) => Some(imp),
+            Binding::Unresolved(_) => None,
+        }
+    }
+
     /// 최소 트리: c 루트(items: f, S), c::m(items: g, 임포트 h→c::util::h).
     fn tree() -> ModTree {
         let mut t = ModTree::default();
@@ -1135,14 +1579,8 @@ mod tests {
         t.modules.insert("c".to_string(), root);
         let mut m = Module::new(PathBuf::from("m.rs"), true, true);
         m.items = BTreeSet::from(["g".to_string()]);
-        m.imports.insert(
-            "h".to_string(),
-            Import {
-                target: "c::util::h".to_string(),
-                cfg: None,
-                scope: Scope::Public,
-            },
-        );
+        m.imports
+            .insert("h".to_string(), bound("c::util::h", &Ns::ALL));
         t.modules.insert("c::m".to_string(), m);
         let mut u = Module::new(PathBuf::from("util.rs"), true, true);
         u.items = BTreeSet::from(["h".to_string()]);
@@ -1233,13 +1671,15 @@ mod tests {
         ];
         assert_eq!(fill_imports_settled(&mut t, &modules, &DepCrates::new()), 0);
         for module in ["c::a", "c::b"] {
-            assert_eq!(t.modules[module].imports["x"].target, "c::src::x");
+            let x = import_in(&t, module, "x", Ns::Value).expect("x in the value namespace");
+            assert_eq!(x.target, "c::src::x");
+            // 값 아이템 `x`는 타입·매크로 이름공간에 들어오지 않는다.
+            assert!(t.modules[module].imports["x"].types.is_none());
+            assert!(t.modules[module].imports["x"].macros.is_none());
         }
-        assert_eq!(t.modules["c::a"].imports["x"].cfg, None);
-        assert_eq!(
-            t.modules["c::b"].imports["x"].cfg.as_deref(),
-            Some("feature = \"fb\"")
-        );
+        let cfg = |module| import_in(&t, module, "x", Ns::Value).and_then(|x| x.cfg.as_deref());
+        assert_eq!(cfg("c::a"), None);
+        assert_eq!(cfg("c::b"), Some("feature = \"fb\""));
     }
 
     /// 그룹 안의 `self`(`use crate::util::{self, h as hh}`·`{self as u2}`)는 그룹 앞 경로 자체를
@@ -1256,13 +1696,19 @@ mod tests {
         let items: Vec<&syn::Item> = file.items.iter().collect();
         fill_imports(&mut t, "c::m", &items, &none);
         let imports = &t.modules["c::m"].imports;
-        let targets: Vec<(&str, &str)> = imports
+        // 이 fixture의 아이템 표는 이름공간을 모른다(이름공간을 정하지 못한 칸에 있다) — 대상마다 한 번씩 센다.
+        let targets: BTreeSet<(&str, &str)> = imports
             .iter()
-            .map(|(alias, imp)| (alias.as_str(), imp.target.as_str()))
+            .flat_map(|(alias, bindings)| {
+                bindings.bound().filter_map(move |b| match b {
+                    Binding::Resolved(imp) => Some((alias.as_str(), imp.target.as_str())),
+                    Binding::Unresolved(_) => None,
+                })
+            })
             .collect();
         assert_eq!(
             targets,
-            [("hh", "c::util::h"), ("u2", "c::util"), ("util", "c::util")]
+            BTreeSet::from([("hh", "c::util::h"), ("u2", "c::util"), ("util", "c::util")])
         );
         assert_eq!(
             t.resolve("c::m", &["util".into(), "h".into()], &none),
@@ -1281,14 +1727,8 @@ mod tests {
         let m = t.modules.get_mut("c::m").expect("fixture module");
         m.items.insert("util".to_string());
         m.value_items.insert("util".to_string());
-        m.imports.insert(
-            "util".to_string(),
-            Import {
-                target: "c::util".to_string(),
-                cfg: None,
-                scope: Scope::Public,
-            },
-        );
+        m.imports
+            .insert("util".to_string(), bound("c::util", &[Ns::Type]));
         assert_eq!(
             t.resolve("c::m", &["util".into(), "h".into()], &none),
             Some("c::util::h".to_string())
@@ -1296,6 +1736,15 @@ mod tests {
         assert_eq!(
             t.resolve("c::m", &["util".into()], &none),
             Some("c::m::util".to_string())
+        );
+        // 자리를 알면 그 이름공간에 묶인 것이다 — 값은 로컬 fn, 타입은 들인 모듈.
+        assert_eq!(
+            t.resolve_in("c::m", &["util".into()], &none, Ns::Value),
+            Some("c::m::util".to_string())
+        );
+        assert_eq!(
+            t.resolve_in("c::m", &["util".into()], &none, Ns::Type),
+            Some("c::util".to_string())
         );
     }
 
@@ -1315,19 +1764,99 @@ mod tests {
             .get_mut("c::m")
             .expect("fixture module")
             .imports
-            .insert(
-                "util".to_string(),
-                Import {
-                    target: "c::util".to_string(),
-                    cfg: None,
-                    scope: Scope::Public,
-                },
-            );
+            .insert("util".to_string(), bound("c::util", &[Ns::Type]));
         assert_eq!(t.resolve("c::m", &["util".into(), "h".into()], &none), None);
         assert_eq!(
             t.resolve("c::m", &["util".into()], &none),
             Some("c::m::util".to_string())
         );
+    }
+
+    /// 이름공간을 정하지 못한 임포트(`pub use ext_derive::Foo`가 해석되지 않은 것)는 같은 이름의 로컬 아이템이나
+    /// 이름공간이 정해진 임포트가 있으면 어느 자리에서도 이기지 못한다 — rustc에서 그 `use`는 그것들과 다른
+    /// 이름공간에 있다(E0255·E0252). 다른 후보가 없으면 그 `use`가 이름의 해석을 멈춘다(크레이트 루트로 넘어가지
+    /// 않는다). 자리를 모르는 해석은 정해진 임포트를 먼저 고른다.
+    #[test]
+    fn undetermined_import_yields_to_local_items_and_determined_imports() {
+        let mut t = tree();
+        let none = DepCrates::new();
+        let undetermined = || PerNs::undetermined_only(Binding::Unresolved(Scope::Public));
+        let m = t.modules.get_mut("c::m").expect("fixture module");
+        // 로컬 trait `Foo`(타입) 옆의 이름공간 모르는 `Foo`.
+        m.items.insert("Foo".to_string());
+        m.type_items.insert("Foo".to_string());
+        m.imports.insert("Foo".to_string(), undetermined());
+        // 글롭이 들인 trait `Bar`(타입, 정해짐) 옆의 이름공간 모르는 `Bar` — 해석된 쪽은 외부 크레이트로 붕괴한 것.
+        let mut bar = bound("c::util::h", &[Ns::Type]);
+        bar.undetermined = Some(Binding::Resolved(Import {
+            target: "ext".to_string(),
+            cfg: None,
+            scope: Scope::Public,
+        }));
+        m.imports.insert("Bar".to_string(), bar);
+        // 다른 후보가 없는 `f` — 크레이트 루트에 `f`가 있어도 넘어가지 않는다.
+        m.imports.insert("f".to_string(), undetermined());
+        for ns in Ns::ALL {
+            assert_eq!(
+                t.resolve_in("c::m", &["Foo".into()], &none, ns),
+                Some("c::m::Foo".to_string()),
+                "{ns:?}"
+            );
+            assert_eq!(
+                t.resolve_in("c::m", &["Bar".into()], &none, ns),
+                Some("c::util::h".to_string()),
+                "{ns:?}"
+            );
+            assert_eq!(t.resolve_in("c::m", &["f".into()], &none, ns), None);
+        }
+        assert_eq!(
+            t.resolve("c::m", &["Bar".into()], &none),
+            Some("c::util::h".to_string())
+        );
+        assert_eq!(t.resolve("c::m", &["f".into()], &none), None);
+    }
+
+    /// 같은 이름을 들이는 명시 `use` 둘 가운데 하나만 이름공간이 정해지면(`pub use crate::split_at::SplitAt`과
+    /// derive 재노출 `pub use ext_derive::SplitAt`) 정해진 칸은 소스 순서와 무관하게 남는다. 이름공간을 모르는
+    /// 명시 `use`는 같은 이름의 글롭을 모두 가린다.
+    #[test]
+    fn determined_explicit_import_survives_an_undetermined_one_in_either_order() {
+        for order in [
+            "use crate::util::h as x; use std::x;",
+            "use std::x; use crate::util::h as x;",
+        ] {
+            let mut t = tree();
+            let none = DepCrates::new();
+            t.modules
+                .get_mut("c::util")
+                .expect("fixture module")
+                .value_items
+                .insert("h".to_string());
+            let file: syn::File = syn::parse_str(&format!("use crate::*; use std::f; {order}"))
+                .expect("valid use items");
+            let items: Vec<&syn::Item> = file.items.iter().collect();
+            fill_imports(&mut t, "c::m", &items, &none);
+            let imports = &t.modules["c::m"].imports;
+            assert_eq!(
+                import_in(&t, "c::m", "x", Ns::Value).map(|i| i.target.as_str()),
+                Some("c::util::h"),
+                "{order}"
+            );
+            assert!(matches!(
+                imports["x"].undetermined,
+                Some(Binding::Unresolved(_))
+            ));
+            // 글롭 `use crate::*`가 들인 `f`는 이름공간 모르는 `use std::f`에 통째로 가려지고, `S`는 남는다.
+            assert!(!imports["f"].has_determined());
+            assert!(matches!(
+                imports["f"].undetermined,
+                Some(Binding::Unresolved(_))
+            ));
+            assert!(matches!(
+                imports["S"].undetermined,
+                Some(Binding::Resolved(_))
+            ));
+        }
     }
 
     #[test]
@@ -1500,14 +2029,11 @@ mod tests {
         );
         // 임포트 `make → real_pkg`를 심고 `make::x`를 해석한다 —
         // 임포트가 가리키는 외부 정점이 external 집합에 있어야 한다.
-        t.modules.get_mut("c").unwrap().imports.insert(
-            "make".to_string(),
-            Import {
-                target: "real_pkg".to_string(),
-                cfg: None,
-                scope: Scope::Public,
-            },
-        );
+        t.modules
+            .get_mut("c")
+            .unwrap()
+            .imports
+            .insert("make".to_string(), bound("real_pkg", &Ns::ALL));
         assert_eq!(
             t.resolve("c", &["make".into(), "x".into()], &map),
             Some("real_pkg".to_string())

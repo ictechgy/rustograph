@@ -975,6 +975,172 @@ fn derive_names_count_as_uses_of_a_proc_macro_crate() {
     );
 }
 
+/// derive 속성 자리의 경로는 매크로 이름공간이다 — 다른 크레이트의 `#[derive(pm_derive::Hello)]`는 proc-macro
+/// 크레이트에 같은 이름의 비공개 `struct Hello`가 있어도 `#[proc_macro_derive(Hello)]` 함수를 가리킨다(proc-macro
+/// 크레이트는 매크로 말고는 내보낼 수 없어 그 struct는 밖에서 보이지도 않는다). 이전에는 로컬 아이템을 먼저 보는
+/// 해석이 struct로 이어 derive 함수 대신 struct에 거짓 사용 간선을 달았다. 크레이트 안의 `Hello { .. }`·`-> Hello`는
+/// 타입 이름공간이라 그대로 struct다. 그 struct는 `app`에서 보이지 않으니 추정 간선으로도 남기지 않는다(아래
+/// `derive_path_keeps_the_same_named_trait_as_a_tentative_edge`와 다른 점). (cargo check 통과 — 미사용 경고 없음)
+#[test]
+fn derive_attribute_paths_resolve_in_the_macro_namespace() {
+    let ws = Workspace::new(
+        "pmderivens",
+        &[
+            ("Cargo.toml", "[workspace]\nmembers=['app','pm']\nresolver='2'\n"),
+            (
+                "pm/Cargo.toml",
+                "[package]\nname='pm-derive'\nversion='0.1.0'\nedition='2021'\n[lib]\nproc-macro=true\n",
+            ),
+            (
+                "pm/src/lib.rs",
+                "extern crate proc_macro;\nuse proc_macro::TokenStream;\nstruct Hello { n: u8 }\nfn make() -> Hello { Hello { n: 0 } }\n#[proc_macro_derive(Hello)]\npub fn hello_impl(_i: TokenStream) -> TokenStream { let h = make(); let _ = h.n; TokenStream::new() }\n",
+            ),
+            (
+                "app/Cargo.toml",
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\npm-derive={path='../pm'}\n",
+            ),
+            ("app/src/lib.rs", "#[derive(pm_derive::Hello)]\npub struct S;\n"),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(has_edge(
+        &doc,
+        "app::S",
+        "pm_derive::hello_impl",
+        EdgeKind::References
+    ));
+    assert!(
+        !doc.edges
+            .iter()
+            .any(|e| e.from == "app::S" && e.to == "pm_derive::Hello"),
+        "derive path linked to the private struct"
+    );
+    // 크레이트 안의 구조체 리터럴과 반환 타입은 타입 이름공간 — struct다.
+    assert!(has_edge(
+        &doc,
+        "pm_derive::make",
+        "pm_derive::Hello",
+        EdgeKind::References
+    ));
+    assert!(has_edge(
+        &doc,
+        "pm_derive::make",
+        "pm_derive::Hello",
+        EdgeKind::Signature
+    ));
+}
+
+/// `mylib`이 trait `Hello`와 같은 워크스페이스 proc-macro의 derive `Hello`를 함께 내보내면(`pub use
+/// mylib_derive::Hello`) `#[derive(mylib::Hello)]`의 확정 간선은 매크로 이름공간의 derive 함수이고, 같은 이름의
+/// trait은 추정 간선으로 남는다 — derive 매크로는 대개 그 trait을 구현하는 코드를 만들고(`impl ::mylib::Hello for
+/// S`) 그 펼침은 구문 분석에 보이지 않는다. 이름공간을 나누기 전에는 이 경로가 trait으로 갔으므로, 추정 간선이
+/// 없으면 trait이 새로 unreachable로 나온다(보존이 좁아진다). trait이 하위 모듈에 있고 재노출 순서가 반대여도 같다.
+/// 확정 간선이 아니라 cycles·rules에는 들어가지 않는다. (cargo check 통과)
+#[test]
+fn derive_path_keeps_the_same_named_trait_as_a_tentative_edge() {
+    let derive = "extern crate proc_macro;\nuse proc_macro::TokenStream;\n\
+                  #[proc_macro_derive(Hello)]\npub fn derive_hello(_i: TokenStream) -> TokenStream {\n    \
+                  \"impl ::mylib::Hello for S {}\".parse().unwrap()\n}\n";
+    let trait_def = "pub trait Hello { fn hello(&self) -> &'static str { \"hi\" } }\n";
+    let flat = format!("{trait_def}pub use mylib_derive::Hello;\n");
+    let nested = format!(
+        "mod hello {{\n{trait_def}}}\npub use mylib_derive::Hello;\npub use crate::hello::Hello;\n"
+    );
+    for (tag, lib, trait_id) in [
+        ("derivetrait", flat.as_str(), "mylib::Hello"),
+        ("derivetraitnested", nested.as_str(), "mylib::hello::Hello"),
+    ] {
+        let ws = Workspace::new(
+            tag,
+            &[
+                (
+                    "Cargo.toml",
+                    "[workspace]\nmembers=['mylib','mylib_derive','app']\nresolver='2'\n",
+                ),
+                (
+                    "mylib_derive/Cargo.toml",
+                    "[package]\nname='mylib_derive'\nversion='0.1.0'\nedition='2021'\n[lib]\nproc-macro=true\n",
+                ),
+                ("mylib_derive/src/lib.rs", derive),
+                (
+                    "mylib/Cargo.toml",
+                    "[package]\nname='mylib'\nversion='0.1.0'\nedition='2021'\n\
+                     [dependencies]\nmylib_derive={path='../mylib_derive'}\n",
+                ),
+                ("mylib/src/lib.rs", lib),
+                (
+                    "app/Cargo.toml",
+                    "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n\
+                     [dependencies]\nmylib={path='../mylib'}\n",
+                ),
+                (
+                    "app/src/main.rs",
+                    "#[derive(mylib::Hello)]\nstruct S;\nfn main() { let s = S; let _ = &s; }\n",
+                ),
+            ],
+        );
+        let doc = symbols(ws.path());
+        let edge = |to: &str| {
+            doc.edges
+                .iter()
+                .find(|e| e.from == "app::S" && e.to == to && e.kind == EdgeKind::References)
+        };
+        let firm = edge("mylib_derive::derive_hello").expect("derive function edge");
+        assert!(!firm.tentative, "{tag}");
+        let hedge = edge(trait_id).expect("same-named trait edge");
+        assert!(hedge.tentative, "{tag}");
+        assert_not_reported(&analysis::dead(&doc).unwrap(), &[trait_id]);
+    }
+}
+
+/// 본문의 매크로 호출도 같다 — `use crate::logging::info`(워크스페이스 매크로) 옆에 로컬 `fn info`가 있으면
+/// `info!()`의 확정 간선은 rustc가 고르는 매크로이고, 자리를 모르는 해석의 대상(로컬 fn — 이름공간을 나누기 전의
+/// 대상)은 추정 간선으로 남는다. `use log::info`처럼 그래프 밖 매크로면 로컬 fn이 그대로 확정 대상이다. 그 fn은
+/// rustc로는 쓰이지 않지만(미사용 경고), 이 경로로만 살아 있던 아이템을 새로 unreachable로 내지 않는 쪽을
+/// 고른다(보존을 좁히지 않는다). (cargo check 통과 — `a::info` 미사용 경고)
+#[test]
+fn macro_call_keeps_the_same_named_local_item_as_a_tentative_edge() {
+    let ws = Workspace::new(
+        "macrohedge",
+        &[
+            ("Cargo.toml", &manifest("macrohedge")),
+            (
+                "src/main.rs",
+                r#"
+mod logging {
+    macro_rules! info {
+        ($($t:tt)*) => {};
+    }
+    pub(crate) use info;
+}
+mod a {
+    use crate::logging::info;
+    pub fn info() {}
+    pub fn go() {
+        info!("x");
+    }
+}
+fn main() { a::go(); }
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    let call = |to: &str| {
+        doc.edges
+            .iter()
+            .find(|e| e.from == "macrohedge::a::go" && e.to == to && e.kind == EdgeKind::Call)
+    };
+    let firm = call("macrohedge::logging::info").expect("macro call edge");
+    assert!(!firm.tentative);
+    let hedge = call("macrohedge::a::info").expect("same-named fn edge");
+    assert!(hedge.tentative);
+    assert_not_reported(
+        &analysis::dead(&doc).unwrap(),
+        &["macrohedge::logging::info", "macrohedge::a::info"],
+    );
+}
+
 /// 함수 안 `impl`·`trait`의 메서드 매개변수는 그 본문에서 같은 이름의 아이템을 가린다 — 묶지 않으면
 /// 매개변수 `log("x")` 호출이 모듈 함수 `log`로 읽혀 거짓 순환이 생겼다.
 #[test]

@@ -1012,3 +1012,370 @@ fn main() { let _ = m::child::f(); }
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["unused"], serde_json::json!([]), "{report}");
 }
+
+/// 글롭은 대상 모듈의 이름을 타입·값 이름공간마다 따로 들인다 — `source`에 값 아이템 `fn harvest`와 타입 이름공간
+/// 임포트 `use crate::harvest::{self}`가 함께 있으면, `use super::*`로 들인 `inner`에서 `harvest::owner_prefixes()`는
+/// 모듈 `crate::harvest`의 함수이고 `harvest()`는 `source::harvest`다. 이름당 바인딩 하나인 표는 선언 아이템(fn)만
+/// 남겨 접두사 자리가 풀리지 않았고, 그 경로로만 불리는 함수가 unreachable로 나왔다(자기 분석의
+/// `scripts/self-dead.expected` 2건). (rustc 실행 결과: 둘 다 쓰임)
+#[test]
+fn glob_brings_type_and_value_namespaces_of_the_same_name() {
+    let ws = Workspace::package(
+        "globns",
+        r#"
+mod harvest {
+    pub fn owner_prefixes() -> usize { 0 }
+    pub fn scans() -> usize { 1 }
+}
+mod source {
+    use crate::harvest::{self};
+    fn harvest() -> usize { harvest::scans() }
+    pub fn run() -> usize { harvest() }
+    pub mod inner {
+        use super::*;
+        pub fn check() -> usize { harvest::owner_prefixes() + harvest() }
+    }
+}
+fn main() { source::run(); source::inner::check(); }
+"#,
+    );
+    let doc = ws.symbols();
+    let check = "globns::source::inner::check";
+    assert!(has_edge(
+        &doc,
+        check,
+        "globns::harvest::owner_prefixes",
+        EdgeKind::Call
+    ));
+    assert!(has_edge(
+        &doc,
+        check,
+        "globns::source::harvest",
+        EdgeKind::Call
+    ));
+    assert!(!dead_ids(&doc).contains(&"globns::harvest::owner_prefixes".to_string()));
+}
+
+/// 명시 임포트는 자기가 들인 이름공간에서만 글롭을 가린다 — `use crate::lib_a::other_tool as shared`(모듈, 타입
+/// 이름공간)는 글롭이 들인 모듈 `shared`(= `tool`)를 가리지만 글롭이 들인 값 `fn shared`는 남긴다. 반대로
+/// `use crate::c::pick`(fn, 값 이름공간)은 글롭의 `fn pick`만 가리고 글롭의 모듈 `pick`은 남긴다. 이름 하나를
+/// 통째로 가리던 표는 `shared()`·`pick::deep()`을 놓쳐 `lib_a::shared`·`values::pick::deep`이 unreachable이었다.
+/// (rustc 실행 결과: `other_tool::run`·`lib_a::shared`·`c::pick`·`values::pick::deep`, `tool::run`은 미사용 경고)
+#[test]
+fn explicit_import_shadows_a_glob_only_in_its_own_namespace() {
+    let ws = Workspace::package(
+        "nsshadow",
+        r#"
+mod lib_a {
+    pub mod tool { pub fn run() {} }
+    pub mod other_tool { pub fn run() {} }
+    #[allow(unused_imports)]
+    pub use self::tool as shared;
+    pub fn shared() {}
+}
+mod user {
+    use crate::lib_a::*;
+    use crate::lib_a::other_tool as shared;
+    pub fn go() { shared::run(); shared(); }
+}
+pub mod values { pub fn pick() {} pub mod pick { pub fn deep() {} } }
+mod c { pub fn pick() {} }
+mod d {
+    use crate::values::*;
+    use crate::c::pick;
+    pub fn go() { pick(); pick::deep(); }
+}
+fn main() { user::go(); d::go(); values::pick(); }
+"#,
+    );
+    let doc = ws.symbols();
+    let go = "nsshadow::user::go";
+    assert!(has_edge(
+        &doc,
+        go,
+        "nsshadow::lib_a::other_tool::run",
+        EdgeKind::Call
+    ));
+    assert!(has_edge(
+        &doc,
+        go,
+        "nsshadow::lib_a::shared",
+        EdgeKind::Call
+    ));
+    assert!(!any_edge(&doc, go, "nsshadow::lib_a::tool::run"));
+    let go = "nsshadow::d::go";
+    assert!(has_edge(&doc, go, "nsshadow::c::pick", EdgeKind::Call));
+    assert!(has_edge(
+        &doc,
+        go,
+        "nsshadow::values::pick::deep",
+        EdgeKind::Call
+    ));
+    let dead = dead_ids(&doc);
+    for id in ["nsshadow::lib_a::shared", "nsshadow::values::pick::deep"] {
+        assert!(!dead.contains(&id.to_string()), "{id} reported: {dead:?}");
+    }
+    assert!(dead.contains(&"nsshadow::lib_a::tool::run".to_string()));
+}
+
+/// 명시 `use a::x`는 `a`에서 `x`가 차지한 이름공간을 모두 들인다 — `a`에 값 아이템 `fn x`와 타입 이름공간 재노출
+/// `pub use crate::m as x`가 있으면 `x()`는 그 fn이고 `x::inner()`는 `m::inner`다. 이전에는 선언 아이템(fn)만
+/// 들여 `x::inner()`가 풀리지 않았다. (rustc 실행 결과: 둘 다 쓰임)
+#[test]
+fn explicit_import_brings_every_namespace_the_name_has() {
+    let ws = Workspace::package(
+        "nsexplicit",
+        r#"
+pub mod m { pub fn inner() {} }
+mod a {
+    pub use crate::m as x;
+    pub fn x() {}
+}
+mod b {
+    use crate::a::x;
+    pub fn go() { x::inner(); x(); }
+}
+fn main() { b::go(); }
+"#,
+    );
+    let doc = ws.symbols();
+    let go = "nsexplicit::b::go";
+    assert!(has_edge(&doc, go, "nsexplicit::m::inner", EdgeKind::Call));
+    assert!(has_edge(&doc, go, "nsexplicit::a::x", EdgeKind::Call));
+    assert!(!dead_ids(&doc).contains(&"nsexplicit::m::inner".to_string()));
+}
+
+/// 워크스페이스 밖 path 의존인 proc-macro 크레이트 `ext_derive`(derive `Foo`·`SplitAt`)와 그것을 쓰는 단일 패키지
+/// `tag`(`src/main.rs` = `main`) — `use ext_derive::Foo`는 `--deps` 없이는 그래프 밖이고, `--deps`면 외부 크레이트
+/// 정점으로 붕괴한다. 어느 쪽이든 아이템 표가 그 이름의 이름공간(매크로)을 모른다.
+fn ext_derive_app(tag: &str, main: &str) -> Workspace {
+    let manifest = format!(
+        "[package]\nname='{tag}'\nversion='0.1.0'\nedition='2021'\n[workspace]\n\
+         [dependencies]\next_derive={{path='../ext_derive'}}\n"
+    );
+    Workspace::new(
+        tag,
+        &[
+            (
+                "ext_derive/Cargo.toml",
+                "[package]\nname='ext_derive'\nversion='0.1.0'\nedition='2021'\n[workspace]\n\
+                 [lib]\nproc-macro=true\n",
+            ),
+            (
+                "ext_derive/src/lib.rs",
+                "extern crate proc_macro;\nuse proc_macro::TokenStream;\n\
+                 #[proc_macro_derive(Foo)]\npub fn derive_foo(_i: TokenStream) -> TokenStream { TokenStream::new() }\n\
+                 #[proc_macro_derive(SplitAt)]\npub fn derive_split_at(_i: TokenStream) -> TokenStream { TokenStream::new() }\n",
+            ),
+            ("app/Cargo.toml", &manifest),
+            ("app/src/main.rs", main),
+        ],
+    )
+}
+
+/// `ext_derive_app`의 패키지를 `--deps` 여부를 정해 심볼 레벨로 수확한다.
+fn app_symbols(ws: &Workspace, include_deps: bool) -> Document {
+    source::load(
+        &ws.path().join("app"),
+        &source::Options {
+            symbol_level: true,
+            include_deps,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+/// 이름공간을 정하지 못한 명시 `use`(`pub use ext_derive::Foo` — 실제로는 derive 매크로, 매크로 이름공간뿐)는 같은
+/// 이름의 로컬 trait을 값 자리에서도 이기지 못한다. 표현식 목록으로 읽히는 매크로 인자 `assert_impl!(Foo)`는 값
+/// 자리라, 그 `use`가 세 이름공간을 다 차지하던 표에서는 `check → Foo` 간선이 사라졌고(`--deps`면 외부 크레이트
+/// `ext_derive`로 가는 확정 간선이 생겼다) trait이 unreachable로 나왔다. rustc에서 명시 `use`는 같은 이름공간의
+/// 로컬 아이템과 공존하지 못하므로(E0255) 그 `use`는 trait과 다른 이름공간에 있다. (cargo check 통과)
+#[test]
+fn undetermined_import_does_not_beat_a_local_item_of_another_namespace() {
+    let ws = ext_derive_app(
+        "nsundet",
+        r#"
+pub trait Foo {}
+pub use ext_derive::Foo;
+
+macro_rules! assert_impl {
+    ($tr:ident) => {};
+}
+
+pub fn check() {
+    assert_impl!(Foo);
+}
+
+fn main() { check(); }
+"#,
+    );
+    for include_deps in [false, true] {
+        let doc = app_symbols(&ws, include_deps);
+        assert!(
+            has_edge(&doc, "nsundet::check", "nsundet::Foo", EdgeKind::References),
+            "deps={include_deps}"
+        );
+        assert!(!any_edge(&doc, "nsundet::check", "ext_derive"));
+        assert!(!dead_ids(&doc).contains(&"nsundet::Foo".to_string()));
+    }
+}
+
+/// 글롭이 들인 이름에서도 같다 — `use super::*`는 trait `Foo`(타입, 정해짐)와 이름공간 모르는 `Foo`를 함께 들이고,
+/// 문법을 모르는 매크로 인자 `mark!(u8: Foo)`의 `Foo`는 정해진 쪽(trait)이다. 세 칸을 다 차지하던 표에서는 추정
+/// 간선이 사라져(`--deps`면 외부 크레이트로 가) trait이 unreachable로 나왔다 — zerocopy의
+/// `unsafe_impl!(T: Unaligned => ..)`(`pub use zerocopy_derive::Unaligned` 옆 `pub unsafe trait Unaligned`)와 같은
+/// 모양이다. (cargo check 통과 — `mark!`가 `impl Foo for u8 {}`로 펼쳐진다. 경고는 함수 안 impl 하나)
+#[test]
+fn undetermined_import_through_a_glob_keeps_the_determined_binding() {
+    let ws = ext_derive_app(
+        "nsundetglob",
+        r#"
+pub trait Foo {}
+pub use ext_derive::Foo;
+
+macro_rules! mark {
+    ($t:ty: $tr:ident) => {
+        impl $tr for $t {}
+    };
+}
+
+mod impls {
+    use super::*;
+    pub fn marks() {
+        mark!(u8: Foo);
+    }
+}
+
+fn main() { impls::marks(); }
+"#,
+    );
+    let marks = "nsundetglob::impls::marks";
+    for include_deps in [false, true] {
+        let doc = app_symbols(&ws, include_deps);
+        assert!(
+            any_edge(&doc, marks, "nsundetglob::Foo"),
+            "deps={include_deps}"
+        );
+        assert!(!any_edge(&doc, marks, "ext_derive"));
+        assert!(!dead_ids(&doc).contains(&"nsundetglob::Foo".to_string()));
+    }
+}
+
+/// 같은 이름을 들이는 명시 `use` 둘 가운데 하나만 이름공간이 정해지면(`pub use crate::split_at::SplitAt`과 derive
+/// 재노출 `pub use ext_derive::SplitAt`) 정해진 쪽은 소스 순서와 무관하게 남는다 — rustc에서 두 명시 `use`는 같은
+/// 이름공간에 있을 수 없다(E0252). 뒤의 것이 이기던 표에서는 derive 재노출이 뒤에 오면 trait이 가려져, 글롭으로
+/// 들인 모듈의 `impl SplitAt for S`가 풀리지 않았다(zerocopy `lib.rs`의 순서). `rev`는 반대 순서다. (cargo check
+/// 통과 — 경고는 `rev`의 쓰지 않는 derive 재노출 하나)
+#[test]
+fn undetermined_import_keeps_a_determined_import_of_the_same_name() {
+    let ws = ext_derive_app(
+        "nsboth",
+        r#"
+mod split_at {
+    pub trait SplitAt {}
+}
+pub use crate::split_at::SplitAt;
+pub use ext_derive::SplitAt;
+
+mod rev {
+    pub use ext_derive::SplitAt;
+    pub use crate::split_at::SplitAt;
+}
+
+mod user {
+    use crate::*;
+    pub struct S;
+    impl SplitAt for S {}
+    pub struct R;
+    impl crate::rev::SplitAt for R {}
+}
+
+fn main() { let _ = (user::S, user::R); }
+"#,
+    );
+    let doc = app_symbols(&ws, false);
+    let tr = "nsboth::split_at::SplitAt";
+    for ty in ["nsboth::user::S", "nsboth::user::R"] {
+        assert!(has_edge(&doc, ty, tr, EdgeKind::Implements), "{ty}");
+    }
+    assert!(has_edge(&doc, "nsboth", tr, EdgeKind::Uses));
+    assert!(has_edge(&doc, "nsboth::rev", tr, EdgeKind::Uses));
+}
+
+/// 문법을 모르는 매크로 인자 토큰은 값인지 타입인지 모르니 이름공간을 가리지 않고 찾는다(로컬 아이템이 먼저) —
+/// `mark!(u8: Marker)`의 `Marker`는 로컬 trait이고, 글롭이 값 이름공간에 들인 유닛 struct `other::Marker`가 아니다.
+/// 값 이름공간에서 먼저 찾으면 trait 간선이 그 struct로 갔다. (cargo check 통과 — 경고는 함수 안 impl과, 그 impl만
+/// 있는 trait의 미사용)
+#[test]
+fn macro_token_paths_resolve_without_a_namespace() {
+    let ws = Workspace::package(
+        "nstoken",
+        r#"
+mod other {
+    pub struct Marker;
+}
+mod m {
+    #[allow(unused_imports)]
+    use crate::other::*;
+    pub trait Marker {}
+    macro_rules! mark {
+        ($t:ty: $tr:ident) => {
+            impl $tr for $t {}
+        };
+    }
+    pub fn marks() {
+        mark!(u8: Marker);
+    }
+}
+fn main() { m::marks(); let _ = other::Marker; }
+"#,
+    );
+    let doc = ws.symbols();
+    assert!(any_edge(&doc, "nstoken::m::marks", "nstoken::m::Marker"));
+    assert!(!any_edge(
+        &doc,
+        "nstoken::m::marks",
+        "nstoken::other::Marker"
+    ));
+}
+
+/// 글롭 대상은 모듈·열거형이라 타입 이름공간에서 찾는다 — `fn harvest`와 `use crate::harvest`가 함께 있는 `source`의
+/// 자식이 `use super::harvest::*`를 쓰면 대상은 모듈 `crate::harvest`다. 자리를 모르고 찾으면 로컬 fn이 잡혀 글롭이
+/// 아무것도 들이지 않았고 `owner_prefixes()`가 풀리지 않았다. (cargo check 통과)
+#[test]
+fn glob_target_resolves_in_the_type_namespace() {
+    let ws = Workspace::package(
+        "nsglobtarget",
+        r#"
+mod harvest {
+    pub fn owner_prefixes() -> usize { 0 }
+}
+mod source {
+    #[allow(unused_imports)]
+    use crate::harvest;
+    pub fn harvest() -> usize { 1 }
+    pub mod inner {
+        use super::harvest::*;
+        pub fn check() -> usize { owner_prefixes() + super::harvest() }
+    }
+}
+fn main() { source::inner::check(); }
+"#,
+    );
+    let doc = ws.symbols();
+    let check = "nsglobtarget::source::inner::check";
+    assert!(has_edge(
+        &doc,
+        check,
+        "nsglobtarget::harvest::owner_prefixes",
+        EdgeKind::Call
+    ));
+    assert!(has_edge(
+        &doc,
+        "nsglobtarget::source::inner",
+        "nsglobtarget::harvest",
+        EdgeKind::Uses
+    ));
+    assert!(!dead_ids(&doc).contains(&"nsglobtarget::harvest::owner_prefixes".to_string()));
+}

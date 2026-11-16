@@ -7,7 +7,7 @@
 
 use crate::fanout::{self, Fanned};
 use crate::graph::{Edge, EdgeKind, Kind, Vertex};
-use crate::modtree::{cfg_of, crate_of, DepCrates, ModTree};
+use crate::modtree::{cfg_of, crate_of, DepCrates, ModTree, Ns};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use syn::parse::Parser;
@@ -591,7 +591,9 @@ pub(crate) fn impls_with_identities<'a>(
     let mut foreign_bodies = Vec::new();
     for b in blocks {
         // self 타입을 해석한다 — 모듈 로컬이면 정점이 있다.
-        let Some(self_id) = tree.resolve(&b.items_module, &b.self_ty, &DepCrates::new()) else {
+        let Some(self_id) =
+            tree.resolve_in(&b.items_module, &b.self_ty, &DepCrates::new(), Ns::Type)
+        else {
             harvest.unresolved_paths += 1;
             harvest.foreign_self_impls += 1;
             foreign_bodies.extend(foreign_impl_bodies(
@@ -604,7 +606,9 @@ pub(crate) fn impls_with_identities<'a>(
             continue;
         };
         if let Some(tp) = &b.trait_path {
-            if let Some(trait_id) = tree.resolve(&b.items_module, tp, &DepCrates::new()) {
+            if let Some(trait_id) =
+                tree.resolve_in(&b.items_module, tp, &DepCrates::new(), Ns::Type)
+            {
                 // unsafe impl의 implements는 경계의 일부다.
                 let mut e = Edge::new(self_id.clone(), trait_id.clone(), EdgeKind::Implements);
                 e.cfg = b.cfg.clone();
@@ -725,7 +729,7 @@ fn foreign_impl_bodies<'a>(
     let trait_id = b
         .trait_path
         .as_ref()
-        .and_then(|tp| tree.resolve(&b.items_module, tp, &DepCrates::new()));
+        .and_then(|tp| tree.resolve_in(&b.items_module, tp, &DepCrates::new(), Ns::Type));
     let mut bodies = Vec::new();
     for &m in &b.methods {
         let owner = trait_id
@@ -796,17 +800,43 @@ pub fn attr_edges(
         } else {
             r.owner.as_str()
         };
-        match tree.resolve(&r.module, &r.path, dep_crates) {
-            Some(to) if to != owner => {
-                let mut e = Edge::new(owner.to_string(), to, EdgeKind::References);
-                e.cfg = r.cfg.clone();
-                edges.push(e);
-            }
-            Some(_) => {}
-            None => harvest.unresolved_paths += 1,
+        // 속성·derive 인자·아이템 위치 매크로 호출의 경로는 매크로 이름공간이다 — proc-macro 크레이트의 같은
+        // 이름 비공개 struct가 아니라 derive 등록 이름으로 간다. 자리를 모르는 해석이 다른 정점이면 그쪽은
+        // 추정 간선으로 남긴다([`macro_hedge`]).
+        let firm = tree.resolve_in(&r.module, &r.path, dep_crates, Ns::Macro);
+        let any = tree.resolve(&r.module, &r.path, dep_crates);
+        if firm.is_none() && any.is_none() {
+            harvest.unresolved_paths += 1;
+        }
+        let hedge = macro_hedge(tree, &r.module, any, firm.as_deref()).filter(|to| to != owner);
+        let firm = firm
+            .filter(|to| to != owner)
+            .map(|to| Edge::new(owner.to_string(), to, EdgeKind::References));
+        let hedge = hedge.map(|to| Edge::maybe(owner.to_string(), to, EdgeKind::References));
+        for mut e in firm.into_iter().chain(hedge) {
+            e.cfg = r.cfg.clone();
+            edges.push(e);
         }
     }
     edges
+}
+
+/// 모듈 `module`의 매크로 경로에서 매크로 이름공간 해석 `firm`과 자리를 모르는 해석 `any`가 다르면 `any` —
+/// 대개 이름공간을 나누기 전에 매크로 경로(속성·derive 인자·매크로 호출)가 가던 곳이다(같다는 보장은 없다 — 지금
+/// 모델의 자리 모르는 해석이다). derive 매크로는 대개 같은 이름의 trait을 구현하는 코드를 만들고
+/// (`#[derive(mylib::Hello)]` → `impl mylib::Hello for S`), 그 펼침은 구문 분석에 보이지 않는다. 매크로 이름공간의
+/// 대상이 rustc가 고르는 것이라 확정 간선은 그쪽이고, `any`는 추정 간선(dead·도달성 전용 — cycles·rules는 제외하고
+/// 센다)으로 남겨 보존을 좁히지 않는다.
+///
+/// `module`에서 보이지 않는 `any`(다른 크레이트의 비공개 아이템 — proc-macro 크레이트의 같은 이름 struct)는
+/// 남기지 않는다. 그 모듈의 코드도, 거기서 펼친 매크로 출력도 그 이름을 쓸 수 없다.
+fn macro_hedge(
+    tree: &ModTree,
+    module: &str,
+    any: Option<String>,
+    firm: Option<&str>,
+) -> Option<String> {
+    any.filter(|to| Some(to.as_str()) != firm && tree.visible_from(to, module))
 }
 
 /// 모은 선언 참조([`DeclRef`])를 references 간선으로 해석한다(2패스).
@@ -819,7 +849,13 @@ pub fn decl_edges(refs: &[DeclRef], tree: &ModTree, dep_crates: &DepCrates) -> V
     let mut seen = BTreeSet::new();
     let mut edges = Vec::new();
     for r in refs {
-        let Some(to) = tree.resolve(&r.module, &r.path, dep_crates) else {
+        // 필드 타입은 타입 이름공간이고, 매크로 본문의 경로(추정)는 자리를 모른다.
+        let to = if r.tentative {
+            tree.resolve(&r.module, &r.path, dep_crates)
+        } else {
+            tree.resolve_in(&r.module, &r.path, dep_crates, Ns::Type)
+        };
+        let Some(to) = to else {
             continue;
         };
         if to == r.owner || !seen.insert((r.owner.as_str(), to.clone(), &r.cfg, r.tentative)) {
@@ -1143,7 +1179,7 @@ pub fn signature_edges(b: &BodyItem, tree: &ModTree, dep_crates: &DepCrates) -> 
                 .as_deref()
                 .and_then(|ty| substitute_self(&p, ty))
                 .unwrap_or(p);
-            if let Some(id) = tree.resolve(&b.module, &p, dep_crates) {
+            if let Some(id) = tree.resolve_in(&b.module, &p, dep_crates, Ns::Type) {
                 if id != b.id {
                     let mut e = Edge::new(b.id.clone(), id, EdgeKind::Signature);
                     e.cfg = b.cfg.clone();
@@ -1209,7 +1245,7 @@ impl BodyVisitor<'_> {
     fn visit_qualified_value_path(&mut self, qself: &syn::QSelf, path: &syn::Path) {
         let segs = path_segments(path);
         let owner = match &*qself.ty {
-            syn::Type::Path(ty) => self.resolve(&path_segments(&ty.path)),
+            syn::Type::Path(ty) => self.resolve_in(&path_segments(&ty.path), Ns::Type),
             _ => None,
         };
         if qself.position == 0 {
@@ -1218,7 +1254,7 @@ impl BodyVisitor<'_> {
                 _ => self.unresolved += 1,
             }
         } else {
-            if let Some(id) = self.resolve(&segs[..qself.position]) {
+            if let Some(id) = self.resolve_in(&segs[..qself.position], Ns::Type) {
                 self.push(id, EdgeKind::References);
             }
             match self.resolve_value(&segs) {
@@ -1293,9 +1329,23 @@ impl BodyVisitor<'_> {
 
     /// 경로를 이 본문의 모듈에서 해석한다. impl 본문의 `Self`는 impl self 타입 경로로 바꿔 해석한다
     /// ([`substitute_self`]) — `Self::f()`·`Self(..)`·`Self { .. }`·`Self::CONST`가 모두 그 타입을 가리킨다.
+    /// 마지막 세그먼트의 이름공간을 모르는 자리(`macro_rules!` 본문)용이다 — 자리를 알면 [`Self::resolve_in`].
     fn resolve(&mut self, segs: &[String]) -> Option<String> {
-        match self.self_ty.and_then(|ty| substitute_self(segs, ty)) {
-            Some(path) => self.tree.resolve(self.module, &path, self.dep_crates),
+        self.resolve_at(segs, None)
+    }
+
+    /// [`Self::resolve`]와 같되 마지막 세그먼트를 이름공간 `ns`에서 먼저 찾는다 — 타입 자리·구조체 리터럴·
+    /// 연관 아이템의 타입 접두사는 타입, 호출·값 경로는 값, 매크로 호출은 매크로 이름공간이다.
+    fn resolve_in(&mut self, segs: &[String], ns: Ns) -> Option<String> {
+        self.resolve_at(segs, Some(ns))
+    }
+
+    /// [`Self::resolve`]·[`Self::resolve_in`]의 본체 — `ns`가 없으면 자리를 모른다.
+    fn resolve_at(&mut self, segs: &[String], ns: Option<Ns>) -> Option<String> {
+        let substituted = self.self_ty.and_then(|ty| substitute_self(segs, ty));
+        let segs = substituted.as_deref().unwrap_or(segs);
+        match ns {
+            Some(ns) => self.tree.resolve_in(self.module, segs, self.dep_crates, ns),
             None => self.tree.resolve(self.module, segs, self.dep_crates),
         }
     }
@@ -1309,6 +1359,19 @@ impl BodyVisitor<'_> {
     /// 모듈로 오독한 것이다. 외부 크레이트로 붕괴한 정점은 모듈 표에 없어
     /// 그대로 남는다(`dep::f()`는 크레이트 경계 증거다).
     fn resolve_value(&mut self, segs: &[String]) -> ValueRes {
+        self.resolve_value_at(segs, Some(Ns::Value))
+    }
+
+    /// 문법을 모르는 매크로 인자 토큰 안의 경로를 해석한다 — 값인지 타입인지 모르니 이름공간을 가리지 않고
+    /// 찾는다(로컬 아이템이 먼저). `unsafe_impl!(T: Unaligned => Unaligned for [T])`의 `Unaligned`는 trait인데,
+    /// 값 이름공간에서 찾으면 같은 이름의 derive 재노출로 가 trait 간선을 잃었다. 지역 묶음·모듈을 버리는 규칙은
+    /// [`Self::resolve_value`]와 같다.
+    fn resolve_mention(&mut self, segs: &[String]) -> ValueRes {
+        self.resolve_value_at(segs, None)
+    }
+
+    /// [`Self::resolve_value`]·[`Self::resolve_mention`]의 본체 — `ns`가 없으면 자리를 모른다.
+    fn resolve_value_at(&mut self, segs: &[String], ns: Option<Ns>) -> ValueRes {
         if segs.len() > 1
             && segs
                 .first()
@@ -1321,7 +1384,7 @@ impl BodyVisitor<'_> {
                 return ValueRes::Local;
             }
         }
-        match self.resolve(segs) {
+        match self.resolve_at(segs, ns) {
             Some(id) if self.tree.modules.contains_key(&id) && !self.value_item(&id) => {
                 ValueRes::Local
             }
@@ -1369,8 +1432,10 @@ impl BodyVisitor<'_> {
             return type_relative;
         };
         let index = self.method_index;
-        let (Some(owner), Some(ids)) = (self.resolve(&path_segments(&ty.path)), index.get(method))
-        else {
+        let (Some(owner), Some(ids)) = (
+            self.resolve_in(&path_segments(&ty.path), Ns::Type),
+            index.get(method),
+        ) else {
             self.unresolved += usize::from(type_relative);
             return type_relative;
         };
@@ -1447,9 +1512,16 @@ impl BodyVisitor<'_> {
     /// 아이템으로 해석되면 추정 간선만 단다. 문법을 모르니 호출인지 단순 언급인지 가릴 수 없다.
     fn visit_macro_call(&mut self, mac: &syn::Macro) {
         let segs = path_segments(&mac.path);
-        match self.resolve(&segs) {
+        let firm = self.resolve_in(&segs, Ns::Macro);
+        let any = self.resolve(&segs);
+        let hedge = macro_hedge(self.tree, self.module, any, firm.as_deref());
+        match firm {
             Some(id) => self.push(id, EdgeKind::Call),
-            None => self.ext_macros += 1,
+            None if hedge.is_none() => self.ext_macros += 1,
+            None => {}
+        }
+        if let Some(id) = hedge {
+            self.push_maybe(id, EdgeKind::Call);
         }
         let parsed = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
             .parse2(mac.tokens.clone());
@@ -1457,7 +1529,7 @@ impl BodyVisitor<'_> {
             // 표현식 목록이 아닌 인자(`json!({"k": f()})`, `matches!(x, P)`) — 토큰 안의 이름이
             // 아이템으로 해석되면 추정 간선을 단다. 문법을 모르니 확정 사용이 아니다(dead·도달성만).
             for path in token_paths(mac.tokens.clone(), 1) {
-                if let ValueRes::Item(id) = self.resolve_value(&path) {
+                if let ValueRes::Item(id) = self.resolve_mention(&path) {
                     self.push_maybe(id, EdgeKind::References);
                 }
             }
@@ -1522,7 +1594,7 @@ impl Visit<'_> for BodyVisitor<'_> {
             .first()
             .is_some_and(|name| self.type_params.contains(name))
         {
-            if let Some(id) = self.resolve(&path) {
+            if let Some(id) = self.resolve_in(&path, Ns::Type) {
                 self.push(id, EdgeKind::References);
             }
         }
@@ -1555,7 +1627,7 @@ impl Visit<'_> for BodyVisitor<'_> {
                     let n = segs.len();
                     let mut hit = false;
                     if n >= 2 {
-                        if let Some(ty) = self.resolve(&segs[..n - 1]) {
+                        if let Some(ty) = self.resolve_in(&segs[..n - 1], Ns::Type) {
                             if let Some(ids) = self.method_index.get(&segs[n - 1]) {
                                 // 접두사는 호출마다 한 번 — 후보마다 만들면 같은 이름 정의가
                                 // 수천 개일 때 할당이 (호출 수 × 정의 수)다.
@@ -1579,7 +1651,7 @@ impl Visit<'_> for BodyVisitor<'_> {
                 self.visit_type(&qself.ty);
                 let path = path_segments(&p.path);
                 if qself.position > 0 {
-                    if let Some(id) = self.resolve(&path[..qself.position]) {
+                    if let Some(id) = self.resolve_in(&path[..qself.position], Ns::Type) {
                         self.push(id, EdgeKind::References);
                     }
                 }
@@ -1603,7 +1675,7 @@ impl Visit<'_> for BodyVisitor<'_> {
         let mut scoped = false;
         if let Some(self_ty) = self.self_ty {
             if matches!(&*e.receiver, syn::Expr::Path(p) if p.path.is_ident("self")) {
-                if let Some(sid) = self.resolve(self_ty) {
+                if let Some(sid) = self.resolve_in(self_ty, Ns::Type) {
                     if let Some(ids) = self.method_index.get(&name) {
                         let prefix = owner_prefix(&sid);
                         for mid in ids {
@@ -1639,7 +1711,7 @@ impl Visit<'_> for BodyVisitor<'_> {
     fn visit_expr_struct(&mut self, e: &syn::ExprStruct) {
         // S{..} 구조체 리터럴 — 생성자 호출과 같은 의미의 참조다.
         let segs = path_segments(&e.path);
-        match self.resolve(&segs) {
+        match self.resolve_in(&segs, Ns::Type) {
             Some(id) => self.push(id, EdgeKind::References),
             None if segs.len() >= 2 => self.unresolved += 1,
             None => {}
@@ -1811,7 +1883,7 @@ impl Visit<'_> for BodyVisitor<'_> {
                 // E::V 형태 — 마지막 세그먼트가 열거형 배리언트/상수면
                 // 앞부분 타입에의 참조다. 그것도 안 되면 진짜 미해석.
                 if segs.len() >= 2 {
-                    match self.resolve(&segs[..segs.len() - 1]) {
+                    match self.resolve_in(&segs[..segs.len() - 1], Ns::Type) {
                         Some(ty) => {
                             // `.map(Type::new)`·`.ok_or_else(Type::err)`처럼 연관 함수를 값으로 넘기면
                             // 그 메서드의 참조다 — 타입만 잇던 때는 그렇게만 쓰는 연관 함수가
