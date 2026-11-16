@@ -6,9 +6,12 @@
 
 아래 변경은 같은 소스에서 dead·rules·cycles·schema·deps 결과를 바꾼다. 대부분은 정점·간선·보존 루트를 더
 수확하는 쪽이다. 경로를 그 자리의 이름공간에서 해석하면서 일부 확정 간선은 대상이 바뀐다 — 두 세그먼트 이상의
-속성·derive 경로, 아이템 위치 매크로 호출, 같은 이름의 로컬 아이템이 있는 본문 매크로 호출은 매크로로 가고, 예전
-대상은 그 모듈에서 보이면 추정 간선으로 남는다. 보존이 좁아지는 곳은 둘이다: 다른 크레이트에서 보이지 않는 예전
-대상(proc-macro 크레이트의 비공개 struct)과, 다른 이름공간의 로컬 아이템으로 가던 값·타입 경로. 반례 말뭉치
+속성·derive 경로, 아이템 위치 매크로 호출, 같은 이름의 로컬 아이템이 있는 본문 매크로 호출(매크로 임포트가
+워크스페이스 매크로로 해석될 때 — `use log::info`처럼 그래프 밖 매크로면 로컬 아이템이 그대로 확정 대상이다)은
+매크로로 가고, 자리를 모르는 해석의 대상은 그 모듈에서 보이면 추정 간선으로 남는다. 보존이 좁아지는 곳은 둘이다:
+다른 크레이트에서 보이지 않는 예전 대상(proc-macro 크레이트의 비공개 struct)과, 다른 이름공간의 로컬 아이템이나
+임포트로 가던 값·타입 경로(글롭이 들인 `fn Foo` 옆 `use crate::types::Foo`(이름 있는 struct)의 `Foo()`는 이제
+fn이다). 반례 말뭉치
 (크레이트 10개와 zerocopy 0.8.50)에서 사라진 간선은 없다. Rust 라이브러리 호출자를 깨는 변경은 공개 구조체 필드
 추가, `modtree::Module::imports`의 타입 변경, `modtree::Module::unresolved_imports` 제거다
 ([0.8 migration](docs/MIGRATING-0.8.md)). CLI 플래그·기본값, 그래프 문서 v1, 순회 문서 v1은 그대로다.
@@ -55,18 +58,23 @@
   않는다(rustc는 그런 공존을 E0255·E0252로 거부하니 그 `use`는 다른 이름공간에 있다) — `pub trait Unaligned` 옆의
   그런 `use`가 있어도 값 자리·매크로 토큰의 `Unaligned`는 trait이다. 그래서 `pub use crate::split_at::SplitAt` 뒤에
   `pub use zerocopy_derive::SplitAt`이 와도 trait이 가려지지 않는다 — 이전에는 소스 순서상 뒤의 것이 이겨 글롭으로
-  들인 모듈의 `impl SplitAt for ..`가 풀리지 않았다. 그런 `use`는 지금처럼 같은 이름의 글롭은 모두 가린다.
+  들인 모듈의 `impl SplitAt for ..`가 풀리지 않았다. `#[cfg]`로 갈린 대안 임포트(`#[cfg(feature = "pl")] use
+  crate::pl::Condvar;`와 `#[cfg(not(..))] use std::sync::Condvar;`)는 실제로는 같은 이름공간이라 위 근거가 닿지
+  않는다(rustc가 둘을 한 빌드에서 보지 않을 뿐이다). 이때도 소스 순서와 무관하게 워크스페이스 쪽이 이긴다(이전에는
+  뒤의 것이 이겼다). 본문 간선(`Condvar::new()` 호출 등)은 지금처럼 임포트의 cfg를 물려받지 않아 조건 없는 확정
+  간선이고, `uses` 간선만 그 cfg를 싣는다. 그런 `use`는 지금처럼 같은 이름의 글롭은 모두 가린다.
   라이브러리 호출자용 `modtree::Module::imports`의 타입이 바뀌고(`PerNs<Binding>` — 이름공간을 정하지 못한 칸은
   `undetermined`) `unresolved_imports`가 빠졌다([0.8 migration](docs/MIGRATING-0.8.md)).
 - 속성·derive 인자·아이템 위치 매크로 호출의 경로를 매크로 이름공간에서 해석한다. 다른 크레이트의
   `#[derive(pm::Hello)]`는 proc-macro 크레이트에 같은 이름의 struct가 있어도 `#[proc_macro_derive(Hello)]` 함수로
   간다. 이전에는 그 struct(proc-macro 크레이트는 매크로 말고는 내보낼 수 없다)로 이어져 derive 함수 대신 struct에
   거짓 사용 간선이 붙었다 — 그 경로로만 살아 있던 struct는 이제 `dead`에 나올 수 있다. 크레이트 안의
-  `Hello { .. }`·`-> Hello`는 그대로 struct다. 매크로 경로(속성·derive 인자·매크로 호출)를 이름공간 없이 해석한
-  예전 대상이 다르고 그 모듈에서 보이면 추정 간선으로 남긴다 — `mylib`이 trait `Hello`와 `pub use
-  mylib_derive::Hello`를 함께 내보내면 `#[derive(mylib::Hello)]`의 확정 간선은 derive 함수, trait은 추정 간선이라
-  `dead`가 trait을 새로 보고하지 않는다(derive 펼침은 대개 그 trait을 구현한다). `use crate::logging::info` 옆
-  로컬 `fn info`가 있는 모듈의 `info!()`도 확정 간선은 매크로, 그 fn은 추정 간선이다.
+  `Hello { .. }`·`-> Hello`는 그대로 struct다. 매크로 경로(속성·derive 인자·매크로 호출)를 자리를 모르게 해석한
+  대상이 다르고 그 모듈에서 보이면 추정 간선으로 남긴다(대개 이름공간 분리 전의 대상이다) — `mylib`이 trait
+  `Hello`와 `pub use mylib_derive::Hello`를 함께 내보내면 `#[derive(mylib::Hello)]`의 확정 간선은 derive 함수,
+  trait은 추정 간선이라 `dead`가 trait을 새로 보고하지 않는다(derive 펼침은 대개 그 trait을 구현한다).
+  `use crate::logging::info`(워크스페이스 매크로) 옆 로컬 `fn info`가 있는 모듈의 `info!()`도 확정 간선은 매크로, 그
+  fn은 추정 간선이다. `use log::info`처럼 그래프 밖 매크로면 로컬 fn이 그대로 확정 대상이다(이름공간 분리 전과 같다).
 - 문서: README·README.ko 그래프 모델이 두 데이터 타입 사이의 필드 간선을 심볼 레벨 `cycles`는 빼고 type·module
   레벨은 세는 근거를 나란히 적는다 — 심볼 레벨은 어느 코드가 재귀하는지, type·module 레벨은 그 단위를 계층으로
   나눌 수 있는지를 묻는다.

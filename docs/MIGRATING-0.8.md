@@ -13,9 +13,13 @@ removed. The graph built from the same source changes in three ways:
   derive list that has two or more segments, every item-position macro call
   (`dep::mac!();`), and a macro call in a body whose name is also a local
   item (`info!()` beside `fn info` and `use crate::logging::info`) now point
-  at the macro rustc picks. The vertex they pointed at before keeps a
-  `tentative` edge when it is visible from that module, so `dead` reports
-  nothing new for it, while `cycles` and `rules` now see the macro. A value
+  at the macro rustc picks. The body macro call moves only when its import
+  resolves to a workspace macro: beside `use log::info`, a macro outside the
+  graph, the local `fn info` stays the confirmed target, as before. The
+  target of position-agnostic resolution, usually the vertex the path pointed
+  at before, keeps a `tentative` edge when it is visible from that module, so
+  `dead` reports nothing new for it, while `cycles` and `rules` now see the
+  macro. A value
   or type path whose name is bound to different vertices in different
   namespaces (`fn harvest` beside `use crate::harvest`) also resolves in its
   own namespace. A glob `use a::b::*` whose `b` names both a function and a
@@ -25,8 +29,10 @@ removed. The graph built from the same source changes in three ways:
   the referencing module (a private struct of a proc-macro crate, which a
   proc-macro crate cannot export) gets no tentative edge, so such a struct
   used only by that path can now be reported by `dead`. A value or type path
-  that used to resolve to a local item of another namespace has no tentative
-  edge either. Over ten crates (syn, tokio, regex-syntax, ra_ap_hir_def,
+  that used to resolve to a local item or an import of another namespace has
+  no tentative edge either: beside a glob that brings `fn Foo`,
+  `use crate::types::Foo` (a struct with named fields) no longer makes
+  `Foo()` a use of the struct, which `dead` can now report. Over ten crates (syn, tokio, regex-syntax, ra_ap_hir_def,
   ra_ap_hir_ty, rowan, serde, serde_derive, clap, rustograph itself) and
   zerocopy 0.8.50, the symbol graph harvested after the namespace change lost
   no edge that the graph harvested before it had.
@@ -70,17 +76,24 @@ can have more vertices and edges than before:
   `pub use foo_derive::Foo` keeps `Foo` the trait in value positions and
   macro tokens, and `pub use crate::split_at::SplitAt` keeps its trait beside
   a later `pub use zerocopy_derive::SplitAt`, whatever the source order. Such
-  a `use` still hides a glob import of the same name, as before.
+  a `use` still hides a glob import of the same name, as before. Alternative
+  imports split by `#[cfg]` (`#[cfg(feature = "pl")] use crate::pl::Condvar;`
+  beside `#[cfg(not(feature = "pl"))] use std::sync::Condvar;`) share one
+  namespace, so the rustc rule above does not cover them; the workspace side
+  now wins whatever the source order (before, the later `use` won). Edges
+  from bodies that use the name (`Condvar::new()`) still do not carry the
+  import's `#[cfg]`; only the module's `uses` edge does.
 - A path in an attribute, a derive list or a macro call resolves in the macro
   namespace. A cross-crate `#[derive(pm::Hello)]` now points at the
   `#[proc_macro_derive(Hello)]` function even when the proc-macro crate also
   has a struct named `Hello`; before, the edge went to that struct, which a
   proc-macro crate cannot export. Inside the proc-macro crate,
   `Hello { .. }` and `-> Hello` still resolve to the struct. Such a struct
-  used only by the derive path can now be reported by `dead`. When the old
-  target is visible from the referencing module (a trait `Hello` that
-  `mylib` exports beside `pub use mylib_derive::Hello`, a local `fn info`
-  beside an imported `info!`), it keeps a `tentative` edge.
+  used only by the derive path can now be reported by `dead`. When resolving
+  the path without a namespace reaches another vertex visible from the
+  referencing module (a trait `Hello` that `mylib` exports beside
+  `pub use mylib_derive::Hello`, a local `fn info` beside an imported
+  workspace `info!`), that vertex keeps a `tentative` edge.
 
 Expect `dead` to report fewer unreachable items, `rules` to see dependencies
 that a field type or a foreign-type impl body carried, and module- and

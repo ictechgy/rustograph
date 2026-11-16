@@ -153,6 +153,10 @@ pub struct PerNs<T> {
     /// std 경로, 매크로가 만든 이름)와 그것을 글롭·재노출로 다시 들인 것이다. 해석은 같은 이름의 로컬 아이템이나
     /// 이름공간이 정해진 칸이 없을 때만 이것을 쓴다([`lookup`]). rustc에서 명시 `use`는 같은 이름공간의 로컬
     /// 아이템·다른 명시 `use`와 공존하지 못하므로(E0255·E0252) 그런 것이 있으면 이 `use`는 다른 이름공간에 있다.
+    /// `#[cfg]`로 갈린 대안 임포트(`#[cfg(feature = "pl")] use crate::pl::Condvar;`와 `#[cfg(not(..))] use
+    /// std::sync::Condvar;`)는 같은 이름공간인데 rustc가 둘을 한 빌드에서 보지 않을 뿐이라 이 근거가 닿지 않는다 —
+    /// 그때도 소스 순서와 무관하게 정해진 쪽(워크스페이스)이 이긴다. 본문 간선은 임포트의 cfg를 물려받지 않으므로
+    /// (이 표가 생기기 전부터) 그 이름을 쓰는 본문 간선은 조건 없는 확정 간선이고, `uses` 간선만 cfg를 싣는다.
     pub undetermined: Option<T>,
 }
 
@@ -707,7 +711,9 @@ fn lookup<'a>(module: &'a Module, name: &str, want: Want) -> Found<'a> {
 /// 같은 이름공간의 로컬 아이템·다른 명시 `use`와 공존하지 못하므로(E0255·E0252), 컴파일되는 코드라면 그 `use`는
 /// 그것들과 다른 이름공간에 있다. `pub trait Foo`와 `pub use foo_derive::Foo`(derive 매크로)가 함께 있는 모듈에서
 /// 매크로 인자·값 자리의 `Foo`가 그 `use`로 가 trait 간선을 잃던 문제다. 쓰지 않으면 [`any_lookup`]이 로컬
-/// 아이템이나 정해진 임포트를 고른다. 아무것도 없으면 그 `use`가 유일한 후보다.
+/// 아이템이나 정해진 임포트를 고른다. 아무것도 없으면 그 `use`가 유일한 후보다. `#[cfg]`로 갈린 같은 이름공간의
+/// 대안 임포트(워크스페이스 쪽·std 쪽)에는 위 근거가 닿지 않지만 결과는 같다 — 소스 순서와 무관하게 정해진
+/// 워크스페이스 쪽이고, 본문 간선은 그 임포트의 cfg를 싣지 않는다([`PerNs::undetermined`]).
 fn undetermined_lookup<'a>(module: &'a Module, name: &str) -> Found<'a> {
     let Some(bindings) = module.imports.get(name) else {
         return Found::Unbound;

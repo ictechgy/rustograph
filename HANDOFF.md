@@ -36,7 +36,10 @@
       이기지 않는다(rustc E0255·E0252 — 그런 `use`는 다른 이름공간에 있다). 자리를 모르는 해석은 정해진 임포트를 먼저
       고르고, 문법을 모르는 매크로 인자 토큰은 값 이름공간이 아니라 자리를 모르는 해석이다(리뷰 제안 3가지 그대로).
       그런 `use`는 지금처럼 같은 이름의 글롭을 모두 가린다(`use std::fmt::Result` 규칙 유지). 덤으로 같은 이름의 정해진
-      명시 `use`가 뒤의 미정 `use`에 가려지지 않는다(zerocopy `SplitAt`, syn·tokio의 `uses` 6개).
+      명시 `use`가 뒤의 미정 `use`에 가려지지 않는다(zerocopy `SplitAt`, syn·tokio의 `uses` 6개). 단 `#[cfg]`로 갈린
+      대안 임포트(tokio의 `parking_lot::Condvar`/`std::sync::Condvar`)는 같은 이름공간이라 E0252 근거가 닿지 않는다 —
+      소스 순서와 무관하게 워크스페이스 쪽이 이기고(이전에는 뒤의 것), 그 이름을 쓰는 본문 간선은 임포트 cfg 없이 확정
+      간선이다(본문 간선이 임포트 cfg를 물려받지 않는 것은 전부터다 — 후속 후보).
     - `c9f6951` fix(modtree) — N1: 글롭 대상 경로를 타입 이름공간에서 해석한다(`fn harvest` 옆 `use crate::harvest`가
       있는 모듈의 `use super::harvest::*`가 fn을 잡아 아무것도 들이지 않았다).
     - `229a0a0` fix(harvest) — S1: 매크로 경로(속성·derive 인자·매크로 호출)의 매크로 이름공간 대상이 자리를 모르는
@@ -49,6 +52,12 @@
     - `09c227c` docs — S3·S4: AGENTS.md 글롭 절을 이름공간별 의미론으로, CHANGELOG 머리말과 0.8 migration을 실제 변화
       (타입 변경·필드 제거, 두 세그먼트 이상의 모든 속성·derive 경로·아이템 위치 매크로 호출·로컬 아이템과 이름이 같은
       본문 매크로 호출의 대상 변경, 남은 보존 축소 둘)로 고쳤다.
+  - **델타 재리뷰**(`f54266f` push 뒤, CI 7/7 성공): 판정 MERGEABLE — 수치 재현, 거짓 확정 간선 없음, 가시성 필터
+    확인. 문서 정확성 4건을 반영했다(HANDOFF와 같은 커밋, 문서·주석만): S1 `#[cfg]`로 갈린 대안 임포트는 같은 이름공간이라
+    E0252 근거가 닿지 않고 워크스페이스 쪽이 순서와 무관하게 이기며 본문 간선은 임포트 cfg를 싣지 않는다(전부터 — 후속
+    후보), N1 보존 축소 (2)는 "다른 이름공간의 로컬 아이템이나 임포트"(`use crate::types::Foo` 옆 글롭 `fn Foo`의
+    `Foo()`), N2 본문 매크로가 매크로로 옮겨 가는 것은 매크로 임포트가 워크스페이스 매크로일 때뿐(`use log::info`면
+    로컬 fn 그대로), N3 추정 간선 대상은 "자리를 모르는 해석의 대상"(대개 분리 전 대상이지만 보장은 아님).
   - **반례 말뭉치**: 크레이트 10개(syn 2.0.119·tokio 1.53.1·regex-syntax 0.8.11·ra_ap_hir_def/hir_ty 0.0.349·rowan
     0.17.0·serde·serde_derive 1.0.229·clap 4.6.7과 이 저장소 `e12ef90` 사본)의 심볼 그래프를 이름공간 분리 전(`e12ef90`)·
     후(최종 트리) 바이너리로 대조했다(`graph --level symbol --tests`, 간선 키는 from·to·kind·tentative·cfg). 사라진 간선
@@ -112,6 +121,11 @@
 3. isthmus `compatibility.json`의 rustograph 핀(현재 0.4.1) 갱신을 isthmus 쪽에 알린다.
 
 ### 후속 후보 (사용자가 고른다)
+
+- 임포트의 `#[cfg]`를 본문 간선으로 전파하기(델타 재리뷰 S1): `#[cfg(feature = "pl")] use crate::pl::Condvar;`와
+  `#[cfg(not(..))] use std::sync::Condvar;` 옆의 `Condvar::new()`는 `make -call-> pl::Condvar::new`·`-signature->
+  pl::Condvar`가 조건 없는 확정 간선이고 `uses` 간선만 `feature = "pl"`을 싣는다. 회귀는 아니다(main은 소스 순서상 뒤의
+  것으로 같은 모양을 냈다). 본문 해석이 임포트를 거쳤으면 그 임포트의 cfg를 간선에 합치면 `--target`·cfg 필터가 정확해진다.
 
 - 같은 이름공간에 같은 이름을 들이는 명시 `use` 둘이 모두 이름공간이 정해지면(`#[cfg]`로 갈린 두 워크스페이스
   대안) 지금처럼 뒤의 것만 남는다. 정해진 것과 정해지지 않은 것(std 대안)이 갈리는 경우는 `abea95b`로 둘 다 남아

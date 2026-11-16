@@ -216,10 +216,11 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
   `#[proc_macro_derive(Hello)]` function even when `mylib` also exports a
   trait `Hello`. When resolving the same path without a namespace reaches a
   different vertex visible from that module (that trait, or a local `fn info`
-  beside an imported `info!` macro), the vertex also gets a tentative edge:
-  the path pointed there before namespaces were kept apart, and a derive's
-  expansion, which syntax cannot see, usually implements the trait it is
-  named after. The tentative edge keeps such items alive in `dead` and stays
+  beside an imported workspace `info!` macro), the vertex also gets a
+  tentative edge: it is the target of position-agnostic resolution, which is
+  usually where the path pointed before namespaces were kept apart, and a
+  derive's expansion, which syntax cannot see, usually implements the trait
+  it is named after. The tentative edge keeps such items alive in `dead` and stays
   out of `cycles` and `rules`.
 - Items inside a function body (a nested `fn`, a local `impl` or
   `macro_rules!`) have no vertex; their edges belong to the enclosing body.

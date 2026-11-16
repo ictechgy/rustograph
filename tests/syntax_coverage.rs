@@ -1093,8 +1093,9 @@ fn derive_path_keeps_the_same_named_trait_as_a_tentative_edge() {
     }
 }
 
-/// 본문의 매크로 호출도 같다 — `use crate::logging::info`(매크로) 옆에 로컬 `fn info`가 있으면 `info!()`의 확정
-/// 간선은 rustc가 고르는 매크로이고, 이름공간을 나누기 전의 대상(로컬 fn)은 추정 간선으로 남는다. 그 fn은
+/// 본문의 매크로 호출도 같다 — `use crate::logging::info`(워크스페이스 매크로) 옆에 로컬 `fn info`가 있으면
+/// `info!()`의 확정 간선은 rustc가 고르는 매크로이고, 자리를 모르는 해석의 대상(로컬 fn — 이름공간을 나누기 전의
+/// 대상)은 추정 간선으로 남는다. `use log::info`처럼 그래프 밖 매크로면 로컬 fn이 그대로 확정 대상이다. 그 fn은
 /// rustc로는 쓰이지 않지만(미사용 경고), 이 경로로만 살아 있던 아이템을 새로 unreachable로 내지 않는 쪽을
 /// 고른다(보존을 좁히지 않는다). (cargo check 통과 — `a::info` 미사용 경고)
 #[test]
