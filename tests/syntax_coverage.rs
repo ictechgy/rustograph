@@ -803,6 +803,122 @@ fn main() {
     );
 }
 
+/// 이름 없는 상수(`const _: () = assert!(..);`)는 보존 루트다 — 컴파일러가 늘 평가하고 rustc는 그것도 그 초기식이
+/// 쓰는 아이템도 미사용으로 경고하지 않는다(이 fixture의 `cargo check` 경고는 `never` 하나다). 예전에는 상수 셋과
+/// 그 안에서만 쓰는 `only_in_anon`·`Marker`·`Check`·`inner::deep`이 unreachable이었다. 같은 모듈의 둘은 소스
+/// 인스턴스 ID로 따로 루트다.
+#[test]
+fn anonymous_consts_are_retention_roots() {
+    let ws = Workspace::new(
+        "anon-const",
+        &[
+            ("Cargo.toml", &manifest("anonconst")),
+            (
+                "src/main.rs",
+                r#"
+const fn only_in_anon() -> bool { true }
+const _: () = assert!(only_in_anon());
+struct Marker;
+trait Check { const OK: bool; }
+impl Check for Marker { const OK: bool = true; }
+const _: () = { assert!(<Marker as Check>::OK); };
+mod inner {
+    pub const fn deep() -> usize { 3 }
+    const _: usize = deep();
+}
+const fn never() -> bool { false }
+fn main() {}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    let anonymous: Vec<&String> = doc.roots.iter().filter(|r| r.ends_with("::_")).collect();
+    assert_eq!(anonymous.len(), 3, "{:?}", doc.roots);
+    assert!(doc.roots.iter().any(|r| r == "anonconst::inner::_"));
+    let report = analysis::dead(&doc).unwrap();
+    assert_eq!(unreachable_ids(&report), ["anonconst::never"]);
+}
+
+/// 테스트 빌드에만 있는 이름 없는 상수(`#[cfg(test)] const _`, `#[cfg(test)] mod tests` 안의 것)는 `#[test]` 함수처럼
+/// `--tests`일 때만 보존 루트다 — 테스트가 아닌 빌드에는 그 상수가 없어 rustc도 그 안에서만 쓰는 `only_test`·
+/// `helper_for_mod`를 미사용으로 경고한다(`cargo check`는 경고, `cargo check --tests`는 경고 없음).
+#[test]
+fn test_only_anonymous_consts_are_roots_only_with_tests() {
+    let ws = Workspace::new(
+        "anon-const-test",
+        &[
+            ("Cargo.toml", &manifest("anontest")),
+            (
+                "src/main.rs",
+                r#"
+const fn only_test() -> bool { true }
+#[cfg(test)]
+const _: () = assert!(only_test());
+const fn helper_for_mod() -> bool { true }
+#[cfg(test)]
+mod tests {
+    const _: () = assert!(super::helper_for_mod());
+}
+fn main() {}
+"#,
+            ),
+        ],
+    );
+    let load = |tests: bool| {
+        source::load(
+            ws.path(),
+            &source::Options {
+                symbol_level: true,
+                tests,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let without = analysis::dead(&load(false)).unwrap();
+    assert_reported(
+        &without,
+        &[
+            "anontest::only_test",
+            "anontest::helper_for_mod",
+            "anontest::tests::_",
+        ],
+    );
+    let with = load(true);
+    assert!(with.roots.iter().any(|r| r == "anontest::tests::_"));
+    assert!(analysis::dead(&with).unwrap().findings.is_empty());
+}
+
+/// 루트가 이름 없는 상수뿐인 lib은 여전히 루트 없는 크레이트다 — 정적 단언은 공개 API의 호출자가 아니라
+/// `--retain-public`을 알리는 limitation이 그대로 남아야 한다(상수가 쓰는 `size`는 닿는다).
+#[test]
+fn anonymous_const_roots_keep_the_rootless_library_limitation() {
+    let ws = Workspace::new(
+        "anon-const-lib",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname='anonlib'\nversion='0.1.0'\nedition='2021'\n[lib]\npath='src/lib.rs'\n[workspace]\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn api() {}\npub const fn size() -> usize { 8 }\nconst _: () = assert!(size() == 8);\n",
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    let report = analysis::dead(&doc).unwrap();
+    assert_eq!(unreachable_ids(&report), ["anonlib::api"]);
+    assert!(
+        report.limitations.iter().any(|l| l.starts_with(
+            "1 unreachable symbols are exported items of crates with no retention root (anonlib)"
+        )),
+        "{:?}",
+        report.limitations
+    );
+}
+
 /// 표현식 목록으로 파싱되지 않는 매크로 인자(`json!({"k": f()})` 같은 독자 문법)의 이름은 아이템으로
 /// 해석되면 추정 간선이 된다 — 예전에는 그 안에서만 쓰는 함수·상수가 unreachable이었다. 지역 묶음과
 /// 같은 이름은 아이템으로 읽지 않는다.

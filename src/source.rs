@@ -1222,11 +1222,13 @@ fn harvest(
     }
     push_limitations(&harvest, &mut limitations);
 
-    // 보존 루트 — 존재하는 정점만 루트가 된다.
+    // 보존 루트 — 존재하는 정점만 루트가 된다. 테스트 빌드에만 있는 이름 없는 상수는 `#[test]`처럼 --tests일 때만
+    // 루트다([`graph::test_only_anonymous_consts`]).
     let ids: BTreeSet<&str> = vertices.iter().map(|v| v.id.as_str()).collect();
+    let test_only = graph::test_only_anonymous_consts(&vertices);
     let mut root_set: BTreeSet<String> = BTreeSet::new();
     for r in entry_roots {
-        if ids.contains(r.as_str()) {
+        if ids.contains(r.as_str()) && (opts.tests || !test_only.contains(r.as_str())) {
             root_set.insert(r);
         }
     }

@@ -379,6 +379,20 @@ pub(crate) fn decls_with_markers<'a>(
                     let unsafe_ = body_has_unsafe(body);
                     out.vertices
                         .push(v(id.clone(), Kind::Const, is_pub(&c.vis), unsafe_));
+                    // 이름 없는 상수(`const _: () = assert!(..);`)는 아무도 이름으로 부를 수 없고 컴파일러가
+                    // 늘 평가한다 — rustc는 그것도 그 초기식이 쓰는 아이템도 미사용으로 경고하지 않는다.
+                    // 보존 루트가 아니면 정적 단언과 그 안에서만 쓰는 const fn·타입이 전부 unreachable이었다.
+                    // 테스트 빌드에만 있는 것은 source가 --tests일 때만 루트로 남긴다.
+                    if is_anonymous_const(c) {
+                        out.entry_roots.push(id.clone());
+                        identities.note_root(
+                            &id,
+                            module_path,
+                            false,
+                            file,
+                            c.span().byte_range().start,
+                        );
+                    }
                     out.bodies.push(BodyItem {
                         generic_scopes: Vec::new(),
                         id,
@@ -2430,6 +2444,11 @@ pub fn is_test_entry(attrs: &[syn::Attribute]) -> bool {
             .last()
             .is_some_and(|s| s.ident == "test" || s.ident == "bench")
     })
+}
+
+/// 이름 없는 상수(`const _: T = ..;`)인가 — 이름으로 쓸 수 없고 컴파일러가 늘 평가하니 보존 루트다.
+fn is_anonymous_const(c: &syn::ItemConst) -> bool {
+    c.ident == "_"
 }
 
 /// 링커·런타임·매크로 확장기가 부르는 진입점 속성 — 이 속성이 붙은 fn·static·impl 메서드는 그래프
