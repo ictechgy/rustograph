@@ -29,7 +29,7 @@ removed. The graph built from the same source changes in four ways:
   `#[cfg]`-gated `use`, re-export or glob carries that condition, so
   `--target` and `--exclude-tests` drop the edge where the import does not
   exist. Without those flags the edge stays, as before.
-- Retention narrows in two places, both following rustc. A derive or
+- Retention narrows in three places, all following rustc. A derive or
   attribute path into another crate whose old target is not visible from
   the referencing module (a private struct of a proc-macro crate, which a
   proc-macro crate cannot export) gets no tentative edge, so such a struct
@@ -37,7 +37,10 @@ removed. The graph built from the same source changes in four ways:
   that used to resolve to a local item or an import of another namespace has
   no tentative edge either: beside a glob that brings `fn Foo`,
   `use crate::types::Foo` (a struct with named fields) no longer makes
-  `Foo()` a use of the struct, which `dead` can now report. Over ten crates (syn, tokio, regex-syntax, ra_ap_hir_def,
+  `Foo()` a use of the struct, which `dead` can now report. A target left over
+  from an early import pass, which the settled tables no longer hold, no
+  longer keeps the vertex it named alive (see the graph results below). Over
+  ten crates (syn, tokio, regex-syntax, ra_ap_hir_def,
   ra_ap_hir_ty, rowan, serde, serde_derive, clap, rustograph itself) and
   zerocopy 0.8.50, the symbol graph harvested after the namespace change lost
   no edge that the graph harvested before it had.
@@ -104,16 +107,50 @@ can have more vertices and edges than before:
   platform;`. Before, the later `use` won and the other build's target lost
   its edges; rustix 1.1.5 reported its Linux `ioctl::linux::compose_opcode`
   and ten constants as unreachable. Now a path through the name gets an edge
-  to every alternative, each under its own condition, and `--target` keeps
-  only the build it describes. Several `use Trait as _` in one module, which
-  bind no name, all stay as the module's `uses` evidence (syn 2.0.119's
-  `syn::error` lost `PunctExt` that way). Two `use`s of the same vertex merge
-  to the weaker condition, as two such globs already did. Over seventeen
-  crates (syn, tokio, regex-syntax, ra_ap_hir_def, ra_ap_hir_ty, rowan, serde,
-  serde_derive, clap_builder, zerocopy, rustix, mio, getrandom,
-  parking_lot_core, crossbeam-utils, hashbrown and rustograph itself), the
-  graph lost no edge, gained 87, and put a condition on 341 edges that had
-  none; `dead --retain-public` reports 13 fewer items and none new.
+  to every alternative, each under its own condition, and `--target` and
+  `--exclude-tests` drop the edges whose import does not exist in that build.
+  Several `use Trait as _` in one module, which bind no name, all stay as the
+  module's `uses` evidence, whether written there or brought in by a glob
+  (syn 2.0.119's `syn::error` lost `PunctExt` that way). Two `use`s of the
+  same vertex merge to the weaker condition, as two such globs already did.
+  When an import that resolves and one that does not (a std path) bind the
+  same slot, the one that resolves stays whatever the source order: before,
+  `#[cfg(not(..))] use std::sync::Mutex;` after
+  `#[cfg(feature = "pl")] use extdep::Mutex;` erased the evidence that the
+  crate uses `extdep`, and `deps` reported it unused.
+- The same holds when `#[cfg]` splits a name between a `use` and another
+  binding. An explicit `use` that carries its own `#[cfg]` no longer hides a
+  glob import of the same name: in builds without the condition the glob's
+  name is visible. `f()` beside `use a::*;` and `#[cfg(test)] use a::f;` is an
+  unconditional edge, and `Clock::now()` beside `use real::*;` and
+  `#[cfg(test)] use mock::Clock;` reaches both clocks; before, `dead` reported
+  `real::Clock::now`. The glob side keeps its own condition (no negation of
+  the `use`'s condition is added, so that edge also stays in the `use`'s own
+  build). A local item whose every declaration carries `#[cfg]` and an import
+  of the same name in the same namespace are alternatives too:
+  `#[cfg(feature = "x")] fn sum()` beside
+  `#[cfg(not(feature = "x"))] use scalar::sum;` makes `sum()` reach both;
+  before, only the local item, and `dead` reported `scalar::sum`. An impl whose
+  self type is such a split import (`impl Sys { .. }`) is harvested once per
+  alternative: its method vertices sit under each alternative type with that
+  import's condition, so `--target` keeps the methods of the build it
+  describes. An impl whose trait path is split, and route handlers, still
+  resolve to one target.
+- While the import tables settle, a target that an early pass resolved and a
+  later pass took back (`pub use foo::bar` read through the crate-root
+  fallback before the module's own glob was expanded) no longer survives
+  between modules that glob each other: when a pass takes a target back, the
+  tables settle once more from empty, resolving explicit `use`s and glob paths
+  against the settled tables. The stale target used to give a false confirmed
+  `call` to the crate-root `foo::bar`, which rustc warns is never used; an
+  item kept alive only by that edge is now reported by `dead`. None of the
+  seventeen corpus crates below needed the extra round.
+- Over seventeen crates (syn, tokio, regex-syntax, ra_ap_hir_def,
+  ra_ap_hir_ty, rowan, serde, serde_derive, clap_builder, zerocopy, rustix,
+  mio, getrandom, parking_lot_core, crossbeam-utils, hashbrown and
+  rustograph itself), the graph lost no edge, gained 92, and put a condition
+  on 341 edges that had none; `dead --retain-public` reports 13 fewer items
+  and none new.
 - A path in an attribute, a derive list or a macro call resolves in the macro
   namespace. A cross-crate `#[derive(pm::Hello)]` now points at the
   `#[proc_macro_derive(Hello)]` function even when the proc-macro crate also
@@ -178,6 +215,12 @@ alike. Add the new fields, or end such patterns with `..`.
   namespaces that are known, or `PerNs::bound` for every binding including
   `undetermined`. `modtree::Ns`, `modtree::PerNs` and `modtree::Binding` are
   new public types.
+- `modtree::Module` adds `cfg_gated`, the names whose every declaration in a
+  namespace carries `#[cfg]`; such an item and a same-namespace import of the
+  name resolve as alternatives. `modtree::Module` and `modtree::ModTree` now
+  derive `Clone` (additive). `harvest::impls` returns one set of method
+  vertices per alternative when an impl's self type is a `#[cfg]`-split
+  import.
 - `modtree::Module` adds `macro_items` (named `macro_rules!` items), and
   `value_items` now also holds tuple and unit structs, whose constructors live
   in the value namespace. Build modules with `Module::new`.

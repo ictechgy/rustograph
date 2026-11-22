@@ -9,9 +9,10 @@
 속성·derive 경로, 아이템 위치 매크로 호출, 같은 이름의 로컬 아이템이 있는 본문 매크로 호출은 매크로로 가고
 (`use log::info`처럼 그래프 밖 매크로면 확정 대상이 없다), 자리를 모르는 해석의 대상은 그 모듈에서 보이면 추정
 간선으로 남는다. 조건부 `use`·재노출을 거쳐 해석한 간선은 그 `#[cfg]`를 싣고, `#[cfg]`로 갈린 대안 임포트는 둘 다
-남아 대안마다 간선이 생긴다. 보존이 좁아지는 곳은 둘이다: 다른 크레이트에서 보이지 않는 예전 대상(proc-macro
+남아 대안마다 간선이 생긴다. 보존이 좁아지는 곳은 셋이다: 다른 크레이트에서 보이지 않는 예전 대상(proc-macro
 크레이트의 비공개 struct)과, 다른 이름공간의 로컬 아이템이나 임포트로 가던 값·타입 경로(글롭이 들인 `fn Foo` 옆
-`use crate::types::Foo`(이름 있는 struct)의 `Foo()`는 이제 fn이다). 반례 말뭉치(크레이트 10개와 zerocopy 0.8.50,
+`use crate::types::Foo`(이름 있는 struct)의 `Foo()`는 이제 fn이다), 임포트 표가 수렴하는 동안 거둬진 앞 바퀴의
+대상(rustc가 쓰이지 않는다고 경고하는 정점으로 가던 거짓 간선)이다. 반례 말뭉치(크레이트 10개와 zerocopy 0.8.50,
 대안 임포트·조건 전파는 크레이트 17개)에서 사라진 간선은 없다. Rust 라이브러리 호출자를 깨는 변경은 공개 구조체
 필드 추가, `modtree::Module::imports`의 타입 변경(`Binding::Alternatives` 포함), `modtree::Module::unresolved_imports`
 제거다([0.8 migration](docs/MIGRATING-0.8.md)). CLI 플래그·기본값, 그래프 문서 v1, 순회 문서 v1은 그대로다.
@@ -81,9 +82,28 @@
   pub use self::unix::*;`), 모듈 별칭 둘(`use linux as platform;`·`use bsd as platform;`). 이전에는 소스 순서상
   뒤의 것만 남아 다른 빌드의 대상과 그 경로로만 쓰는 아이템이 `dead`에 거짓으로 나왔다(rustix 1.1.5의 리눅스
   `ioctl::linux::compose_opcode`와 상수 10개 — `--target x86_64-unknown-linux-gnu`에서도). 이제 그 이름을 거친 경로는
-  대안마다 간선을 얻고 간선은 각 임포트의 조건을 싣는다 — `--target`은 그 빌드의 것만 남긴다. 한 모듈의 `use T as
-  _` 여럿도 모두 `uses` 의존 증거로 남는다(syn 2.0.119의 `syn::error`가 `PunctExt`를 잃어 `dead --retain-public`에
-  거짓으로 나왔다). 같은 정점을 들이는 명시 `use` 둘은 글롭처럼 약한 조건으로 합친다.
+  대안마다 간선을 얻고 간선은 각 임포트의 조건을 싣는다 — `--target`·`--exclude-tests`는 그 빌드에 없는 임포트를
+  거친 간선을 지운다. 한 모듈의 `use T as _` 여럿(명시든 글롭으로 들인 것이든)도 모두 `uses` 의존 증거로
+  남는다(syn 2.0.119의 `syn::error`가 `PunctExt`를 잃어 `dead --retain-public`에 거짓으로 나왔다). 같은 정점을
+  들이는 명시 `use` 둘은 글롭처럼 약한 조건으로 합친다. 같은 칸에서 해석되는 임포트와 해석되지 않는 임포트(std
+  경로)가 만나면 소스 순서와 무관하게 해석되는 쪽이 남는다 — `#[cfg(feature = "pl")] use extdep::Mutex;` 뒤의
+  `#[cfg(not(..))] use std::sync::Mutex;`가 외부 크레이트 사용 증거를 지워 `deps`가 쓰는 의존을 unused로 냈다.
+- 같은 갈림이 `use`와 다른 바인딩 사이에 있어도 둘 다 남긴다. 자기 `#[cfg]`를 단 명시 `use`는 같은 칸의 글롭을
+  가리지 않는다 — `use a::*;` 옆 `#[cfg(test)] use a::f;`의 `f()`는 조건 없는 간선이고, `use real::*;` 옆
+  `#[cfg(test)] use mock::Clock;`의 `Clock::now()`는 두 대안이다. 이전에는 명시 `use`가 늘 글롭을 가려 테스트가 아닌
+  빌드에서 쓰이는 `real::Clock::now`가 `dead`에 나왔다(이 브랜치의 앞 머리에서는 `a::f` 간선에 `cfg(test)`가 붙어
+  `--exclude-tests`·`--target`이 `a::f`를 냈다). 글롭 쪽은 자기 조건을 그대로 싣는다(명시 `use` 조건의 부정을 더하지
+  않는다 — 그 조건의 빌드에서도 남는 간선이다). 모든 선언이 `#[cfg]`를 단 로컬 아이템 옆의 같은 이름공간 임포트도
+  그 아이템이 없는 빌드의 대안이다 — `#[cfg(feature = "x")] fn sum()` 옆 `#[cfg(not(feature = "x"))] use
+  scalar::sum;`의 `sum()`은 두 정점을 부른다(이전에는 로컬 아이템만이라 기본 빌드에서 쓰이는 `scalar::sum`이 `dead`에
+  나왔다). 그런 대안 임포트를 self 타입으로 쓴 impl(`impl Sys { .. }`)은 대안마다 수확해 메서드 정점이 대안 타입
+  아래에 그 임포트의 조건을 달고 생긴다 — 하나만 수확하면 다른 빌드에서 쓰이는 메서드가 `--target`에서 거짓
+  unreachable이었다. 트레이트 경로가 갈린 impl과 routes는 아직 대상 하나다.
+- 임포트 표를 수렴시키는 동안 앞 바퀴의 해석이 거둬지면(글롭이 아직 펼쳐지지 않아 크레이트 루트로 넘어간 `pub use
+  foo::bar`) 빈 표에서 다시 수렴시킨다 — 명시 `use`와 글롭 대상은 수렴한 표로 해석하고 글롭이 펼치는 이름만 새로
+  쌓는다. 거둔 대상이 서로를 글롭으로 들이는 모듈 사이에 남아 거짓 확정 간선(rustc가 쓰이지 않는다고 경고하는
+  루트의 `foo::bar`로 가는 call)이 되던 것을 고쳤다 — 그 거짓 간선으로만 살아 있던 아이템은 이제 `dead`에 나온다.
+  반례 말뭉치 17개에서는 다시 수렴시킨 크레이트가 없다.
 - 조건부 `use`·재노출·글롭을 거쳐 해석한 간선이 그 `#[cfg]`를 싣는다 — 본문(호출·참조·구조체 리터럴·매크로)·시그니처·
   필드 타입·속성 간선과, 조건부 재노출을 `use`한 모듈의 `uses` 간선이다. `#[cfg(feature = "pl")] use
   crate::pl::Condvar;` 옆의 `Condvar::new()`는 `feature = "pl"` 아래의 `call`이고, `#[cfg(test)] use crate::fake::Clock;`

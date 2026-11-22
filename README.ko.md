@@ -98,6 +98,8 @@ rustograph impact --format language-traversal --roots-from schema-facts.json  # 
 `call`). `#[cfg]`가 한 이름을 두 임포트로 가르면(`#[cfg(unix)] use crate::unix::Sys;`와
 `#[cfg(windows)] use crate::windows::Sys;`, 또는 플랫폼별 글롭 둘) 둘 다 남고, 그 이름을 거친 경로는
 대안마다 각자의 조건을 단 간선을 얻습니다 — rustc는 한 빌드에서 둘을 보지 않고 그래프는 모든 빌드를 봅니다.
+자기 `#[cfg]`를 단 `use` 옆의 같은 이름 글롭(글롭을 가리지 않습니다), `#[cfg]`를 단 로컬 아이템 옆의 같은 이름
+임포트, 그런 갈린 임포트를 self 타입으로 쓴 impl(메서드 정점이 대안 타입마다 생깁니다)도 같습니다.
 `unsafe`는 경계를 표시합니다 — `unsafe fn`/`unsafe trait`이거나
 `unsafe {}` 블록을 품은 정점에 `unsafe: true`, `unsafe {}` 안에서 만든
 간선은 경계 진입 간선입니다. 구성원이 한 모듈과 그 자손뿐인 모듈 레벨 순환(부모가
