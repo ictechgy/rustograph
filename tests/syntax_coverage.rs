@@ -1036,6 +1036,56 @@ fn main() { let _ = m::gen(); back(); }
     );
 }
 
+/// 파일을 찾지 못해 싣지 않은 `mod` 선언(`#[cfg_attr(unix, path = ..)] mod backend;` — 수확은 `cfg_attr` 안의 `path`를 따르지
+/// 않는다, `#[cfg(any())] mod missing;`)은 limitation으로 세고, 그리로 가는 `uses` 간선(정점 없는 경로)을 내지 않는다.
+/// 예전에는 셈 없이 조용했고 `#[cfg]`를 단 선언은 "modules behind #[cfg] were included"로 실린 것처럼 셌다.
+#[test]
+fn unloaded_mod_declarations_are_counted_and_get_no_edges() {
+    let ws = Workspace::new(
+        "unloaded-mods",
+        &[
+            ("Cargo.toml", &manifest("unloaded")),
+            (
+                "src/main.rs",
+                r#"
+#[cfg_attr(unix, path = "imp_unix.rs")]
+mod backend;
+#[cfg(any())] mod missing;
+mod user {
+    use crate::backend;
+    use crate::backend::Thing;
+    pub fn f() -> u8 { let _ = Thing; backend::g() + backend::Thing::k() }
+}
+fn main() { user::f(); }
+"#,
+            ),
+            (
+                "src/imp_unix.rs",
+                "pub fn g() -> u8 { 1 }\npub struct Thing;\nimpl Thing { pub fn k() -> u8 { 2 } }\n",
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    let ids: std::collections::BTreeSet<&str> =
+        doc.vertices.iter().map(|v| v.id.as_str()).collect();
+    for e in &doc.edges {
+        assert!(
+            ids.contains(e.from.as_str()) && ids.contains(e.to.as_str()),
+            "edge to a missing vertex: {e:?}"
+        );
+    }
+    assert!(
+        doc.limitations.iter().any(|l| l
+            .starts_with("2 mod declarations were not loaded because their file was not found")),
+        "{:?}",
+        doc.limitations
+    );
+    assert!(!doc
+        .limitations
+        .iter()
+        .any(|l| l.contains("modules behind #[cfg] were included")));
+}
+
 /// 이름 없는 상수(`const _: () = assert!(..);`)는 보존 루트다 — 컴파일러가 늘 평가하고 rustc는 그것도 그 초기식이
 /// 쓰는 아이템도 미사용으로 경고하지 않는다(이 fixture의 `cargo check` 경고는 `never` 하나다). 예전에는 상수 셋과
 /// 그 안에서만 쓰는 `only_in_anon`·`Marker`·`Check`·`inner::deep`이 unreachable이었다. 같은 모듈의 둘은 소스

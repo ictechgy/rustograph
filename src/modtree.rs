@@ -1182,17 +1182,23 @@ pub(crate) fn collect_target_submodules(
                 None => None,
             }
         };
+        // 파일 없는 mod(조건부·생성·`#[cfg_attr(.., path = ..)]`) — 정점 없이 limitation만(`unloaded_mods`를 source가
+        // 센다). 병합 루트의 다른 타깃이 실은 경로는 적지 않는다.
+        let Some((file, is_file_module, dir)) = resolved else {
+            if !tree.modules.contains_key(&path) {
+                tree.unloaded_mods.insert(path);
+            }
+            continue;
+        };
+        // 다른 타깃이 파일을 못 찾아 적어 둔 경로라도 이 타깃이 실으면 정점이 있다.
+        tree.unloaded_mods.remove(&path);
         // 병합 루트(lib+같은 이름 bin)를 두 번째 타깃이 다시 훑을 때 같은
         // mod 선언을 재계수하지 않는다 — 처음 보는 경로일 때만 센다.
-        // 건너뛴 선언(skipped_mods)은 실리지 않았으니 세지 않는다.
+        // 건너뛴 선언(skipped_mods)과 파일이 없어 싣지 않은 선언은 실리지 않았으니 세지 않는다 — 예전에는
+        // `#[cfg(any())] mod missing;`도 "included"로 셌다.
         if cfg.is_some() && !tree.modules.contains_key(&path) {
             *conditional_count += 1;
         }
-        // 파일 없는 mod(조건부·생성) — 정점 없이 limitation만.
-        let Some((file, is_file_module, dir)) = resolved else {
-            tree.unloaded_mods.insert(path);
-            continue;
-        };
         let public = matches!(m.vis, syn::Visibility::Public(_));
         let mut module = Module::new(file, is_file_module, public);
         module.cfg = cfg;
