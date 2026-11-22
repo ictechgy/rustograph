@@ -1652,16 +1652,19 @@ impl BodyVisitor<'_> {
 
     /// 타입 `owner` 범위에서 이름이 `name`인 메서드(고유·트레이트 impl)로 references 간선을 단다 —
     /// 연관 함수를 값으로 넘긴 경로(`Type::new`)다. 같은 이름 메서드가 없으면(배리언트·연관 상수)
-    /// 아무것도 하지 않는다. 간선은 타입에 닿으려고 거친 임포트의 조건을 싣는다.
-    fn push_associated(&mut self, owner: &Resolved, name: &str) {
+    /// 아무것도 하지 않는다. 간선은 타입에 닿으려고 거친 임포트의 조건을 싣는다. 반환: 간선을 달았는가.
+    fn push_associated(&mut self, owner: &Resolved, name: &str) -> bool {
         let index = self.method_index;
         let Some(ids) = index.get(name) else {
-            return;
+            return false;
         };
         let prefix = owner_prefix(&owner.target);
+        let mut hit = false;
         for mid in ids.iter().filter(|mid| mid.starts_with(&prefix)) {
             self.push(mid.clone(), &owner.cfg, EdgeKind::References);
+            hit = true;
         }
+        hit
     }
 
     /// `<T as Tr>::m(..)`·`<T>::m(..)` — self 타입이 적힌 정적 호출이다. `T`가 워크스페이스 타입이면
@@ -1760,6 +1763,32 @@ impl BodyVisitor<'_> {
     /// 않으면 그렇게만 쓰는 메서드가 limitation 없이 unreachable이었다.
     fn type_relative_resolved(&self, resolved: bool, hit: bool, name: &str) -> bool {
         resolved && (hit || !self.method_index.contains_key(name))
+    }
+
+    /// 값 경로로 풀리지 않은 호출이 아닌 경로 `Type::name`·`E::W`·`m::X` — 앞부분 대상([`Self::path_prefix_owners`])으로
+    /// references 간선을 단다. 앞부분이 타입이면 그 타입 범위의 같은 이름 메서드도 잇는다 — `.map(Type::new)`·
+    /// `.ok_or_else(Type::err)`처럼 연관 함수를 값으로 넘긴 경로다(타입만 잇던 때는 그렇게만 쓰는 연관 함수가
+    /// unreachable이었다). 앞부분이 모듈이면 메서드 후보를 찾지 않는다 — `let f = m::gen;`(매크로가 만든 함수)은
+    /// `m::S::gen`이 아니다. 예전에는 그 메서드로 확정 간선이 붙어 rustc가 경고하는 `S::gen`이 살아 있고 그 메서드가
+    /// 부르는 함수 사이에 거짓 심볼 순환이 생겼다. 모듈로 가는 간선은 그대로 두되 이름은 풀리지 않았으니 센다 — 셈 기준은
+    /// 호출과 같다([`Self::type_relative_resolved`]).
+    fn type_relative_value(&mut self, prefix: &[String], name: &str) {
+        let mut resolved = false;
+        let mut hit = false;
+        for owner in self.path_prefix_owners(prefix) {
+            if self.dep_crates.external.contains(owner.target.as_str()) {
+                resolved = true;
+            } else if self.type_item(&owner.target)
+                && !self.tree.modules.contains_key(&owner.target)
+            {
+                resolved = true;
+                hit |= self.push_associated(&owner, name);
+            }
+            self.push_resolved(owner, EdgeKind::References);
+        }
+        if !self.type_relative_resolved(resolved, hit, name) {
+            self.unresolved += 1;
+        }
     }
 
     /// [`Self::path_prefix_owners`] 가운데 타입(모듈·외부 크레이트가 아닌 타입 이름공간 아이템)만 — 타입 상대 경로의
@@ -2166,20 +2195,8 @@ impl Visit<'_> for BodyVisitor<'_> {
             ValueRes::Unresolved => {
                 // E::V 형태 — 마지막 세그먼트가 열거형 배리언트/상수면
                 // 앞부분 타입에의 참조다. 그것도 안 되면 진짜 미해석.
-                if segs.len() >= 2 {
-                    // 함수·상수로 넘어간 앞부분은 버린다 — `let f = process::exit;`가 `use std::process;` 옆
-                    // `fn process`를 살려 두던 것([`BodyVisitor::path_prefix_owners`]).
-                    let owners = self.path_prefix_owners(&segs[..segs.len() - 1]);
-                    if owners.is_empty() {
-                        self.unresolved += 1;
-                    }
-                    for ty in owners {
-                        // `.map(Type::new)`·`.ok_or_else(Type::err)`처럼 연관 함수를 값으로 넘기면
-                        // 그 메서드의 참조다 — 타입만 잇던 때는 그렇게만 쓰는 연관 함수가
-                        // unreachable이었다. 호출(`Type::assoc()`)과 같은 타입 범위 후보를 쓴다.
-                        self.push_associated(&ty, &segs[segs.len() - 1]);
-                        self.push_resolved(ty, EdgeKind::References);
-                    }
+                if let Some((name, prefix)) = segs.split_last().filter(|(_, p)| !p.is_empty()) {
+                    self.type_relative_value(prefix, name);
                 }
             }
         }

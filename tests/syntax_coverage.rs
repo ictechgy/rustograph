@@ -993,6 +993,49 @@ fn main() { use c::Tr as _; let _ = c::S::d(); let _ = a::A::new(); }
     );
 }
 
+/// 호출이 아닌 모듈 앞부분 경로(`let f = m::gen;` — 매크로가 만든 함수)도 `m` 안 타입의 같은 이름 메서드(`m::S::gen`)가
+/// 아니다 — 예전에는 그 메서드로 확정 간선이 붙어 rustc가 경고하는 `S::gen`이 살아 있고, 그 메서드가 부르는 `back`과
+/// 거짓 심볼 순환 `back -> m::S::gen`이 생겼다(`cargo check` 경고는 `S`·`gen`). 호출처럼 미해석으로 센다.
+#[test]
+fn module_prefix_value_paths_pick_no_same_named_methods() {
+    let ws = Workspace::new(
+        "prefix-value-module",
+        &[
+            ("Cargo.toml", &manifest("valuemodule")),
+            (
+                "src/main.rs",
+                r#"
+macro_rules! gen_fn { () => { pub fn gen() -> u8 { 0 } } }
+mod m {
+    pub struct S;
+    impl S { pub fn gen() -> u8 { crate::back() } }
+    gen_fn!();
+}
+fn back() -> u8 { let f = m::gen; f() }
+fn main() { let _ = m::gen(); back(); }
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(!doc
+        .edges
+        .iter()
+        .any(|e| e.from == "valuemodule::back" && e.to == "valuemodule::m::S::gen"));
+    assert!(analysis::cycles(&doc).cycles.is_empty());
+    assert_reported(
+        &analysis::dead(&doc).unwrap(),
+        &["valuemodule::m::S", "valuemodule::m::S::gen"],
+    );
+    assert!(
+        doc.limitations
+            .iter()
+            .any(|l| l.starts_with("2 path references could not be resolved")),
+        "{:?}",
+        doc.limitations
+    );
+}
+
 /// 이름 없는 상수(`const _: () = assert!(..);`)는 보존 루트다 — 컴파일러가 늘 평가하고 rustc는 그것도 그 초기식이
 /// 쓰는 아이템도 미사용으로 경고하지 않는다(이 fixture의 `cargo check` 경고는 `never` 하나다). 예전에는 상수 셋과
 /// 그 안에서만 쓰는 `only_in_anon`·`Marker`·`Check`·`inner::deep`이 unreachable이었다. 같은 모듈의 둘은 소스
