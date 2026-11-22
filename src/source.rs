@@ -949,6 +949,12 @@ fn harvest(
             Some((mp, flatten_items(&groups)))
         })
         .collect();
+    // 2015 판 타깃은 `use` 경로가 크레이트 기준이다 — 이 해석기의 규칙(2018 판 이후)과 달라, 앞 바퀴의 대상을 거둬
+    // 지우지 않는다(`fill_imports_settled`).
+    tree.edition_2015 = source_targets(meta)
+        .filter(|t| t.edition == "2015")
+        .map(|t| t.name.clone())
+        .collect();
     let unsettled = modtree::fill_imports_settled(&mut tree, &module_uses, &dep_crates);
     if unsettled > 0 {
         limitations.push(format!(
@@ -956,6 +962,7 @@ fn harvest(
             modtree::MAX_IMPORT_PASSES
         ));
     }
+    push_import_settling(&tree, &mut limitations);
 
     // 1패스: 모듈·아이템 선언 — 정점과 contains/uses/implements 간선.
     let mut bodies: Vec<BodyItem<'_>> = Vec::new();
@@ -1873,6 +1880,24 @@ fn harvest_module<'a>(
         vertex,
         edges,
         decls,
+    }
+}
+
+/// 임포트 표를 수렴시키며 남은 실측([`modtree::fill_imports_settled`])을 limitation으로 싣는다 — 다시 수렴시켜도
+/// 거둔 대상을 다 지우지 못한 모듈과, 2015 판이라 거둔 대상을 지우지 않은 크레이트.
+fn push_import_settling(tree: &ModTree, limitations: &mut Vec<String>) {
+    if tree.stale_import_modules > 0 {
+        limitations.push(format!(
+            "{} modules may keep stale re-export targets: an import resolved in an early pass was replaced later, and {} clean re-resolutions did not settle; edges through those imports can also reach the replaced target",
+            tree.stale_import_modules,
+            modtree::MAX_IMPORT_PASSES
+        ));
+    }
+    if !tree.edition_2015_kept.is_empty() {
+        limitations.push(format!(
+            "{} edition-2015 crates kept import targets that a later resolution pass replaced; edition-2015 `use` paths are crate-relative, which this resolver does not model, so edges through those imports can reach either target",
+            tree.edition_2015_kept.len()
+        ));
     }
 }
 
@@ -2802,6 +2827,7 @@ mod tests {
                     name: target.to_string(),
                     kind: kind.to_string(),
                     src: PathBuf::from("src/lib.rs"),
+                    edition: "2021".to_string(),
                 })
                 .collect(),
             workspace_member: member,

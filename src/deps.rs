@@ -386,6 +386,7 @@ mod tests {
                         name: name.to_string(),
                         kind: k.to_string(),
                         src: PathBuf::from("x.rs"),
+                        edition: "2021".to_string(),
                     })
                     .collect(),
             });
@@ -526,6 +527,7 @@ mod tests {
                 name: "app".into(),
                 kind: "bin".into(),
                 src: PathBuf::from("x.rs"),
+                edition: "2021".into(),
             }],
         });
         by_id.insert("p_real".to_string(), 1);
@@ -539,6 +541,7 @@ mod tests {
                 name: "real_lib".into(), // [lib] name ≠ package name
                 kind: "lib".into(),
                 src: PathBuf::from("x.rs"),
+                edition: "2021".into(),
             }],
         });
         let meta = Metadata {
@@ -594,6 +597,7 @@ mod tests {
                 name: name.into(),
                 kind: "lib".into(),
                 src: PathBuf::from("x.rs"),
+                edition: "2021".into(),
             }],
         }
     }

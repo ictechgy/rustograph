@@ -442,6 +442,17 @@ pub struct ModTree {
     /// 정점 없이 건너뛴 `mod` 선언 — 모듈 경로 → 사유. limitation으로 올린다.
     /// 경로가 키라 병합 루트(lib+같은 이름 bin)를 두 타깃이 다시 훑어도 한 번만 센다.
     pub skipped_mods: BTreeMap<String, SkippedMod>,
+    /// 2015 판 타깃의 루트 모듈(크레이트) 경로 — 호출자가 채운다. 이 해석기는 2018 판 이후의 경로 규칙이라, 2015 판의
+    /// 크레이트 기준 `use` 경로(`use foo::bar`가 `crate::foo::bar`)를 모른다. 그런 크레이트의 모듈에서는
+    /// [`fill_imports_settled`]가 앞 바퀴의 대상을 거둬 지우지 않는다(거둔 쪽이 2015 판의 제 대상일 수 있다).
+    pub edition_2015: BTreeSet<String>,
+    /// [`fill_imports_settled`]가 남긴 것 — 앞 바퀴의 대상을 거둔 모듈이 있어 빈 표에서 다시 수렴시켰는데
+    /// [`MAX_IMPORT_PASSES`]번 다시 쌓아도 앞 바퀴의 대상을 거두는 모듈 수. 그 모듈의 임포트는 거둔 대상을 대안으로 남길 수
+    /// 있다 — limitation으로 올린다.
+    pub stale_import_modules: usize,
+    /// [`fill_imports_settled`]가 남긴 것 — 앞 바퀴의 대상을 거둔 모듈이 있는데 2015 판이라 거둔 대상을 지우지 않은
+    /// 크레이트([`ModTree::edition_2015`]). limitation으로 올린다.
+    pub edition_2015_kept: BTreeSet<String>,
 }
 
 /// 모듈 경로 깊이(세그먼트 수) 상한이다. 순환은 조상 파일 검사가 끊지만, 그 검사를
@@ -1446,6 +1457,12 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
     fill_imports_from(tree, None, path, items, dep_crates);
 }
 
+/// 모듈 하나의 임포트 표와 글롭 대상 — [`fill_imports_from`]이 바꾸기 전 표를 돌려준다.
+type Tables = (
+    BTreeMap<String, PerNs<Binding>>,
+    BTreeMap<String, Option<String>>,
+);
+
 /// [`fill_imports`]의 본체 — `frozen`이 있으면 명시 `use`와 글롭 대상 경로를 그 트리(앞서 수렴한 임포트 표)로
 /// 해석하고, 글롭이 펼치는 이름만 `tree`의 지금 표에서 읽는다([`fill_imports_settled`]의 깨끗한 바퀴).
 fn fill_imports_from(
@@ -1454,7 +1471,7 @@ fn fill_imports_from(
     path: &str,
     items: &[&syn::Item],
     dep_crates: &DepCrates,
-) {
+) -> Tables {
     let resolver: &ModTree = frozen.unwrap_or(tree);
     let derive_names = derive_macro_names(path, items);
     let mut uses: Vec<(Vec<String>, Option<String>, Scope)> = Vec::new();
@@ -1579,9 +1596,11 @@ fn fill_imports_from(
         shadow_globs(imports.entry(name).or_default(), bindings, &own);
     }
     let module = tree.modules.get_mut(path).expect("module must exist");
-    module.imports = imports;
-    module.glob_targets = glob_targets;
     module.local_alternatives = local_alternatives;
+    (
+        std::mem::replace(&mut module.imports, imports),
+        std::mem::replace(&mut module.glob_targets, glob_targets),
+    )
 }
 
 /// 명시 `use` 하나(조건 `cfg`, 가시성 `scope`)가 한 이름공간에서 찾은 대상들의 칸 값 — 정점으로 해석된 대상이
@@ -1905,9 +1924,6 @@ fn merge_imports(imports: Vec<Import>) -> Vec<Import> {
 /// [`fill_imports_settled`]가 돌리는 해석 바퀴의 상한.
 pub const MAX_IMPORT_PASSES: usize = 32;
 
-/// [`fill_imports_settled`]가 깨끗한 표에서 다시 수렴시키는 횟수의 상한.
-const MAX_CLEAN_ROUNDS: usize = 4;
-
 /// 전 모듈의 `use`를 임포트 표가 더 바뀌지 않을 때까지 되풀이해 해석한다 — `modules`는 (모듈 경로,
 /// 그 모듈의 아이템). 재노출을 따라가는 해석([`ModTree::resolve`])은 다른 모듈의 임포트 표를 읽으므로,
 /// 한 바퀴로는 처리 순서상 뒤에 오는 모듈의 재노출(`pub use zz::Tr`이 거치는 `zz`의 `pub use`)을
@@ -1916,90 +1932,97 @@ const MAX_CLEAN_ROUNDS: usize = 4;
 ///
 /// 앞 바퀴의 해석이 나중에 거둬지면(다른 모듈의 글롭이 아직 펼쳐지지 않아 크레이트 루트로 넘어간 `pub use foo::bar`가
 /// 다음 바퀴에 제 대상을 찾으면) 거둔 대상이 서로를 글롭으로 들이는 모듈 사이를 돌며 수렴한 표에 남는다 — 대안
-/// 임포트를 남기는 표에서는 거짓 대안이 된다. 그런 일이 있었으면 수렴한 표를 얼려 두고, 빈 표에서 다시 수렴시킨다 —
+/// 임포트를 남기는 표에서는 거짓 대안이 된다. 그런 일이 있었으면 수렴한 표를 얼려 두고, 빈 표에서 다시 쌓는다 —
 /// 명시 `use`와 글롭 대상은 언 표로 해석하고 글롭이 펼치는 이름만 새로 쌓으니, 근거 없이 서로만 받치던 대상은
-/// 다시 생기지 않는다. 다시 수렴한 표가 언 표와 같아질 때까지 [`MAX_CLEAN_ROUNDS`]번까지 되풀이한다.
+/// 다시 생기지 않는다. 그 다음 지금 표로 한 번 더 수렴시켜(대개 한 바퀴) 거두는 것이 없으면 끝이다 — 언 표로 해석한
+/// 재노출 사슬의 고리가 남아 거두면 다시 빈 표에서 쌓는다. 이것을 [`MAX_IMPORT_PASSES`]번까지 되풀이하고, 그래도
+/// 거두는 모듈 수는 [`ModTree::stale_import_modules`]에 남긴다. 2015 판 크레이트([`ModTree::edition_2015`])의 모듈이
+/// 거둔 것은 지우지 않고 그 크레이트를 [`ModTree::edition_2015_kept`]에 남긴다 — 그 판의 크레이트 기준 `use` 경로에서는
+/// 거둔 쪽이 제 대상일 수 있다. 그런 모듈은 다시 쌓을 때도 표를 비우지 않고 지금 표로 해석한다.
 pub fn fill_imports_settled(
     tree: &mut ModTree,
     modules: &[(String, Vec<&syn::Item>)],
     dep_crates: &DepCrates,
 ) -> usize {
-    let (changed, mut retracted) = settle_imports(tree, None, modules, dep_crates);
-    if changed > 0 {
-        return changed;
-    }
+    tree.stale_import_modules = 0;
+    tree.edition_2015_kept.clear();
+    let (mut changed, mut retracting) = settle_imports(tree, None, modules, dep_crates);
     let mut rounds = 0;
-    while retracted && rounds < MAX_CLEAN_ROUNDS {
+    while changed == 0 && retracting > 0 && rounds < MAX_IMPORT_PASSES {
         rounds += 1;
         let frozen = tree.clone();
         for (path, _) in modules {
+            if tree.edition_2015.contains(&crate_of(path)) {
+                continue;
+            }
             if let Some(module) = tree.modules.get_mut(path) {
                 module.imports.clear();
                 module.glob_targets.clear();
             }
         }
-        let (changed, _) = settle_imports(tree, Some(&frozen), modules, dep_crates);
+        changed = settle_imports(tree, Some(&frozen), modules, dep_crates).0;
         if changed > 0 {
-            return changed;
+            break;
         }
-        retracted = modules.iter().any(|(path, _)| {
-            let tables = |t: &ModTree| {
-                t.modules
-                    .get(path)
-                    .map(|m| (m.imports.clone(), m.glob_targets.clone()))
-            };
-            tables(tree) != tables(&frozen)
-        });
+        // 깨끗하게 쌓은 표에서 지금 표로 다시 해석해 거두는 것이 없으면 끝이다 — 처음 수렴과 같은 판정이고, 대개
+        // 한 바퀴다(언 표로 해석한 재노출 사슬의 고리가 남아 있으면 거두므로 한 번 더 깨끗하게 쌓는다).
+        (changed, retracting) = settle_imports(tree, None, modules, dep_crates);
     }
-    if retracted {
-        // 깨끗한 바퀴로도 언 표와 같아지지 않았다 — 바뀐 모듈 수를 수렴하지 못한 것으로 센다.
-        return modules.len().max(1);
+    if changed == 0 && retracting > 0 {
+        tree.stale_import_modules = retracting;
     }
-    0
+    changed
 }
 
 /// [`fill_imports_settled`]의 한 수렴 — 바퀴를 [`MAX_IMPORT_PASSES`]까지 돌려 (마지막 바퀴에서 표가 바뀐 모듈 수,
-/// 어느 바퀴에서든 모듈 표가 앞 바퀴의 해석된 대상을 거뒀는가)를 돌려준다. `frozen`은 [`fill_imports_from`]과 같다.
+/// 2015 판이 아니면서 어느 바퀴에서든 앞 바퀴의 해석된 대상을 거둔 모듈 수)를 돌려준다. 2015 판 모듈이 거두면 그
+/// 크레이트를 [`ModTree::edition_2015_kept`]에 적는다. `frozen`은 [`fill_imports_from`]과 같되 2015 판 모듈은 늘
+/// 지금 표로 해석한다.
 fn settle_imports(
     tree: &mut ModTree,
     frozen: Option<&ModTree>,
     modules: &[(String, Vec<&syn::Item>)],
     dep_crates: &DepCrates,
-) -> (usize, bool) {
-    let tables = |tree: &ModTree, path: &str| {
-        tree.modules
-            .get(path)
-            .map(|m| (m.imports.clone(), m.glob_targets.clone()))
-    };
+) -> (usize, usize) {
     let mut changed = 0;
-    let mut retracted = false;
+    let mut retracting: BTreeSet<&str> = BTreeSet::new();
     for _ in 0..MAX_IMPORT_PASSES {
         changed = 0;
         for (path, items) in modules {
-            let before = tables(tree, path);
-            fill_imports_from(tree, frozen, path, items, dep_crates);
-            let after = tables(tree, path);
-            if after != before {
-                changed += 1;
-                retracted |= matches!((&before, &after), (Some(b), Some(a)) if retracts(b, a));
+            let krate = crate_of(path);
+            let legacy = tree.edition_2015.contains(&krate);
+            let (imports, glob_targets) =
+                fill_imports_from(tree, frozen.filter(|_| !legacy), path, items, dep_crates);
+            let Some(module) = tree.modules.get(path) else {
+                continue;
+            };
+            if module.imports == imports && module.glob_targets == glob_targets {
+                continue;
+            }
+            changed += 1;
+            if retracts(&imports, &module.imports) {
+                if legacy {
+                    tree.edition_2015_kept.insert(krate);
+                } else {
+                    retracting.insert(path);
+                }
             }
         }
         if changed == 0 {
             break;
         }
     }
-    (changed, retracted)
+    (changed, retracting.len())
 }
 
-/// 모듈 하나의 임포트 표와 글롭 대상 — [`settle_imports`]가 바퀴 사이에 비교한다.
-type Tables = (
-    BTreeMap<String, PerNs<Binding>>,
-    BTreeMap<String, Option<String>>,
-);
-
-/// 모듈 표가 `before`에서 `after`로 바뀌며 해석된 대상을 거뒀는가 — 앞에 있던 (이름, 대상)이나 글롭 대상이 뒤에
-/// 없다. 해석되지 않던 이름이 해석되는 것은 거두는 것이 아니다.
-fn retracts(before: &Tables, after: &Tables) -> bool {
+/// 모듈 임포트 표가 `before`에서 `after`로 바뀌며 해석된 대상을 거뒀는가 — 앞에 있던 (이름, 대상)이 뒤에 없다.
+/// 해석되지 않던 이름이 해석되는 것은 거두는 것이 아니다. 글롭 대상(`glob_targets`)은 보지 않는다 — 거둔 글롭 대상이
+/// 들이던 이름이 있었으면 그 이름이 여기서 잡히고, 없었으면 다른 모듈로 퍼질 것이 없다(글롭 대상 자신은 그 모듈의
+/// 의존 증거일 뿐 다른 모듈이 펼치지 않는다).
+fn retracts(
+    before: &BTreeMap<String, PerNs<Binding>>,
+    after: &BTreeMap<String, PerNs<Binding>>,
+) -> bool {
     let targets = |bindings: &PerNs<Binding>| -> BTreeSet<String> {
         bindings
             .bound()
@@ -2007,11 +2030,10 @@ fn retracts(before: &Tables, after: &Tables) -> bool {
             .map(|imp| imp.target.clone())
             .collect()
     };
-    let names_lost = before.0.iter().any(|(name, bindings)| {
-        let now = after.0.get(name).map(targets).unwrap_or_default();
+    before.iter().any(|(name, bindings)| {
+        let now = after.get(name).map(targets).unwrap_or_default();
         !targets(bindings).is_subset(&now)
-    });
-    names_lost || before.1.keys().any(|target| !after.1.contains_key(target))
+    })
 }
 
 /// 두 `#[cfg]` 조건이 함께 성립해야 하는 조건 — 글롭 `use`의 조건과 그 글롭이 펼친 재노출의 조건.

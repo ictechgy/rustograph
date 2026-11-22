@@ -1106,6 +1106,116 @@ fn main() {
     );
 }
 
+/// 2015 판 크레이트에서는 `use foo::bar`가 크레이트 기준이라 수렴 중 거둔 대상(크레이트 루트 `foo::bar`)이 제 대상일 수
+/// 있다 — 거둔 대상을 지우지 않고(187163b와 같다) 그렇게 남긴 크레이트 수를 limitation으로 싣는다. 826e20b는 그것을
+/// 지워, 2015 판 rustc가 쓰는 루트 `foo::bar`를 `dead`로 냈다.
+#[test]
+fn edition_2015_keeps_retracted_targets_and_says_so() {
+    let manifest = "[package]\nname='legacy'\nversion='0.1.0'\nedition='2015'\n[workspace]\n";
+    let main = r#"
+mod x {
+    pub use z::*;
+    #[allow(unused_imports)]
+    pub use y::*;
+}
+mod y {
+    #[allow(unused_imports)]
+    pub use x::*;
+}
+mod foo {
+    pub fn bar() {}
+}
+mod real {
+    pub mod foo {
+        pub fn bar() {}
+    }
+}
+mod z {
+    #[allow(unused_imports)]
+    use real::*;
+    pub use foo::bar;
+}
+fn main() {
+    x::bar();
+}
+"#;
+    let doc = harvest_files("legacy", &[("Cargo.toml", manifest), ("src/main.rs", main)]);
+    assert!(!dead_ids(&doc).contains(&"legacy::foo::bar".to_string()));
+    assert!(
+        doc.limitations
+            .iter()
+            .any(|l| l.starts_with("1 edition-2015 crates kept import targets")),
+        "{:?}",
+        doc.limitations
+    );
+}
+
+/// 거둔 대상은 재노출 사슬(`w1`·`w2`가 차례로 `pub use crate::x::bar`를 다시 내보냄)을 거쳐도 지워지고, 수렴하지 못했다는
+/// limitation은 없다. 826e20b는 사슬이 길면(고리 셋 이상) 깨끗하게 다시 쌓는 횟수(4)가 모자라 모든 모듈을 "still changed"로
+/// 세거나 거짓 간선을 남겼다.
+#[test]
+fn retracted_targets_are_cleaned_through_reexport_chains() {
+    let doc = harvest(
+        "stalechain",
+        "",
+        r#"
+mod x {
+    pub use crate::z::*;
+    #[allow(unused_imports)]
+    pub use crate::y::*;
+}
+mod y {
+    #[allow(unused_imports)]
+    pub use crate::x::*;
+}
+mod foo {
+    pub fn bar() {}
+}
+mod real {
+    pub mod foo {
+        pub fn bar() {}
+    }
+}
+mod z {
+    use crate::real::*;
+    pub use foo::bar;
+}
+mod w1 {
+    pub use crate::x::bar;
+}
+mod w2 {
+    pub use crate::w1::bar;
+}
+mod w3 {
+    pub use crate::w2::bar;
+}
+mod w4 {
+    pub use crate::w3::bar;
+}
+fn main() {
+    w4::bar();
+}
+"#,
+    );
+    assert_eq!(
+        edge_cfg(
+            &doc,
+            "stalechain::main",
+            "stalechain::real::foo::bar",
+            EdgeKind::Call
+        ),
+        Some(None)
+    );
+    assert_eq!(dead_ids(&doc), ["stalechain::foo::bar"]);
+    assert!(
+        !doc.limitations
+            .iter()
+            .any(|l| l.contains("still changed") || l.contains("stale re-export")),
+        "{:?}",
+        doc.limitations
+    );
+}
+
 /// 같은 조건의 글롭과 명시 `use`는 늘 함께 있어 명시 `use`가 글롭을 가린다 — `#[cfg(feature = "x")] use a::*;` 옆
 /// `#[cfg(feature = "x")] use b::f;`의 `f()`는 `b::f`뿐이다(rustc `--features x`는 `a::f`를 쓰이지 않는다고 경고한다).
 #[test]

@@ -69,6 +69,9 @@ pub struct Target {
     pub kind: String,
     /// 엔트리 소스 파일.
     pub src: PathBuf,
+    /// 타깃의 Rust 판(`"2015"`·`"2018"`·`"2021"`·`"2024"`) — cargo metadata가 주지 않으면 빈 문자열이다. 이름 해석은
+    /// 2018 판 이후의 규칙이라 2015 판 타깃은 따로 센다.
+    pub edition: String,
 }
 
 /// 워크스페이스 의존 해석 결과 — `from → to` 크레이트 간선과 종류.
@@ -128,6 +131,8 @@ struct RawTarget {
     name: String,
     kind: Vec<String>,
     src_path: String,
+    #[serde(default)]
+    edition: String,
 }
 
 #[derive(Deserialize)]
@@ -752,6 +757,7 @@ fn parse(bytes: &[u8]) -> Result<Metadata, String> {
                         name: normalize_name(&t.name),
                         kind: kind.to_string(),
                         src: PathBuf::from(t.src_path),
+                        edition: t.edition,
                     })
                 })
                 .collect(),
