@@ -178,7 +178,8 @@ scripts/verify-self-dead.sh      # dead 자기 분석 — 알려진 목록(scrip
   하니, 선언이 여럿이면 모든 빌드를 덮을 수 있습니다). 대안을 거친 간선의 조건이
   쓰는 자리·출발 아이템·그 조상 모듈의 조건과 글자로 모순이면(`P`와 `not (P)`)
   수확 끝에 지우고 그 수를 limitation으로 셉니다(`drop_impossible_edges`). 갈린 임포트를 self 타입이나 트레이트 경로로 쓴
-  impl은 대안마다 수확하거나 implements 간선을 냅니다. routes는 아직 대상
+  impl은 대안마다 수확하거나 implements 간선을 냅니다. self 타입이 워크스페이스 밖인 impl의 트레이트 경로도
+  대안마다 선언 메서드가 본문을 대신 소유합니다(`foreign_impl_bodies`). routes는 아직 대상
   하나(`resolve`)입니다. 임포트 표 수렴 중 앞 바퀴의 대상이 거둬지면
   `fill_imports_settled`가 빈 표에서 다시 쌓습니다 — 서로를 글롭으로 들이는
   모듈 사이에 근거 없는 대상이 남지 않게 합니다. 2015 판 크레이트에서는
