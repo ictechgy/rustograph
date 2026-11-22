@@ -124,33 +124,51 @@ can have more vertices and edges than before:
   name is visible. `f()` beside `use a::*;` and `#[cfg(test)] use a::f;` is an
   unconditional edge, and `Clock::now()` beside `use real::*;` and
   `#[cfg(test)] use mock::Clock;` reaches both clocks; before, `dead` reported
-  `real::Clock::now`. The glob side keeps its own condition (no negation of
-  the `use`'s condition is added, so that edge also stays in the `use`'s own
-  build). A local item whose every declaration carries `#[cfg]` and an import
-  of the same name in the same namespace are alternatives too:
+  `real::Clock::now`. A glob import whose own condition implies the `use`'s
+  condition (`#[cfg(feature = "x")] use a::*;` beside
+  `#[cfg(feature = "x")] use b::f;`) is always hidden, as before. The glob
+  side keeps its own condition (no negation of the `use`'s condition is added,
+  so that edge also stays in the `use`'s own build). A local item whose every
+  declaration carries `#[cfg]`, `#[cfg] mod` included, and an explicit `use`
+  of the same name in the same namespace are alternatives:
   `#[cfg(feature = "x")] fn sum()` beside
-  `#[cfg(not(feature = "x"))] use scalar::sum;` makes `sum()` reach both;
-  before, only the local item, and `dead` reported `scalar::sum`. An impl whose
-  self type is such a split import (`impl Sys { .. }`) is harvested once per
-  alternative: its method vertices sit under each alternative type with that
-  import's condition, so `--target` keeps the methods of the build it
-  describes. An impl whose trait path is split, and route handlers, still
+  `#[cfg(not(feature = "x"))] use scalar::sum;` makes `sum()` reach both, and
+  `#[cfg(feature = "x")] mod imp` beside
+  `#[cfg(not(..))] use crate::other as imp;` makes `imp::f()` reach both;
+  before, only the local item, and `dead` reported `scalar::sum` and
+  `other::f`. A glob name can legally sit beside a local item and is only
+  hidden by it, so it is an alternative only when the item has a single
+  declaration and the glob's target carries no `#[cfg]` of its own; its edge
+  then carries the negated condition (`not (unix)`). With several gated
+  declarations (`#[cfg(unix)] fn sys` and `#[cfg(not(unix))] fn sys`) the
+  glob name may be hidden in every build, so it is not an alternative. An impl
+  whose self type is such a split import (`impl Sys { .. }`) is harvested once
+  per alternative: its method vertices sit under each alternative type with
+  that import's condition. An impl whose trait path is split
+  (`impl plat::Tr for X`) gets one `implements` edge per alternative; method
+  IDs use the trait's last segment and do not change. Route handlers still
   resolve to one target.
 - While the import tables settle, a target that an early pass resolved and a
   later pass took back (`pub use foo::bar` read through the crate-root
   fallback before the module's own glob was expanded) no longer survives
   between modules that glob each other: when a pass takes a target back, the
-  tables settle once more from empty, resolving explicit `use`s and glob paths
-  against the settled tables. The stale target used to give a false confirmed
-  `call` to the crate-root `foo::bar`, which rustc warns is never used; an
-  item kept alive only by that edge is now reported by `dead`. None of the
-  seventeen corpus crates below needed the extra round.
+  tables are rebuilt from empty, resolving explicit `use`s and glob paths
+  against the settled tables, and then settle once more against the rebuilt
+  tables; a re-export chain that still takes a target back is rebuilt again,
+  up to 32 times, after which the modules that still do are counted in a "may
+  keep stale re-export targets" limitation. The stale target used to give a
+  false confirmed `call` to the crate-root `foo::bar`, which rustc warns is
+  never used; an item kept alive only by that edge is now reported by `dead`.
+  Edition-2015 crates are left out: their `use` paths are crate-relative,
+  which this resolver does not model, so the target taken back may be the
+  right one there; they keep both targets and a limitation counts them. None
+  of the seventeen corpus crates below needed the extra rebuild.
 - Over seventeen crates (syn, tokio, regex-syntax, ra_ap_hir_def,
   ra_ap_hir_ty, rowan, serde, serde_derive, clap_builder, zerocopy, rustix,
   mio, getrandom, parking_lot_core, crossbeam-utils, hashbrown and
-  rustograph itself), the graph lost no edge, gained 92, and put a condition
-  on 341 edges that had none; `dead --retain-public` reports 13 fewer items
-  and none new.
+  rustograph itself), the graph lost no edge and no vertex ID changed; it
+  gained 92 edges and put a condition on 342 edges that had none;
+  `dead --retain-public` reports 13 fewer items and none new.
 - A path in an attribute, a derive list or a macro call resolves in the macro
   namespace. A cross-crate `#[derive(pm::Hello)]` now points at the
   `#[proc_macro_derive(Hello)]` function even when the proc-macro crate also
@@ -215,12 +233,16 @@ alike. Add the new fields, or end such patterns with `..`.
   namespaces that are known, or `PerNs::bound` for every binding including
   `undetermined`. `modtree::Ns`, `modtree::PerNs` and `modtree::Binding` are
   new public types.
-- `modtree::Module` adds `cfg_gated`, the names whose every declaration in a
-  namespace carries `#[cfg]`; such an item and a same-namespace import of the
-  name resolve as alternatives. `modtree::Module` and `modtree::ModTree` now
-  derive `Clone` (additive). `harvest::impls` returns one set of method
-  vertices per alternative when an impl's self type is a `#[cfg]`-split
-  import.
+- `modtree::Module` adds `cfg_gated` (name → namespace → the `#[cfg]` of
+  each declaration, present only when every declaration carries one) and
+  `local_alternatives` (the imports a gated local item stands aside for in
+  builds without it). `modtree::ModTree` adds `edition_2015` (crate roots of
+  edition-2015 targets, filled by the caller), `stale_import_modules` and
+  `edition_2015_kept` (what `fill_imports_settled` left; the source harvest
+  turns both into limitations). `modtree::Module` and `modtree::ModTree` now
+  derive `Clone` (additive). `cargo_meta::Target` adds `edition`.
+  `harvest::impls` returns one set of method vertices per alternative when an
+  impl's self type is a `#[cfg]`-split import.
 - `modtree::Module` adds `macro_items` (named `macro_rules!` items), and
   `value_items` now also holds tuple and unit structs, whose constructors live
   in the value namespace. Build modules with `Module::new`.
