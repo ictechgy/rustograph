@@ -845,3 +845,323 @@ fn attribute_paths_follow_each_alternative() {
         under("not (unix)")
     );
 }
+
+/// 글롭 이름은 같은 이름의 로컬 아이템 옆에 합법적으로 있으면서 가려지기만 한다(E0255는 명시 `use`만이다). 로컬
+/// 아이템의 선언이 여럿이면(`#[cfg(unix)] fn sys`와 `#[cfg(not(unix))] fn sys`) 모든 빌드를 덮을 수 있어 글롭 이름은
+/// 대안이 아니다 — 826e20b는 대안으로 보고 `m::run → sys`(루트)라는 거짓 간선과 거짓 순환 `m::run → sys`를 냈고,
+/// 글롭으로 다시 들인 모듈(`user`)에서도 `common::open`으로 가는 거짓 간선을 냈다. rustc는 루트 `sys`와
+/// `common::open`을 쓰이지 않는다고 경고한다(187163b와 같은 보고).
+#[test]
+fn glob_name_beside_complementary_gated_locals_is_not_an_alternative() {
+    let doc = harvest(
+        "gatedpair",
+        "",
+        r#"
+fn sys() -> u32 {
+    m::run()
+}
+mod m {
+    #[allow(unused_imports)]
+    use super::*;
+    #[cfg(unix)]
+    fn sys() -> u32 {
+        1
+    }
+    #[cfg(not(unix))]
+    fn sys() -> u32 {
+        2
+    }
+    pub fn run() -> u32 {
+        sys()
+    }
+}
+mod common {
+    pub fn open() -> u32 {
+        0
+    }
+    pub fn close() -> u32 {
+        0
+    }
+}
+mod plat {
+    pub use crate::common::*;
+    #[cfg(unix)]
+    pub fn open() -> u32 {
+        1
+    }
+    #[cfg(not(unix))]
+    pub fn open() -> u32 {
+        2
+    }
+}
+mod user {
+    use crate::plat::*;
+    pub fn run() -> u32 {
+        open() + close()
+    }
+}
+fn main() {
+    let _ = m::run();
+    let _ = user::run();
+}
+"#,
+    );
+    assert_eq!(
+        edge_cfg(&doc, "gatedpair::m::run", "gatedpair::sys", EdgeKind::Call),
+        None
+    );
+    assert_eq!(
+        edge_cfg(
+            &doc,
+            "gatedpair::user::run",
+            "gatedpair::common::open",
+            EdgeKind::Call
+        ),
+        None
+    );
+    assert!(analysis::cycles(&doc).cycles.is_empty());
+    assert_eq!(
+        dead_ids(&doc),
+        ["gatedpair::common::open", "gatedpair::sys"]
+    );
+}
+
+/// 선언이 하나인 `#[cfg]` 로컬 아이템 옆의 글롭 이름은 그 아이템이 없는 빌드의 대안이다 — 간선은 그 조건의 부정을
+/// 단다. `plat`의 `#[cfg(unix)] pub fn open` 옆 `pub use crate::common::*`를 글롭으로 들인 `user`의 `open()`은 리눅스에서
+/// `plat::open`, 그 밖에서 `common::open`이다(rustc 리눅스 빌드는 `common::open`을 쓰이지 않는다고 경고한다).
+#[test]
+fn glob_name_beside_a_single_gated_local_is_an_alternative_elsewhere() {
+    let doc = harvest(
+        "gatedone",
+        "",
+        r#"
+mod common {
+    pub fn open() -> u32 {
+        0
+    }
+}
+mod plat {
+    pub use crate::common::*;
+    #[cfg(unix)]
+    pub fn open() -> u32 {
+        1
+    }
+}
+mod user {
+    use crate::plat::*;
+    pub fn run() -> u32 {
+        open()
+    }
+}
+fn main() {
+    let _ = user::run();
+}
+"#,
+    );
+    let run = "gatedone::user::run";
+    assert_eq!(
+        edge_cfg(&doc, run, "gatedone::plat::open", EdgeKind::Call),
+        Some(None)
+    );
+    assert_eq!(
+        edge_cfg(&doc, run, "gatedone::common::open", EdgeKind::Call),
+        under("not (unix)")
+    );
+    assert!(dead_ids(&doc).is_empty(), "{:?}", dead_ids(&doc));
+    assert_eq!(
+        dead_ids(&for_target(&doc, LINUX)),
+        ["gatedone::common::open"]
+    );
+    assert!(dead_ids(&for_target(&doc, WINDOWS)).is_empty());
+}
+
+/// `#[cfg] mod imp` 옆의 `#[cfg(not(..))] use crate::other as imp;`도 대안이다 — 경로 접두사(`imp::f()`,
+/// `crate::imp::S::m()`)와 글롭(`use crate::imp::*`) 모두 두 모듈로 간다. 예전에는 `mod` 선언이 자식 모듈 표에 먼저
+/// 들어가 있어 조건 없는 앞선 선언으로 보였고, 기본 빌드에서 쓰이는 `other::f`·`other::S::m`이 `dead`에 나왔다.
+#[test]
+fn gated_module_and_alias_import_are_alternatives() {
+    let doc = harvest(
+        "gatedmod",
+        "x = []",
+        r#"
+mod other {
+    pub fn f() -> u32 {
+        2
+    }
+    pub struct S;
+    impl S {
+        pub fn m() -> u32 {
+            5
+        }
+    }
+}
+#[cfg(feature = "x")]
+mod imp {
+    pub fn f() -> u32 {
+        1
+    }
+    pub struct S;
+    impl S {
+        pub fn m() -> u32 {
+            6
+        }
+    }
+}
+#[cfg(not(feature = "x"))]
+use crate::other as imp;
+mod user {
+    pub fn run() -> u32 {
+        crate::imp::f() + crate::imp::S::m()
+    }
+}
+mod user2 {
+    use crate::imp::*;
+    pub fn run() -> u32 {
+        f()
+    }
+}
+fn main() {
+    let _ = user::run();
+    let _ = user2::run();
+}
+"#,
+    );
+    let off = "not (feature = \"x\")";
+    for (from, to) in [
+        ("gatedmod::user::run", "gatedmod::other::f"),
+        ("gatedmod::user::run", "gatedmod::other::S::m"),
+        ("gatedmod::user2::run", "gatedmod::other::f"),
+    ] {
+        assert_eq!(edge_cfg(&doc, from, to, EdgeKind::Call), under(off), "{to}");
+    }
+    assert_eq!(
+        edge_cfg(
+            &doc,
+            "gatedmod::user::run",
+            "gatedmod::imp::f",
+            EdgeKind::Call
+        ),
+        Some(None)
+    );
+    let dead = dead_ids(&doc);
+    for used in [
+        "gatedmod::other::f",
+        "gatedmod::other::S::m",
+        "gatedmod::imp::f",
+    ] {
+        assert!(!dead.contains(&used.to_string()), "{used}: {dead:?}");
+    }
+}
+
+/// 같은 조건의 글롭과 명시 `use`는 늘 함께 있어 명시 `use`가 글롭을 가린다 — `#[cfg(feature = "x")] use a::*;` 옆
+/// `#[cfg(feature = "x")] use b::f;`의 `f()`는 `b::f`뿐이다(rustc `--features x`는 `a::f`를 쓰이지 않는다고 경고한다).
+#[test]
+fn cfg_explicit_use_hides_a_glob_under_the_same_cfg() {
+    let doc = harvest(
+        "samecfg",
+        "x = []",
+        r#"
+mod a {
+    pub fn f() -> u32 {
+        1
+    }
+    pub fn g() -> u32 {
+        1
+    }
+}
+mod b {
+    pub fn f() -> u32 {
+        2
+    }
+}
+#[cfg(feature = "x")]
+use a::*;
+#[cfg(feature = "x")]
+use b::f;
+fn main() {
+    #[cfg(feature = "x")]
+    let _ = f() + g();
+}
+"#,
+    );
+    assert_eq!(
+        edge_cfg(&doc, "samecfg::main", "samecfg::a::f", EdgeKind::Call),
+        None
+    );
+    assert_eq!(
+        edge_cfg(&doc, "samecfg::main", "samecfg::b::f", EdgeKind::Call),
+        under("feature = \"x\"")
+    );
+    assert_eq!(dead_ids(&doc), ["samecfg::a::f"]);
+}
+
+/// 문법을 모르는 매크로 인자 토큰(`matches!(sum(), n if n > 0)`)처럼 자리를 모르는 해석도 `#[cfg]` 로컬 아이템과 그
+/// 대안 임포트를 함께 준다(추정 간선).
+#[test]
+fn position_agnostic_resolution_reaches_gated_local_alternatives() {
+    let doc = harvest(
+        "mention",
+        "x = []",
+        r#"
+mod scalar {
+    pub fn sum() -> u32 {
+        1
+    }
+}
+#[cfg(feature = "x")]
+fn sum() -> u32 {
+    2
+}
+#[cfg(not(feature = "x"))]
+use scalar::sum;
+fn main() {
+    let _ = matches!(sum(), n if n > 0);
+}
+"#,
+    );
+    for to in ["mention::sum", "mention::scalar::sum"] {
+        assert!(
+            doc.edges
+                .iter()
+                .any(|e| e.from == "mention::main" && e.to == to && e.tentative),
+            "{to}"
+        );
+    }
+}
+
+/// 자기 `#[cfg]`를 단, 해석되지 않는 명시 `use`(`#[cfg(feature = "x")] use std::time::Instant as Clock;`)도 글롭을 가리지
+/// 않는다 — 그 조건이 아닌 빌드의 `Clock::now()`는 글롭의 `real::Clock::now`다.
+#[test]
+fn conditional_unresolved_use_does_not_hide_a_glob() {
+    let doc = harvest(
+        "condstd",
+        "x = []",
+        r#"
+mod real {
+    pub struct Clock;
+    impl Clock {
+        pub fn now() -> u32 {
+            1
+        }
+    }
+}
+use real::*;
+#[cfg(feature = "x")]
+use std::time::Instant as Clock;
+fn main() {
+    #[cfg(not(feature = "x"))]
+    let _ = Clock::now();
+}
+"#,
+    );
+    assert_eq!(
+        edge_cfg(
+            &doc,
+            "condstd::main",
+            "condstd::real::Clock::now",
+            EdgeKind::Call
+        ),
+        Some(None)
+    );
+    assert!(!dead_ids(&doc).contains(&"condstd::real::Clock::now".to_string()));
+}
