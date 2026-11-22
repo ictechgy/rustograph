@@ -1938,8 +1938,8 @@ fn module_cfg_chain(tree: &ModTree, module: &str) -> Vec<String> {
     out
 }
 
-/// 임포트 표를 수렴시키며 남은 실측([`modtree::fill_imports_settled`])을 limitation으로 싣는다 — 다시 수렴시켜도
-/// 거둔 대상을 다 지우지 못한 모듈과, 2015 판이라 거둔 대상을 지우지 않은 크레이트.
+/// 임포트 표를 수렴시키며 남은 실측([`modtree::fill_imports_settled`])을 limitation으로 싣는다 — 다시 쌓아도 거둔
+/// 대상을 다 지우지 못한 모듈과, 크레이트 기준 `use` 경로를 2018 판 규칙으로 푼 2015 판 크레이트.
 fn push_import_settling(tree: &ModTree, limitations: &mut Vec<String>) {
     if tree.stale_import_modules > 0 {
         limitations.push(format!(
@@ -1948,10 +1948,10 @@ fn push_import_settling(tree: &ModTree, limitations: &mut Vec<String>) {
             modtree::MAX_IMPORT_PASSES
         ));
     }
-    if !tree.edition_2015_kept.is_empty() {
+    if !tree.edition_2015_crate_relative.is_empty() {
         limitations.push(format!(
-            "{} edition-2015 crates kept import targets that a later resolution pass replaced; edition-2015 `use` paths are crate-relative, which this resolver does not model, so edges through those imports can reach either target",
-            tree.edition_2015_kept.len()
+            "{} edition-2015 crates have `use` paths that edition 2015 resolves from the crate root, but this resolver resolves them from the enclosing module (edition-2018 rules); dead may report items used only through those paths, and their edges may point at a different item",
+            tree.edition_2015_crate_relative.len()
         ));
     }
 }
@@ -2132,6 +2132,22 @@ fn push_sem_stats(
 mod tests {
     use super::*;
 
+    /// 임포트 표 수렴이 남긴 실측은 limitation 문구로 그대로 옮겨진다 — 다시 쌓기가 남긴 모듈 수와 크레이트 기준 `use`
+    /// 경로를 가진 2015 판 크레이트 수. 남긴 것이 없으면 조용하다.
+    #[test]
+    fn import_settling_limitations_say_what_was_left() {
+        let mut tree = ModTree::default();
+        let mut limitations = Vec::new();
+        push_import_settling(&tree, &mut limitations);
+        assert!(limitations.is_empty());
+        tree.stale_import_modules = 3;
+        tree.edition_2015_crate_relative
+            .insert("legacy".to_string());
+        push_import_settling(&tree, &mut limitations);
+        assert_eq!(limitations.len(), 2);
+        assert!(limitations[0].starts_with("3 modules may keep stale re-export targets"));
+        assert!(limitations[1].starts_with("1 edition-2015 crates have `use` paths"));
+    }
     use crate::cargo_meta::Metadata;
     use crate::graph::{document, Level};
 

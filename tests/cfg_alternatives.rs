@@ -1107,8 +1107,9 @@ fn main() {
 }
 
 /// 2015 판 크레이트에서는 `use foo::bar`가 크레이트 기준이라 수렴 중 거둔 대상(크레이트 루트 `foo::bar`)이 제 대상일 수
-/// 있다 — 거둔 대상을 지우지 않고(187163b와 같다) 그렇게 남긴 크레이트 수를 limitation으로 싣는다. 826e20b는 그것을
-/// 지워, 2015 판 rustc가 쓰는 루트 `foo::bar`를 `dead`로 냈다.
+/// 있다 — 거둔 대상을 지우지 않는다(187163b와 같다 — 826e20b는 그것을 지워 2015 판 rustc가 쓰는 루트 `foo::bar`를
+/// `dead`로 냈다). 해석은 2018 판 규칙이라 크레이트 기준 `use` 경로를 가진 2015 판 크레이트는 거둔 것이 없어도(로컬
+/// `mod foo`가 크레이트 기준 경로를 가리는 경우처럼 조용히 틀릴 때도) limitation으로 센다.
 #[test]
 fn edition_2015_keeps_retracted_targets_and_says_so() {
     let manifest = "[package]\nname='legacy'\nversion='0.1.0'\nedition='2015'\n[workspace]\n";
@@ -1139,15 +1140,37 @@ fn main() {
     x::bar();
 }
 "#;
+    let shadowed = r#"
+mod foo {
+    pub fn bar() {}
+}
+mod z {
+    mod foo {
+        pub fn bar() {}
+    }
+    pub use foo::bar;
+}
+fn main() {
+    z::bar();
+}
+"#;
+    let limitation =
+        "1 edition-2015 crates have `use` paths that edition 2015 resolves from the crate root";
     let doc = harvest_files("legacy", &[("Cargo.toml", manifest), ("src/main.rs", main)]);
     assert!(!dead_ids(&doc).contains(&"legacy::foo::bar".to_string()));
-    assert!(
-        doc.limitations
-            .iter()
-            .any(|l| l.starts_with("1 edition-2015 crates kept import targets")),
-        "{:?}",
-        doc.limitations
-    );
+    for doc in [
+        doc,
+        harvest_files(
+            "legacy",
+            &[("Cargo.toml", manifest), ("src/main.rs", shadowed)],
+        ),
+    ] {
+        assert!(
+            doc.limitations.iter().any(|l| l.starts_with(limitation)),
+            "{:?}",
+            doc.limitations
+        );
+    }
 }
 
 /// 거둔 대상은 재노출 사슬(`w1`·`w2`가 차례로 `pub use crate::x::bar`를 다시 내보냄)을 거쳐도 지워지고, 수렴하지 못했다는
@@ -1660,6 +1683,69 @@ fn main() {
         .iter()
         .any(|e| e.from == "kani::m::run" && e.to == "kani::tests::helper"));
     assert!(dead_ids(&doc).contains(&"kani::tests::helper".to_string()));
+}
+
+/// 2018 판 크레이트가 다시 쌓기를 일으켜도 같은 워크스페이스의 2015 판 크레이트는 지금 표로 다시 해석해 이른 대상을
+/// 지킨다 — `b`의 크레이트 기준 `use foo::bar`(2015 판 rustc가 쓰는 루트 `foo::bar`)가 `dead`에 나오지 않는다. `a`는
+/// rustc처럼 루트 `foo::bar`를 낸다.
+#[test]
+fn edition_2015_member_keeps_early_targets_when_another_member_rebuilds() {
+    let a = r#"
+mod x {
+    pub use crate::z::*;
+    #[allow(unused_imports)]
+    pub use crate::y::*;
+}
+mod y {
+    #[allow(unused_imports)]
+    pub use crate::x::*;
+}
+mod foo {
+    pub fn bar() {}
+}
+mod real {
+    pub mod foo {
+        pub fn bar() {}
+    }
+}
+mod z {
+    use crate::real::*;
+    pub use foo::bar;
+}
+fn main() {
+    x::bar();
+}
+"#;
+    let b = a
+        .replace("crate::z::*", "z::*")
+        .replace("crate::y::*", "y::*")
+        .replace("crate::x::*", "x::*")
+        .replace(
+            "use crate::real::*;",
+            "#[allow(unused_imports)]\n    use real::*;",
+        );
+    let doc = harvest_files(
+        "mixed",
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = ['a', 'b']\nresolver = '2'\n",
+            ),
+            (
+                "a/Cargo.toml",
+                "[package]\nname='a'\nversion='0.1.0'\nedition='2021'\n",
+            ),
+            ("a/src/main.rs", a),
+            (
+                "b/Cargo.toml",
+                "[package]\nname='b'\nversion='0.1.0'\nedition='2015'\n",
+            ),
+            ("b/src/main.rs", &b),
+        ],
+    );
+    let dead = dead_ids(&doc);
+    assert!(dead.contains(&"a::foo::bar".to_string()), "{dead:?}");
+    assert!(!dead.contains(&"b::foo::bar".to_string()), "{dead:?}");
 }
 
 /// 조건부 글롭 대상을 대안으로 두지 않는 규칙은 쓰는 자리가 다른 조건(`#[cfg(kani)]`) 아래 있어도 지킨다 — `kani`만 켠

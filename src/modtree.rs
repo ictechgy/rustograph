@@ -450,9 +450,11 @@ pub struct ModTree {
     /// [`MAX_IMPORT_PASSES`]번 다시 쌓아도 앞 바퀴의 대상을 거두는 모듈 수. 그 모듈의 임포트는 거둔 대상을 대안으로 남길 수
     /// 있다 — limitation으로 올린다.
     pub stale_import_modules: usize,
-    /// [`fill_imports_settled`]가 남긴 것 — 앞 바퀴의 대상을 거둔 모듈이 있는데 2015 판이라 거둔 대상을 지우지 않은
-    /// 크레이트([`ModTree::edition_2015`]). limitation으로 올린다.
-    pub edition_2015_kept: BTreeSet<String>,
+    /// [`fill_imports_settled`]가 남긴 것 — 루트가 아닌 모듈의 `use` 경로가 크레이트 루트가 선언한 이름으로 시작하는
+    /// 2015 판 크레이트([`ModTree::edition_2015`]). 2015 판은 그 경로를 크레이트 루트부터 풀지만 이 해석기는 그 모듈부터
+    /// 푼다(2018 판 규칙) — 그 경로로만 쓰는 아이템을 `dead`가 낼 수 있고 간선이 다른 아이템으로 갈 수 있다. limitation으로
+    /// 올린다.
+    pub edition_2015_crate_relative: BTreeSet<String>,
 }
 
 /// 모듈 경로 깊이(세그먼트 수) 상한이다. 순환은 조상 파일 검사가 끊지만, 그 검사를
@@ -1974,29 +1976,40 @@ pub const MAX_IMPORT_PASSES: usize = 32;
 ///
 /// 앞 바퀴의 해석이 나중에 거둬지면(다른 모듈의 글롭이 아직 펼쳐지지 않아 크레이트 루트로 넘어간 `pub use foo::bar`가
 /// 다음 바퀴에 제 대상을 찾으면) 거둔 대상이 서로를 글롭으로 들이는 모듈 사이를 돌며 수렴한 표에 남는다 — 대안
-/// 임포트를 남기는 표에서는 거짓 대안이 된다. 그런 일이 있었으면 수렴한 표를 얼려 두고, 빈 표에서 다시 쌓는다 —
-/// 명시 `use`와 글롭 대상은 언 표로 해석하고 글롭이 펼치는 이름만 새로 쌓으니, 근거 없이 서로만 받치던 대상은
+/// 임포트를 남기는 표에서는 거짓 대안이 된다. 그런 일이 있었으면 수렴한 표를 얼려 두고, 모든 모듈의 표를 비워 다시
+/// 쌓는다 — 명시 `use`와 글롭 대상은 언 표로 해석하고 글롭이 펼치는 이름만 새로 쌓으니, 근거 없이 서로만 받치던 대상은
 /// 다시 생기지 않는다. 그 다음 지금 표로 한 번 더 수렴시켜(대개 한 바퀴) 거두는 것이 없으면 끝이다 — 언 표로 해석한
-/// 재노출 사슬의 고리가 남아 거두면 다시 빈 표에서 쌓는다. 이것을 [`MAX_IMPORT_PASSES`]번까지 되풀이하고, 그래도
-/// 거두는 모듈 수는 [`ModTree::stale_import_modules`]에 남긴다. 2015 판 크레이트([`ModTree::edition_2015`])의 모듈이
-/// 거둔 것은 지우지 않고 그 크레이트를 [`ModTree::edition_2015_kept`]에 남긴다 — 그 판의 크레이트 기준 `use` 경로에서는
-/// 거둔 쪽이 제 대상일 수 있다. 그런 모듈은 다시 쌓을 때도 표를 비우지 않고 지금 표로 해석한다.
+/// 재노출 사슬의 고리가 남아 거두면 다시 쌓는다. 이것을 [`MAX_IMPORT_PASSES`]번까지 되풀이하고, 그래도 거두는 모듈 수는
+/// [`ModTree::stale_import_modules`]에 남긴다.
+///
+/// 2015 판 크레이트([`ModTree::edition_2015`])의 모듈은 거둔 것을 세지 않고, 다시 쌓을 때도 지금 표로 해석한다 — 그
+/// 판의 크레이트 기준 `use` 경로에서는 첫 바퀴에 크레이트 루트로 넘어간 대상이 제 대상일 수 있다. 빈 표에서 지금 표로
+/// 다시 쌓으면 그 모듈들은 처음과 같은 이른 대상을 다시 얻고, 이미 깨끗해진 의존 크레이트에서 들인 거둔 대상만 잃는다.
+/// 루트가 아닌 모듈의 `use` 경로가 크레이트 루트가 선언한 이름으로 시작하는 2015 판 크레이트는
+/// [`ModTree::edition_2015_crate_relative`]에 남긴다.
 pub fn fill_imports_settled(
     tree: &mut ModTree,
     modules: &[(String, Vec<&syn::Item>)],
     dep_crates: &DepCrates,
 ) -> usize {
+    fill_imports_settled_within(tree, modules, dep_crates, MAX_IMPORT_PASSES)
+}
+
+/// [`fill_imports_settled`]의 본체 — 다시 쌓기를 `max_rebuilds`번까지 한다(테스트가 상한을 낮춰 남은 수를 본다).
+fn fill_imports_settled_within(
+    tree: &mut ModTree,
+    modules: &[(String, Vec<&syn::Item>)],
+    dep_crates: &DepCrates,
+    max_rebuilds: usize,
+) -> usize {
     tree.stale_import_modules = 0;
-    tree.edition_2015_kept.clear();
+    tree.edition_2015_crate_relative = crate_relative_2015(tree, modules);
     let (mut changed, mut retracting) = settle_imports(tree, None, modules, dep_crates);
     let mut rounds = 0;
-    while changed == 0 && retracting > 0 && rounds < MAX_IMPORT_PASSES {
+    while changed == 0 && retracting > 0 && rounds < max_rebuilds {
         rounds += 1;
         let frozen = tree.clone();
         for (path, _) in modules {
-            if tree.edition_2015.contains(&crate_of(path)) {
-                continue;
-            }
             if let Some(module) = tree.modules.get_mut(path) {
                 module.imports.clear();
                 module.glob_targets.clear();
@@ -2016,10 +2029,43 @@ pub fn fill_imports_settled(
     changed
 }
 
+/// 루트가 아닌 모듈의 `use` 경로가 크레이트 루트가 선언한 이름(아이템·자식 모듈)으로 시작하는 2015 판 크레이트 —
+/// 그 판은 그 경로를 크레이트 루트부터 풀지만 이 해석기는 그 모듈부터 푼다. `crate::`·`self::`·`super::`·`::`로
+/// 시작하는 경로는 두 규칙이 같다.
+fn crate_relative_2015(tree: &ModTree, modules: &[(String, Vec<&syn::Item>)]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (path, items) in modules {
+        let krate = crate_of(path);
+        if *path == krate || !tree.edition_2015.contains(&krate) || out.contains(&krate) {
+            continue;
+        }
+        let Some(root) = tree.modules.get(&krate) else {
+            continue;
+        };
+        let mut found = false;
+        for item in items {
+            let syn::Item::Use(u) = item else {
+                continue;
+            };
+            if u.leading_colon.is_some() {
+                continue;
+            }
+            flatten_use(&u.tree, &mut Vec::new(), &mut |segs| {
+                let first = segs.first().map(String::as_str).unwrap_or_default();
+                found |= !matches!(first, "crate" | "self" | "super" | "*")
+                    && (root.items.contains(first) || root.children.contains_key(first));
+            });
+        }
+        if found {
+            out.insert(krate);
+        }
+    }
+    out
+}
+
 /// [`fill_imports_settled`]의 한 수렴 — 바퀴를 [`MAX_IMPORT_PASSES`]까지 돌려 (마지막 바퀴에서 표가 바뀐 모듈 수,
-/// 2015 판이 아니면서 어느 바퀴에서든 앞 바퀴의 해석된 대상을 거둔 모듈 수)를 돌려준다. 2015 판 모듈이 거두면 그
-/// 크레이트를 [`ModTree::edition_2015_kept`]에 적는다. `frozen`은 [`fill_imports_from`]과 같되 2015 판 모듈은 늘
-/// 지금 표로 해석한다.
+/// 2015 판이 아니면서 어느 바퀴에서든 앞 바퀴의 해석된 대상을 거둔 모듈 수)를 돌려준다. `frozen`은
+/// [`fill_imports_from`]과 같되 2015 판 모듈은 늘 지금 표로 해석한다.
 fn settle_imports(
     tree: &mut ModTree,
     frozen: Option<&ModTree>,
@@ -2042,12 +2088,8 @@ fn settle_imports(
                 continue;
             }
             changed += 1;
-            if retracts(&imports, &module.imports) {
-                if legacy {
-                    tree.edition_2015_kept.insert(krate);
-                } else {
-                    retracting.insert(path);
-                }
+            if !legacy && retracts(&imports, &module.imports) {
+                retracting.insert(path);
             }
         }
         if changed == 0 {
@@ -2789,6 +2831,84 @@ mod tests {
             alternatives(open),
             [("c::plat::sys".to_string(), Some("not (unix)".to_string()))]
         );
+    }
+
+    /// 다시 쌓기 상한 안에서 거둔 대상이 다 지워지지 않으면 그렇게 남은 모듈 수를 [`ModTree::stale_import_modules`]에
+    /// 남긴다 — 재노출 사슬(`w1`·`w2`·`w3`)은 한 번에 한 고리씩 깨끗해지므로 상한 한 번으로는 남고, 기본 상한으로는
+    /// 0이다.
+    #[test]
+    fn stale_import_modules_counts_what_the_rebuild_limit_left() {
+        let modules: &[(&str, &str)] = &[
+            (
+                "c",
+                "mod x {} mod y {} mod foo {} mod real {} mod z {} mod w1 {} mod w2 {} mod w3 {}",
+            ),
+            ("c::x", "pub use crate::z::*; pub use crate::y::*;"),
+            ("c::y", "pub use crate::x::*;"),
+            ("c::foo", "pub fn bar() {}"),
+            ("c::real", "pub mod foo {}"),
+            ("c::real::foo", "pub fn bar() {}"),
+            ("c::z", "use crate::real::*; pub use foo::bar;"),
+            ("c::w1", "pub use crate::x::bar;"),
+            ("c::w2", "pub use crate::w1::bar;"),
+            ("c::w3", "pub use crate::w2::bar;"),
+        ];
+        let settle = |limit: usize| {
+            let (mut t, files) = tree_from(modules);
+            let uses: Vec<(String, Vec<&syn::Item>)> = files
+                .iter()
+                .map(|(path, file)| (path.clone(), file.items.iter().collect()))
+                .collect();
+            assert_eq!(
+                fill_imports_settled_within(&mut t, &uses, &DepCrates::new(), limit),
+                0
+            );
+            let w3 = t.modules["c::w3"].imports["bar"].get(Ns::Value).map(|b| {
+                b.imports()
+                    .iter()
+                    .map(|i| i.target.clone())
+                    .collect::<Vec<_>>()
+            });
+            (t.stale_import_modules, w3)
+        };
+        let (stale, _) = settle(1);
+        assert!(stale > 0, "one rebuild should leave a stale chain link");
+        assert_eq!(
+            settle(MAX_IMPORT_PASSES),
+            (0, Some(vec!["c::real::foo::bar".to_string()]))
+        );
+    }
+
+    /// 2015 판 크레이트의 루트가 아닌 모듈에서 크레이트 루트가 선언한 이름으로 시작하는 `use` 경로를 센다 — `crate::`·
+    /// `self::`·`super::`·`::`로 시작하거나 루트에 없는 이름이면 두 판의 규칙이 같아 세지 않는다.
+    #[test]
+    fn crate_relative_use_paths_are_counted_for_edition_2015_only() {
+        let count = |use_line: &str, edition_2015: bool| {
+            let (mut t, files) = tree_from(&[
+                ("c", "mod foo {} mod z {}"),
+                ("c::foo", "pub fn bar() {}"),
+                ("c::z", use_line),
+            ]);
+            if edition_2015 {
+                t.edition_2015.insert("c".to_string());
+            }
+            let uses: Vec<(String, Vec<&syn::Item>)> = files
+                .iter()
+                .map(|(path, file)| (path.clone(), file.items.iter().collect()))
+                .collect();
+            fill_imports_settled(&mut t, &uses, &DepCrates::new());
+            t.edition_2015_crate_relative.len()
+        };
+        assert_eq!(count("pub use foo::bar;", true), 1);
+        assert_eq!(count("pub use foo::bar;", false), 0);
+        for same in [
+            "pub use crate::foo::bar;",
+            "pub use super::foo::bar;",
+            "pub use ::std::fmt;",
+            "pub use std::fmt;",
+        ] {
+            assert_eq!(count(same, true), 0, "{same}");
+        }
     }
 
     /// 같은 모듈을 두 번 채우면(아이템 묶음이 둘) 선언을 합친다 — 앞이든 뒤든 조건 없는 선언이 있는 이름공간은
