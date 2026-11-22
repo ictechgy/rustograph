@@ -1267,6 +1267,7 @@ fn harvest(
             missing_roots.len(), missing_roots.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
+    limitations.extend(anonymous_roots_with_items(&vertices, &bodies, &root_set));
 
     let level = if opts.symbol_level {
         Level::Symbol
@@ -1299,6 +1300,33 @@ fn harvest(
         ),
         uses_include,
     ))
+}
+
+/// 중첩 아이템을 품은 이름 없는 상수 루트를 센 limitation — 셀 것이 없으면 없다. 블록 안 아이템(`const _: () = { fn
+/// f() { helper() } };`)에는 정점이 없어 함수 안 아이템처럼 그 간선을 상수가 소유하고, 상수는 늘 보존 루트라 그 아이템을
+/// 아무도 쓰지 않아도 그것이 쓰는 것(`helper`)이 닿은 것으로 남는다 — rustc는 중첩 아이템을 따로 보고 경고한다. 상수의
+/// 초기식이 부르는 중첩 `const fn`은 실제로 쓰이니 간선을 떼지 않고 센다. 이번 실행의 루트인 것만 센다(테스트 전용
+/// 상수는 `--tests`일 때만 루트다).
+fn anonymous_roots_with_items(
+    vertices: &[Vertex],
+    bodies: &[BodyItem<'_>],
+    roots: &BTreeSet<String>,
+) -> Option<String> {
+    let anonymous: BTreeSet<&str> = vertices
+        .iter()
+        .filter(|v| v.is_anonymous_const())
+        .map(|v| v.id.as_str())
+        .collect();
+    let count = bodies
+        .iter()
+        .filter(|b| anonymous.contains(b.id.as_str()) && roots.contains(&b.id))
+        .filter(|b| harvest::has_nested_items(b.body))
+        .count();
+    (count > 0).then(|| {
+        format!(
+            "{count} `const _` retention roots contain nested items (fn, impl, ...); like items in a function body they have no vertex and their edges belong to the constant, so what they use stays reachable even where the nested item itself is never used"
+        )
+    })
 }
 
 /// 정점별 소스 범위를 모은다 — 본문 아이템(fn·메서드·const·static·

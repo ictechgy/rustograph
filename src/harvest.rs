@@ -2493,6 +2493,28 @@ pub(crate) fn text_has_generated_marker(src: &str) -> bool {
     })
 }
 
+/// 본문 안에 중첩 아이템(블록 안의 `fn`·`impl`·`struct` 등)이 있는가 — 매크로 토큰 안은 보지 않는다. 중첩
+/// 아이템에는 정점이 없어 그 간선은 바깥 본문이 소유한다. 보존 루트인 이름 없는 상수(`const _: () = { fn f() {..} };`)
+/// 에서는 그 아이템을 아무도 쓰지 않아도 그것이 쓰는 것이 닿은 것으로 남으므로 source가 이것으로 센다.
+pub(crate) fn has_nested_items(body: Body<'_>) -> bool {
+    struct Finder(bool);
+    impl Visit<'_> for Finder {
+        fn visit_item(&mut self, _i: &syn::Item) {
+            self.0 = true;
+        }
+    }
+    let mut f = Finder(false);
+    match body {
+        Body::Expr(e) => f.visit_expr(e),
+        Body::Stmts(stmts) => {
+            for stmt in stmts {
+                f.visit_stmt(stmt);
+            }
+        }
+    }
+    f.0
+}
+
 /// 본문 안에 `unsafe {}` 블록이 있는지 본다 — 재귀 방문. 본문 방문([`body_edges`])처럼 최상위
 /// 아이템은 보지 않는다. 매크로 토큰 안도 보지 않는다(syn 기본 순회는 토큰을 내리지 않는다).
 fn body_has_unsafe(body: Body<'_>) -> bool {

@@ -914,6 +914,10 @@ fn main() {}
     assert!(doc.roots.iter().any(|r| r == "anonconst::inner::_"));
     let report = analysis::dead(&doc).unwrap();
     assert_eq!(unreachable_ids(&report), ["anonconst::never"]);
+    assert!(!doc
+        .limitations
+        .iter()
+        .any(|l| l.contains("retention roots contain nested items")));
 }
 
 /// 테스트 빌드에만 있는 이름 없는 상수(`#[cfg(test)] const _`, `#[cfg(test)] mod tests` 안의 것)는 `#[test]` 함수처럼
@@ -964,6 +968,48 @@ fn main() {}
     let with = load(true);
     assert!(with.roots.iter().any(|r| r == "anontest::tests::_"));
     assert!(analysis::dead(&with).unwrap().findings.is_empty());
+}
+
+/// 중첩 아이템을 품은 `const _` 루트는 limitation으로 센다 — 블록 안 아이템에는 정점이 없어 그 간선을 상수가 소유하니,
+/// rustc가 다섯 모두 미사용으로 경고하는 이 fixture에서도(`nested_unused`·`only_in_unused_nested`·`Hidden`·`go`·
+/// `helper`) 닿은 것으로 남는다. 간선을 떼지 않는 것은 상수 초기식이 부르는 중첩 `const fn`(`check()`)은 실제로 쓰여
+/// rustc가 `helper`를 경고하지 않기 때문이다. 중첩 아이템이 없는 상수는 세지 않는다.
+#[test]
+fn anonymous_const_roots_with_nested_items_are_counted() {
+    let ws = Workspace::new(
+        "anon-const-nested",
+        &[
+            ("Cargo.toml", &manifest("anonnested")),
+            (
+                "src/main.rs",
+                r#"
+fn only_in_unused_nested() -> u8 { 1 }
+const _: () = {
+    fn nested_unused() -> u8 { only_in_unused_nested() }
+};
+mod m {
+    pub fn helper() -> u8 { 2 }
+    const _: () = {
+        struct Hidden;
+        impl Hidden { fn go() -> u8 { super::m::helper() } }
+    };
+}
+const fn checked() -> bool { true }
+const _: () = assert!(checked());
+fn main() {}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(
+        doc.limitations
+            .iter()
+            .any(|l| l
+                .starts_with("2 `const _` retention roots contain nested items (fn, impl, ...)")),
+        "{:?}",
+        doc.limitations
+    );
 }
 
 /// 루트가 이름 없는 상수뿐인 lib은 여전히 루트 없는 크레이트다 — 정적 단언은 공개 API의 호출자가 아니라
