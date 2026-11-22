@@ -1727,19 +1727,14 @@ impl BodyVisitor<'_> {
     /// 워크스페이스 모듈이면(매크로가 만든 함수 `m::generated()`) 타입도 메서드 후보도 잇지 않는다 — `m::gen()`은
     /// `m` 안 아무 타입의 같은 이름 메서드(`m::S::gen`)를 부를 수 없다.
     ///
-    /// 반환: 앞부분이 타입으로 풀렸는가 — 아니면 호출자가 미해석으로 센다. 호출이 아닌 값 경로(`E::W`)와 같은
-    /// 기준이라, 메서드 정점이 없는 배리언트·derive 연관 함수(`E::V(1)`, `D::default()`)도 타입 간선을 얻은 경로로
-    /// 셈에서 빠진다(예전에는 같은 이름 메서드에 닿았는지로 세어, 타입 간선이 있는데도 미해석으로 셌다).
+    /// 반환: 경로 전체가 풀렸는가 — 아니면 호출자가 미해석으로 센다([`Self::type_relative_resolved`]).
     fn type_relative_call(&mut self, segs: &[String]) -> bool {
         let Some((name, prefix_segs)) = segs.split_last().filter(|(_, p)| !p.is_empty()) else {
             return false;
         };
-        let types: Vec<Resolved> = self
-            .path_prefix_owners(prefix_segs)
-            .into_iter()
-            .filter(|ty| self.type_item(&ty.target) && !self.tree.modules.contains_key(&ty.target))
-            .collect();
+        let types = self.path_prefix_types(prefix_segs);
         let resolved = !types.is_empty();
+        let mut hit = false;
         for ty in types {
             if let Some(ids) = self.method_index.get(name) {
                 // 접두사는 대상 타입마다 한 번 — 후보마다 만들면 같은 이름 정의가
@@ -1748,12 +1743,32 @@ impl BodyVisitor<'_> {
                 for mid in ids {
                     if mid.starts_with(&prefix) {
                         self.push(mid.clone(), &ty.cfg, EdgeKind::Call);
+                        hit = true;
                     }
                 }
             }
             self.push_resolved(ty, EdgeKind::References);
         }
-        resolved
+        self.type_relative_resolved(resolved, hit, name)
+    }
+
+    /// 타입 상대 경로(`Type::name`)를 미해석으로 세지 않아도 되는가 — 앞부분이 타입으로 풀렸고(`resolved`), 그 타입의
+    /// 같은 이름 메서드에 닿았거나(`hit`) 워크스페이스에 그 이름의 메서드가 아예 없을 때다. 뒤의 것은 메서드 정점이
+    /// 없는 배리언트·derive가 만든 연관 함수·외부 트레이트 메서드(`E::V(1)`, `D::default()`)로, 타입 간선이 경로의
+    /// 워크스페이스 쪽 전부다. 같은 이름의 워크스페이스 메서드가 있는데 그 타입 아래에서 닿지 못했으면(트레이트 기본
+    /// 메서드를 타입으로 부른 `S::d()`, 타입 별칭을 거친 `A::new()`) 이은 것이 없는 워크스페이스 대상이라 센다 — 세지
+    /// 않으면 그렇게만 쓰는 메서드가 limitation 없이 unreachable이었다.
+    fn type_relative_resolved(&self, resolved: bool, hit: bool, name: &str) -> bool {
+        resolved && (hit || !self.method_index.contains_key(name))
+    }
+
+    /// [`Self::path_prefix_owners`] 가운데 타입(모듈·외부 크레이트가 아닌 타입 이름공간 아이템)만 — 타입 상대 경로의
+    /// 메서드 후보와 타입 간선을 다는 대상이다.
+    fn path_prefix_types(&mut self, prefix: &[String]) -> Vec<Resolved> {
+        self.path_prefix_owners(prefix)
+            .into_iter()
+            .filter(|ty| self.type_item(&ty.target) && !self.tree.modules.contains_key(&ty.target))
+            .collect()
     }
 
     /// 본문을 아레나에서 바로 방문한다 — 최상위 문장 규칙은 [`body_edges`] 문서에 있다.

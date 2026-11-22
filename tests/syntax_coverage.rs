@@ -955,6 +955,44 @@ fn missing_module_files_get_no_prefix_edges() {
     );
 }
 
+/// 타입 상대 호출의 미해석 셈은 진실해야 한다 — 앞부분이 타입으로 풀려도 같은 이름의 워크스페이스 메서드가 있는데 그
+/// 타입 아래에서 닿지 못하면(트레이트 기본 메서드를 타입으로 부른 `c::S::d()`, 타입 별칭을 거친 `a::A::new()`) 이은 것이
+/// 없는 워크스페이스 대상이라 센다. 이 fixture는 `cargo check` 경고가 없는데 `dead`는 `c::Tr::d`·`a::S::new`를 낸다 —
+/// 셈이 없으면 그 거짓 dead가 아무 경고 없이 나왔다.
+#[test]
+fn type_relative_calls_missing_a_workspace_method_are_counted() {
+    let ws = Workspace::new(
+        "prefix-count",
+        &[
+            ("Cargo.toml", &manifest("prefixcount")),
+            (
+                "src/main.rs",
+                r#"
+mod c {
+    pub trait Tr { fn d() -> u8 where Self: Sized { 0 } }
+    pub struct S;
+    impl Tr for S {}
+}
+mod a {
+    pub struct S;
+    impl S { pub fn new() -> S { S } }
+    pub type A = S;
+}
+fn main() { use c::Tr as _; let _ = c::S::d(); let _ = a::A::new(); }
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(
+        doc.limitations
+            .iter()
+            .any(|l| l.starts_with("2 path references could not be resolved")),
+        "{:?}",
+        doc.limitations
+    );
+}
+
 /// 이름 없는 상수(`const _: () = assert!(..);`)는 보존 루트다 — 컴파일러가 늘 평가하고 rustc는 그것도 그 초기식이
 /// 쓰는 아이템도 미사용으로 경고하지 않는다(이 fixture의 `cargo check` 경고는 `never` 하나다). 예전에는 상수 셋과
 /// 그 안에서만 쓰는 `only_in_anon`·`Marker`·`Check`·`inner::deep`이 unreachable이었다. 같은 모듈의 둘은 소스
