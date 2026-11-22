@@ -903,14 +903,15 @@ fn found_of(binding: &Binding) -> Found<'_> {
 /// union·trait·type)은 같은 이름의 타입 이름공간 임포트(글롭)를 이기고, 로컬 이름이 값·매크로 아이템뿐이면
 /// 타입 이름공간에 묶인 임포트를 따른다 — `fn harvest`가 있는 모듈의 `harvest::f()`는 `use crate::harvest`다.
 /// 그 이름공간에 아무것도 없으면 이름공간을 정하지 못한 임포트를 보되, 같은 이름의 로컬 아이템이나 이름공간이
-/// 정해진 임포트가 있으면 보지 않는다([`undetermined_lookup`]). 그래도 없으면 [`Want::Any`]다([`any_lookup`]).
+/// 정해진 임포트가 있으면 보지 않는다(매크로 자리는 예외 — [`undetermined_lookup`]). 그래도 없으면 [`Want::Any`]다
+/// ([`any_lookup`]).
 fn lookup<'a>(module: &'a Module, name: &str, want: Want) -> Found<'a> {
     if let Want::Prefer(ns) = want {
         match strict_lookup(module, name, ns) {
             Found::Unbound => {}
             found => return found,
         }
-        match undetermined_lookup(module, name) {
+        match undetermined_lookup(module, name, ns) {
             Found::Unbound => {}
             found => return found,
         }
@@ -927,13 +928,21 @@ fn lookup<'a>(module: &'a Module, name: &str, want: Want) -> Found<'a> {
 /// 아이템이나 정해진 임포트를 고른다. 아무것도 없으면 그 `use`가 유일한 후보다. `#[cfg]`로 갈린 같은 이름공간의
 /// 대안 임포트(워크스페이스 쪽·std 쪽)에는 위 근거가 닿지 않지만 결과는 같다 — 소스 순서와 무관하게 정해진
 /// 워크스페이스 쪽이고, 그 이름으로 해석한 간선은 그 임포트의 cfg를 싣는다([`PerNs::undetermined`]).
-fn undetermined_lookup<'a>(module: &'a Module, name: &str) -> Found<'a> {
+///
+/// 매크로 자리(`ns`가 [`Ns::Macro`])는 다르다 — 여기 왔으면 매크로 이름공간에는 로컬 매크로도 정해진 임포트도 없고,
+/// 같은 이름의 로컬 fn·trait·struct·mod나 정해진 타입·값 임포트는 매크로가 될 수 없다. 위 근거대로 그 `use`는 그것들과
+/// 다른 이름공간에 있으니 매크로 이름공간에 있을 수 있는 유일한 후보다 — `fn info` 옆 `use log::info`의 `info!()`는
+/// 로컬 fn이 아니라 그 `use`다(rustc는 그 fn을 "never used"로 경고한다). 예전에는 로컬 fn이 확정 대상이라 거짓
+/// call 간선이 생겼고, 그 fn이 다시 부르는 곳과 거짓 순환이 됐다. 로컬 fn은 자리를 모르는 해석의 대상이라 호출자가
+/// 추정 간선으로 남긴다(보존은 그대로다).
+fn undetermined_lookup<'a>(module: &'a Module, name: &str, ns: Ns) -> Found<'a> {
     let Some(bindings) = module.imports.get(name) else {
         return Found::Unbound;
     };
-    let claimed = module.items.contains(name)
-        || module.children.contains_key(name)
-        || bindings.has_determined();
+    let claimed = ns != Ns::Macro
+        && (module.items.contains(name)
+            || module.children.contains_key(name)
+            || bindings.has_determined());
     match &bindings.undetermined {
         Some(binding) if !claimed => found_of(binding),
         _ => Found::Unbound,
@@ -2036,9 +2045,11 @@ mod tests {
     }
 
     /// 이름공간을 정하지 못한 임포트(`pub use ext_derive::Foo`가 해석되지 않은 것)는 같은 이름의 로컬 아이템이나
-    /// 이름공간이 정해진 임포트가 있으면 어느 자리에서도 이기지 못한다 — rustc에서 그 `use`는 그것들과 다른
-    /// 이름공간에 있다(E0255·E0252). 다른 후보가 없으면 그 `use`가 이름의 해석을 멈춘다(크레이트 루트로 넘어가지
-    /// 않는다). 자리를 모르는 해석은 정해진 임포트를 먼저 고른다.
+    /// 이름공간이 정해진 임포트가 있으면 타입·값 자리에서 이기지 못한다 — rustc에서 그 `use`는 그것들과 다른
+    /// 이름공간에 있다(E0255·E0252). 같은 근거로 매크로 자리에서는 그 `use`가 유일한 후보다 — 로컬 trait `Foo`와
+    /// 글롭이 들인 trait `Bar`는 매크로가 될 수 없다(`#[derive(Foo)]`는 derive 매크로다). 다른 후보가 없으면 그
+    /// `use`가 이름의 해석을 멈춘다(크레이트 루트로 넘어가지 않는다). 자리를 모르는 해석은 정해진 임포트를 먼저
+    /// 고른다.
     #[test]
     fn undetermined_import_yields_to_local_items_and_determined_imports() {
         let mut t = tree();
@@ -2059,7 +2070,7 @@ mod tests {
         m.imports.insert("Bar".to_string(), bar);
         // 다른 후보가 없는 `f` — 크레이트 루트에 `f`가 있어도 넘어가지 않는다.
         m.imports.insert("f".to_string(), undetermined());
-        for ns in Ns::ALL {
+        for ns in [Ns::Type, Ns::Value] {
             assert_eq!(
                 t.resolve_in("c::m", &["Foo".into()], &none, ns),
                 Some("c::m::Foo".to_string()),
@@ -2070,6 +2081,19 @@ mod tests {
                 Some("c::util::h".to_string()),
                 "{ns:?}"
             );
+        }
+        // 매크로 자리: 해석되지 않는 derive 재노출이 해석을 멈추고, 해석된 쪽은 그 외부 크레이트 정점이다(`--deps`).
+        assert_eq!(
+            t.resolve_in("c::m", &["Foo".into()], &none, Ns::Macro),
+            None
+        );
+        let mut deps = DepCrates::new();
+        deps.external.insert("ext".to_string());
+        assert_eq!(
+            t.resolve_in("c::m", &["Bar".into()], &deps, Ns::Macro),
+            Some("ext".to_string())
+        );
+        for ns in Ns::ALL {
             assert_eq!(t.resolve_in("c::m", &["f".into()], &none, ns), None);
         }
         assert_eq!(
