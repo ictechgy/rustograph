@@ -9,8 +9,10 @@
   v0.6.0은 2026-10-25, v0.5.0은 2026-10-13에 발행됐다. v0.4.2는 태그 없이 v0.5.0으로 이어졌다.
 - 2026-11-15의 이름공간 분리·derive 해석 브랜치는 PR #56으로 `main`에 스쿼시 머지됐다(`9a79ce5`, 아래 그 날짜 절).
   dependabot PR #55(같은 `taiki-e/install-action` 핀)가 닫혔는지는 이 세션에서 확인하지 않았다.
-- **브랜치 `ccr-37904670-hxdjsx`**(`origin/main` `9a79ce5` 위)에 아래 커밋이 있다. push·PR·머지는 하지 않았다
-  (2026-11-22). 사용자 변화는 CHANGELOG `[Unreleased]`, 공개 Rust API 변화는 [0.8 migration](docs/MIGRATING-0.8.md)에 있다.
+- **브랜치 `ccr-37904670-hxdjsx`**(`origin/main` `9a79ce5` 위)에 아래 커밋이 있다. 앞의 네 커밋(`187163b`까지)은
+  [PR #57](https://github.com/ictechgy/rustograph/pull/57)로 push됐고 그 머리의 CI 7개가 성공했다(코디네이터 확인).
+  독립 리뷰 반영 커밋(`4341405`부터)은 push하지 않았다(2026-11-22). 사용자 변화는 CHANGELOG `[Unreleased]`, 공개
+  Rust API 변화는 [0.8 migration](docs/MIGRATING-0.8.md)에 있다.
   - `55644b7` fix(modtree): 같은 이름공간에 같은 이름을 들이는 서로 다른 임포트 둘(명시 `use` 둘·글롭 둘)을 둘 다
     남기고(`Binding::Alternatives` — 첫 원소가 소스 순서상 뒤의 것), 임포트를 거친 해석이 거쳐 온 `use`·재노출·글롭의
     `#[cfg]`를 싣는다(`ModTree::resolve_all` → `Resolved { target, cfg }`, `with_import_cfg`). 본문(호출·참조·구조체
@@ -22,6 +24,33 @@
     가는 확정 call 간선을 만들어 거짓 심볼 순환(`cycles --level symbol --strict` 종료 코드 1)이 나던 것을 고쳤다. 로컬
     fn은 추정 간선이라 dead는 그대로다.
   - `35ee8d5` docs: README·README.ko 그래프 모델, AGENTS.md 수확 의미론, CHANGELOG, 0.8 migration.
+  - `187163b` docs: HANDOFF.
+  - **독립 리뷰(PR #57, `187163b` 대상) 반영** — 리뷰어 fixture(스크래치 `fx/` fa·fb·fi·fj·fs·fu·fx1, 모두 `cargo check`
+    통과)를 9a79ce5(old)·187163b(pr)·고친 뒤(new) 바이너리로 대조했다.
+    - `4341405` fix(modtree) — B1(이 브랜치의 회귀): `use a::*;` 옆 `#[cfg(test)] use a::f;`에서 명시 `use`가 글롭 칸을
+      바꿔 `f()` 간선이 `cfg(test)`를 달았다 — `dead --exclude-tests`·`--target x86_64-unknown-linux-gnu`가 old 0건,
+      pr `unreachable fn: fa::a::f`, new 0건(rustc 경고 없음). 자기 `#[cfg]` 없는 명시 `use`가 차지한 칸만 글롭을
+      가리고, 칸의 명시 `use`가 모두 자기 조건을 달면 글롭 칸과 합친다(글롭 쪽은 자기 조건 그대로). 같은 규칙으로
+      S3의 fb(`use real::*;` + `#[cfg(test)] use mock::Clock;`, old·pr 기본 dead에 `real::Clock`·`::now`)가 new 0건.
+      S2: 해석되는 임포트가 해석되지 않는 임포트(std)를 순서와 무관하게 이긴다 — `#[cfg(feature="pl")] use
+      extdep::Mutex;` 뒤 `#[cfg(not(..))] use std::sync::Mutex;`면 old·pr `deps`가 `unused: fj -> extdep`, new 0
+      unused(리뷰 설명과 달리 리뷰어 fixture fj의 줄 순서에서는 old·pr도 맞고, std가 뒤에 올 때 틀린다 — 스크래치
+      `r3-rustograph/fx-fj2`). S3 fx1: `#[cfg(feature="x")] fn sum()` + `#[cfg(not(..))] use scalar::sum;`면 old·pr 기본
+      dead에 `scalar::sum`, new 0건(`Module::cfg_gated`, `Found::LocalOr`). N2: 명시 `use BExt as _`가 글롭의 `_`
+      (`AExt`)를 가렸다 — old·pr `user`의 uses가 `BExt`뿐, new는 `AExt`도.
+    - `4dc0c53` fix(harvest) — S1: 갈린 임포트를 self 타입으로 쓴 `impl Sys { fn extra() }`를 대안마다 수확한다.
+      `--target` 리눅스: old `unix_impl::Sys`(거짓 — 리눅스에서 쓰인다), pr `win_impl::Sys`·`win_impl::Sys::extra`
+      (뒤는 거짓), new `win_impl::Sys`만(rustc 리눅스 경고 5행과 같음). windows는 셋 다 `unix_impl::Sys`만.
+    - `c463667` fix(modtree) — S4: 수렴 중 어느 모듈 표가 해석된 대상을 거두면 언 표로 명시 `use`·글롭 대상을 풀며
+      빈 표에서 다시 수렴시킨다. fs: old는 `main → fs::foo::bar`(거짓)만 잇고 dead에 `real::foo::bar`(거짓), pr은 두
+      call을 다 잇고 dead 0건, new는 `main → real::foo::bar`만 잇고 dead에 `fs::foo::bar` — rustc가 9행 `bar`를 쓰이지
+      않는다고 경고하는 그 정점이다(거짓 간선으로만 살던 것이라 보존이 좁아진다).
+    - `2021c62` test — N1: 살아남은 변이 셋(`attr_edges`·`decl_edges`가 임포트 조건을 버림, `push_associated`가
+      `&None`)을 잡는 속성·필드 타입·값으로 넘긴 연관 함수 테스트.
+    - `08d4ccf` docs — N3: "`--target`은 그 빌드의 것만 남긴다"를 실제 동작으로, 보존 축소에 거둔 대상을 더했다.
+    - 새 통합 테스트 9개 가운데 7개는 187163b 코드에서 실패한다(N1 둘은 187163b에서도 통과 — 변이용). 고친 것마다
+      되돌리는 변이(늘 가리기·섞이면 뒤의 것·로컬 대안 끄기·첫 대안만 impl 수확·다시 수렴 끄기·`_`도 가리기·N1 셋)를
+      각각 해당 테스트가 잡았다.
   - 이 HANDOFF 커밋.
 - **재현과 근거**(스크래치 fixture, 모두 `cargo check` 통과):
   - `#[cfg(unix)] use crate::unix_impl::Sys;`/`#[cfg(windows)] use crate::win_impl::Sys;` + `Sys::open()`: main은
@@ -37,20 +66,20 @@
 - **반례 말뭉치**(크레이트 17개: syn 2.0.119·tokio 1.53.1·regex-syntax 0.8.11·ra_ap_hir_def/hir_ty 0.0.349·rowan 0.17.0·
   serde/serde_derive 1.0.229·clap_builder 4.6.7·zerocopy 0.8.50·rustix 1.1.5·mio 1.2.3·getrandom 0.3.4·parking_lot_core
   0.9.12·crossbeam-utils 0.8.23·hashbrown 0.16.1·이 저장소 `9a79ce5` 사본, `graph --level symbol --tests` 간선 키
-  from·to·kind·tentative·cfg): main 대비 cfg를 빼고 사라진 간선 0, 새 (from,to,kind,tentative) 87개(tokio 44·zerocopy 33·
-  rustix 6·syn 4), 조건 없던 간선이 조건을 얻은 것 341개(rustix 199·syn 90·clap_builder 35·tokio 6·parking_lot_core 4·
+  from·to·kind·tentative·cfg, 마지막 바이너리 기준): main 대비 cfg를 빼고 사라진 간선 0, 새 (from,to,kind,tentative)
+  92개(tokio 44·zerocopy 38·rustix 6·syn 4 — 187163b 대비로는 zerocopy `r#ref::tests`의 `_` 칸 uses 5개만 늘었다), 조건 없던 간선이 조건을 얻은 것 341개(rustix 199·syn 90·clap_builder 35·tokio 6·parking_lot_core 4·
   zerocopy 4·이 저장소 3 — 이 저장소는 `#[cfg(feature = "semantic")] use crate::sem::..`를 거친 3개). `dead --tests` 차이 0,
   `dead --tests --retain-public` 2건 덜 냄(syn `ext::PunctExt`, zerocopy `util::polyfills::NonNullExt` — 둘 다 `use .. as _`
   여럿), `dead --retain-public` 13건 덜 냄(그 둘과 rustix `ioctl::linux::compose_opcode`·상수 10개). 새로 낸 것 0.
   심볼·type 레벨 순환 수는 바뀐 크레이트 모두 같고, tokio module 레벨(기본)만 1 → 2다 — 새 순환
   `loom::mocked::sync → loom::std::barrier → loom::std::sync`의 첫 간선은 2018 판 `tokio::loom::mocked`의
   `use loom::sync::*`(외부 크레이트 `loom`)를 크레이트 루트의 `tokio::loom`으로 읽는 기존 폴백에서 온다(아래 후속 후보).
-  `--exclude-tests`면 둘 다 0이다. 매크로 자리 규칙은 말뭉치에서 바뀐 간선이 없다. 같은 크레이트에서 두 번 돌린
+  `--exclude-tests`면 둘 다 0이다. 매크로 자리 규칙은 말뭉치에서 바뀐 간선이 없고, 수렴을 다시 돈 크레이트도 없다. 같은 크레이트에서 두 번 돌린
   `graph`는 바이트 단위로 같았다(ra_ap_hir_def·syn·rustix).
 - **검증**(2026-11-22, 로컬 cargo 1.97, `CARGO_PROFILE_DEV_DEBUG=0`·`-j 2` — 공유 디스크가 모자라 디버그 정보를 껐다):
   `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` 0, `cargo test --locked`(26개 실행 단위
-  547개 통과 — 새 통합 7·단위 5), `rules --strict` 0, `cycles --level symbol --strict` 0(type 23·module 2 — 변경 전과
-  같음), `scripts/verify-self-dead.sh`(0건 일치), `scripts/verify-cli-contract.sh` OK, `scripts/coverage.sh` 94.71%(게이트 90%, 그 안의 테스트 실패 0).
+  556개 통과 — 이 브랜치의 새 통합 16·단위 5), `rules --strict` 0, `cycles --level symbol --strict` 0(type 23·module 2 — 변경 전과
+  같음), `scripts/verify-self-dead.sh`(0건 일치), `scripts/verify-cli-contract.sh` OK, `scripts/coverage.sh` 94.72%(게이트 90%, 그 안의 테스트 실패 0).
   새 통합 테스트 7개는 `main`의 `src/`로 돌리면 모두 실패하고, 변이 6개(대상이 다른 임포트를 뒤의 것만, 경로 조건 버림,
   재노출 조건 버림, 대안 중 첫 경로만 걷기, 같은 대상의 조건을 뒤의 것으로, 본문 간선의 경로 조건 버림·연관 함수 호출의
   첫 타입만)와 매크로 자리 규칙 되돌리기는 모두 테스트가 잡았다.
@@ -78,10 +107,15 @@
   모듈의 이름이나 외부 크레이트다. tokio `tokio::loom::mocked`의 `use loom::sync::*`(외부 크레이트 `loom`)가
   `tokio::loom`으로 읽혀, 대안 임포트를 남긴 뒤로 tokio module 레벨 순환(기본)이 1 → 2가 됐다. 고치려면 타깃마다 판을
   알아야 하고 간선이 줄어드니 반례 말뭉치 근거가 필요하다.
-- impl self 타입·트레이트 경로(정점 정체성, `implements` 간선)와 routes(`source/routes`)는 아직 대상 하나
-  (`resolve_in`·`resolve`)다 — 대안 임포트를 거치면 첫 대상뿐이고 임포트 조건을 싣지 않는다.
-- `#[cfg]`를 단 명시 `use`는 같은 이름의 글롭을 조건 없이 가린다(`#[cfg(unix)] use a::X;` 옆 `use b::*`의 `X`는
-  unix가 아닌 빌드에서 글롭의 것이다). 글롭 쪽을 부정 조건의 대안으로 남기면 정확해진다(간선이 늘어나는 쪽).
+- impl의 트레이트 경로(`implements` 간선)와 routes(`source/routes`)는 아직 대상 하나(`resolve_in`·`resolve`)다 —
+  대안 임포트를 거치면 첫 대상뿐이고 임포트 조건을 싣지 않는다. self 타입은 대안마다 수확한다(`4dc0c53`).
+- 자기 `#[cfg]`를 단 명시 `use`와 합친 글롭 쪽은 자기 조건만 싣는다 — 명시 `use` 조건의 부정(`not(test)`)을 더하면
+  그 조건의 빌드에서 가려지는 간선까지 정확해진다(보수적으로 두었다).
+- 모든 선언이 `#[cfg]`를 단 로컬 아이템 옆의 이름공간을 정하지 못한 `use`(그래프 밖 대안)는 대안으로 보지 않는다 —
+  본문 간선은 로컬 아이템만이고 `uses` 증거는 남는다.
+- 메서드가 모두 기본 구현인 트레이트(`impl T1 for u8 {}`)는 그 메서드가 이름 팬아웃으로 닿아도 트레이트 정점이
+  unreachable로 나온다(리뷰어 fg: `use c::T1 as _;` + `1u8.t1()` — rustc 경고 없음). old·pr·new 모두 같다. 기본 메서드에서
+  트레이트로 가는 간선이 없어서다.
 - cycles·rules의 추정 간선 note 문구("speculative method-fan-out edges")는 매크로 경로의 추정 간선도 센다 — 문구를
   바꾸면 텍스트 출력이 바뀐다.
 - `_` 이름(리뷰 r2 N3): `use X as _` 여럿은 이번 브랜치에서 모두 `uses` 증거로 남는다. 남은 것은 `_` 칸이 이름 해석
