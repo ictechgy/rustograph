@@ -722,6 +722,87 @@ fn main() {
     assert_reported(&report, &["assocvalue::Item::unused_assoc"]);
 }
 
+/// 호출 경로 `Type::assoc()`·`Enum::Variant(..)`는 메서드(있으면)와 함께 타입 자체를 references로 잇는다 — rustc는
+/// `S::m()`의 `S`를 struct의 사용으로, `E::V(1)`을 enum의 사용으로 본다(이 fixture의 `cargo check` 경고는 `Unused`와
+/// 배리언트 필드뿐이다). 예전에는 메서드에만 잇거나(`S::m()`) 아무것도 잇지 않아(`E::V(1)`, derive가 만든
+/// `D::default()`) 그렇게만 쓰는 타입이 unreachable이었다. 앞부분이 모듈이면(매크로가 만든 `gen::generated()`) 모듈로
+/// 잇지 않고, 미해석 계수(메서드 정점이 없는 셋)는 그대로다.
+#[test]
+fn associated_calls_and_tuple_variants_reference_their_type() {
+    let ws = Workspace::new(
+        "assoc-call",
+        &[
+            ("Cargo.toml", &manifest("assoccall")),
+            (
+                "src/main.rs",
+                r#"
+mod imp {
+    pub struct S;
+    impl S { pub fn m() -> u8 { 1 } }
+    pub enum E { V(u8) }
+    #[derive(Default)]
+    pub struct D;
+    pub struct Unused;
+}
+mod gen {
+    macro_rules! make { () => { pub fn generated() {} }; }
+    make!();
+}
+struct Local;
+impl Local { fn make() -> u8 { 4 } }
+fn main() {
+    let _ = imp::S::m();
+    let _ = imp::E::V(1);
+    let _ = Local::make();
+    let _ = imp::D::default();
+    gen::generated();
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    for ty in ["imp::S", "imp::E", "imp::D", "Local"] {
+        assert!(
+            has_edge(
+                &doc,
+                "assoccall::main",
+                &format!("assoccall::{ty}"),
+                EdgeKind::References
+            ),
+            "main must reference {ty}"
+        );
+    }
+    assert!(has_edge(
+        &doc,
+        "assoccall::main",
+        "assoccall::imp::S::m",
+        EdgeKind::Call
+    ));
+    assert!(!doc
+        .edges
+        .iter()
+        .any(|e| e.from == "assoccall::main" && e.to == "assoccall::gen"));
+    let report = analysis::dead(&doc).unwrap();
+    assert_not_reported(
+        &report,
+        &[
+            "assoccall::imp::S",
+            "assoccall::imp::E",
+            "assoccall::imp::D",
+            "assoccall::Local",
+        ],
+    );
+    assert_reported(&report, &["assoccall::imp::Unused"]);
+    assert!(
+        doc.limitations
+            .iter()
+            .any(|l| l.starts_with("3 path references could not be resolved")),
+        "{:?}",
+        doc.limitations
+    );
+}
+
 /// 표현식 목록으로 파싱되지 않는 매크로 인자(`json!({"k": f()})` 같은 독자 문법)의 이름은 아이템으로
 /// 해석되면 추정 간선이 된다 — 예전에는 그 안에서만 쓰는 함수·상수가 unreachable이었다. 지역 묶음과
 /// 같은 이름은 아이템으로 읽지 않는다.

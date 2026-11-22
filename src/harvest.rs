@@ -1586,6 +1586,42 @@ impl BodyVisitor<'_> {
         false
     }
 
+    /// 값 경로로 풀리지 않은 호출 `Type::assoc(..)`·`Enum::Variant(..)` — 마지막 세그먼트가 연관 함수나
+    /// 배리언트이고 앞부분이 타입이다. 앞부분을 타입 이름공간에서 해석해(`#[cfg]`로 갈린 대안 임포트면 대안
+    /// 타입마다) 그 타입 범위의 같은 이름 메서드로 call 간선을 단다.
+    ///
+    /// 타입 자체로도 references 간선을 단다 — 경로가 그 타입을 이름 붙인다. rustc는 `S::m()`의 `S`를
+    /// struct의 사용으로 보고 `E::V(..)`는 enum의 사용이다(둘 다 dead_code 경고가 없다). 메서드에만 잇던 때는
+    /// 그렇게만 쓰는 struct·enum이 unreachable이었다. 호출이 아닌 값 경로(`E::W`, `.map(Type::new)`)는
+    /// [`Visit::visit_expr_path`]가 같은 규칙으로 타입을 잇는다. 앞부분이 워크스페이스 모듈이면(매크로가 만든
+    /// 함수 `m::generated()`) 잇지 않는다 — 모듈은 이름 붙일 아이템이 아니다.
+    ///
+    /// 반환: 같은 이름 메서드에 닿았는가 — 닿지 않았으면 호출자가 미해석으로 센다(배리언트·derive가 만든
+    /// 연관 함수는 메서드 정점이 없다). 미해석 계수는 타입 간선을 더하기 전과 같다.
+    fn type_relative_call(&mut self, segs: &[String]) -> bool {
+        let Some((name, prefix_segs)) = segs.split_last().filter(|(_, p)| !p.is_empty()) else {
+            return false;
+        };
+        let mut hit = false;
+        for ty in self.resolve_in(prefix_segs, Ns::Type) {
+            if let Some(ids) = self.method_index.get(name) {
+                // 접두사는 대상 타입마다 한 번 — 후보마다 만들면 같은 이름 정의가
+                // 수천 개일 때 할당이 (호출 수 × 정의 수)다.
+                let prefix = owner_prefix(&ty.target);
+                for mid in ids {
+                    if mid.starts_with(&prefix) {
+                        self.push(mid.clone(), &ty.cfg, EdgeKind::Call);
+                        hit = true;
+                    }
+                }
+            }
+            if !self.tree.modules.contains_key(&ty.target) {
+                self.push_resolved(ty, EdgeKind::References);
+            }
+        }
+        hit
+    }
+
     /// 본문을 아레나에서 바로 방문한다 — 최상위 문장 규칙은 [`body_edges`] 문서에 있다.
     /// 최상위를 [`Visit::visit_block`]으로 돌리면 겹이 하나 더 열리고 `let .. else`의 방문 순서가
     /// 달라져 간선이 달라진다.
@@ -1739,27 +1775,7 @@ impl Visit<'_> for BodyVisitor<'_> {
                 // 지역 클로저·함수 값 호출 — 아이템 호출이 아니다.
                 ValueRes::Local => {}
                 ValueRes::Unresolved => {
-                    // Type::assoc_fn() — 마지막 세그먼트가 연관 함수다.
-                    // 앞부분이 타입 정점이면 그 타입의 메서드로 좁힌다. 타입이 `#[cfg]`로 갈린 대안
-                    // 임포트면 대안 타입마다 본다.
-                    let n = segs.len();
-                    let mut hit = false;
-                    if n >= 2 {
-                        for ty in self.resolve_in(&segs[..n - 1], Ns::Type) {
-                            if let Some(ids) = self.method_index.get(&segs[n - 1]) {
-                                // 접두사는 대상 타입마다 한 번 — 후보마다 만들면 같은 이름 정의가
-                                // 수천 개일 때 할당이 (호출 수 × 정의 수)다.
-                                let prefix = owner_prefix(&ty.target);
-                                for mid in ids {
-                                    if mid.starts_with(&prefix) {
-                                        self.push(mid.clone(), &ty.cfg, EdgeKind::Call);
-                                        hit = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if !hit {
+                    if !self.type_relative_call(&segs) {
                         self.unresolved += 1;
                     }
                 }
