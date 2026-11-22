@@ -580,10 +580,28 @@ pub(crate) struct ImplParts<'a> {
     pub bodies: Vec<BodyItem<'a>>,
     /// `#[no_mangle]` 같은 진입점 속성이 붙은 impl 메서드 — 항상 보존 루트다.
     pub entry_roots: Vec<String>,
-    /// self 타입이 워크스페이스 정점이 아닌 impl의 메서드 본문 — 소유자는 구현한 워크스페이스
-    /// 트레이트의 선언 메서드나 impl이 선언된 모듈이다([`foreign_impl_bodies`]). 호출자는 소유자가
-    /// 정점으로 남았는지 확인한 뒤 쓴다.
+    /// self 타입이 워크스페이스 정점이 아닌 impl의 메서드 본문 — 소유자는 impl이 선언된 모듈이거나, 구현한
+    /// 워크스페이스 트레이트의 선언 메서드다([`foreign_impl_bodies`] — 메서드마다 모듈 소유 하나와 트레이트
+    /// 대안마다 선언 메서드 소유 하나). 호출자는 선언 메서드 소유자가 정점으로 남았는지 확인한 뒤 쓴다.
     pub foreign_bodies: Vec<BodyItem<'a>>,
+    /// 그런 impl이 구현한 워크스페이스 트레이트의 선언 메서드 — 메서드에서 트레이트로 가는 references 간선의
+    /// 후보다([`ForeignTraitMethod`]).
+    pub foreign_trait_methods: Vec<ForeignTraitMethod>,
+}
+
+/// self 타입이 워크스페이스 정점이 아닌 impl(`impl Tr for String`)이 구현한 워크스페이스 트레이트의 선언 메서드
+/// 하나. self 타입 정점이 없어 implements 간선을 둘 수 없으니 호출자가 선언 메서드에서 트레이트로 references
+/// 간선을 둔다 — 그 메서드를 부르면(이름 팬아웃 포함) 이 impl을 거쳐 트레이트를 쓰는 것이다. impl이 재정의한
+/// 메서드와 재정의하지 않아 기본 구현을 쓰는 메서드 모두다. 이것이 없으면 워크스페이스 밖 타입에만 구현한 확장
+/// 트레이트가 메서드를 써도 unreachable이었다. 두 정점이 남았는지는 호출자가 본다(소스 인스턴스 ID로 바뀐
+/// 선언은 남지 않는다 — 유령 정점 금지).
+pub(crate) struct ForeignTraitMethod {
+    /// 트레이트의 선언 메서드 ID(`Tr::m`).
+    pub method: String,
+    /// 트레이트 정점 ID — 트레이트 경로가 `#[cfg]`로 갈린 대안 임포트를 지나면 대안마다 하나씩이다.
+    pub trait_id: String,
+    /// 간선 조건 — impl(재정의한 메서드면 그 메서드도)의 `#[cfg]`와 트레이트에 닿은 임포트의 조건을 합친 것.
+    pub cfg: Option<String>,
 }
 
 /// 소스 수확의 전역 충돌 판정에 선언 위치를 넘긴다. 공개 수확 API는 그대로 둔다.
@@ -604,6 +622,7 @@ pub(crate) fn impls_with_identities<'a>(
         bodies: Vec::new(),
         entry_roots: Vec::new(),
         foreign_bodies: Vec::new(),
+        foreign_trait_methods: Vec::new(),
     };
     for b in blocks {
         // self 타입을 해석한다 — 모듈 로컬이면 정점이 있다. `#[cfg]`로 갈린 대안 임포트(`#[cfg(unix)] use
@@ -625,6 +644,7 @@ pub(crate) fn impls_with_identities<'a>(
                 methods,
                 harvest,
                 &mut parts.attr_refs,
+                &mut parts.foreign_trait_methods,
             ));
             continue;
         }
@@ -794,31 +814,33 @@ fn impl_block_parts<'a>(
 /// 그런 impl(`impl Render for String`, blanket `impl<T: Tr> Greet for T`, `impl Tr for &Local`)의
 /// 메서드에는 정점이 없다 — 예전에는 본문을 통째로 버려, 그 안에서만 부르는 함수가 unreachable로
 /// 보였고 본문이 다른 모듈을 부르는 의존이 레이어 규칙에서 사라졌다. 확정 간선은 impl이 선언된
-/// 모듈이 소유한다 — 의존이 실제로 나가는 곳이라 규칙·순환이 그 모듈의 의존으로 본다. 구현한
-/// 트레이트가 워크스페이스 트레이트이고 그 메서드를 선언했으면, 반환하는 항목의 `id`는 선언
-/// 메서드(`Trait::m`)다 — 호출자([`crate::source`])가 그 소유로 같은 본문을 한 번 더 풀어 추정 간선으로
-/// 싣는다. 그 메서드를 부르는 곳(이름 팬아웃 포함)에서 본문의 호출이 닿되, 트레이트 모듈에서 impl
-/// 모듈로 가는 의존은 규칙·순환의 증거가 되지 않는다. 모듈은 `--retain-public`이면 `pub mod`가 보존
-/// 루트라 그때는 모듈이 소유한 간선도 dead 판정을 넓힌다. impl 메서드의 `Self`는 워크스페이스 밖
-/// 타입이라 바꾸지 않는다. 속성 경로 참조는 확정 의존이라 impl 모듈이 소유한다.
+/// 모듈이 소유한다 — 의존이 실제로 나가는 곳이라 규칙·순환이 그 모듈의 의존으로 본다. 그래서 메서드마다
+/// `id`가 impl 모듈인 항목이 하나 있다. 구현한 트레이트가 워크스페이스 트레이트이고 그 메서드를 선언했으면
+/// 같은 본문을 `id`가 선언 메서드(`Trait::m`)인 항목으로 하나 더 준다 — 호출자([`crate::source`])가 그 소유로
+/// 다시 풀어 추정 간선으로 싣는다. 그 메서드를 부르는 곳(이름 팬아웃 포함)에서 본문의 호출이 닿되, 트레이트
+/// 모듈에서 impl 모듈로 가는 의존은 규칙·순환의 증거가 되지 않는다. 모듈은 `--retain-public`이면 `pub mod`가
+/// 보존 루트라 그때는 모듈이 소유한 간선도 dead 판정을 넓힌다. impl 메서드의 `Self`는 워크스페이스 밖 타입이라
+/// 바꾸지 않는다. 속성 경로 참조는 확정 의존이라 impl 모듈이 소유한다.
+///
+/// 트레이트 경로가 `#[cfg]`로 갈린 대안 임포트를 지나면(`#[cfg(unix)] use crate::unix::Tr;`와 windows 쪽 옆의
+/// `impl Tr for String`) 대안 트레이트마다 선언 메서드 소유 항목을 주고 그 조건에 임포트의 조건을 더한다 —
+/// self 타입이 워크스페이스 타입인 impl의 implements 간선과 같은 규칙이다. 예전에는 대안 하나만 이어 다른 빌드의
+/// 트레이트가 거짓 unreachable이었다. 대안 트레이트마다 선언 메서드를 `trait_methods`에 더한다([`ForeignTraitMethod`]).
 fn foreign_impl_bodies<'a>(
     b: &ImplBlock<'a>,
     tree: &ModTree,
     methods: &BTreeSet<String>,
     harvest: &mut Harvest,
     attr_refs: &mut Vec<AttrRef>,
+    trait_methods: &mut Vec<ForeignTraitMethod>,
 ) -> Vec<BodyItem<'a>> {
-    let trait_id = b
+    let traits = b
         .trait_path
         .as_ref()
-        .and_then(|tp| tree.resolve_in(&b.items_module, tp, &DepCrates::new(), Ns::Type));
+        .map(|tp| tree.resolve_all(&b.items_module, tp, &DepCrates::new(), Some(Ns::Type)))
+        .unwrap_or_default();
     let mut bodies = Vec::new();
     for &m in &b.methods {
-        let owner = trait_id
-            .as_ref()
-            .map(|t| format!("{t}::{}", m.sig.ident))
-            .filter(|declared| methods.contains(declared))
-            .unwrap_or_else(|| b.items_module.clone());
         let own_cfg = cfg_of(&m.attrs);
         harvest.cfg_items += usize::from(own_cfg.is_some());
         let mcfg = match own_cfg {
@@ -833,20 +855,69 @@ fn foreign_impl_bodies<'a>(
             &mcfg,
             attr_refs,
         );
-        bodies.push(BodyItem {
+        let body = BodyItem {
             generic_scopes: generic_scopes([b.generics, &m.sig.generics]),
-            id: owner,
+            id: b.items_module.clone(),
             module: b.items_module.clone(),
             self_ty: None,
             body: Body::Stmts(&m.block.stmts),
             params: locals::param_bindings(&m.sig),
             signature_surface: fn_signature_types(&m.sig),
-            cfg: mcfg,
+            cfg: mcfg.clone(),
             file: b.file.clone(),
             range: m.span().byte_range(),
-        });
+        };
+        for tr in &traits {
+            let declared = format!("{}::{}", tr.target, m.sig.ident);
+            if !methods.contains(&declared) {
+                continue;
+            }
+            let cfg = with_import_cfg(&mcfg, &tr.cfg);
+            trait_methods.push(ForeignTraitMethod {
+                method: declared.clone(),
+                trait_id: tr.target.clone(),
+                cfg: cfg.clone(),
+            });
+            bodies.push(BodyItem {
+                id: declared,
+                cfg,
+                ..body.clone()
+            });
+        }
+        bodies.push(body);
+    }
+    for tr in &traits {
+        inherited_trait_methods(b, tr, methods, trait_methods);
     }
     bodies
+}
+
+/// impl 블록 `b`가 재정의하지 않은 트레이트 `tr`의 선언 메서드 — 기본 구현을 그대로 쓰는 메서드다. 그 메서드를
+/// 부르면 이 impl을 거쳐 트레이트를 쓰니 재정의한 메서드처럼 [`ForeignTraitMethod`]로 더한다(조건은 impl의 것과
+/// 임포트의 것). `impl T1 for u8 {}` 옆의 `1u8.t1()`이 기본 메서드 `T1::t1`에만 닿아 트레이트 `T1`이 unreachable이던
+/// 것을 막는다 — rustc는 쓰인 트레이트 아이템의 트레이트를 쓰인 것으로 본다.
+fn inherited_trait_methods(
+    b: &ImplBlock<'_>,
+    tr: &Resolved,
+    methods: &BTreeSet<String>,
+    trait_methods: &mut Vec<ForeignTraitMethod>,
+) {
+    let prefix = format!("{}::", tr.target);
+    let cfg = with_import_cfg(&b.cfg, &tr.cfg);
+    let declared = methods
+        .range(prefix.clone()..)
+        .take_while(|id| id.starts_with(&prefix));
+    for method in declared {
+        let name = &method[prefix.len()..];
+        if name.contains("::") || b.methods.iter().any(|m| m.sig.ident == name) {
+            continue;
+        }
+        trait_methods.push(ForeignTraitMethod {
+            method: method.clone(),
+            trait_id: tr.target.clone(),
+            cfg: cfg.clone(),
+        });
+    }
 }
 
 /// 시그니처 표면(파라미터·반환·where)의 타입 목록.

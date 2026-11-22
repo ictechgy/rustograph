@@ -1106,6 +1106,75 @@ fn main() {
     );
 }
 
+/// self 타입이 워크스페이스 밖인 impl(`impl Tr for String`)의 트레이트 경로가 `#[cfg]`로 갈린 대안 임포트를 지나면
+/// 대안 트레이트마다 선언 메서드가 본문을 대신 소유하고(추정 간선) 트레이트로 references 간선을 둔다 — 둘 다 그
+/// 임포트의 조건을 싣는다. 예전에는 대안 하나(`resolve`)만 이어 기본 `dead`와 `--target` 리눅스가 리눅스에서 쓰이는
+/// `plat_unix::Tr`을 냈다. 이제 리눅스에서는 windows 쪽만, windows에서는 unix 쪽만 낸다 — 각 타깃의 `cargo check`
+/// 경고(`trait Tr is never used`)와 같다.
+#[test]
+fn foreign_impl_of_a_split_trait_follows_each_alternative() {
+    let doc = harvest(
+        "foreignsplit",
+        "",
+        r#"
+mod plat_unix {
+    pub trait Tr {
+        fn hello(&self) -> u8;
+    }
+}
+mod plat_win {
+    pub trait Tr {
+        fn hello(&self) -> u8;
+    }
+}
+#[cfg(unix)]
+use crate::plat_unix::Tr;
+#[cfg(windows)]
+use crate::plat_win::Tr;
+impl Tr for String {
+    fn hello(&self) -> u8 {
+        helper()
+    }
+}
+fn helper() -> u8 {
+    7
+}
+fn main() {
+    let _ = String::new().hello();
+}
+"#,
+    );
+    for (plat, cfg) in [("plat_unix", "unix"), ("plat_win", "windows")] {
+        let method = format!("foreignsplit::{plat}::Tr::hello");
+        let tr = format!("foreignsplit::{plat}::Tr");
+        assert_eq!(
+            edge_cfg(&doc, &method, &tr, EdgeKind::References),
+            under(cfg)
+        );
+        assert!(
+            doc.edges.iter().any(|e| e.from == method
+                && e.to == "foreignsplit::helper"
+                && e.tentative
+                && e.cfg.as_deref() == Some(cfg)),
+            "{method} must own the impl body under {cfg}"
+        );
+    }
+    // 확정 간선은 impl 모듈이 한 번 소유한다(대안마다 겹치지 않는다).
+    assert_eq!(
+        edge_cfg(&doc, "foreignsplit", "foreignsplit::helper", EdgeKind::Call),
+        Some(None)
+    );
+    assert!(dead_ids(&doc).is_empty(), "{:?}", dead_ids(&doc));
+    assert_eq!(
+        dead_ids(&for_target(&doc, LINUX)),
+        ["foreignsplit::plat_win::Tr"]
+    );
+    assert_eq!(
+        dead_ids(&for_target(&doc, WINDOWS)),
+        ["foreignsplit::plat_unix::Tr"]
+    );
+}
+
 /// 2015 판 크레이트에서는 `use foo::bar`가 크레이트 기준이라 수렴 중 거둔 대상(크레이트 루트 `foo::bar`)이 제 대상일 수
 /// 있다 — 거둔 대상을 지우지 않는다(187163b와 같다 — 826e20b는 그것을 지워 2015 판 rustc가 쓰는 루트 `foo::bar`를
 /// `dead`로 냈다). 해석은 2018 판 규칙이라 크레이트 기준 `use` 경로를 가진 2015 판 크레이트는 거둔 것이 없어도(로컬

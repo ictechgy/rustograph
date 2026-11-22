@@ -919,6 +919,59 @@ fn anonymous_const_roots_keep_the_rootless_library_limitation() {
     );
 }
 
+/// 워크스페이스 밖 타입의 impl이 재정의하지 않은 기본 메서드도 그 트레이트의 사용 증거다 — `impl T1 for u8 {}`
+/// 옆의 `1u8.t1()`은 기본 메서드 `T1::t1`에만 닿는데, 예전에는 거기서 트레이트로 가는 간선이 없어 `T1`이
+/// unreachable이었다(rustc는 쓰인 트레이트 아이템의 트레이트를 쓰인 것으로 본다). rustc가 경고하는 것 — 부르지 않는
+/// 트레이트 `T2`, 부르지 않는 선언 `T3::t3` — 은 그대로 낸다(이 fixture의 `cargo check` 경고와 같다).
+#[test]
+fn foreign_impl_default_methods_keep_their_trait_reachable() {
+    let ws = Workspace::new(
+        "foreign-default",
+        &[
+            ("Cargo.toml", &manifest("foreigndefault")),
+            (
+                "src/main.rs",
+                r#"
+mod ext {
+    pub trait T1 { fn t1(&self) -> u8 { 1 } }
+    impl T1 for u8 {}
+    pub trait T2 { fn t2(&self) -> u8 { 2 } }
+    impl T2 for u8 {}
+    pub trait T3 {
+        fn t3(&self) -> u8;
+        fn t3_default(&self) -> u8 { only_from_default() }
+    }
+    impl T3 for u8 { fn t3(&self) -> u8 { 3 } }
+    fn only_from_default() -> u8 { 4 }
+}
+use ext::T1 as _;
+use ext::T3 as _;
+fn main() {
+    let _ = 1u8.t1();
+    let _ = 1u8.t3_default();
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(has_edge(
+        &doc,
+        "foreigndefault::ext::T1::t1",
+        "foreigndefault::ext::T1",
+        EdgeKind::References
+    ));
+    let report = analysis::dead(&doc).unwrap();
+    assert_eq!(
+        unreachable_ids(&report),
+        [
+            "foreigndefault::ext::T2",
+            "foreigndefault::ext::T2::t2",
+            "foreigndefault::ext::T3::t3",
+        ]
+    );
+}
+
 /// 표현식 목록으로 파싱되지 않는 매크로 인자(`json!({"k": f()})` 같은 독자 문법)의 이름은 아이템으로
 /// 해석되면 추정 간선이 된다 — 예전에는 그 안에서만 쓰는 함수·상수가 unreachable이었다. 지역 묶음과
 /// 같은 이름은 아이템으로 읽지 않는다.

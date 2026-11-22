@@ -1003,6 +1003,7 @@ fn harvest(
         .map(|v| v.id.clone())
         .collect();
     let mut foreign_bodies: Vec<BodyItem<'_>> = Vec::new();
+    let mut foreign_trait_methods: Vec<harvest::ForeignTraitMethod> = Vec::new();
     for block in &impls {
         let krate = modtree::crate_of(&block.items_module);
         let parts = harvest::impls_with_identities(
@@ -1019,6 +1020,7 @@ fn harvest(
         bodies.extend(parts.bodies);
         annotated_roots.extend(parts.entry_roots);
         foreign_bodies.extend(parts.foreign_bodies);
+        foreign_trait_methods.extend(parts.foreign_trait_methods);
     }
     let identities = identity_registry.identify(&mut vertices, &meta.workspace_root);
     drop(identity_registry);
@@ -1027,30 +1029,34 @@ fn harvest(
     for body in &mut bodies {
         body.id = identities.owner(&body.id, &body.module, &body.file, body.range.start);
     }
-    // 대신 소유시킨 본문은 소유자가 정점으로 남았을 때만 쓴다 — 같은 경로의 트레이트 선언이 여럿이라
-    // 선언 메서드가 소스 인스턴스 ID로 바뀌었으면 impl 모듈이 소유한다(유령 정점 금지).
+    // 대신 소유시킨 본문·간선은 선언 메서드와 트레이트가 정점으로 남았을 때만 쓴다 — 같은 경로의 트레이트
+    // 선언이 여럿이라 선언 메서드가 소스 인스턴스 ID로 바뀌었으면 impl 모듈 소유 본문만 남는다(유령 정점 금지).
     let vertex_ids: BTreeSet<&str> = vertices.iter().map(|v| v.id.as_str()).collect();
+    // 워크스페이스 밖 타입의 impl이 구현한 트레이트다. self 타입 정점이 없어 implements 간선을 둘 수 없으니 선언
+    // 메서드에서 트레이트로 references 간선을 둔다 — 워크스페이스 밖 타입에만 구현한 확장 트레이트(`impl ItemIdent
+    // for syn::Item`)는 이것이 없으면 메서드를 써도 트레이트 정점이 unreachable이었다.
+    for m in foreign_trait_methods {
+        if vertex_ids.contains(m.method.as_str()) && vertex_ids.contains(m.trait_id.as_str()) {
+            let mut e = Edge::new(m.method, m.trait_id, EdgeKind::References);
+            e.cfg = m.cfg;
+            edges.push(e);
+        }
+    }
     // 선언 메서드가 대신 소유할 본문 — 2패스 뒤에 그 소유로 다시 풀어 추정 간선으로만 싣는다.
     let mut proxy_bodies: Vec<BodyItem<'_>> = Vec::new();
-    for mut body in foreign_bodies {
-        let trait_id = (body.id != body.module && vertex_ids.contains(body.id.as_str()))
-            .then(|| body.id.rsplit_once("::").map(|(t, _)| t.to_string()))
-            .flatten()
-            .filter(|t| vertex_ids.contains(t.as_str()));
-        // 선언 메서드가 소유한 본문은 그 트레이트의 impl이다. self 타입 정점이 없어 implements
-        // 간선을 둘 수 없으니 소유 메서드에서 트레이트로 references 간선을 둔다 — 워크스페이스 밖
-        // 타입에만 구현한 확장 트레이트(`impl ItemIdent for syn::Item`)는 이것이 없으면 메서드를
-        // 써도 트레이트 정점이 unreachable이었다.
-        if let Some(trait_id) = trait_id {
-            let mut e = Edge::new(body.id.clone(), trait_id, EdgeKind::References);
-            e.cfg = body.cfg.clone();
-            edges.push(e);
-            proxy_bodies.push(body.clone());
+    for body in foreign_bodies {
+        if body.id == body.module {
+            // 확정 간선은 impl이 선언된 모듈이 소유한다 — 의존이 실제로 나가는 곳이다. 선언 메서드가
+            // 소유하면 트레이트 모듈에서 impl 모듈로 가는 거짓 의존이 규칙 위반·순환으로 보였다.
+            bodies.push(body);
+        } else if vertex_ids.contains(body.id.as_str())
+            && body
+                .id
+                .rsplit_once("::")
+                .is_some_and(|(trait_id, _)| vertex_ids.contains(trait_id))
+        {
+            proxy_bodies.push(body);
         }
-        // 확정 간선은 impl이 선언된 모듈이 소유한다 — 의존이 실제로 나가는 곳이다. 선언 메서드가
-        // 소유하면 트레이트 모듈에서 impl 모듈로 가는 거짓 의존이 규칙 위반·순환으로 보였다.
-        body.id = body.module.clone();
-        bodies.push(body);
     }
     for span in &mut item_spans {
         let module = span
