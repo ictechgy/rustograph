@@ -141,7 +141,16 @@ can have more vertices and edges than before:
   declaration and the glob's target carries no `#[cfg]` of its own; its edge
   then carries the negated condition (`not (unix)`). With several gated
   declarations (`#[cfg(unix)] fn sys` and `#[cfg(not(unix))] fn sys`) the
-  glob name may be hidden in every build, so it is not an alternative. An impl
+  glob name may be hidden in every build, so it is not an alternative; nor is
+  a glob whose own condition implies the item's (it is visible only where the
+  item exists), or one that a conditional explicit `use` in the same slot
+  hides wherever the item is absent. An edge through an alternative whose
+  condition contradicts, letter for letter, the condition of its use site,
+  source item or that item's modules (`unix` beside `not (unix)`; inside
+  tokio's `#[cfg(all(test, loom))] mod mocked`, an edge to the
+  `not(all(test, loom))` side) exists in no build: it is left out and counted
+  in an "edges were left out because their #[cfg] conditions contradict"
+  limitation. Before, such edges made false cycles. An impl
   whose self type is such a split import (`impl Sys { .. }`) is harvested once
   per alternative: its method vertices sit under each alternative type with
   that import's condition. An impl whose trait path is split
@@ -160,14 +169,19 @@ can have more vertices and edges than before:
   false confirmed `call` to the crate-root `foo::bar`, which rustc warns is
   never used; an item kept alive only by that edge is now reported by `dead`.
   Edition-2015 crates are left out: their `use` paths are crate-relative,
-  which this resolver does not model, so the target taken back may be the
-  right one there; they keep both targets and a limitation counts them. None
+  and this resolver uses edition-2018 rules, so the target taken back may be
+  the right one there. An "edition-2015 crates have `use` paths that edition
+  2015 resolves from the crate root" limitation counts every edition-2015
+  crate whose non-root modules have a `use` path starting with a name the
+  crate root declares; `dead` may report items used only through such paths,
+  as it did before. None
   of the seventeen corpus crates below needed the extra rebuild.
 - Over seventeen crates (syn, tokio, regex-syntax, ra_ap_hir_def,
   ra_ap_hir_ty, rowan, serde, serde_derive, clap_builder, zerocopy, rustix,
   mio, getrandom, parking_lot_core, crossbeam-utils, hashbrown and
-  rustograph itself), the graph lost no edge and no vertex ID changed; it
-  gained 92 edges and put a condition on 342 edges that had none;
+  rustograph itself), no vertex ID changed; the graph lost only six tokio
+  edges that exist in no build (their condition contradicts their source
+  module's), gained 64 edges and put a condition on 339 edges that had none;
   `dead --retain-public` reports 13 fewer items and none new.
 - A path in an attribute, a derive list or a macro call resolves in the macro
   namespace. A cross-crate `#[derive(pm::Hello)]` now points at the
@@ -238,8 +252,8 @@ alike. Add the new fields, or end such patterns with `..`.
   `local_alternatives` (the imports a gated local item stands aside for in
   builds without it). `modtree::ModTree` adds `edition_2015` (crate roots of
   edition-2015 targets, filled by the caller), `stale_import_modules` and
-  `edition_2015_kept` (what `fill_imports_settled` left; the source harvest
-  turns both into limitations). `modtree::Module` and `modtree::ModTree` now
+  `edition_2015_crate_relative` (what `fill_imports_settled` found; the source
+  harvest turns both into limitations). `modtree::cfg_contradicts` is new. `modtree::Module` and `modtree::ModTree` now
   derive `Clone` (additive). `cargo_meta::Target` adds `edition`.
   `harvest::impls` returns one set of method vertices per alternative when an
   impl's self type is a `#[cfg]`-split import.

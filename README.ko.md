@@ -101,7 +101,8 @@ rustograph impact --format language-traversal --roots-from schema-facts.json  # 
 자기 `#[cfg]`를 단 `use` 옆의 같은 이름 글롭(글롭의 조건이 그 `use`의 조건을 함축하지 않으면 가리지 않습니다),
 `#[cfg]`를 단 로컬 아이템·`mod` 옆의 같은 이름 명시 `use`(글롭 이름은 아이템의 선언이 하나일 때만 — 간선은 그 조건의
 부정을 답니다), 그런 갈린 임포트를 self 타입이나 트레이트 경로로 쓴 impl(메서드 정점이 대안 self 타입마다 생기고 대안
-트레이트마다 implements 간선이 생깁니다)도 같습니다.
+트레이트마다 implements 간선이 생깁니다)도 같습니다. 조건이 쓰는 자리나 출발 아이템의 모듈 조건과 글자로 모순인 간선
+(`unix`와 `not (unix)`)은 어느 빌드에도 없어 빼고 그 수를 limitation으로 셉니다.
 `unsafe`는 경계를 표시합니다 — `unsafe fn`/`unsafe trait`이거나
 `unsafe {}` 블록을 품은 정점에 `unsafe: true`, `unsafe {}` 안에서 만든
 간선은 경계 진입 간선입니다. 구성원이 한 모듈과 그 자손뿐인 모듈 레벨 순환(부모가

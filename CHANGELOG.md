@@ -13,7 +13,8 @@
 크레이트의 비공개 struct)과, 다른 이름공간의 로컬 아이템이나 임포트로 가던 값·타입 경로(글롭이 들인 `fn Foo` 옆
 `use crate::types::Foo`(이름 있는 struct)의 `Foo()`는 이제 fn이다), 임포트 표가 수렴하는 동안 거둬진 앞 바퀴의
 대상(rustc가 쓰이지 않는다고 경고하는 정점으로 가던 거짓 간선)이다. 반례 말뭉치(크레이트 10개와 zerocopy 0.8.50,
-대안 임포트·조건 전파는 크레이트 17개)에서 사라진 간선은 없다. Rust 라이브러리 호출자를 깨는 변경은 공개 구조체
+대안 임포트·조건 전파는 크레이트 17개)에서 사라진 간선은 어느 빌드에도 없는 tokio 간선 6개(조건이 출발 모듈의 조건과
+모순)뿐이다. Rust 라이브러리 호출자를 깨는 변경은 공개 구조체
 필드 추가, `modtree::Module::imports`의 타입 변경(`Binding::Alternatives` 포함), `modtree::Module::unresolved_imports`
 제거다([0.8 migration](docs/MIGRATING-0.8.md)). CLI 플래그·기본값, 그래프 문서 v1, 순회 문서 v1은 그대로다.
 
@@ -101,7 +102,13 @@
   기본 빌드에서 쓰이는 `scalar::sum`·`other::f`가 `dead`에 나왔다). 글롭 이름은 로컬 아이템 옆에 합법적으로 있으면서
   가려지기만 하므로, 아이템의 선언이 하나이고 글롭 대상이 스스로 조건부가 아닐 때만 그 조건의 부정(`not (..)`)을 달고
   대안이다 — `#[cfg(unix)] fn sys`와 `#[cfg(not(unix))] fn sys`처럼 선언이 여럿이면 모든 빌드를 덮을 수 있어 대안이
-  아니다. 그런 대안 임포트를 self 타입으로 쓴 impl(`impl Sys { .. }`)은 대안마다 수확해 메서드 정점이 대안 타입 아래에
+  아니다. 글롭이 보이는 빌드에 늘 아이템이 있거나(같은 `#[cfg(feature = "x")]`) 아이템이 없는 빌드에서 같은 칸의 명시
+  `use`가 글롭을 가리면(`#[cfg(not(unix))] use crate::b::sys;` 옆 `#[cfg(unix)] fn sys`) 역시 대안이 아니다. 대안을 거친
+  간선의 조건이 쓰는 자리·출발 아이템·그 조상 모듈의 조건과 글자로 모순이면(`#[cfg(unix)] fn run`이
+  `#[cfg(not(unix))] use crate::plat::sys;`를 거침, tokio의 `#[cfg(all(test, loom))] mod mocked` 안에서
+  `not(all(test, loom))` 쪽으로 가는 간선) 어느 빌드에도 없는 간선이라 지우고 그 수를 limitation("edges were left out
+  because their #[cfg] conditions contradict ...")으로 싣는다 — 지우지 않으면 거짓 순환이 됐다(tokio module 레벨 순환이
+  9a79ce5와 같은 1로 돌아왔다). 그런 대안 임포트를 self 타입으로 쓴 impl(`impl Sys { .. }`)은 대안마다 수확해 메서드 정점이 대안 타입 아래에
   그 임포트의 조건을 달고 생기고, 트레이트 경로로 쓴 impl(`impl plat::Tr for X`)은 대안마다 implements 간선을 낸다
   — 하나만 이으면 다른 빌드의 메서드·트레이트가 거짓 unreachable이었다(`--target` 리눅스가 리눅스에서 쓰이는 것을
   냈다). routes는 아직 대상 하나다.
@@ -111,8 +118,10 @@
   수를 "may keep stale re-export targets" limitation으로 싣는다). 거둔 대상이 서로를 글롭으로 들이는 모듈 사이에 남아
   거짓 확정 간선(rustc가 쓰이지 않는다고 경고하는 루트의 `foo::bar`로 가는 call)이 되던 것을 고쳤다 — 그 거짓
   간선으로만 살아 있던 아이템은 이제 `dead`에 나온다. 2015 판 크레이트에서는 거두지 않는다 — 그 판의 `use` 경로는
-  크레이트 기준이라 거둔 쪽이 제 대상일 수 있는데 이 해석기는 그것을 모델하지 않는다. 그런 크레이트 수를 limitation으로
-  싣는다. 반례 말뭉치 17개에서는 다시 쌓은 크레이트가 없다.
+  크레이트 기준이라 거둔 쪽이 제 대상일 수 있는데 이 해석기는 2018 판 규칙으로 푼다. 루트가 아닌 모듈의 `use` 경로가
+  크레이트 루트가 선언한 이름으로 시작하는 2015 판 크레이트를 세어 "edition-2015 crates have `use` paths that edition
+  2015 resolves from the crate root ..." limitation으로 싣는다(그 경로로만 쓰는 아이템을 `dead`가 낼 수 있다 —
+  9a79ce5부터 그랬고 이제 알린다). 반례 말뭉치 17개에서는 다시 쌓은 크레이트가 없다.
 - 조건부 `use`·재노출·글롭을 거쳐 해석한 간선이 그 `#[cfg]`를 싣는다 — 본문(호출·참조·구조체 리터럴·매크로)·시그니처·
   필드 타입·속성 간선과, 조건부 재노출을 `use`한 모듈의 `uses` 간선이다. `#[cfg(feature = "pl")] use
   crate::pl::Condvar;` 옆의 `Condvar::new()`는 `feature = "pl"` 아래의 `call`이고, `#[cfg(test)] use crate::fake::Clock;`
