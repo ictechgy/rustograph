@@ -1095,7 +1095,7 @@ fn derive_path_keeps_the_same_named_trait_as_a_tentative_edge() {
 
 /// 본문의 매크로 호출도 같다 — `use crate::logging::info`(워크스페이스 매크로) 옆에 로컬 `fn info`가 있으면
 /// `info!()`의 확정 간선은 rustc가 고르는 매크로이고, 자리를 모르는 해석의 대상(로컬 fn — 이름공간을 나누기 전의
-/// 대상)은 추정 간선으로 남는다. `use log::info`처럼 그래프 밖 매크로면 로컬 fn이 그대로 확정 대상이다. 그 fn은
+/// 대상)은 추정 간선으로 남는다. 그래프 밖 매크로(`use log::info`)도 같다 — 다음 테스트. 그 fn은
 /// rustc로는 쓰이지 않지만(미사용 경고), 이 경로로만 살아 있던 아이템을 새로 unreachable로 내지 않는 쪽을
 /// 고른다(보존을 좁히지 않는다). (cargo check 통과 — `a::info` 미사용 경고)
 #[test]
@@ -1139,6 +1139,50 @@ fn main() { a::go(); }
         &analysis::dead(&doc).unwrap(),
         &["macrohedge::logging::info", "macrohedge::a::info"],
     );
+}
+
+/// 매크로를 그래프 밖에서 들여도(`use std::println;` — `use log::info`와 같은 모양) 같은 이름의 로컬 `fn println`은
+/// 매크로 호출의 확정 대상이 아니다 — 로컬 fn은 매크로가 될 수 없으니 매크로 자리의 후보는 그 `use`뿐이다.
+/// 예전에는 로컬 fn으로 가는 확정 call 간선이 생겨, 그 fn이 `go()`를 부르면 `cycles --level symbol --strict`가
+/// 거짓 순환 `go → println`으로 실패했다(rustc는 `a::println`을 미사용으로 경고한다). 로컬 fn은 추정 간선으로
+/// 남아 보존은 그대로다. (cargo check 통과 — `a::println` 미사용 경고)
+#[test]
+fn external_macro_import_beats_a_same_named_local_fn_in_macro_position() {
+    let ws = Workspace::new(
+        "extmacro",
+        &[
+            ("Cargo.toml", &manifest("extmacro")),
+            (
+                "src/main.rs",
+                r#"
+mod a {
+    use std::println;
+    pub fn println() {
+        go();
+    }
+    pub fn go() {
+        println!("x");
+    }
+}
+fn main() { a::go(); }
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    let call = doc
+        .edges
+        .iter()
+        .find(|e| {
+            e.from == "extmacro::a::go"
+                && e.to == "extmacro::a::println"
+                && e.kind == EdgeKind::Call
+        })
+        .expect("same-named fn edge");
+    assert!(call.tentative);
+    let cycles = analysis::cycles(&doc);
+    assert!(cycles.cycles.is_empty(), "{:?}", cycles.cycles);
+    assert_not_reported(&analysis::dead(&doc).unwrap(), &["extmacro::a::println"]);
 }
 
 /// 함수 안 `impl`·`trait`의 메서드 매개변수는 그 본문에서 같은 이름의 아이템을 가린다 — 묶지 않으면

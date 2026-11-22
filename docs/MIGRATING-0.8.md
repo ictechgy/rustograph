@@ -4,7 +4,7 @@ These notes cover changes on `main` after the v0.7.0 release. They have not
 shipped in a release yet; confirm the matching tag and assets on GitHub
 Releases before relying on them. CLI flags and defaults, graph document v1 and
 language-traversal v1 stay compatible: no document field is renamed or
-removed. The graph built from the same source changes in three ways:
+removed. The graph built from the same source changes in four ways:
 
 - Edges, retention roots and limitation lines are added (most of the list
   below).
@@ -13,9 +13,10 @@ removed. The graph built from the same source changes in three ways:
   derive list that has two or more segments, every item-position macro call
   (`dep::mac!();`), and a macro call in a body whose name is also a local
   item (`info!()` beside `fn info` and `use crate::logging::info`) now point
-  at the macro rustc picks. The body macro call moves only when its import
-  resolves to a workspace macro: beside `use log::info`, a macro outside the
-  graph, the local `fn info` stays the confirmed target, as before. The
+  at the macro rustc picks. Beside `use log::info`, a macro outside the
+  graph, the local `fn info` is no longer the confirmed target either: the
+  call has no confirmed workspace edge (with `--deps`, a `references` edge to
+  the `log` crate vertex). The
   target of position-agnostic resolution, usually the vertex the path pointed
   at before, keeps a `tentative` edge when it is visible from that module, so
   `dead` reports nothing new for it, while `cycles` and `rules` now see the
@@ -24,7 +25,11 @@ removed. The graph built from the same source changes in three ways:
   namespaces (`fn harvest` beside `use crate::harvest`) also resolves in its
   own namespace. A glob `use a::b::*` whose `b` names both a function and a
   module now targets the module.
-- Retention narrows in two places, both following rustc. A derive or
+- Some confirmed edges gain a `cfg`: a path that resolves through a
+  `#[cfg]`-gated `use`, re-export or glob carries that condition, so
+  `--target` and `--exclude-tests` drop the edge where the import does not
+  exist. Without those flags the edge stays, as before.
+- Retention narrows in three places, all following rustc. A derive or
   attribute path into another crate whose old target is not visible from
   the referencing module (a private struct of a proc-macro crate, which a
   proc-macro crate cannot export) gets no tentative edge, so such a struct
@@ -32,7 +37,10 @@ removed. The graph built from the same source changes in three ways:
   that used to resolve to a local item or an import of another namespace has
   no tentative edge either: beside a glob that brings `fn Foo`,
   `use crate::types::Foo` (a struct with named fields) no longer makes
-  `Foo()` a use of the struct, which `dead` can now report. Over ten crates (syn, tokio, regex-syntax, ra_ap_hir_def,
+  `Foo()` a use of the struct, which `dead` can now report. A target left over
+  from an early import pass, which the settled tables no longer hold, no
+  longer keeps the vertex it named alive (see the graph results below). Over
+  ten crates (syn, tokio, regex-syntax, ra_ap_hir_def,
   ra_ap_hir_ty, rowan, serde, serde_derive, clap, rustograph itself) and
   zerocopy 0.8.50, the symbol graph harvested after the namespace change lost
   no edge that the graph harvested before it had.
@@ -81,8 +89,100 @@ can have more vertices and edges than before:
   beside `#[cfg(not(feature = "pl"))] use std::sync::Condvar;`) share one
   namespace, so the rustc rule above does not cover them; the workspace side
   now wins whatever the source order (before, the later `use` won). Edges
-  from bodies that use the name (`Condvar::new()`) still do not carry the
-  import's `#[cfg]`; only the module's `uses` edge does.
+  from bodies that use the name (`Condvar::new()`) carry the import's
+  `#[cfg]`, like the module's `uses` edge (see below). In a macro position the
+  rule turns around: a local function or trait, or an import whose namespace
+  is known to be type or value, cannot be a macro, so such a `use` is the only
+  candidate. `info!()` beside `fn info` and `use log::info` no longer makes a
+  confirmed `call` edge to `fn info` (rustc warns that `fn info` is never
+  used); the function keeps a `tentative` edge, so `dead` is unchanged, and a
+  false symbol-level cycle through it (`fn info` calling back into the caller)
+  is gone.
+- Two imports that bind one name in one namespace to different vertices both
+  stay. rustc never lets two explicit `use`s (E0252) or two globs (E0659 on
+  use) share a name in one build, so they belong to builds that `#[cfg]`
+  keeps apart: `#[cfg(unix)] use crate::unix::Sys;` beside
+  `#[cfg(windows)] use crate::windows::Sys;`, two platform globs, or
+  `#[cfg(..)] use linux as platform;` beside `#[cfg(..)] use bsd as
+  platform;`. Before, the later `use` won and the other build's target lost
+  its edges; rustix 1.1.5 reported its Linux `ioctl::linux::compose_opcode`
+  and ten constants as unreachable. Now a path through the name gets an edge
+  to every alternative, each under its own condition, and `--target` and
+  `--exclude-tests` drop the edges whose import does not exist in that build.
+  Several `use Trait as _` in one module, which bind no name, all stay as the
+  module's `uses` evidence, whether written there or brought in by a glob
+  (syn 2.0.119's `syn::error` lost `PunctExt` that way). Two `use`s of the
+  same vertex merge to the weaker condition, as two such globs already did.
+  When an import that resolves and one that does not (a std path) bind the
+  same slot, the one that resolves stays whatever the source order: before,
+  `#[cfg(not(..))] use std::sync::Mutex;` after
+  `#[cfg(feature = "pl")] use extdep::Mutex;` erased the evidence that the
+  crate uses `extdep`, and `deps` reported it unused.
+- The same holds when `#[cfg]` splits a name between a `use` and another
+  binding. An explicit `use` that carries its own `#[cfg]` no longer hides a
+  glob import of the same name: in builds without the condition the glob's
+  name is visible. `f()` beside `use a::*;` and `#[cfg(test)] use a::f;` is an
+  unconditional edge, and `Clock::now()` beside `use real::*;` and
+  `#[cfg(test)] use mock::Clock;` reaches both clocks; before, `dead` reported
+  `real::Clock::now`. A glob import whose own condition implies the `use`'s
+  condition (`#[cfg(feature = "x")] use a::*;` beside
+  `#[cfg(feature = "x")] use b::f;`) is always hidden, as before. The glob
+  side keeps its own condition (no negation of the `use`'s condition is added,
+  so that edge also stays in the `use`'s own build). A local item whose every
+  declaration carries `#[cfg]`, `#[cfg] mod` included, and an explicit `use`
+  of the same name in the same namespace are alternatives:
+  `#[cfg(feature = "x")] fn sum()` beside
+  `#[cfg(not(feature = "x"))] use scalar::sum;` makes `sum()` reach both, and
+  `#[cfg(feature = "x")] mod imp` beside
+  `#[cfg(not(..))] use crate::other as imp;` makes `imp::f()` reach both;
+  before, only the local item, and `dead` reported `scalar::sum` and
+  `other::f`. A glob name can legally sit beside a local item and is only
+  hidden by it, so it is an alternative only when the item has a single
+  declaration and the glob's target carries no `#[cfg]` of its own; its edge
+  then carries the negated condition (`not (unix)`). With several gated
+  declarations (`#[cfg(unix)] fn sys` and `#[cfg(not(unix))] fn sys`) the
+  glob name may be hidden in every build, so it is not an alternative; nor is
+  a glob whose own condition implies the item's (it is visible only where the
+  item exists), or one that a conditional explicit `use` in the same slot
+  hides wherever the item is absent. An edge through an alternative whose
+  condition contradicts, letter for letter, the condition of its use site,
+  source item or that item's modules (`unix` beside `not (unix)`; inside
+  tokio's `#[cfg(all(test, loom))] mod mocked`, an edge to the
+  `not(all(test, loom))` side) exists in no build: it is left out and counted
+  in an "edges were left out because their #[cfg] conditions contradict"
+  limitation. Before, such edges made false cycles. An impl
+  whose self type is such a split import (`impl Sys { .. }`) is harvested once
+  per alternative: its method vertices sit under each alternative type with
+  that import's condition. An impl whose trait path is split
+  (`impl plat::Tr for X`) gets one `implements` edge per alternative; method
+  IDs use the trait's last segment and do not change. Route handlers still
+  resolve to one target.
+- While the import tables settle, a target that an early pass resolved and a
+  later pass took back (`pub use foo::bar` read through the crate-root
+  fallback before the module's own glob was expanded) no longer survives
+  between modules that glob each other: when a pass takes a target back, the
+  tables are rebuilt from empty, resolving explicit `use`s and glob paths
+  against the settled tables, and then settle once more against the rebuilt
+  tables; a re-export chain that still takes a target back is rebuilt again,
+  up to 32 times, after which the modules that still do are counted in a "may
+  keep stale re-export targets" limitation. The stale target used to give a
+  false confirmed `call` to the crate-root `foo::bar`, which rustc warns is
+  never used; an item kept alive only by that edge is now reported by `dead`.
+  Edition-2015 crates are left out: their `use` paths are crate-relative,
+  and this resolver uses edition-2018 rules, so the target taken back may be
+  the right one there. An "edition-2015 crates have `use` paths that edition
+  2015 resolves from the crate root" limitation counts every edition-2015
+  crate whose non-root modules have a `use` path starting with a name the
+  crate root declares; `dead` may report items used only through such paths,
+  as it did before. None
+  of the seventeen corpus crates below needed the extra rebuild.
+- Over seventeen crates (syn, tokio, regex-syntax, ra_ap_hir_def,
+  ra_ap_hir_ty, rowan, serde, serde_derive, clap_builder, zerocopy, rustix,
+  mio, getrandom, parking_lot_core, crossbeam-utils, hashbrown and
+  rustograph itself), no vertex ID changed; the graph lost only six tokio
+  edges that exist in no build (their condition contradicts their source
+  module's), gained 64 edges and put a condition on 339 edges that had none;
+  `dead --retain-public` reports 13 fewer items and none new.
 - A path in an attribute, a derive list or a macro call resolves in the macro
   namespace. A cross-crate `#[derive(pm::Hello)]` now points at the
   `#[proc_macro_derive(Hello)]` function even when the proc-macro crate also
@@ -93,7 +193,7 @@ can have more vertices and edges than before:
   the path without a namespace reaches another vertex visible from the
   referencing module (a trait `Hello` that `mylib` exports beside
   `pub use mylib_derive::Hello`, a local `fn info` beside an imported
-  workspace `info!`), that vertex keeps a `tentative` edge.
+  `info!`), that vertex keeps a `tentative` edge.
 
 Expect `dead` to report fewer unreachable items, `rules` to see dependencies
 that a field type or a foreign-type impl body carried, and module- and
@@ -134,7 +234,12 @@ alike. Add the new fields, or end such patterns with `..`.
   `BTreeMap<String, PerNs<Binding>>`: each name maps to one binding per
   namespace (`types`, `values`, `macros`) plus `undetermined`, the binding of
   an explicit `use` whose namespace the item tables cannot tell. A binding is
-  either `Binding::Resolved(Import)` or `Binding::Unresolved(Scope)`.
+  `Binding::Resolved(Import)`, `Binding::Alternatives(Vec<Import>)` (two or
+  more imports of different vertices that `#[cfg]` keeps apart; the first is
+  the later one in source order), or `Binding::Unresolved(Scope)`.
+  `Binding::imports` returns the resolved imports of any of them, so match on
+  it rather than on the variants. `Import::cfg` now also carries the
+  conditions of the re-exports an explicit `use` resolved through.
   `modtree::Module::unresolved_imports` is removed; its entries are the
   `Binding::Unresolved` slots, usually `undetermined`. Read a name's binding
   in one namespace with `module.imports.get(name).and_then(|b| b.get(Ns::Value))`
@@ -142,6 +247,16 @@ alike. Add the new fields, or end such patterns with `..`.
   namespaces that are known, or `PerNs::bound` for every binding including
   `undetermined`. `modtree::Ns`, `modtree::PerNs` and `modtree::Binding` are
   new public types.
+- `modtree::Module` adds `cfg_gated` (name → namespace → the `#[cfg]` of
+  each declaration, present only when every declaration carries one) and
+  `local_alternatives` (the imports a gated local item stands aside for in
+  builds without it). `modtree::ModTree` adds `edition_2015` (crate roots of
+  edition-2015 targets, filled by the caller), `stale_import_modules` and
+  `edition_2015_crate_relative` (what `fill_imports_settled` found; the source
+  harvest turns both into limitations). `modtree::cfg_contradicts` is new. `modtree::Module` and `modtree::ModTree` now
+  derive `Clone` (additive). `cargo_meta::Target` adds `edition`.
+  `harvest::impls` returns one set of method vertices per alternative when an
+  impl's self type is a `#[cfg]`-split import.
 - `modtree::Module` adds `macro_items` (named `macro_rules!` items), and
   `value_items` now also holds tuple and unit structs, whose constructors live
   in the value namespace. Build modules with `Module::new`.
@@ -150,5 +265,12 @@ alike. Add the new fields, or end such patterns with `..`.
   `Ns::Value` for calls and value paths, `Ns::Macro` for macro calls and
   attributes). `resolve` keeps its signature and resolves without knowing the
   position.
+- `modtree::ModTree::resolve_all` and `modtree::Resolved` are new:
+  `resolve_all(from, segs, deps, ns)` returns every vertex a path names
+  across builds, one per `#[cfg]`-split alternative, each with the `cfg` of
+  the imports it went through. `resolve` and `resolve_in` keep their
+  signatures and return the first of those targets; build edges from
+  `resolve_all` so that other builds' targets keep their edges.
+  `modtree::with_import_cfg` joins such a `cfg` to an edge's own condition.
 - `modtree::ModTree::visible_from` is new: whether a module or item vertex is
   visible from a module, by its declared visibility only.

@@ -7,7 +7,7 @@
 
 use crate::fanout::{self, Fanned};
 use crate::graph::{Edge, EdgeKind, Kind, Vertex};
-use crate::modtree::{cfg_of, crate_of, DepCrates, ModTree, Ns};
+use crate::modtree::{cfg_of, crate_of, with_import_cfg, DepCrates, ModTree, Ns, Resolved};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use syn::parse::Parser;
@@ -583,127 +583,195 @@ pub(crate) fn impls_with_identities<'a>(
     harvest: &mut Harvest,
     identities: &mut identity::Registry,
 ) -> ImplParts<'a> {
-    let mut vertices = Vec::new();
-    let mut edges = Vec::new();
-    let mut attr_refs = Vec::new();
-    let mut bodies = Vec::new();
-    let mut entry_roots = Vec::new();
-    let mut foreign_bodies = Vec::new();
+    let mut parts = ImplParts {
+        vertices: Vec::new(),
+        edges: Vec::new(),
+        attr_refs: Vec::new(),
+        bodies: Vec::new(),
+        entry_roots: Vec::new(),
+        foreign_bodies: Vec::new(),
+    };
     for b in blocks {
-        // self 타입을 해석한다 — 모듈 로컬이면 정점이 있다.
-        let Some(self_id) =
-            tree.resolve_in(&b.items_module, &b.self_ty, &DepCrates::new(), Ns::Type)
-        else {
+        // self 타입을 해석한다 — 모듈 로컬이면 정점이 있다. `#[cfg]`로 갈린 대안 임포트(`#[cfg(unix)] use
+        // unix_impl::Sys;`와 windows 쪽 옆의 `impl Sys {..}`)면 그 impl은 빌드마다 다른 타입의 것이라 대안마다 한 번씩
+        // 수확한다 — 메서드 정점은 그 대안 타입 아래이고 조건은 impl의 것과 그 임포트의 것이다. 하나만 수확하면
+        // (예전에는 뒤의 `use`) 다른 빌드에서 쓰이는 메서드가 `--target`에서 거짓 unreachable이 됐다.
+        let selves = tree.resolve_all(
+            &b.items_module,
+            &b.self_ty,
+            &DepCrates::new(),
+            Some(Ns::Type),
+        );
+        if selves.is_empty() {
             harvest.unresolved_paths += 1;
             harvest.foreign_self_impls += 1;
-            foreign_bodies.extend(foreign_impl_bodies(
+            parts.foreign_bodies.extend(foreign_impl_bodies(
                 b,
                 tree,
                 methods,
                 harvest,
-                &mut attr_refs,
+                &mut parts.attr_refs,
             ));
             continue;
-        };
-        if let Some(tp) = &b.trait_path {
-            if let Some(trait_id) =
-                tree.resolve_in(&b.items_module, tp, &DepCrates::new(), Ns::Type)
-            {
-                // unsafe impl의 implements는 경계의 일부다.
-                let mut e = Edge::new(self_id.clone(), trait_id.clone(), EdgeKind::Implements);
-                e.cfg = b.cfg.clone();
-                e.unsafe_ = b.unsafe_;
-                edges.push(e);
-            } else {
-                harvest.unresolved_paths += 1;
-            }
         }
-        for &m in &b.methods {
-            let own_cfg = cfg_of(&m.attrs);
-            harvest.cfg_items += usize::from(own_cfg.is_some());
-            let mcfg = match own_cfg {
-                Some(ref condition) => conjoin(&b.cfg, condition),
-                None => b.cfg.clone(),
-            };
-            // 트레이트 impl 메서드는 `Type::<Trait>::m` — 고유 선언과 충돌 안 함.
-            let mid = match &b.trait_path {
-                Some(tp) => {
-                    let tname = tp.last().cloned().unwrap_or_default();
-                    format!("{self_id}::<{tname}>::{}", m.sig.ident)
+        let split = selves.len() > 1;
+        for (i, self_res) in selves.into_iter().enumerate() {
+            let site = if split {
+                ImplSite {
+                    self_ty: canonical_path(&self_res.target, &b.items_module),
+                    cfg: with_import_cfg(&b.cfg, &self_res.cfg),
+                    self_id: self_res.target,
+                    first: i == 0,
                 }
-                None => format!("{self_id}::{}", m.sig.ident),
+            } else {
+                ImplSite {
+                    self_ty: b.self_ty.clone(),
+                    cfg: b.cfg.clone(),
+                    self_id: self_res.target,
+                    first: true,
+                }
             };
-            let body = Body::Stmts(&m.block.stmts);
-            // unsafe impl의 메서드, unsafe fn 메서드, unsafe 본문 모두 경계다.
-            let unsafe_ = b.unsafe_ || m.sig.unsafety.is_some() || body_has_unsafe(body);
-            vertices.push(Vertex {
-                id: mid.clone(),
-                kind: Kind::Method,
-                krate: krate.to_string(),
-                module: b.items_module.clone(),
-                position: Some(format!("{}:{}", b.file.display(), line_of(&m.sig.ident))),
-                exported: matches!(m.vis, syn::Visibility::Public(_)),
-                generated: b.generated,
-                cfg: mcfg.clone(),
-                unsafe_,
-            });
-            identities.note(
-                vertices.last().expect("method vertex was just inserted"),
-                &b.file,
-                m.span().byte_range().start,
-            );
-            if is_extern_entry(&m.attrs) {
-                entry_roots.push(mid.clone());
-                identities.note_root(
-                    &mid,
-                    &b.items_module,
-                    false,
-                    &b.file,
-                    m.span().byte_range().start,
-                );
+            impl_block_parts(b, &site, krate, tree, harvest, identities, &mut parts);
+        }
+    }
+    parts
+}
+
+/// impl 블록 하나를 self 타입 하나로 수확하는 자리 — `#[cfg]`로 갈린 대안 self 타입이면 대안마다 하나다.
+struct ImplSite {
+    /// self 타입 정점 ID.
+    self_id: String,
+    /// 본문의 `Self`가 가리키는 경로 — 대안이면 그 정점의 정규 경로다(소스 경로는 대안 모두로 풀린다).
+    self_ty: Vec<String>,
+    /// impl의 `#[cfg]`와 그 self 타입에 닿은 임포트의 조건을 합친 것.
+    cfg: Option<String>,
+    /// 이 블록의 첫 자리인가 — 수확 계수(cfg 아이템·미해석 경로)는 블록마다 한 번만 센다.
+    first: bool,
+}
+
+/// 정점 ID `target`을 모듈 `from`에서 다시 해석되는 경로로 — 같은 크레이트면 `crate::..`, 아니면 크레이트 루트
+/// 이름부터다(다른 워크스페이스 크레이트 루트로 걷는 해석이 받는다).
+fn canonical_path(target: &str, from: &str) -> Vec<String> {
+    let mut segs: Vec<String> = target.split("::").map(str::to_string).collect();
+    if segs.first().is_some_and(|root| *root == crate_of(from)) {
+        segs[0] = "crate".to_string();
+    }
+    segs
+}
+
+/// impl 블록 `b`를 자리 `site`의 self 타입으로 수확해 `parts`에 더한다 — implements 간선, 메서드 정점·contains 간선,
+/// 메서드 속성 참조, 본문.
+fn impl_block_parts<'a>(
+    b: &ImplBlock<'a>,
+    site: &ImplSite,
+    krate: &str,
+    tree: &ModTree,
+    harvest: &mut Harvest,
+    identities: &mut identity::Registry,
+    parts: &mut ImplParts<'a>,
+) {
+    let self_id = &site.self_id;
+    if let Some(tp) = &b.trait_path {
+        // 트레이트 경로가 `#[cfg]`로 갈린 대안 임포트를 지나면(`#[cfg(unix)] use unix_impl as plat;`와 windows 쪽 옆의
+        // `impl plat::Tr for X`) 대안마다 implements 간선이고 그 임포트의 조건을 싣는다 — 하나만 이으면 다른 빌드의
+        // 트레이트가 거짓 unreachable이었다. 메서드 ID는 트레이트 경로의 마지막 세그먼트만 쓰니 그대로다.
+        let traits = tree.resolve_all(&b.items_module, tp, &DepCrates::new(), Some(Ns::Type));
+        if traits.is_empty() && site.first {
+            harvest.unresolved_paths += 1;
+        }
+        for trait_res in traits {
+            // unsafe impl의 implements는 경계의 일부다.
+            let mut e = Edge::new(self_id.clone(), trait_res.target, EdgeKind::Implements);
+            e.cfg = with_import_cfg(&site.cfg, &trait_res.cfg);
+            e.unsafe_ = b.unsafe_;
+            parts.edges.push(e);
+        }
+    }
+    for &m in &b.methods {
+        let own_cfg = cfg_of(&m.attrs);
+        if site.first {
+            harvest.cfg_items += usize::from(own_cfg.is_some());
+        }
+        let mcfg = match own_cfg {
+            Some(ref condition) => conjoin(&site.cfg, condition),
+            None => site.cfg.clone(),
+        };
+        // 트레이트 impl 메서드는 `Type::<Trait>::m` — 고유 선언과 충돌 안 함.
+        let mid = match &b.trait_path {
+            Some(tp) => {
+                let tname = tp.last().cloned().unwrap_or_default();
+                format!("{self_id}::<{tname}>::{}", m.sig.ident)
             }
-            let mut contains = Edge::new(self_id.clone(), mid.clone(), EdgeKind::Contains);
-            contains.cfg = mcfg.clone();
-            contains.unsafe_ = b.unsafe_;
-            edges.push(contains);
-            // 메서드 속성의 경로 참조 — #[dep::attr] fn m()도 사용 증거다.
-            // impl과 메서드 자신의 cfg를 둘 다 물린다 — 둘 다 성립해야
-            // 이 참조가 존재한다.
-            let first_attr = attr_refs.len();
-            harvest.unparsed_attrs += collect_attr_refs(
-                &m.attrs,
+            None => format!("{self_id}::{}", m.sig.ident),
+        };
+        let body = Body::Stmts(&m.block.stmts);
+        // unsafe impl의 메서드, unsafe fn 메서드, unsafe 본문 모두 경계다.
+        let unsafe_ = b.unsafe_ || m.sig.unsafety.is_some() || body_has_unsafe(body);
+        parts.vertices.push(Vertex {
+            id: mid.clone(),
+            kind: Kind::Method,
+            krate: krate.to_string(),
+            module: b.items_module.clone(),
+            position: Some(format!("{}:{}", b.file.display(), line_of(&m.sig.ident))),
+            exported: matches!(m.vis, syn::Visibility::Public(_)),
+            generated: b.generated,
+            cfg: mcfg.clone(),
+            unsafe_,
+        });
+        identities.note(
+            parts
+                .vertices
+                .last()
+                .expect("method vertex was just inserted"),
+            &b.file,
+            m.span().byte_range().start,
+        );
+        if is_extern_entry(&m.attrs) {
+            parts.entry_roots.push(mid.clone());
+            identities.note_root(
                 &mid,
                 &b.items_module,
                 false,
-                &mcfg,
-                &mut attr_refs,
-            );
-            identities.note_attrs(
-                &attr_refs[first_attr..],
                 &b.file,
                 m.span().byte_range().start,
             );
-            bodies.push(BodyItem {
-                generic_scopes: generic_scopes([b.generics, &m.sig.generics]),
-                id: mid,
-                module: b.items_module.clone(),
-                self_ty: Some(b.self_ty.clone()),
-                body,
-                params: locals::param_bindings(&m.sig),
-                signature_surface: fn_signature_types(&m.sig),
-                cfg: mcfg,
-                file: b.file.clone(),
-                range: m.span().byte_range(),
-            });
         }
-    }
-    ImplParts {
-        vertices,
-        edges,
-        attr_refs,
-        bodies,
-        entry_roots,
-        foreign_bodies,
+        let mut contains = Edge::new(self_id.clone(), mid.clone(), EdgeKind::Contains);
+        contains.cfg = mcfg.clone();
+        contains.unsafe_ = b.unsafe_;
+        parts.edges.push(contains);
+        // 메서드 속성의 경로 참조 — #[dep::attr] fn m()도 사용 증거다.
+        // impl과 메서드 자신의 cfg를 둘 다 물린다 — 둘 다 성립해야
+        // 이 참조가 존재한다.
+        let first_attr = parts.attr_refs.len();
+        let unparsed = collect_attr_refs(
+            &m.attrs,
+            &mid,
+            &b.items_module,
+            false,
+            &mcfg,
+            &mut parts.attr_refs,
+        );
+        if site.first {
+            harvest.unparsed_attrs += unparsed;
+        }
+        identities.note_attrs(
+            &parts.attr_refs[first_attr..],
+            &b.file,
+            m.span().byte_range().start,
+        );
+        parts.bodies.push(BodyItem {
+            generic_scopes: generic_scopes([b.generics, &m.sig.generics]),
+            id: mid,
+            module: b.items_module.clone(),
+            self_ty: Some(site.self_ty.clone()),
+            body,
+            params: locals::param_bindings(&m.sig),
+            signature_surface: fn_signature_types(&m.sig),
+            cfg: mcfg,
+            file: b.file.clone(),
+            range: m.span().byte_range(),
+        });
     }
 }
 
@@ -803,25 +871,31 @@ pub fn attr_edges(
         // 속성·derive 인자·아이템 위치 매크로 호출의 경로는 매크로 이름공간이다 — proc-macro 크레이트의 같은
         // 이름 비공개 struct가 아니라 derive 등록 이름으로 간다. 자리를 모르는 해석이 다른 정점이면 그쪽은
         // 추정 간선으로 남긴다([`macro_hedge`]).
-        let firm = tree.resolve_in(&r.module, &r.path, dep_crates, Ns::Macro);
-        let any = tree.resolve(&r.module, &r.path, dep_crates);
-        if firm.is_none() && any.is_none() {
+        // `#[cfg]`로 갈린 대안 임포트를 지나면 대안마다 간선이고, 간선은 거쳐 온 임포트의 조건을 함께 싣는다.
+        let firm = tree.resolve_all(&r.module, &r.path, dep_crates, Some(Ns::Macro));
+        let any = tree.resolve_all(&r.module, &r.path, dep_crates, None);
+        if firm.is_empty() && any.is_empty() {
             harvest.unresolved_paths += 1;
         }
-        let hedge = macro_hedge(tree, &r.module, any, firm.as_deref()).filter(|to| to != owner);
-        let firm = firm
-            .filter(|to| to != owner)
-            .map(|to| Edge::new(owner.to_string(), to, EdgeKind::References));
-        let hedge = hedge.map(|to| Edge::maybe(owner.to_string(), to, EdgeKind::References));
-        for mut e in firm.into_iter().chain(hedge) {
-            e.cfg = r.cfg.clone();
+        let hedge = macro_hedge(tree, &r.module, any, &firm);
+        let firm = firm.into_iter().map(|to| (to, false));
+        for (to, tentative) in firm.chain(hedge.into_iter().map(|to| (to, true))) {
+            if to.target == owner {
+                continue;
+            }
+            let mut e = if tentative {
+                Edge::maybe(owner.to_string(), to.target, EdgeKind::References)
+            } else {
+                Edge::new(owner.to_string(), to.target, EdgeKind::References)
+            };
+            e.cfg = with_import_cfg(&r.cfg, &to.cfg);
             edges.push(e);
         }
     }
     edges
 }
 
-/// 모듈 `module`의 매크로 경로에서 매크로 이름공간 해석 `firm`과 자리를 모르는 해석 `any`가 다르면 `any` —
+/// 모듈 `module`의 매크로 경로에서 자리를 모르는 해석 `any`의 대상 가운데 매크로 이름공간 해석 `firm`에 없는 것 —
 /// 대개 이름공간을 나누기 전에 매크로 경로(속성·derive 인자·매크로 호출)가 가던 곳이다(같다는 보장은 없다 — 지금
 /// 모델의 자리 모르는 해석이다). derive 매크로는 대개 같은 이름의 trait을 구현하는 코드를 만들고
 /// (`#[derive(mylib::Hello)]` → `impl mylib::Hello for S`), 그 펼침은 구문 분석에 보이지 않는다. 매크로 이름공간의
@@ -829,14 +903,19 @@ pub fn attr_edges(
 /// 센다)으로 남겨 보존을 좁히지 않는다.
 ///
 /// `module`에서 보이지 않는 `any`(다른 크레이트의 비공개 아이템 — proc-macro 크레이트의 같은 이름 struct)는
-/// 남기지 않는다. 그 모듈의 코드도, 거기서 펼친 매크로 출력도 그 이름을 쓸 수 없다.
+/// 남기지 않는다. 그 모듈의 코드도, 거기서 펼친 매크로 출력도 그 이름을 쓸 수 없다. `#[cfg]`로 갈린 대안 임포트를
+/// 지나면 대상이 여럿일 수 있어 목록으로 받는다.
 fn macro_hedge(
     tree: &ModTree,
     module: &str,
-    any: Option<String>,
-    firm: Option<&str>,
-) -> Option<String> {
-    any.filter(|to| Some(to.as_str()) != firm && tree.visible_from(to, module))
+    any: Vec<Resolved>,
+    firm: &[Resolved],
+) -> Vec<Resolved> {
+    any.into_iter()
+        .filter(|to| {
+            !firm.iter().any(|f| f.target == to.target) && tree.visible_from(&to.target, module)
+        })
+        .collect()
 }
 
 /// 모은 선언 참조([`DeclRef`])를 references 간선으로 해석한다(2패스).
@@ -849,25 +928,29 @@ pub fn decl_edges(refs: &[DeclRef], tree: &ModTree, dep_crates: &DepCrates) -> V
     let mut seen = BTreeSet::new();
     let mut edges = Vec::new();
     for r in refs {
-        // 필드 타입은 타입 이름공간이고, 매크로 본문의 경로(추정)는 자리를 모른다.
-        let to = if r.tentative {
-            tree.resolve(&r.module, &r.path, dep_crates)
-        } else {
-            tree.resolve_in(&r.module, &r.path, dep_crates, Ns::Type)
-        };
-        let Some(to) = to else {
-            continue;
-        };
-        if to == r.owner || !seen.insert((r.owner.as_str(), to.clone(), &r.cfg, r.tentative)) {
-            continue;
+        // 필드 타입은 타입 이름공간이고, 매크로 본문의 경로(추정)는 자리를 모른다. `#[cfg]`로 갈린 대안 임포트를
+        // 지나면 대안마다 간선이고, 간선은 거쳐 온 임포트의 조건을 함께 싣는다.
+        let ns = (!r.tentative).then_some(Ns::Type);
+        for to in tree.resolve_all(&r.module, &r.path, dep_crates, ns) {
+            let cfg = with_import_cfg(&r.cfg, &to.cfg);
+            if to.target == r.owner
+                || !seen.insert((
+                    r.owner.as_str(),
+                    to.target.clone(),
+                    cfg.clone(),
+                    r.tentative,
+                ))
+            {
+                continue;
+            }
+            let mut e = if r.tentative {
+                Edge::maybe(r.owner.clone(), to.target, EdgeKind::References)
+            } else {
+                Edge::new(r.owner.clone(), to.target, EdgeKind::References)
+            };
+            e.cfg = cfg;
+            edges.push(e);
         }
-        let mut e = if r.tentative {
-            Edge::maybe(r.owner.clone(), to, EdgeKind::References)
-        } else {
-            Edge::new(r.owner.clone(), to, EdgeKind::References)
-        };
-        e.cfg = r.cfg.clone();
-        edges.push(e);
     }
     edges
 }
@@ -1179,10 +1262,11 @@ pub fn signature_edges(b: &BodyItem, tree: &ModTree, dep_crates: &DepCrates) -> 
                 .as_deref()
                 .and_then(|ty| substitute_self(&p, ty))
                 .unwrap_or(p);
-            if let Some(id) = tree.resolve_in(&b.module, &p, dep_crates, Ns::Type) {
-                if id != b.id {
-                    let mut e = Edge::new(b.id.clone(), id, EdgeKind::Signature);
-                    e.cfg = b.cfg.clone();
+            // `#[cfg]`로 갈린 대안 임포트를 지나면 대안마다 간선이고, 간선은 거쳐 온 임포트의 조건을 함께 싣는다.
+            for to in tree.resolve_all(&b.module, &p, dep_crates, Some(Ns::Type)) {
+                if to.target != b.id {
+                    let mut e = Edge::new(b.id.clone(), to.target, EdgeKind::Signature);
+                    e.cfg = with_import_cfg(&b.cfg, &to.cfg);
                     edges.push(e);
                 }
             }
@@ -1244,32 +1328,37 @@ impl BodyVisitor<'_> {
     /// 타입과 경로의 타입 인자는 참조다.
     fn visit_qualified_value_path(&mut self, qself: &syn::QSelf, path: &syn::Path) {
         let segs = path_segments(path);
-        let owner = match &*qself.ty {
+        let owners = match &*qself.ty {
             syn::Type::Path(ty) => self.resolve_in(&path_segments(&ty.path), Ns::Type),
-            _ => None,
+            _ => Vec::new(),
         };
         if qself.position == 0 {
-            match (&owner, segs.last()) {
-                (Some(ty), Some(name)) => self.push_associated(ty, name),
+            match segs.last() {
+                Some(name) if !owners.is_empty() => {
+                    for ty in &owners {
+                        self.push_associated(ty, name);
+                    }
+                }
                 _ => self.unresolved += 1,
             }
         } else {
-            if let Some(id) = self.resolve_in(&segs[..qself.position], Ns::Type) {
-                self.push(id, EdgeKind::References);
-            }
+            let found = self.resolve_in(&segs[..qself.position], Ns::Type);
+            self.push_all(found, EdgeKind::References);
             match self.resolve_value(&segs) {
-                ValueRes::Item(id) => self.push(id, EdgeKind::References),
+                ValueRes::Item(ids) => self.push_all(ids, EdgeKind::References),
                 ValueRes::Local => {}
                 ValueRes::Unresolved => self.unresolved += 1,
             }
-            if let (Some(ty), Some(name)) = (&owner, segs.last()) {
-                let exact = format!("{ty}::<{}>::{name}", segs[qself.position - 1]);
-                if self
-                    .method_index
-                    .get(name)
-                    .is_some_and(|ids| ids.contains(&exact))
-                {
-                    self.push(exact, EdgeKind::References);
+            if let Some(name) = segs.last() {
+                for ty in &owners {
+                    let exact = format!("{}::<{}>::{name}", ty.target, segs[qself.position - 1]);
+                    if self
+                        .method_index
+                        .get(name)
+                        .is_some_and(|ids| ids.contains(&exact))
+                    {
+                        self.push(exact, &ty.cfg, EdgeKind::References);
+                    }
                 }
             }
         }
@@ -1279,7 +1368,9 @@ impl BodyVisitor<'_> {
         }
     }
 
-    fn push(&mut self, to: String, kind: EdgeKind) {
+    /// 확정 간선 — `via`는 그 대상에 닿으려고 거친 `use` 임포트들의 조건이다([`Resolved::cfg`]). 간선은 소유
+    /// 아이템의 조건과 그 조건이 모두 성립할 때만 있다.
+    fn push(&mut self, to: String, via: &Option<String>, kind: EdgeKind) {
         // 외부 크레이트 정점으로의 간선 — 크레이트 안은 안 보이니
         // `dep::f()`의 call도 실은 "크레이트 경계 참조"다. 멤버 크레이트
         // 정점은 external에 없다 — 멤버 안은 실제 정점이다.
@@ -1290,19 +1381,39 @@ impl BodyVisitor<'_> {
         };
         if to != self.owner {
             let mut e = Edge::new(self.owner.to_string(), to, kind);
-            e.cfg = self.edge_cfg.clone();
+            e.cfg = with_import_cfg(self.edge_cfg, via);
             e.unsafe_ = self.in_unsafe > 0;
             self.edges.push(e);
         }
     }
 
-    /// 추정 간선 — 팬아웃의 "이 중 하나일 수 있다"는 확정이 아니다.
-    fn push_maybe(&mut self, to: String, kind: EdgeKind) {
+    /// 추정 간선 — 팬아웃의 "이 중 하나일 수 있다"는 확정이 아니다. `via`는 [`Self::push`]와 같다.
+    fn push_maybe(&mut self, to: String, via: &Option<String>, kind: EdgeKind) {
         if to != self.owner {
             let mut e = Edge::maybe(self.owner.to_string(), to, kind);
-            e.cfg = self.edge_cfg.clone();
+            e.cfg = with_import_cfg(self.edge_cfg, via);
             e.unsafe_ = self.in_unsafe > 0;
             self.edges.push(e);
+        }
+    }
+
+    /// 경로를 해석한 대상 하나로 확정 간선 — 거쳐 온 임포트의 조건을 함께 싣는다.
+    fn push_resolved(&mut self, to: Resolved, kind: EdgeKind) {
+        let Resolved { target, cfg } = to;
+        self.push(target, &cfg, kind);
+    }
+
+    /// 경로를 해석한 대상 전부로 확정 간선 — `#[cfg]`로 갈린 대안 임포트를 지나면 대안마다 하나다.
+    fn push_all(&mut self, targets: Vec<Resolved>, kind: EdgeKind) {
+        for to in targets {
+            self.push_resolved(to, kind);
+        }
+    }
+
+    /// 경로를 해석한 대상 전부로 추정 간선 — 문법을 모르는 매크로 인자·`macro_rules!` 본문의 이름이다.
+    fn push_all_maybe(&mut self, targets: Vec<Resolved>, kind: EdgeKind) {
+        for Resolved { target, cfg } in targets {
+            self.push_maybe(target, &cfg, kind);
         }
     }
 
@@ -1315,7 +1426,7 @@ impl BodyVisitor<'_> {
         match fanout::select(ids, self.visible) {
             Fanned::Candidates(picked) => {
                 for mid in picked {
-                    self.push_maybe(mid.to_string(), EdgeKind::Call);
+                    self.push_maybe(mid.to_string(), &None, EdgeKind::Call);
                 }
                 self.fanned += 1;
             }
@@ -1330,24 +1441,24 @@ impl BodyVisitor<'_> {
     /// 경로를 이 본문의 모듈에서 해석한다. impl 본문의 `Self`는 impl self 타입 경로로 바꿔 해석한다
     /// ([`substitute_self`]) — `Self::f()`·`Self(..)`·`Self { .. }`·`Self::CONST`가 모두 그 타입을 가리킨다.
     /// 마지막 세그먼트의 이름공간을 모르는 자리(`macro_rules!` 본문)용이다 — 자리를 알면 [`Self::resolve_in`].
-    fn resolve(&mut self, segs: &[String]) -> Option<String> {
+    /// 대상은 `#[cfg]`로 갈린 대안 임포트를 지나면 대안마다 하나고, 거쳐 온 임포트의 조건을 싣는다
+    /// ([`ModTree::resolve_all`]). 비어 있으면 해석되지 않았다.
+    fn resolve(&mut self, segs: &[String]) -> Vec<Resolved> {
         self.resolve_at(segs, None)
     }
 
     /// [`Self::resolve`]와 같되 마지막 세그먼트를 이름공간 `ns`에서 먼저 찾는다 — 타입 자리·구조체 리터럴·
     /// 연관 아이템의 타입 접두사는 타입, 호출·값 경로는 값, 매크로 호출은 매크로 이름공간이다.
-    fn resolve_in(&mut self, segs: &[String], ns: Ns) -> Option<String> {
+    fn resolve_in(&mut self, segs: &[String], ns: Ns) -> Vec<Resolved> {
         self.resolve_at(segs, Some(ns))
     }
 
     /// [`Self::resolve`]·[`Self::resolve_in`]의 본체 — `ns`가 없으면 자리를 모른다.
-    fn resolve_at(&mut self, segs: &[String], ns: Option<Ns>) -> Option<String> {
+    fn resolve_at(&mut self, segs: &[String], ns: Option<Ns>) -> Vec<Resolved> {
         let substituted = self.self_ty.and_then(|ty| substitute_self(segs, ty));
         let segs = substituted.as_deref().unwrap_or(segs);
-        match ns {
-            Some(ns) => self.tree.resolve_in(self.module, segs, self.dep_crates, ns),
-            None => self.tree.resolve(self.module, segs, self.dep_crates),
-        }
+        self.tree
+            .resolve_all(self.module, segs, self.dep_crates, ns)
     }
 
     /// 값 자리(표현식 경로·호출 대상·포맷 캡처)의 경로를 해석한다.
@@ -1384,12 +1495,19 @@ impl BodyVisitor<'_> {
                 return ValueRes::Local;
             }
         }
-        match self.resolve_at(segs, ns) {
-            Some(id) if self.tree.modules.contains_key(&id) && !self.value_item(&id) => {
-                ValueRes::Local
-            }
-            Some(id) => ValueRes::Item(id),
-            None => ValueRes::Unresolved,
+        let found = self.resolve_at(segs, ns);
+        if found.is_empty() {
+            return ValueRes::Unresolved;
+        }
+        // 값이 될 수 없는 워크스페이스 모듈로 해석된 대상은 버린다 — 대안마다 따로 본다.
+        let items: Vec<Resolved> = found
+            .into_iter()
+            .filter(|r| !self.tree.modules.contains_key(&r.target) || self.value_item(&r.target))
+            .collect();
+        if items.is_empty() {
+            ValueRes::Local
+        } else {
+            ValueRes::Item(items)
         }
     }
 
@@ -1407,15 +1525,15 @@ impl BodyVisitor<'_> {
 
     /// 타입 `owner` 범위에서 이름이 `name`인 메서드(고유·트레이트 impl)로 references 간선을 단다 —
     /// 연관 함수를 값으로 넘긴 경로(`Type::new`)다. 같은 이름 메서드가 없으면(배리언트·연관 상수)
-    /// 아무것도 하지 않는다.
-    fn push_associated(&mut self, owner: &str, name: &str) {
+    /// 아무것도 하지 않는다. 간선은 타입에 닿으려고 거친 임포트의 조건을 싣는다.
+    fn push_associated(&mut self, owner: &Resolved, name: &str) {
         let index = self.method_index;
         let Some(ids) = index.get(name) else {
             return;
         };
-        let prefix = owner_prefix(owner);
+        let prefix = owner_prefix(&owner.target);
         for mid in ids.iter().filter(|mid| mid.starts_with(&prefix)) {
-            self.push(mid.clone(), EdgeKind::References);
+            self.push(mid.clone(), &owner.cfg, EdgeKind::References);
         }
     }
 
@@ -1432,35 +1550,37 @@ impl BodyVisitor<'_> {
             return type_relative;
         };
         let index = self.method_index;
-        let (Some(owner), Some(ids)) = (
-            self.resolve_in(&path_segments(&ty.path), Ns::Type),
-            index.get(method),
-        ) else {
+        let owners = self.resolve_in(&path_segments(&ty.path), Ns::Type);
+        let Some(ids) = index.get(method).filter(|_| !owners.is_empty()) else {
             self.unresolved += usize::from(type_relative);
             return type_relative;
         };
         if type_relative {
-            let prefix = owner_prefix(&owner);
             let mut hit = false;
-            for mid in ids.iter().filter(|mid| mid.starts_with(&prefix)) {
-                self.push(mid.clone(), EdgeKind::Call);
-                hit = true;
+            for owner in &owners {
+                let prefix = owner_prefix(&owner.target);
+                for mid in ids.iter().filter(|mid| mid.starts_with(&prefix)) {
+                    self.push(mid.clone(), &owner.cfg, EdgeKind::Call);
+                    hit = true;
+                }
             }
             self.unresolved += usize::from(!hit);
             return true;
         }
         let trait_name = &segs[qself.position - 1];
-        let exact = format!("{owner}::<{trait_name}>::{method}");
-        if ids.contains(&exact) {
-            self.push(exact, EdgeKind::Call);
-        } else {
+        for owner in &owners {
+            let exact = format!("{}::<{trait_name}>::{method}", owner.target);
+            if ids.contains(&exact) {
+                self.push(exact, &owner.cfg, EdgeKind::Call);
+                continue;
+            }
             // 별칭·재노출 이름으로 적은 트레이트 — 같은 타입의 같은 이름 impl 메서드 중 하나다.
-            let (prefix, suffix) = (format!("{owner}::<"), format!(">::{method}"));
+            let (prefix, suffix) = (format!("{}::<", owner.target), format!(">::{method}"));
             for mid in ids
                 .iter()
                 .filter(|mid| mid.starts_with(&prefix) && mid.ends_with(&suffix))
             {
-                self.push_maybe(mid.clone(), EdgeKind::Call);
+                self.push_maybe(mid.clone(), &owner.cfg, EdgeKind::Call);
             }
         }
         false
@@ -1514,23 +1634,20 @@ impl BodyVisitor<'_> {
         let segs = path_segments(&mac.path);
         let firm = self.resolve_in(&segs, Ns::Macro);
         let any = self.resolve(&segs);
-        let hedge = macro_hedge(self.tree, self.module, any, firm.as_deref());
-        match firm {
-            Some(id) => self.push(id, EdgeKind::Call),
-            None if hedge.is_none() => self.ext_macros += 1,
-            None => {}
+        let hedge = macro_hedge(self.tree, self.module, any, &firm);
+        if firm.is_empty() && hedge.is_empty() {
+            self.ext_macros += 1;
         }
-        if let Some(id) = hedge {
-            self.push_maybe(id, EdgeKind::Call);
-        }
+        self.push_all(firm, EdgeKind::Call);
+        self.push_all_maybe(hedge, EdgeKind::Call);
         let parsed = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
             .parse2(mac.tokens.clone());
         let Ok(exprs) = parsed else {
             // 표현식 목록이 아닌 인자(`json!({"k": f()})`, `matches!(x, P)`) — 토큰 안의 이름이
             // 아이템으로 해석되면 추정 간선을 단다. 문법을 모르니 확정 사용이 아니다(dead·도달성만).
             for path in token_paths(mac.tokens.clone(), 1) {
-                if let ValueRes::Item(id) = self.resolve_mention(&path) {
-                    self.push_maybe(id, EdgeKind::References);
+                if let ValueRes::Item(ids) = self.resolve_mention(&path) {
+                    self.push_all_maybe(ids, EdgeKind::References);
                 }
             }
             return;
@@ -1545,8 +1662,8 @@ impl BodyVisitor<'_> {
             }) = ex
             {
                 for name in format_captures(&s.value()) {
-                    if let ValueRes::Item(id) = self.resolve_value(&[name]) {
-                        self.push(id, EdgeKind::References);
+                    if let ValueRes::Item(ids) = self.resolve_value(&[name]) {
+                        self.push_all(ids, EdgeKind::References);
                     }
                 }
             }
@@ -1578,8 +1695,9 @@ fn owner_prefix(owner: &str) -> String {
 
 /// 값 자리 경로의 해석 결과다.
 enum ValueRes {
-    /// 크레이트 아이템(또는 외부 크레이트 경계 정점).
-    Item(String),
+    /// 크레이트 아이템(또는 외부 크레이트 경계 정점) — 비어 있지 않고, `#[cfg]`로 갈린 대안 임포트를 지나면
+    /// 대안마다 하나다.
+    Item(Vec<Resolved>),
     /// 지역 묶음·`self`·값이 될 수 없는 모듈 — 간선도 미해석 계수도 없다.
     Local,
     /// 아이템 표에서 찾지 못함.
@@ -1594,9 +1712,8 @@ impl Visit<'_> for BodyVisitor<'_> {
             .first()
             .is_some_and(|name| self.type_params.contains(name))
         {
-            if let Some(id) = self.resolve_in(&path, Ns::Type) {
-                self.push(id, EdgeKind::References);
-            }
+            let found = self.resolve_in(&path, Ns::Type);
+            self.push_all(found, EdgeKind::References);
         }
         syn::visit::visit_type_path(self, ty);
     }
@@ -1618,23 +1735,24 @@ impl Visit<'_> for BodyVisitor<'_> {
             } else {
                 self.resolve_value(&segs)
             } {
-                ValueRes::Item(id) => self.push(id, EdgeKind::Call),
+                ValueRes::Item(ids) => self.push_all(ids, EdgeKind::Call),
                 // 지역 클로저·함수 값 호출 — 아이템 호출이 아니다.
                 ValueRes::Local => {}
                 ValueRes::Unresolved => {
                     // Type::assoc_fn() — 마지막 세그먼트가 연관 함수다.
-                    // 앞부분이 타입 정점이면 그 타입의 메서드로 좁힌다.
+                    // 앞부분이 타입 정점이면 그 타입의 메서드로 좁힌다. 타입이 `#[cfg]`로 갈린 대안
+                    // 임포트면 대안 타입마다 본다.
                     let n = segs.len();
                     let mut hit = false;
                     if n >= 2 {
-                        if let Some(ty) = self.resolve_in(&segs[..n - 1], Ns::Type) {
+                        for ty in self.resolve_in(&segs[..n - 1], Ns::Type) {
                             if let Some(ids) = self.method_index.get(&segs[n - 1]) {
-                                // 접두사는 호출마다 한 번 — 후보마다 만들면 같은 이름 정의가
+                                // 접두사는 대상 타입마다 한 번 — 후보마다 만들면 같은 이름 정의가
                                 // 수천 개일 때 할당이 (호출 수 × 정의 수)다.
-                                let prefix = owner_prefix(&ty);
+                                let prefix = owner_prefix(&ty.target);
                                 for mid in ids {
                                     if mid.starts_with(&prefix) {
-                                        self.push(mid.clone(), EdgeKind::Call);
+                                        self.push(mid.clone(), &ty.cfg, EdgeKind::Call);
                                         hit = true;
                                     }
                                 }
@@ -1651,9 +1769,8 @@ impl Visit<'_> for BodyVisitor<'_> {
                 self.visit_type(&qself.ty);
                 let path = path_segments(&p.path);
                 if qself.position > 0 {
-                    if let Some(id) = self.resolve_in(&path[..qself.position], Ns::Type) {
-                        self.push(id, EdgeKind::References);
-                    }
+                    let found = self.resolve_in(&path[..qself.position], Ns::Type);
+                    self.push_all(found, EdgeKind::References);
                 }
             }
             for segment in &p.path.segments {
@@ -1675,12 +1792,15 @@ impl Visit<'_> for BodyVisitor<'_> {
         let mut scoped = false;
         if let Some(self_ty) = self.self_ty {
             if matches!(&*e.receiver, syn::Expr::Path(p) if p.path.is_ident("self")) {
-                if let Some(sid) = self.resolve_in(self_ty, Ns::Type) {
+                let owners = self.resolve_in(self_ty, Ns::Type);
+                if !owners.is_empty() {
                     if let Some(ids) = self.method_index.get(&name) {
-                        let prefix = owner_prefix(&sid);
-                        for mid in ids {
-                            if mid.starts_with(&prefix) {
-                                self.push_maybe(mid.clone(), EdgeKind::Call);
+                        for sid in &owners {
+                            let prefix = owner_prefix(&sid.target);
+                            for mid in ids {
+                                if mid.starts_with(&prefix) {
+                                    self.push_maybe(mid.clone(), &sid.cfg, EdgeKind::Call);
+                                }
                             }
                         }
                     }
@@ -1711,11 +1831,11 @@ impl Visit<'_> for BodyVisitor<'_> {
     fn visit_expr_struct(&mut self, e: &syn::ExprStruct) {
         // S{..} 구조체 리터럴 — 생성자 호출과 같은 의미의 참조다.
         let segs = path_segments(&e.path);
-        match self.resolve_in(&segs, Ns::Type) {
-            Some(id) => self.push(id, EdgeKind::References),
-            None if segs.len() >= 2 => self.unresolved += 1,
-            None => {}
+        let found = self.resolve_in(&segs, Ns::Type);
+        if found.is_empty() && segs.len() >= 2 {
+            self.unresolved += 1;
         }
+        self.push_all(found, EdgeKind::References);
         syn::visit::visit_expr_struct(self, e);
     }
 
@@ -1789,9 +1909,8 @@ impl Visit<'_> for BodyVisitor<'_> {
             if m.ident.is_some() && m.mac.path.is_ident("macro_rules") {
                 // 지역 `macro_rules!` 정의 본문의 경로 — 펼친 곳에서 쓰이는 이름이라 추정 간선이다.
                 for path in macro_body_paths(m.mac.tokens.clone()) {
-                    if let Some(id) = self.resolve(&path) {
-                        self.push_maybe(id, EdgeKind::References);
-                    }
+                    let found = self.resolve(&path);
+                    self.push_all_maybe(found, EdgeKind::References);
                 }
             }
         }
@@ -1877,21 +1996,22 @@ impl Visit<'_> for BodyVisitor<'_> {
         // 단일 식별자는 모듈 아이템이면 잡고 지역 변수면 조용히 넘긴다.
         let segs = path_segments(&e.path);
         match self.resolve_value(&segs) {
-            ValueRes::Item(id) => self.push(id, EdgeKind::References),
+            ValueRes::Item(ids) => self.push_all(ids, EdgeKind::References),
             ValueRes::Local => {}
             ValueRes::Unresolved => {
                 // E::V 형태 — 마지막 세그먼트가 열거형 배리언트/상수면
                 // 앞부분 타입에의 참조다. 그것도 안 되면 진짜 미해석.
                 if segs.len() >= 2 {
-                    match self.resolve_in(&segs[..segs.len() - 1], Ns::Type) {
-                        Some(ty) => {
-                            // `.map(Type::new)`·`.ok_or_else(Type::err)`처럼 연관 함수를 값으로 넘기면
-                            // 그 메서드의 참조다 — 타입만 잇던 때는 그렇게만 쓰는 연관 함수가
-                            // unreachable이었다. 호출(`Type::assoc()`)과 같은 타입 범위 후보를 쓴다.
-                            self.push_associated(&ty, &segs[segs.len() - 1]);
-                            self.push(ty, EdgeKind::References);
-                        }
-                        None => self.unresolved += 1,
+                    let owners = self.resolve_in(&segs[..segs.len() - 1], Ns::Type);
+                    if owners.is_empty() {
+                        self.unresolved += 1;
+                    }
+                    for ty in owners {
+                        // `.map(Type::new)`·`.ok_or_else(Type::err)`처럼 연관 함수를 값으로 넘기면
+                        // 그 메서드의 참조다 — 타입만 잇던 때는 그렇게만 쓰는 연관 함수가
+                        // unreachable이었다. 호출(`Type::assoc()`)과 같은 타입 범위 후보를 쓴다.
+                        self.push_associated(&ty, &segs[segs.len() - 1]);
+                        self.push_resolved(ty, EdgeKind::References);
                     }
                 }
             }

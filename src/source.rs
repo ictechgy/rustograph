@@ -949,6 +949,12 @@ fn harvest(
             Some((mp, flatten_items(&groups)))
         })
         .collect();
+    // 2015 판 타깃은 `use` 경로가 크레이트 기준이다 — 이 해석기의 규칙(2018 판 이후)과 달라, 앞 바퀴의 대상을 거둬
+    // 지우지 않는다(`fill_imports_settled`).
+    tree.edition_2015 = source_targets(meta)
+        .filter(|t| t.edition == "2015")
+        .map(|t| t.name.clone())
+        .collect();
     let unsettled = modtree::fill_imports_settled(&mut tree, &module_uses, &dep_crates);
     if unsettled > 0 {
         limitations.push(format!(
@@ -956,6 +962,7 @@ fn harvest(
             modtree::MAX_IMPORT_PASSES
         ));
     }
+    push_import_settling(&tree, &mut limitations);
 
     // 1패스: 모듈·아이템 선언 — 정점과 contains/uses/implements 간선.
     let mut bodies: Vec<BodyItem<'_>> = Vec::new();
@@ -1207,6 +1214,12 @@ fn harvest(
         edges.extend(identities.edges(harvest::decl_edges(&decl_refs, &tree, &dep_crates), false));
     }
 
+    let impossible = drop_impossible_edges(&mut edges, &vertices, &tree);
+    if impossible > 0 {
+        limitations.push(format!(
+            "{impossible} edges were left out because their #[cfg] conditions contradict each other or those of their source item and its modules (for example `unix` and `not (unix)`); they exist in no build"
+        ));
+    }
     push_limitations(&harvest, &mut limitations);
 
     // 보존 루트 — 존재하는 정점만 루트가 된다.
@@ -1841,16 +1854,15 @@ fn harvest_module<'a>(
     // 아니면 소유 모듈로. 아이템 표는 1단계에서 전 모듈에 채워졌으므로
     // 모듈 처리 순서와 무관하게 같은 결과가 나온다. 임포트에 cfg가 있으면
     // 간선도 그 조건 아래서만 성립한다. 글롭이 들이는 모듈·외부 크레이트 자신(`use m::*`의 `m`)도
-    // 같은 의존 증거다. 한 이름이 이름공간마다 다른 정점에 묶이면 각각이 증거이고, 같은 정점이면 한 번이다.
+    // 같은 의존 증거다. 한 이름이 이름공간마다 다른 정점에 묶이거나 `#[cfg]`로 갈린 대안 임포트를 가지면 각각이
+    // 증거이고, 같은 정점이면 한 번이다.
     let module = &tree.modules[mp];
     let imports: BTreeSet<(&String, &Option<String>)> = module
         .imports
         .values()
         .flat_map(modtree::PerNs::bound)
-        .filter_map(|binding| match binding {
-            modtree::Binding::Resolved(imp) => Some((&imp.target, &imp.cfg)),
-            modtree::Binding::Unresolved(_) => None,
-        })
+        .flat_map(modtree::Binding::imports)
+        .map(|imp| (&imp.target, &imp.cfg))
         .collect();
     for (target, cfg) in imports.into_iter().chain(&module.glob_targets) {
         let to = if tree.item_exists(target) {
@@ -1874,6 +1886,73 @@ fn harvest_module<'a>(
         vertex,
         edges,
         decls,
+    }
+}
+
+/// 조건이 서로 모순인 간선(어느 빌드에도 없는 것)을 지우고 그 수를 돌려준다 — 간선 자신의 조건, 출발 정점의 조건,
+/// 출발 정점이 있는 모듈과 그 조상 모듈의 `mod` 조건을 함께 본다([`modtree::cfg_contradicts`] — 글자로 보이는 `P`와
+/// `not (P)`만). 대안 임포트를 거친 간선은 그 임포트의 조건을 싣는데, 쓰는 자리가 반대 조건 아래 있으면
+/// (`#[cfg(unix)] fn run() { sys() }`가 `#[cfg(not(unix))] use crate::plat::sys;`를 거침, tokio의 `#[cfg(all(test, loom))]
+/// mod mocked` 안에서 `not(all(test, loom))` 쪽 대안으로 가는 `uses`) 그런 간선이 생겨 거짓 순환을 만들었다. contains
+/// 간선은 구조라 그대로 둔다.
+fn drop_impossible_edges(edges: &mut Vec<Edge>, vertices: &[Vertex], tree: &ModTree) -> usize {
+    let by_id: BTreeMap<&str, &Vertex> = vertices.iter().map(|v| (v.id.as_str(), v)).collect();
+    let mut chains: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let before = edges.len();
+    edges.retain(|e| {
+        if e.kind == EdgeKind::Contains {
+            return true;
+        }
+        let Some(cfg) = e.cfg.as_deref() else {
+            return true;
+        };
+        let source = by_id.get(e.from.as_str());
+        let module = match source {
+            Some(v) if tree.modules.contains_key(&v.id) => v.id.as_str(),
+            Some(v) => v.module.as_str(),
+            None => e.from.as_str(),
+        };
+        let chain = chains
+            .entry(module.to_string())
+            .or_insert_with(|| module_cfg_chain(tree, module));
+        let own = source.and_then(|v| v.cfg.as_deref());
+        !modtree::cfg_contradicts(
+            std::iter::once(cfg)
+                .chain(own)
+                .chain(chain.iter().map(String::as_str)),
+        )
+    });
+    before - edges.len()
+}
+
+/// 모듈 `module`과 그 조상 모듈의 `mod` 선언에 단 `#[cfg]` 조건.
+fn module_cfg_chain(tree: &ModTree, module: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = Some(module.to_string());
+    while let Some(path) = cur {
+        if let Some(cfg) = tree.modules.get(&path).and_then(|m| m.cfg.clone()) {
+            out.push(cfg);
+        }
+        cur = modtree::parent_of(&path);
+    }
+    out
+}
+
+/// 임포트 표를 수렴시키며 남은 실측([`modtree::fill_imports_settled`])을 limitation으로 싣는다 — 다시 쌓아도 거둔
+/// 대상을 다 지우지 못한 모듈과, 크레이트 기준 `use` 경로를 2018 판 규칙으로 푼 2015 판 크레이트.
+fn push_import_settling(tree: &ModTree, limitations: &mut Vec<String>) {
+    if tree.stale_import_modules > 0 {
+        limitations.push(format!(
+            "{} modules may keep stale re-export targets: an import resolved in an early pass was replaced later, and {} clean re-resolutions did not settle; edges through those imports can also reach the replaced target",
+            tree.stale_import_modules,
+            modtree::MAX_IMPORT_PASSES
+        ));
+    }
+    if !tree.edition_2015_crate_relative.is_empty() {
+        limitations.push(format!(
+            "{} edition-2015 crates have `use` paths that edition 2015 resolves from the crate root, but this resolver resolves them from the enclosing module (edition-2018 rules); dead may report items used only through those paths, and their edges may point at a different item",
+            tree.edition_2015_crate_relative.len()
+        ));
     }
 }
 
@@ -2052,6 +2131,23 @@ fn push_sem_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 임포트 표 수렴이 남긴 실측은 limitation 문구로 그대로 옮겨진다 — 다시 쌓기가 남긴 모듈 수와 크레이트 기준 `use`
+    /// 경로를 가진 2015 판 크레이트 수. 남긴 것이 없으면 조용하다.
+    #[test]
+    fn import_settling_limitations_say_what_was_left() {
+        let mut tree = ModTree::default();
+        let mut limitations = Vec::new();
+        push_import_settling(&tree, &mut limitations);
+        assert!(limitations.is_empty());
+        tree.stale_import_modules = 3;
+        tree.edition_2015_crate_relative
+            .insert("legacy".to_string());
+        push_import_settling(&tree, &mut limitations);
+        assert_eq!(limitations.len(), 2);
+        assert!(limitations[0].starts_with("3 modules may keep stale re-export targets"));
+        assert!(limitations[1].starts_with("1 edition-2015 crates have `use` paths"));
+    }
     use crate::cargo_meta::Metadata;
     use crate::graph::{document, Level};
 
@@ -2803,6 +2899,7 @@ mod tests {
                     name: target.to_string(),
                     kind: kind.to_string(),
                     src: PathBuf::from("src/lib.rs"),
+                    edition: "2021".to_string(),
                 })
                 .collect(),
             workspace_member: member,

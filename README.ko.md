@@ -93,7 +93,17 @@ rustograph impact --format language-traversal --roots-from schema-facts.json  # 
 
 `#[cfg]` 조건은 메타데이터로 그래프에 실립니다 — 정점의 `cfg`는 자기
 `#[cfg(...)]` 토큰, 간선의 `cfg`는 그 조건 아래서만 성립하는 의존을
-표시합니다. `unsafe`는 경계를 표시합니다 — `unsafe fn`/`unsafe trait`이거나
+표시합니다. 조건부 `use`·재노출을 거쳐 해석한 경로의 간선도 그 조건을 싣습니다
+(`#[cfg(feature = "pl")] use crate::pl::Condvar;` 옆의 `Condvar::new()`는 `feature = "pl"` 아래의
+`call`). `#[cfg]`가 한 이름을 두 임포트로 가르면(`#[cfg(unix)] use crate::unix::Sys;`와
+`#[cfg(windows)] use crate::windows::Sys;`, 또는 플랫폼별 글롭 둘) 둘 다 남고, 그 이름을 거친 경로는
+대안마다 각자의 조건을 단 간선을 얻습니다 — rustc는 한 빌드에서 둘을 보지 않고 그래프는 모든 빌드를 봅니다.
+자기 `#[cfg]`를 단 `use` 옆의 같은 이름 글롭(글롭의 조건이 그 `use`의 조건을 함축하지 않으면 가리지 않습니다),
+`#[cfg]`를 단 로컬 아이템·`mod` 옆의 같은 이름 명시 `use`(글롭 이름은 아이템의 선언이 하나일 때만 — 간선은 그 조건의
+부정을 답니다), 그런 갈린 임포트를 self 타입이나 트레이트 경로로 쓴 impl(메서드 정점이 대안 self 타입마다 생기고 대안
+트레이트마다 implements 간선이 생깁니다)도 같습니다. 조건이 쓰는 자리나 출발 아이템의 모듈 조건과 글자로 모순인 간선
+(`unix`와 `not (unix)`)은 어느 빌드에도 없어 빼고 그 수를 limitation으로 셉니다.
+`unsafe`는 경계를 표시합니다 — `unsafe fn`/`unsafe trait`이거나
 `unsafe {}` 블록을 품은 정점에 `unsafe: true`, `unsafe {}` 안에서 만든
 간선은 경계 진입 간선입니다. 구성원이 한 모듈과 그 자손뿐인 모듈 레벨 순환(부모가
 자식을 쓰고 자식이 `super::`로 부모를 부르는 관용 구조)은 `cycles --level module`이
@@ -414,8 +424,8 @@ impl 본문·시그니처의 `Self`는 impl self 타입이고, `<T as Tr>::m()`�
 목록이 아닌 매크로 인자(`json!({..})`) 안에서 지역 묶음이 아닌 아이템으로 해석되는 이름은 추정
 (tentative) 간선이 되어 도달성에만 쓰입니다. 속성·derive 인자·매크로 호출의 경로는 rustc처럼 매크로 이름공간에서
 해석합니다 — `mylib`이 trait `Hello`도 내보내도 `#[derive(mylib::Hello)]`는 `#[proc_macro_derive(Hello)]` 함수를
-가리킵니다. 같은 경로를 이름공간 없이 해석한 결과가 그 모듈에서 보이는 다른 정점(그 trait, 들인 워크스페이스
-`info!` 매크로 옆의 로컬 `fn info`)이면 그 정점에도 추정 간선을 둡니다 — 자리를 모르는 해석의 대상이고 대개 이름공간을
+가리킵니다. 같은 경로를 이름공간 없이 해석한 결과가 그 모듈에서 보이는 다른 정점(그 trait, 들인 `info!` 매크로
+옆의 로컬 `fn info` — 워크스페이스 매크로든 `use log::info`처럼 그래프 밖 매크로든)이면 그 정점에도 추정 간선을 둡니다 — 자리를 모르는 해석의 대상이고 대개 이름공간을
 나누기 전에 경로가 가리키던 곳이며, 구문 분석이 보지 못하는 derive 펼침은 대개 같은 이름의 trait을 구현합니다. 이 추정 간선은 `dead`에서 그 아이템을 살려 두고
 `cycles`·`rules`에는 들어가지 않습니다. 함수 안 아이템(중첩 `fn`, 지역 `impl`·`macro_rules!`)은
 정점이 없고 그 간선은 바깥 본문이 소유합니다. self 타입이 워크스페이스 정점이 아닌 impl(`impl Tr for

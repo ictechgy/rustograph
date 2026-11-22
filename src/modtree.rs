@@ -107,12 +107,14 @@ impl Scope {
 }
 
 /// `use` 임포트 하나 — 해석된 정규 경로와 `#[cfg]` 조건, 가시 범위.
-/// 조건이 있으면 그 빌드에서만 존재하는 임포트다 — 간선도 조건을 물려받는다.
+/// 조건이 있으면 그 빌드에서만 존재하는 임포트다 — 그 이름으로 해석한 간선(`uses`, 본문·시그니처·필드·속성)도
+/// 조건을 물려받는다([`Resolved::cfg`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Import {
     /// 정규 ID (`crate::mod::item`).
     pub target: String,
-    /// `#[cfg(...)]` 조건 토큰 — 없으면 무조건 임포트.
+    /// `#[cfg(...)]` 조건 토큰 — 없으면 무조건 임포트. 그 `use`의 조건에 거쳐 온 재노출(`pub use`·글롭)의 조건을
+    /// 함께 싣는다.
     pub cfg: Option<String>,
     /// 이 임포트(재노출)가 보이는 범위 — 다른 모듈의 글롭은 그 모듈에서 보이는 임포트만 펼친다.
     pub scope: Scope,
@@ -155,8 +157,8 @@ pub struct PerNs<T> {
     /// 아이템·다른 명시 `use`와 공존하지 못하므로(E0255·E0252) 그런 것이 있으면 이 `use`는 다른 이름공간에 있다.
     /// `#[cfg]`로 갈린 대안 임포트(`#[cfg(feature = "pl")] use crate::pl::Condvar;`와 `#[cfg(not(..))] use
     /// std::sync::Condvar;`)는 같은 이름공간인데 rustc가 둘을 한 빌드에서 보지 않을 뿐이라 이 근거가 닿지 않는다 —
-    /// 그때도 소스 순서와 무관하게 정해진 쪽(워크스페이스)이 이긴다. 본문 간선은 임포트의 cfg를 물려받지 않으므로
-    /// (이 표가 생기기 전부터) 그 이름을 쓰는 본문 간선은 조건 없는 확정 간선이고, `uses` 간선만 cfg를 싣는다.
+    /// 그때도 소스 순서와 무관하게 정해진 쪽(워크스페이스)이 이기고, std 쪽은 그래프 밖이라 간선이 없다. 그 이름으로
+    /// 해석한 간선은 워크스페이스 쪽 임포트의 cfg(`feature = "pl"`)를 싣는다([`Resolved::cfg`]).
     pub undetermined: Option<T>,
 }
 
@@ -231,8 +233,91 @@ impl<T> PerNs<T> {
 pub enum Binding {
     /// 정점으로 해석된 임포트.
     Resolved(Import),
+    /// 서로 다른 정점을 가리키는 대안 임포트 둘 이상 — 같은 이름공간에 같은 이름을 들이는 명시 `use` 둘
+    /// (`#[cfg(unix)] use crate::unix::Sys;`와 `#[cfg(windows)] use crate::windows::Sys;`)이나 글롭 둘
+    /// (`#[cfg(unix)] pub use self::unix::*;`와 `#[cfg(windows)] pub use self::windows::*;`)이 같은 이름을 들였다.
+    /// rustc는 한 빌드의 한 이름공간에 그런 둘을 두지 않으므로(명시 `use`는 E0252, 글롭 이름은 쓰면 E0659)
+    /// 둘은 서로 다른 빌드의 것이다 — 모든 빌드의 합집합을 보는 그래프는 둘 다 남기고, 간선은 각 임포트의 cfg를
+    /// 싣는다. 하나만 남기면(예전에는 소스 순서상 뒤의 것) 다른 빌드의 대상과 그 경로로만 쓰는 아이템이 거짓
+    /// unreachable이 됐다. 이름을 묶지 않는 `use T as _`는 rustc에서도 여럿이 공존하므로, 한 모듈의 `_` 칸에 모인
+    /// 그것들도 같은 모양으로 모두 남는다(모듈 `uses` 의존 증거다). 첫 원소가 소스 순서상 뒤의 것이다 — 대상 하나를
+    /// 고르는 해석([`ModTree::resolve`])이 예전처럼 그것을 고른다. 원소는 둘 이상이고 대상이 서로 다르다.
+    Alternatives(Vec<Import>),
     /// 해석되지 않는 임포트의 가시 범위.
     Unresolved(Scope),
+}
+
+impl Binding {
+    /// 해석된 임포트 전부 — 대상 하나를 고르는 해석이 따르는 것이 첫 원소다. 해석되지 않는 이름이면 비어 있다.
+    pub fn imports(&self) -> &[Import] {
+        match self {
+            Binding::Resolved(imp) => std::slice::from_ref(imp),
+            Binding::Alternatives(imps) => imps,
+            Binding::Unresolved(_) => &[],
+        }
+    }
+
+    /// 해석된 임포트 목록을 칸 값으로 — 하나면 [`Binding::Resolved`], 둘 이상이면 [`Binding::Alternatives`]다.
+    /// 비어 있으면 `None`이다.
+    fn of_imports(mut imports: Vec<Import>) -> Option<Binding> {
+        match imports.len() {
+            0 => None,
+            1 => imports.pop().map(Binding::Resolved),
+            _ => Some(Binding::Alternatives(imports)),
+        }
+    }
+}
+
+/// 경로 하나를 해석한 대상 — 정점 ID와, 그 정점에 닿으려고 거친 `use` 임포트(재노출·글롭 포함)들의 `#[cfg]`를
+/// 모두 합친 조건. 그 임포트가 없는 빌드에서는 그 이름으로 그 정점에 닿을 수 없으므로 그 경로로 만든 간선도 같은
+/// 조건 아래서만 성립한다 — `#[cfg(feature = "pl")] use crate::pl::Condvar;` 옆의 `Condvar::new()`는
+/// `feature = "pl"`일 때만 `pl::Condvar::new`를 부른다. 로컬 아이템과 `crate::`·`self::`·`super::` 경로로 바로
+/// 닿은 정점은 조건이 없다(정점 자신의 cfg는 정점에 있다).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    /// 정규 ID (`crate::mod::item`), 또는 외부 크레이트 정점.
+    pub target: String,
+    /// 거친 임포트들의 `#[cfg]`를 합친 조건 — 없으면 조건 없이 닿는다.
+    pub cfg: Option<String>,
+}
+
+impl Resolved {
+    /// 임포트를 거치지 않고 닿은 정점(로컬 아이템, `crate::`·`self::`·`super::`, 크레이트 루트) — 조건이 없다.
+    fn plain(target: String) -> Resolved {
+        Resolved { target, cfg: None }
+    }
+
+    /// 경로의 첫 세그먼트가 묶인 임포트 `imp`로 닿은 정점 — 그 임포트의 조건이다.
+    fn via(imp: &Import) -> Resolved {
+        Resolved {
+            target: imp.target.clone(),
+            cfg: imp.cfg.clone(),
+        }
+    }
+
+    /// 지금 닿은 모듈에서 임포트 `imp`(재노출)를 따라간 정점 — 거쳐 온 조건에 그 임포트의 조건을 더한다.
+    fn through(&self, imp: &Import) -> Resolved {
+        Resolved {
+            target: imp.target.clone(),
+            cfg: with_import_cfg(&self.cfg, &imp.cfg),
+        }
+    }
+
+    /// 임포트를 거치지 않고 한 단계 내려간 정점(자식 모듈·아이템) — 조건은 그대로다.
+    fn at(self, target: String) -> Resolved {
+        Resolved {
+            target,
+            cfg: self.cfg,
+        }
+    }
+}
+
+/// [`ModTree::resolve_use`]가 한 이름공간에서 찾은 대상 하나 — `target`이 `None`이면 그래프 밖 이름이고, `cfg`는
+/// 거쳐 온 재노출들의 조건이다(그 `use` 자신의 조건은 칸을 만들 때 더한다).
+#[derive(Debug, Clone)]
+struct UseTarget {
+    target: Option<String>,
+    cfg: Option<String>,
 }
 
 /// 경로의 마지막 세그먼트를 어느 이름공간에서 찾는가. 접두사 세그먼트는 늘 타입 이름공간이다.
@@ -250,8 +335,12 @@ enum Want {
 enum Found<'a> {
     /// 그 모듈이 선언한 아이템(자식 모듈 포함) — `모듈::이름`이다.
     Local,
-    /// `use`로 들인 정점.
-    Import(&'a Import),
+    /// 모든 선언이 `#[cfg]`를 단 로컬 아이템(먼저)과, 그 아이템이 없는 빌드에서 그 이름이 가리키는 같은 이름공간의
+    /// 임포트들([`Module::local_alternatives`]) — 비어 있지 않다.
+    LocalOr(&'a [Import]),
+    /// `use`로 들인 정점 — 비어 있지 않고, 첫 원소가 대상 하나를 고르는 해석이 따르는 것이다
+    /// ([`Binding::imports`]). 둘 이상이면 `#[cfg]`로 갈린 대안이다.
+    Import(&'a [Import]),
     /// 그래프 밖에서 들인 이름 — 해석을 멈춘다.
     Unresolved,
     /// 그 모듈에 없는 이름.
@@ -260,7 +349,7 @@ enum Found<'a> {
 
 /// 모듈 하나 — 파일 단위든 인라인 `mod x {}`든 동일하게 표현한다.
 /// 경로는 트리의 맵 키이므로 필드로 중복 저장하지 않는다.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Module {
     /// 이 모듈의 선언이 있는 파일(인라인 모듈은 부모와 같은 파일).
     pub file: PathBuf,
@@ -290,6 +379,18 @@ pub struct Module {
     pub type_items: BTreeSet<String>,
     /// 그중 매크로 이름공간의 아이템(이름 있는 `macro_rules!`).
     pub macro_items: BTreeSet<String>,
+    /// 이름 → 이름공간 → 그 이름공간의 선언마다 단 `#[cfg]` 조건(선언이 모두 `#[cfg]`를 달았을 때만 있다). 그런
+    /// 로컬 아이템은 조건이 아닌 빌드에 없으므로 같은 이름의 임포트가 그 빌드의 대안일 수 있다
+    /// ([`Module::local_alternatives`]). `#[cfg] mod`도 같다.
+    pub cfg_gated: BTreeMap<String, BTreeMap<Ns, Vec<String>>>,
+    /// 이름 → 이름공간마다 `#[cfg]`를 단 로컬 아이템([`Module::cfg_gated`])이 없는 빌드에서 그 이름이 가리키는 임포트.
+    /// 같은 이름공간의 명시 `use`는 늘 대안이다 — rustc는 한 빌드에서 로컬 아이템과 명시 `use`가 이름공간을 나누지
+    /// 못하게 하니(E0255) 그 `use`는 아이템이 없는 빌드의 것이다(`#[cfg(feature = "x")] fn sum()` 옆
+    /// `#[cfg(not(feature = "x"))] use scalar::sum;`). 글롭 이름은 로컬 아이템 옆에 합법적으로 있으면서 가려지기만
+    /// 하므로, 아이템의 선언이 하나일 때만 그 조건의 부정(`not (..)`)을 달고 대안이 된다 — 선언이 여럿이면
+    /// (`#[cfg(unix)] fn sys`와 `#[cfg(not(unix))] fn sys`) 모든 빌드를 덮을 수 있어 글롭 이름은 대안이 아니다.
+    /// [`fill_imports`]가 채운다.
+    pub local_alternatives: BTreeMap<String, PerNs<Binding>>,
     /// 선언 아이템(자식 모듈 포함)이 보이는 범위 — 이름 → 같은 이름 아이템 가운데 가장 넓은 범위.
     /// 없는 이름은 `pub`으로 본다. 같은 모듈의 같은 이름 아이템은 이름공간이 달라도 정점 ID가 같다.
     pub item_scopes: BTreeMap<String, Scope>,
@@ -297,7 +398,8 @@ pub struct Module {
     /// 이름공간에만 묶이고, 글롭은 대상 모듈의 이름을 이름공간마다 따로 들인다. 명시 임포트는 같은
     /// 이름공간의 글롭만 가린다(rustc와 같다). derive 등록 이름은 매크로 이름공간에 있다. 이름공간을 정하지
     /// 못한 명시 `use`는 [`PerNs::undetermined`]에 있고, 어느 이름공간을 차지하는지 모르니 같은 이름의 글롭을
-    /// 모두 가린다.
+    /// 모두 가린다. 같은 칸에 대상이 다른 명시 `use` 둘(또는 글롭 둘)이 오면 둘 다 남는다
+    /// ([`Binding::Alternatives`]).
     pub imports: BTreeMap<String, PerNs<Binding>>,
     /// 이 모듈이 글롭으로 들이는 모듈·외부 크레이트 정점(`use m::*`의 `m`) → 그 `use`의 `#[cfg]`. 그 글롭의
     /// 의존 증거(uses 간선, deps의 사용 증거)일 뿐 이름이 아니다 — 이름 해석과 다른 모듈의 글롭에 쓰지 않는다.
@@ -320,6 +422,8 @@ impl Module {
             value_items: BTreeSet::new(),
             type_items: BTreeSet::new(),
             macro_items: BTreeSet::new(),
+            cfg_gated: BTreeMap::new(),
+            local_alternatives: BTreeMap::new(),
             item_scopes: BTreeMap::new(),
             imports: BTreeMap::new(),
             glob_targets: BTreeMap::new(),
@@ -329,7 +433,7 @@ impl Module {
 }
 
 /// 크레이트 하나의 모듈 트리 전체.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ModTree {
     /// 경로 → 모듈.
     pub modules: BTreeMap<String, Module>,
@@ -338,6 +442,19 @@ pub struct ModTree {
     /// 정점 없이 건너뛴 `mod` 선언 — 모듈 경로 → 사유. limitation으로 올린다.
     /// 경로가 키라 병합 루트(lib+같은 이름 bin)를 두 타깃이 다시 훑어도 한 번만 센다.
     pub skipped_mods: BTreeMap<String, SkippedMod>,
+    /// 2015 판 타깃의 루트 모듈(크레이트) 경로 — 호출자가 채운다. 이 해석기는 2018 판 이후의 경로 규칙이라, 2015 판의
+    /// 크레이트 기준 `use` 경로(`use foo::bar`가 `crate::foo::bar`)를 모른다. 그런 크레이트의 모듈에서는
+    /// [`fill_imports_settled`]가 앞 바퀴의 대상을 거둬 지우지 않는다(거둔 쪽이 2015 판의 제 대상일 수 있다).
+    pub edition_2015: BTreeSet<String>,
+    /// [`fill_imports_settled`]가 남긴 것 — 앞 바퀴의 대상을 거둔 모듈이 있어 빈 표에서 다시 수렴시켰는데
+    /// [`MAX_IMPORT_PASSES`]번 다시 쌓아도 앞 바퀴의 대상을 거두는 모듈 수. 그 모듈의 임포트는 거둔 대상을 대안으로 남길 수
+    /// 있다 — limitation으로 올린다.
+    pub stale_import_modules: usize,
+    /// [`fill_imports_settled`]가 남긴 것 — 루트가 아닌 모듈의 `use` 경로가 크레이트 루트가 선언한 이름으로 시작하는
+    /// 2015 판 크레이트([`ModTree::edition_2015`]). 2015 판은 그 경로를 크레이트 루트부터 풀지만 이 해석기는 그 모듈부터
+    /// 푼다(2018 판 규칙) — 그 경로로만 쓰는 아이템을 `dead`가 낼 수 있고 간선이 다른 아이템으로 갈 수 있다. limitation으로
+    /// 올린다.
+    pub edition_2015_crate_relative: BTreeSet<String>,
 }
 
 /// 모듈 경로 깊이(세그먼트 수) 상한이다. 순환은 조상 파일 검사가 끊지만, 그 검사를
@@ -412,9 +529,11 @@ impl ModTree {
     /// 실제 루트부터 걷는다 — 나머지 세그먼트가 진짜 정점이다.
     ///
     /// 마지막 세그먼트의 이름공간을 모르는 자리다 — 로컬 아이템이 먼저다. 자리를 알면
-    /// [`ModTree::resolve_in`]을 쓴다.
+    /// [`ModTree::resolve_in`]을 쓴다. 대상 하나만 준다 — `#[cfg]`로 갈린 대안 임포트([`Binding::Alternatives`])를
+    /// 지나면 우선 순위가 가장 높은 것이다. 간선을 만드는 해석은 대상 전부와 조건을 주는 [`ModTree::resolve_all`]을
+    /// 쓴다.
     pub fn resolve(&self, from: &str, segs: &[String], dep_crates: &DepCrates) -> Option<String> {
-        self.resolve_want(from, segs, dep_crates, Want::Any)
+        first_target(self.resolve_want(from, segs, dep_crates, Want::Any))
     }
 
     /// [`ModTree::resolve`]와 같되 마지막 세그먼트를 이름공간 `ns`에서 먼저 찾는다 — 값 자리(호출·값 경로)는
@@ -429,201 +548,313 @@ impl ModTree {
         dep_crates: &DepCrates,
         ns: Ns,
     ) -> Option<String> {
-        self.resolve_want(from, segs, dep_crates, Want::Prefer(ns))
+        first_target(self.resolve_want(from, segs, dep_crates, Want::Prefer(ns)))
+    }
+
+    /// 경로가 이름 붙이는 정점을 모든 빌드에 걸쳐 전부 준다 — `ns`가 `None`이면 [`ModTree::resolve`], 있으면
+    /// [`ModTree::resolve_in`]의 자리다. `#[cfg]`로 갈린 대안 임포트([`Binding::Alternatives`])를 지나면 대안마다
+    /// 대상이 하나씩이고, 대상마다 거쳐 온 임포트들의 `#[cfg]`를 합친 조건을 싣는다([`Resolved`]). 간선을 만드는
+    /// 해석은 이것을 쓴다 — 대상 하나만 잇으면 다른 빌드의 대상이 거짓 unreachable이 되고, 조건을 버리면
+    /// `--target`·`--exclude-tests`가 그 빌드에 없는 임포트를 거친 간선을 지우지 못한다. 첫 원소가
+    /// [`ModTree::resolve`]·[`ModTree::resolve_in`]의 결과다. 같은 대상에 여러 경로로 닿으면 하나로 합치고 조건은
+    /// 약한 쪽이다(어느 경로로든 닿는다). 해석되지 않으면 비어 있다.
+    pub fn resolve_all(
+        &self,
+        from: &str,
+        segs: &[String],
+        dep_crates: &DepCrates,
+        ns: Option<Ns>,
+    ) -> Vec<Resolved> {
+        self.resolve_want(from, segs, dep_crates, ns.map_or(Want::Any, Want::Prefer))
     }
 
     /// 경로 해석의 본체 — `want`는 마지막 세그먼트를 찾는 이름공간이다. 접두사 세그먼트는 늘 타입 이름공간이다.
+    /// 대상은 우선 순위 순이다(대안 임포트는 [`Binding::imports`]의 순서로 깊이 우선으로 따른다).
     fn resolve_want(
         &self,
         from: &str,
         segs: &[String],
         dep_crates: &DepCrates,
         want: Want,
-    ) -> Option<String> {
-        if segs.is_empty() {
-            return None;
-        }
+    ) -> Vec<Resolved> {
+        let Some(first) = segs.first() else {
+            return Vec::new();
+        };
         let mut i = 1usize;
-        let start: String = match segs[0].as_str() {
-            "crate" => crate_of(from),
-            "self" => from.to_string(),
+        let starts: Vec<Resolved> = match first.as_str() {
+            "crate" => vec![Resolved::plain(crate_of(from))],
+            "self" => vec![Resolved::plain(from.to_string())],
             "super" => {
-                let mut m = parent_of(from)?;
+                let mut m = parent_of(from);
                 while i < segs.len() && segs[i] == "super" {
-                    m = parent_of(&m)?;
+                    m = m.as_deref().and_then(parent_of);
                     i += 1;
                 }
-                m
+                m.map(Resolved::plain).into_iter().collect()
             }
             first => {
-                let module = self.modules.get(from)?;
+                let Some(module) = self.modules.get(from) else {
+                    return Vec::new();
+                };
                 let first_want = if segs.len() > 1 {
                     Want::Prefer(Ns::Type)
                 } else {
                     want
                 };
                 match lookup(module, first, first_want) {
-                    Found::Local => format!("{from}::{first}"),
-                    Found::Import(imp) => imp.target.clone(),
+                    Found::Local => vec![Resolved::plain(format!("{from}::{first}"))],
+                    Found::LocalOr(imps) => {
+                        std::iter::once(Resolved::plain(format!("{from}::{first}")))
+                            .chain(imps.iter().map(Resolved::via))
+                            .collect()
+                    }
+                    Found::Import(imps) => imps.iter().map(Resolved::via).collect(),
                     // 그래프 밖(std 등)에서 들인 이름이다 — 크레이트 루트의 같은 이름으로 넘어가지 않는다.
-                    Found::Unresolved => return None,
+                    Found::Unresolved => return Vec::new(),
                     Found::Unbound => {
-                        let root = crate_of(from);
-                        let root_mod = self.modules.get(&root)?;
-                        if root_mod.items.contains(first) || root_mod.children.contains_key(first) {
-                            format!("{root}::{first}")
-                        } else if let Some(t) = dep_crates.lookup(from, first) {
-                            // 선언된 의존 별칭이 워크스페이스 루트보다 우선한다 —
-                            // 같은 이름의 멤버가 있어도 `app`의 `foo`는 선언된
-                            // 패키지다. 외부는 크레이트 정점으로 붕괴하고 멤버
-                            // 별칭은 그 멤버의 루트 정점으로 재작성해 계속 걷는다
-                            // — 패키지 이름과 타깃(루트) 이름이 다를 수 있다.
-                            return if t.member {
-                                match self.walk(&t.vertex, &segs[1..], dep_crates, want) {
-                                    Some(x) => Some(x),
-                                    // 루트 모듈이 트리에 없는 멤버(proc-macro
-                                    // 크레이트 등)는 내부를 모른다 — 외부처럼
-                                    // 크레이트 정점으로 붕괴한다. 안 그러면
-                                    // `use member_lib;`·`use member::x`가
-                                    // 미해석이 돼 dep 사용 증거가 새 나간다.
-                                    None if !self.modules.contains_key(&t.vertex) => {
-                                        Some(t.vertex.clone())
-                                    }
-                                    None => None,
-                                }
-                            } else {
-                                Some(t.vertex.clone())
-                            };
-                        } else if self.modules.contains_key(first) {
-                            // 같은 워크스페이스의 다른 크레이트 루트 모듈 —
-                            // 선언 없는 직접 참조는 컴파일되지 않지만, 관대하게
-                            // 해석하는 쪽이 잃는 것보다 낫다.
-                            return self.walk(first, &segs[1..], dep_crates, want);
-                        } else {
-                            return None;
-                        }
+                        return self.resolve_unbound(from, first, &segs[1..], dep_crates, want)
                     }
                 }
             }
         };
-        // `use serde::Deserialize`가 만든 임포트처럼 시작점 자체가 외부
-        // 크레이트 정점이면 그 정점이다 — walk은 외부 안을 못 본다.
-        // 멤버 정점은 여기 오지 않는다 — 멤버 안은 실제 정점으로 걷는다.
-        if dep_crates.external.contains(start.as_str()) {
-            return Some(start);
+        let mut out = Vec::new();
+        for start in starts {
+            self.walk(start, &segs[i..], dep_crates, want, &mut out);
         }
-        self.walk(&start, &segs[i..], dep_crates, want)
+        merge_routes(out)
     }
 
-    /// 시작 경로에서 나머지 세그먼트를 따라 걷는다.
+    /// 첫 세그먼트 `first`가 모듈 `from`에 묶이지 않은 경로 — 크레이트 루트의 아이템, 선언된 의존 별칭, 같은
+    /// 워크스페이스의 다른 크레이트 루트 순으로 찾는다. `rest`는 나머지 세그먼트다.
+    fn resolve_unbound(
+        &self,
+        from: &str,
+        first: &str,
+        rest: &[String],
+        dep_crates: &DepCrates,
+        want: Want,
+    ) -> Vec<Resolved> {
+        let root = crate_of(from);
+        let Some(root_mod) = self.modules.get(&root) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        if root_mod.items.contains(first) || root_mod.children.contains_key(first) {
+            let start = Resolved::plain(format!("{root}::{first}"));
+            self.walk(start, rest, dep_crates, want, &mut out);
+        } else if let Some(t) = dep_crates.lookup(from, first) {
+            // 선언된 의존 별칭이 워크스페이스 루트보다 우선한다 —
+            // 같은 이름의 멤버가 있어도 `app`의 `foo`는 선언된
+            // 패키지다. 외부는 크레이트 정점으로 붕괴하고 멤버
+            // 별칭은 그 멤버의 루트 정점으로 재작성해 계속 걷는다
+            // — 패키지 이름과 타깃(루트) 이름이 다를 수 있다.
+            if t.member {
+                self.walk(
+                    Resolved::plain(t.vertex.clone()),
+                    rest,
+                    dep_crates,
+                    want,
+                    &mut out,
+                );
+            }
+            // 루트 모듈이 트리에 없는 멤버(proc-macro 크레이트 등)는 내부를 모른다 — 외부처럼 크레이트 정점으로
+            // 붕괴한다. 안 그러면 `use member_lib;`·`use member::x`가 미해석이 돼 dep 사용 증거가 새 나간다.
+            if !t.member || (out.is_empty() && !self.modules.contains_key(&t.vertex)) {
+                out.push(Resolved::plain(t.vertex.clone()));
+            }
+        } else if self.modules.contains_key(first) {
+            // 같은 워크스페이스의 다른 크레이트 루트 모듈 —
+            // 선언 없는 직접 참조는 컴파일되지 않지만, 관대하게
+            // 해석하는 쪽이 잃는 것보다 낫다.
+            self.walk(
+                Resolved::plain(first.to_string()),
+                rest,
+                dep_crates,
+                want,
+                &mut out,
+            );
+        }
+        merge_routes(out)
+    }
+
+    /// 경로 `route`에서 나머지 세그먼트 `rest`를 따라 걸어 닿은 대상을 `out`에 우선 순위 순으로 더한다.
     /// 중간 세그먼트가 모듈이면 내려가고, 아니면 아이템 경로로 존재를 확인한다.
     /// 지나는 모듈이 그 세그먼트를 선언하지 않고 `use`로 들였으면(재노출 — `pub use inner::Tr`,
     /// `pub use inner::*`가 펼친 이름, 모듈 별칭) 그 임포트의 대상에서 이어 걷는다 — 정규 ID는
     /// 정의 위치다. 따라갈 때마다 세그먼트를 하나 소비하므로 재노출이 서로를 가리켜도 끝난다.
-    /// 대상이 외부 크레이트 정점이면 그 정점으로 붕괴한다([`ModTree::resolve`]와 같다).
+    /// 그 임포트가 `#[cfg]`로 갈린 대안이면 대안마다 걷고(깊이 우선 — 첫 대안의 대상이 먼저다), 따라간 임포트의
+    /// 조건을 경로에 더한다. 대상이 외부 크레이트 정점이면 그 정점으로 붕괴한다([`ModTree::resolve`]와 같다).
     /// 중간 세그먼트는 타입 이름공간에서, 마지막 세그먼트는 `want`로 찾는다 — 로컬 아이템이 먼저인 것은
     /// 첫 세그먼트와 같은 규칙이다([`lookup`]). 비공개 `use`도 따른다 — 크레이트 안에서는 자손 모듈이 볼 수
     /// 있고, 보이지 않는 경로는 컴파일되지 않으니 관대하게 해석해 잃는 것이 없다.
     fn walk(
         &self,
-        start: &str,
+        route: Resolved,
         rest: &[String],
         dep_crates: &DepCrates,
         want: Want,
-    ) -> Option<String> {
-        let mut cur = start.to_string();
-        let mut j = 0;
-        while j < rest.len() {
-            let seg = &rest[j];
-            let here = if j + 1 < rest.len() {
-                Want::Prefer(Ns::Type)
-            } else {
-                want
-            };
-            let found = self
-                .modules
-                .get(&cur)
-                .map_or(Found::Unbound, |m| lookup(m, seg, here));
-            if let Found::Import(imp) = found {
-                if dep_crates.external.contains(imp.target.as_str()) {
-                    return Some(imp.target.clone());
+        out: &mut Vec<Resolved>,
+    ) {
+        // `use serde::Deserialize`가 만든 임포트처럼 지금 닿은 것이 외부 크레이트 정점이면 그 정점이다 — 외부 안은
+        // 못 본다. 멤버 정점은 external에 없다 — 멤버 안은 실제 정점으로 걷는다.
+        if dep_crates.external.contains(route.target.as_str()) {
+            out.push(route);
+            return;
+        }
+        let Some((seg, tail)) = rest.split_first() else {
+            if self.modules.contains_key(&route.target) || self.item_exists(&route.target) {
+                out.push(route);
+            }
+            return;
+        };
+        let here = if tail.is_empty() {
+            want
+        } else {
+            Want::Prefer(Ns::Type)
+        };
+        let found = self
+            .modules
+            .get(&route.target)
+            .map_or(Found::Unbound, |m| lookup(m, seg, here));
+        match found {
+            Found::Import(imps) => {
+                for imp in imps {
+                    self.walk(route.through(imp), tail, dep_crates, want, out);
                 }
-                cur = imp.target.clone();
-                j += 1;
-                continue;
             }
-            let next = format!("{cur}::{seg}");
-            if self.modules.contains_key(&next) {
-                cur = next;
-                j += 1;
-                continue;
+            // `#[cfg]`를 단 로컬 아이템이 먼저고, 그것이 없는 빌드의 임포트가 대안이다.
+            Found::LocalOr(imps) => {
+                self.walk_declared(route.clone(), rest, dep_crates, want, out);
+                for imp in imps {
+                    self.walk(route.through(imp), tail, dep_crates, want, out);
+                }
             }
-            // 모듈이 아니면 아이템이다 — 뒤는 전부 아이템 하위 경로.
-            let tail = rest[j..].join("::");
-            let candidate = format!("{cur}::{tail}");
-            return self.item_exists(&candidate).then_some(candidate);
+            Found::Local | Found::Unresolved | Found::Unbound => {
+                self.walk_declared(route, rest, dep_crates, want, out)
+            }
         }
-        if self.modules.contains_key(&cur) {
-            return Some(cur);
+    }
+
+    /// [`ModTree::walk`]에서 다음 세그먼트(`rest`의 첫 원소)를 지금 닿은 모듈의 선언으로 따라간다 — 자식 모듈이면
+    /// 내려가고, 아니면 나머지 전부가 아이템 하위 경로인지 확인한다.
+    fn walk_declared(
+        &self,
+        route: Resolved,
+        rest: &[String],
+        dep_crates: &DepCrates,
+        want: Want,
+        out: &mut Vec<Resolved>,
+    ) {
+        let Some((seg, tail)) = rest.split_first() else {
+            return;
+        };
+        let child = format!("{}::{seg}", route.target);
+        if self.modules.contains_key(&child) {
+            return self.walk(route.at(child), tail, dep_crates, want, out);
         }
-        self.item_exists(&cur).then_some(cur)
+        // 모듈이 아니면 아이템이다 — 뒤는 전부 아이템 하위 경로.
+        let candidate = format!("{}::{}", route.target, rest.join("::"));
+        if self.item_exists(&candidate) {
+            out.push(route.at(candidate));
+        }
     }
 
     /// `use` 경로 하나를 이름공간마다 해석한다 — 명시 `use a::x`는 `a`에서 `x`가 차지한 이름공간을 모두 들인다
     /// (`a`에 `fn x`와 `pub use crate::m as x`가 함께 있으면 값은 그 fn, 타입은 `m`). 앞 세그먼트는 타입
-    /// 이름공간으로 걷고, 마지막 세그먼트를 그 모듈에서 이름공간마다 찾는다. 칸의 `Some(None)`은 그 이름공간에서
+    /// 이름공간으로 걷고, 마지막 세그먼트를 그 모듈에서 이름공간마다 찾는다. 대상이 `None`이면 그 이름공간에서
     /// 그래프 밖 이름으로 묶였다는 뜻이다. 그 모듈에서 이름공간을 정하지 못한 칸([`PerNs::undetermined`])은 그대로
     /// 이름공간을 정하지 못한 칸으로 물려받는다. 어디서도 정점을 정하지 못하면 이름공간을 가리지 않는
-    /// 해석([`ModTree::resolve`])을 이름공간을 정하지 못한 칸에 둔다 — 외부 크레이트로 붕괴한 경로, 멤버 루트, 아이템
+    /// 해석([`ModTree::resolve_all`])을 이름공간을 정하지 못한 칸에 둔다 — 외부 크레이트로 붕괴한 경로, 멤버 루트, 아이템
     /// 표가 이름공간을 모르는 이름이 그렇다. 그래서 이름공간을 나누기 전에 묶이던 대상은 늘 어느 칸엔가 있다.
+    ///
+    /// 앞 세그먼트나 그 모듈의 임포트가 `#[cfg]`로 갈린 대안이면 대안마다 찾고, 칸에는 찾은 대상을 우선 순위
+    /// 순으로 둔다. 대상마다 거쳐 온 재노출의 조건을 싣는다 — `use crate::sync::Condvar`가 `sync`의
+    /// `#[cfg(feature = "pl")] pub use crate::pl::Condvar`를 거치면 `feature = "pl"`이다. 비어 있는 칸은 `None`이다.
     fn resolve_use(
         &self,
         from: &str,
         segs: &[String],
         dep_crates: &DepCrates,
-    ) -> PerNs<Option<String>> {
-        let mut out = PerNs::default();
+    ) -> PerNs<Vec<UseTarget>> {
+        let mut out: PerNs<Vec<UseTarget>> = PerNs::default();
         if let Some((last, prefix)) = segs.split_last().filter(|(_, p)| !p.is_empty()) {
-            let owner = self
-                .resolve_want(from, prefix, dep_crates, Want::Prefer(Ns::Type))
-                .filter(|o| !dep_crates.external.contains(o.as_str()));
-            if let Some((owner, module)) = owner
-                .as_deref()
-                .and_then(|o| self.modules.get(o).map(|m| (o, m)))
-            {
-                for ns in Ns::ALL {
-                    *out.slot(ns) = match strict_lookup(module, last, ns) {
-                        Found::Local => Some(Some(format!("{owner}::{last}"))),
-                        found => self.use_target(found, dep_crates),
-                    };
+            for owner in self.resolve_want(from, prefix, dep_crates, Want::Prefer(Ns::Type)) {
+                if dep_crates.external.contains(owner.target.as_str()) {
+                    continue;
                 }
-                out.undetermined = module
+                let Some(module) = self.modules.get(&owner.target) else {
+                    continue;
+                };
+                for ns in Ns::ALL {
+                    let local = || UseTarget {
+                        target: Some(format!("{}::{last}", owner.target)),
+                        cfg: owner.cfg.clone(),
+                    };
+                    let found = match strict_lookup(module, last, ns) {
+                        Found::Local => vec![local()],
+                        Found::LocalOr(imps) => std::iter::once(local())
+                            .chain(self.use_targets(Found::Import(imps), &owner, dep_crates))
+                            .collect(),
+                        found => self.use_targets(found, &owner, dep_crates),
+                    };
+                    extend_slot(out.slot(ns), found);
+                }
+                if let Some(binding) = module
                     .imports
                     .get(last)
                     .and_then(|b| b.undetermined.as_ref())
-                    .and_then(|binding| self.use_target(found_of(binding), dep_crates));
+                {
+                    let found = self.use_targets(found_of(binding), &owner, dep_crates);
+                    extend_slot(&mut out.undetermined, found);
+                }
             }
         }
-        if out.bound().any(Option::is_some) {
+        if out.bound().flatten().any(|t| t.target.is_some()) {
             return out;
         }
-        match self.resolve(from, segs, dep_crates) {
-            Some(target) => PerNs::undetermined_only(Some(target)),
-            None => out,
+        let all: Vec<UseTarget> = self
+            .resolve_want(from, segs, dep_crates, Want::Any)
+            .into_iter()
+            .map(|r| UseTarget {
+                target: Some(r.target),
+                cfg: r.cfg,
+            })
+            .collect();
+        if all.is_empty() {
+            out
+        } else {
+            PerNs::undetermined_only(all)
         }
     }
 
-    /// [`ModTree::resolve_use`]가 대상 모듈에서 찾은 임포트 하나를 칸 값으로 — `Some(None)`은 그래프 밖 이름이다.
-    /// 따라간 대상이 정점이 아니면(트리에 없는 멤버 루트 등) 칸을 정하지 않는다(`None`).
-    fn use_target(&self, found: Found<'_>, dep_crates: &DepCrates) -> Option<Option<String>> {
+    /// [`ModTree::resolve_use`]가 대상 모듈(경로 `owner`로 닿은)에서 찾은 임포트 칸을 대상들로 — 대상이 `None`이면
+    /// 그래프 밖 이름이다. 조건은 `owner`까지 거쳐 온 것과 그 임포트의 것을 함께 싣는다. 따라간 대상이 정점이
+    /// 아니면(트리에 없는 멤버 루트 등) 그 대상은 빠진다.
+    fn use_targets(
+        &self,
+        found: Found<'_>,
+        owner: &Resolved,
+        dep_crates: &DepCrates,
+    ) -> Vec<UseTarget> {
         match found {
-            Found::Import(imp) => (dep_crates.external.contains(imp.target.as_str())
-                || self.modules.contains_key(&imp.target)
-                || self.item_exists(&imp.target))
-            .then(|| Some(imp.target.clone())),
-            Found::Unresolved => Some(None),
+            Found::Import(imps) => imps
+                .iter()
+                .filter(|imp| {
+                    dep_crates.external.contains(imp.target.as_str())
+                        || self.modules.contains_key(&imp.target)
+                        || self.item_exists(&imp.target)
+                })
+                .map(|imp| UseTarget {
+                    target: Some(imp.target.clone()),
+                    cfg: with_import_cfg(&owner.cfg, &imp.cfg),
+                })
+                .collect(),
+            Found::Unresolved => vec![UseTarget {
+                target: None,
+                cfg: owner.cfg.clone(),
+            }],
             // 로컬 아이템은 호출자가 정규 ID로 바꾼다 — 여기 오는 것은 임포트 칸뿐이다.
-            Found::Local | Found::Unbound => None,
+            Found::Local | Found::LocalOr(_) | Found::Unbound => Vec::new(),
         }
     }
 
@@ -654,6 +885,62 @@ impl ModTree {
     }
 }
 
+/// 우선 순위 순의 대상들 가운데 첫 번째의 정점 ID — 대상 하나를 고르는 해석([`ModTree::resolve`])의 결과다.
+fn first_target(routes: Vec<Resolved>) -> Option<String> {
+    routes.into_iter().next().map(|r| r.target)
+}
+
+/// 우선 순위 순의 대상들에서 같은 정점을 하나로 합친다 — 자리는 처음 나온 곳이고, 조건은 둘 중 약한 쪽이다
+/// (어느 경로로든 그 정점에 닿으면 그 이름이 가리키는 것이다).
+fn merge_routes(routes: Vec<Resolved>) -> Vec<Resolved> {
+    let mut out: Vec<Resolved> = Vec::with_capacity(routes.len());
+    for route in routes {
+        match out.iter_mut().find(|seen| seen.target == route.target) {
+            Some(seen) => seen.cfg = weaker_cfg(&seen.cfg, &route.cfg),
+            None => out.push(route),
+        }
+    }
+    out
+}
+
+/// [`ModTree::resolve_use`]의 칸 하나에 찾은 대상들을 더한다 — 찾은 것이 없으면 칸을 만들지 않는다(비어 있는
+/// 칸은 `None`이라는 불변식).
+fn extend_slot(slot: &mut Option<Vec<UseTarget>>, found: Vec<UseTarget>) {
+    if !found.is_empty() {
+        slot.get_or_insert_with(Vec::new).extend(found);
+    }
+}
+
+/// 조건 `own`(간선·경로의 것)에 거쳐 온 임포트의 조건 `via`를 더한다 — 둘 다 성립해야 한다. `via`가 없거나 그
+/// 조건들이 이미 `own`에 있으면 `own`을 글자 그대로 둔다(아이템과 임포트가 같은 `#[cfg(feature = "x")]`을 달면 간선의
+/// 표기가 바뀌지 않는다). `own`이 없으면 `via` 그대로, 둘 다 있으면 [`conjoin_cfg`]처럼 정렬된 조건 집합의
+/// `all(..)`이다.
+pub fn with_import_cfg(own: &Option<String>, via: &Option<String>) -> Option<String> {
+    let Some(via_cfg) = via else {
+        return own.clone();
+    };
+    let Some(own_cfg) = own else {
+        return via.clone();
+    };
+    let (mut have, mut add) = (BTreeSet::new(), BTreeSet::new());
+    push_conjuncts(own_cfg.trim(), &mut have);
+    push_conjuncts(via_cfg.trim(), &mut add);
+    if add.is_subset(&have) {
+        own.clone()
+    } else {
+        conjoin_cfg(own, via)
+    }
+}
+
+/// 앞선 [`fill_items`]가 이름공간 `ns`에 `name`을 선언 아이템으로 적었는가 — 자식 모듈 표는 보지 않는다.
+fn declared_in(module: &Module, name: &str, ns: Ns) -> bool {
+    match ns {
+        Ns::Type => module.type_items.contains(name),
+        Ns::Value => module.value_items.contains(name),
+        Ns::Macro => module.macro_items.contains(name),
+    }
+}
+
 /// 모듈 `module`의 로컬 아이템 가운데 이름공간 `ns`에 `name`이 있는가 — 자식 모듈은 타입 이름공간이다.
 fn local_in(module: &Module, name: &str, ns: Ns) -> bool {
     match ns {
@@ -668,7 +955,7 @@ fn local_in(module: &Module, name: &str, ns: Ns) -> bool {
 /// ([`PerNs::undetermined`])은 보지 않는다.
 fn strict_lookup<'a>(module: &'a Module, name: &str, ns: Ns) -> Found<'a> {
     if local_in(module, name, ns) {
-        return Found::Local;
+        return gated_alternatives(module, name, ns).map_or(Found::Local, Found::LocalOr);
     }
     match module.imports.get(name).and_then(|b| b.get(ns)) {
         Some(binding) => found_of(binding),
@@ -676,11 +963,18 @@ fn strict_lookup<'a>(module: &'a Module, name: &str, ns: Ns) -> Found<'a> {
     }
 }
 
+/// 이름공간 `ns`의 `#[cfg]`를 단 로컬 아이템 `name`이 없는 빌드에서 그 이름이 가리키는 임포트
+/// ([`Module::local_alternatives`]) — 없으면 `None`이다.
+fn gated_alternatives<'a>(module: &'a Module, name: &str, ns: Ns) -> Option<&'a [Import]> {
+    let imports = module.local_alternatives.get(name)?.get(ns)?.imports();
+    (!imports.is_empty()).then_some(imports)
+}
+
 /// 임포트 칸 하나를 찾은 결과로.
 fn found_of(binding: &Binding) -> Found<'_> {
     match binding {
-        Binding::Resolved(imp) => Found::Import(imp),
         Binding::Unresolved(_) => Found::Unresolved,
+        resolved => Found::Import(resolved.imports()),
     }
 }
 
@@ -690,14 +984,15 @@ fn found_of(binding: &Binding) -> Found<'_> {
 /// union·trait·type)은 같은 이름의 타입 이름공간 임포트(글롭)를 이기고, 로컬 이름이 값·매크로 아이템뿐이면
 /// 타입 이름공간에 묶인 임포트를 따른다 — `fn harvest`가 있는 모듈의 `harvest::f()`는 `use crate::harvest`다.
 /// 그 이름공간에 아무것도 없으면 이름공간을 정하지 못한 임포트를 보되, 같은 이름의 로컬 아이템이나 이름공간이
-/// 정해진 임포트가 있으면 보지 않는다([`undetermined_lookup`]). 그래도 없으면 [`Want::Any`]다([`any_lookup`]).
+/// 정해진 임포트가 있으면 보지 않는다(매크로 자리는 예외 — [`undetermined_lookup`]). 그래도 없으면 [`Want::Any`]다
+/// ([`any_lookup`]).
 fn lookup<'a>(module: &'a Module, name: &str, want: Want) -> Found<'a> {
     if let Want::Prefer(ns) = want {
         match strict_lookup(module, name, ns) {
             Found::Unbound => {}
             found => return found,
         }
-        match undetermined_lookup(module, name) {
+        match undetermined_lookup(module, name, ns) {
             Found::Unbound => {}
             found => return found,
         }
@@ -713,14 +1008,22 @@ fn lookup<'a>(module: &'a Module, name: &str, want: Want) -> Found<'a> {
 /// 매크로 인자·값 자리의 `Foo`가 그 `use`로 가 trait 간선을 잃던 문제다. 쓰지 않으면 [`any_lookup`]이 로컬
 /// 아이템이나 정해진 임포트를 고른다. 아무것도 없으면 그 `use`가 유일한 후보다. `#[cfg]`로 갈린 같은 이름공간의
 /// 대안 임포트(워크스페이스 쪽·std 쪽)에는 위 근거가 닿지 않지만 결과는 같다 — 소스 순서와 무관하게 정해진
-/// 워크스페이스 쪽이고, 본문 간선은 그 임포트의 cfg를 싣지 않는다([`PerNs::undetermined`]).
-fn undetermined_lookup<'a>(module: &'a Module, name: &str) -> Found<'a> {
+/// 워크스페이스 쪽이고, 그 이름으로 해석한 간선은 그 임포트의 cfg를 싣는다([`PerNs::undetermined`]).
+///
+/// 매크로 자리(`ns`가 [`Ns::Macro`])는 다르다 — 여기 왔으면 매크로 이름공간에는 로컬 매크로도 정해진 임포트도 없고,
+/// 같은 이름의 로컬 fn·trait·struct·mod나 정해진 타입·값 임포트는 매크로가 될 수 없다. 위 근거대로 그 `use`는 그것들과
+/// 다른 이름공간에 있으니 매크로 이름공간에 있을 수 있는 유일한 후보다 — `fn info` 옆 `use log::info`의 `info!()`는
+/// 로컬 fn이 아니라 그 `use`다(rustc는 그 fn을 "never used"로 경고한다). 예전에는 로컬 fn이 확정 대상이라 거짓
+/// call 간선이 생겼고, 그 fn이 다시 부르는 곳과 거짓 순환이 됐다. 로컬 fn은 자리를 모르는 해석의 대상이라 호출자가
+/// 추정 간선으로 남긴다(보존은 그대로다).
+fn undetermined_lookup<'a>(module: &'a Module, name: &str, ns: Ns) -> Found<'a> {
     let Some(bindings) = module.imports.get(name) else {
         return Found::Unbound;
     };
-    let claimed = module.items.contains(name)
-        || module.children.contains_key(name)
-        || bindings.has_determined();
+    let claimed = ns != Ns::Macro
+        && (module.items.contains(name)
+            || module.children.contains_key(name)
+            || bindings.has_determined());
     match &bindings.undetermined {
         Some(binding) if !claimed => found_of(binding),
         _ => Found::Unbound,
@@ -734,7 +1037,12 @@ fn undetermined_lookup<'a>(module: &'a Module, name: &str) -> Found<'a> {
 /// 들인 trait(타입 이름공간)이 같은 이름의 derive 재노출(이름공간을 모름)에 가려지지 않게 하기 위해서다.
 fn any_lookup<'a>(module: &'a Module, name: &str) -> Found<'a> {
     if module.items.contains(name) || module.children.contains_key(name) {
-        return Found::Local;
+        // `#[cfg]`를 단 로컬 아이템 옆의 같은 이름공간 임포트는 그 아이템이 없는 빌드의 대안이다.
+        let alternatives = [Ns::Value, Ns::Type, Ns::Macro]
+            .into_iter()
+            .filter(|ns| local_in(module, name, *ns))
+            .find_map(|ns| gated_alternatives(module, name, ns));
+        return alternatives.map_or(Found::Local, Found::LocalOr);
     }
     let Some(bindings) = module.imports.get(name) else {
         return Found::Unbound;
@@ -743,8 +1051,9 @@ fn any_lookup<'a>(module: &'a Module, name: &str) -> Found<'a> {
         .into_iter()
         .filter_map(|ns| bindings.get(ns));
     for binding in determined.chain(bindings.undetermined.as_ref()) {
-        if let Binding::Resolved(imp) = binding {
-            return Found::Import(imp);
+        let imports = binding.imports();
+        if !imports.is_empty() {
+            return Found::Import(imports);
         }
     }
     if bindings.is_empty() {
@@ -971,28 +1280,40 @@ pub fn fill_items(tree: &mut ModTree, path: &str, items: &[&syn::Item]) {
     let mut names = BTreeSet::new();
     let (mut types, mut values, mut macros) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
     let mut scopes: BTreeMap<String, Scope> = BTreeMap::new();
+    // (이름, 이름공간) → 이 호출에서 본 그 선언들의 `#[cfg]` 조건 — 조건 없는 선언이 하나라도 있으면 `None`.
+    let mut gated: BTreeMap<(String, Ns), Option<Vec<String>>> = BTreeMap::new();
     for item in items {
-        // (이름, 가시성, 차지하는 이름공간). 튜플·유닛 struct는 생성자로 값 이름공간도 차지한다.
+        // (이름, 가시성, 차지하는 이름공간, 속성). 튜플·유닛 struct는 생성자로 값 이름공간도 차지한다.
         // `macro_rules!`은 경로 가시성이 없어 지금처럼 어디서나 보이는 것으로 둔다.
-        let (ident, vis, namespaces): (_, _, &[Ns]) = match item {
-            syn::Item::Fn(f) => (&f.sig.ident, Some(&f.vis), &[Ns::Value]),
+        let (ident, vis, namespaces, attrs): (_, _, &[Ns], &[syn::Attribute]) = match item {
+            syn::Item::Fn(f) => (&f.sig.ident, Some(&f.vis), &[Ns::Value], &f.attrs),
             syn::Item::Struct(s) => match s.fields {
-                syn::Fields::Named(_) => (&s.ident, Some(&s.vis), &[Ns::Type]),
-                _ => (&s.ident, Some(&s.vis), &[Ns::Type, Ns::Value]),
+                syn::Fields::Named(_) => (&s.ident, Some(&s.vis), &[Ns::Type], &s.attrs),
+                _ => (&s.ident, Some(&s.vis), &[Ns::Type, Ns::Value], &s.attrs),
             },
-            syn::Item::Enum(e) => (&e.ident, Some(&e.vis), &[Ns::Type]),
-            syn::Item::Trait(t) => (&t.ident, Some(&t.vis), &[Ns::Type]),
-            syn::Item::Union(u) => (&u.ident, Some(&u.vis), &[Ns::Type]),
-            syn::Item::Type(t) => (&t.ident, Some(&t.vis), &[Ns::Type]),
-            syn::Item::Const(c) => (&c.ident, Some(&c.vis), &[Ns::Value]),
-            syn::Item::Static(s) => (&s.ident, Some(&s.vis), &[Ns::Value]),
-            syn::Item::Mod(m) => (&m.ident, Some(&m.vis), &[Ns::Type]),
+            syn::Item::Enum(e) => (&e.ident, Some(&e.vis), &[Ns::Type], &e.attrs),
+            syn::Item::Trait(t) => (&t.ident, Some(&t.vis), &[Ns::Type], &t.attrs),
+            syn::Item::Union(u) => (&u.ident, Some(&u.vis), &[Ns::Type], &u.attrs),
+            syn::Item::Type(t) => (&t.ident, Some(&t.vis), &[Ns::Type], &t.attrs),
+            syn::Item::Const(c) => (&c.ident, Some(&c.vis), &[Ns::Value], &c.attrs),
+            syn::Item::Static(s) => (&s.ident, Some(&s.vis), &[Ns::Value], &s.attrs),
+            syn::Item::Mod(m) => (&m.ident, Some(&m.vis), &[Ns::Type], &m.attrs),
             syn::Item::Macro(m) => match &m.ident {
-                Some(id) => (id, None, &[Ns::Macro]),
+                Some(id) => (id, None, &[Ns::Macro], &m.attrs),
                 None => continue,
             },
             _ => continue,
         };
+        let condition = cfg_of(attrs);
+        for ns in namespaces {
+            let seen = gated
+                .entry((ident.to_string(), *ns))
+                .or_insert_with(|| Some(Vec::new()));
+            match (seen.as_mut(), &condition) {
+                (Some(conditions), Some(condition)) => conditions.push(condition.clone()),
+                _ => *seen = None,
+            }
+        }
         let name = ident.to_string();
         let scope = vis.map_or(Scope::Public, |vis| scope_of(vis, path));
         let scope = match scopes.get(&name) {
@@ -1011,6 +1332,32 @@ pub fn fill_items(tree: &mut ModTree, path: &str, items: &[&syn::Item]) {
         names.insert(name);
     }
     let module = tree.modules.get_mut(path).expect("module must exist");
+    // 같은 모듈을 두 번 채우면 앞서 채운 선언과 합친다 — 앞서 본 조건 없는 선언이 있는 이름공간은 조건부가 아니다.
+    // 앞선 선언은 아이템 표(이름공간별 표)로 본다 — 자식 모듈 표는 `mod` 선언을 훑을 때 미리 채워지므로, 그것을 보면
+    // `#[cfg] mod imp`가 늘 앞선 조건 없는 선언으로 보였다.
+    for ((name, ns), conditions) in gated {
+        let earlier = declared_in(module, &name, ns);
+        let previous = module
+            .cfg_gated
+            .get(&name)
+            .and_then(|spaces| spaces.get(&ns))
+            .cloned();
+        let merged = match (conditions, earlier, previous) {
+            (Some(conditions), false, _) => Some(conditions),
+            (Some(conditions), true, Some(previous)) => Some([previous, conditions].concat()),
+            _ => None,
+        };
+        let spaces = module.cfg_gated.entry(name).or_default();
+        match merged {
+            Some(conditions) => {
+                spaces.insert(ns, conditions);
+            }
+            None => {
+                spaces.remove(&ns);
+            }
+        }
+    }
+    module.cfg_gated.retain(|_, spaces| !spaces.is_empty());
     module.items.extend(names);
     module.type_items.extend(types);
     module.value_items.extend(values);
@@ -1109,6 +1456,25 @@ fn derive_name(attr: &syn::Attribute) -> Option<String> {
 /// 이 모듈의 임포트 표([`Module::imports`])는 부를 때마다 그 모듈의 `use`로 새로 만든다 — 해석은 다른 모듈과
 /// 이 모듈의 지난 표를 읽고, 다 만든 표로 바꾼다. 그래서 글롭 대상이 바뀌면 지난번에 펼친 이름이 남지 않는다.
 pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_crates: &DepCrates) {
+    fill_imports_from(tree, None, path, items, dep_crates);
+}
+
+/// 모듈 하나의 임포트 표와 글롭 대상 — [`fill_imports_from`]이 바꾸기 전 표를 돌려준다.
+type Tables = (
+    BTreeMap<String, PerNs<Binding>>,
+    BTreeMap<String, Option<String>>,
+);
+
+/// [`fill_imports`]의 본체 — `frozen`이 있으면 명시 `use`와 글롭 대상 경로를 그 트리(앞서 수렴한 임포트 표)로
+/// 해석하고, 글롭이 펼치는 이름만 `tree`의 지금 표에서 읽는다([`fill_imports_settled`]의 깨끗한 바퀴).
+fn fill_imports_from(
+    tree: &mut ModTree,
+    frozen: Option<&ModTree>,
+    path: &str,
+    items: &[&syn::Item],
+    dep_crates: &DepCrates,
+) -> Tables {
+    let resolver: &ModTree = frozen.unwrap_or(tree);
     let derive_names = derive_macro_names(path, items);
     let mut uses: Vec<(Vec<String>, Option<String>, Scope)> = Vec::new();
     for item in items {
@@ -1127,6 +1493,9 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
     // std 경로여도 같은 이름공간의 글롭 임포트를 소스 순서와 무관하게 가린다.
     let mut globbed: BTreeMap<String, PerNs<Binding>> = BTreeMap::new();
     let mut explicit: BTreeMap<String, PerNs<Binding>> = BTreeMap::new();
+    // 칸마다 그 칸을 차지한 명시 `use`들의 자기 `#[cfg]`(없으면 `None`) — 같은 칸의 글롭을 얼마나 가리는지 정한다
+    // ([`shadow_globs`]).
+    let mut conditions: BTreeMap<String, PerNs<Vec<Option<String>>>> = BTreeMap::new();
     let mut glob_targets: BTreeMap<String, Option<String>> = BTreeMap::new();
     for (segs, cfg, scope) in &uses {
         let glob = segs.last().is_some_and(|s| s == "*");
@@ -1139,22 +1508,30 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
             // 해석되지 않는 글롭(외부 크레이트)은 무슨 이름을 들이는지 모른다 — 가릴 것도 없다. 글롭 대상은 모듈·
             // 열거형이라 타입 이름공간에서 찾는다 — `fn harvest`와 `use crate::harvest`가 함께 있는 모듈의
             // `use super::harvest::*`가 그 fn을 대상으로 잡아 아무것도 들이지 않던 문제다.
-            let Some(full) = tree.resolve_in(path, &clean, dep_crates, Ns::Type) else {
-                continue;
-            };
-            if let Some(target) = tree.modules.get(&full) {
-                for (name, bindings) in glob_bindings(target, &full, path, cfg, scope) {
-                    merge_glob(globbed.entry(name).or_default(), bindings);
+            // 대상 경로가 `#[cfg]`로 갈린 대안 임포트를 지나면 대안마다 들인다(조건은 글롭의 것과 거쳐 온 임포트의
+            // 것을 함께). 우선 순위가 낮은 대안부터 심어, 대상 하나를 고르는 해석의 대상이 칸의 첫 원소가 된다.
+            for full in resolver
+                .resolve_all(path, &clean, dep_crates, Some(Ns::Type))
+                .into_iter()
+                .rev()
+            {
+                let glob_cfg = with_import_cfg(cfg, &full.cfg);
+                if let Some(target) = tree.modules.get(&full.target) {
+                    for (name, bindings) in
+                        glob_bindings(target, &full.target, path, &glob_cfg, scope)
+                    {
+                        merge_glob(globbed.entry(name).or_default(), bindings);
+                    }
                 }
+                // 글롭한 모듈 자신은 이름으로 묶지 않는다(`use m::*`는 `m`을 들이지 않는다) — 그 글롭의 의존
+                // 증거(대상 모듈·외부 크레이트 정점으로 가는 uses 간선)로만 따로 둔다. 같은 대상을 여러 글롭이
+                // 들이면 약한 조건이다.
+                let glob_cfg = match glob_targets.remove(&full.target) {
+                    Some(seen) => weaker_cfg(&seen, &glob_cfg),
+                    None => glob_cfg,
+                };
+                glob_targets.insert(full.target, glob_cfg);
             }
-            // 글롭한 모듈 자신은 이름으로 묶지 않는다(`use m::*`는 `m`을 들이지 않는다) — 그 글롭의 의존
-            // 증거(대상 모듈·외부 크레이트 정점으로 가는 uses 간선)로만 따로 둔다. 같은 대상을 여러 글롭이
-            // 들이면 약한 조건이다.
-            let cfg = match glob_targets.remove(&full) {
-                Some(seen) => weaker_cfg(&seen, cfg),
-                None => cfg.clone(),
-            };
-            glob_targets.insert(full, cfg);
             continue;
         }
         let alias = segs
@@ -1163,20 +1540,31 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
             .find(|s| s.starts_with("as "))
             .map(|s| s[3..].to_string())
             .unwrap_or_else(|| segs.last().unwrap().clone());
-        let targets = tree.resolve_use(path, &clean, dep_crates);
+        let targets = resolver.resolve_use(path, &clean, dep_crates);
         // 어디에도 묶이지 않는 `use`(std 경로 등)는 이름공간을 정하지 못한, 해석되지 않는 이름이다.
         let targets = if targets.is_empty() {
-            PerNs::undetermined_only(None)
+            PerNs::undetermined_only(vec![UseTarget {
+                target: None,
+                cfg: None,
+            }])
         } else {
             targets
         };
+        let own = conditions.entry(alias.clone()).or_default();
         let slots = explicit.entry(alias).or_default();
-        for (ns, target) in targets.iter() {
-            // 같은 이름공간에 같은 이름을 들이는 `use`가 둘이면 지금처럼 뒤의 것이다.
-            *slots.slot(ns) = Some(use_binding(target, cfg, scope));
+        // 같은 이름공간에 같은 이름을 들이는 `use`가 둘이면 대상이 다를 때 둘 다 남는다([`merge_slot`] —
+        // `#[cfg]`로 갈린 대안이다). 대상 하나를 고르는 해석은 지금처럼 뒤의 것을 고른다.
+        for ns in Ns::ALL {
+            if let Some(found) = targets.get(ns) {
+                merge_slot(slots.slot(ns), use_binding(found, cfg, scope));
+                own.slot(ns).get_or_insert_with(Vec::new).push(cfg.clone());
+            }
         }
-        if let Some(target) = &targets.undetermined {
-            slots.undetermined = Some(use_binding(target, cfg, scope));
+        if let Some(found) = &targets.undetermined {
+            merge_slot(&mut slots.undetermined, use_binding(found, cfg, scope));
+            own.undetermined
+                .get_or_insert_with(Vec::new)
+                .push(cfg.clone());
         }
     }
     // derive 매크로는 함수 이름이 아니라 등록한 이름으로 쓰인다 — `pub use self::hello_impl as Hello;`
@@ -1184,58 +1572,244 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
     // deps가 실제로 쓰는 proc-macro 의존을 unused로 보고했다. 명시 `use`가 같은 이름을 매크로 이름공간에
     // 들이면 그쪽이 이긴다.
     for (name, import) in derive_names {
+        conditions
+            .entry(name.clone())
+            .or_default()
+            .macros
+            .get_or_insert_with(Vec::new)
+            .push(import.cfg.clone());
         explicit
             .entry(name)
             .or_default()
             .macros
             .get_or_insert(Binding::Resolved(import));
     }
+    let local_alternatives = match tree.modules.get(path) {
+        Some(module) => local_alternatives(tree, module, path, &explicit, &conditions, &globbed),
+        None => BTreeMap::new(),
+    };
     let mut imports = globbed;
     for (name, bindings) in explicit {
-        shadow_globs(imports.entry(name).or_default(), bindings);
+        // 이름을 묶지 않는 `use T as _`는 아무것도 가리지 않는다 — 글롭이 들인 `_`와 함께 남는다.
+        let own = match conditions.remove(&name) {
+            Some(own) if name != "_" => own,
+            _ => PerNs::default(),
+        };
+        shadow_globs(imports.entry(name).or_default(), bindings, &own);
     }
     let module = tree.modules.get_mut(path).expect("module must exist");
-    module.imports = imports;
-    module.glob_targets = glob_targets;
+    module.local_alternatives = local_alternatives;
+    (
+        std::mem::replace(&mut module.imports, imports),
+        std::mem::replace(&mut module.glob_targets, glob_targets),
+    )
 }
 
-/// 명시 `use` 하나의 칸 값 — `None` 대상은 그래프 밖 이름이다.
-fn use_binding(target: &Option<String>, cfg: &Option<String>, scope: &Scope) -> Binding {
-    match target {
-        Some(full) => Binding::Resolved(Import {
-            target: full.clone(),
-            cfg: cfg.clone(),
-            scope: scope.clone(),
-        }),
-        None => Binding::Unresolved(scope.clone()),
-    }
+/// 명시 `use` 하나(조건 `cfg`, 가시성 `scope`)가 한 이름공간에서 찾은 대상들의 칸 값 — 정점으로 해석된 대상이
+/// 있으면 그것들이고(조건은 그 `use`의 것과 거쳐 온 재노출의 것을 함께), 없으면 그래프 밖 이름이다.
+fn use_binding(found: &[UseTarget], cfg: &Option<String>, scope: &Scope) -> Binding {
+    let imports = found
+        .iter()
+        .filter_map(|t| {
+            t.target.as_ref().map(|target| Import {
+                target: target.clone(),
+                cfg: with_import_cfg(cfg, &t.cfg),
+                scope: scope.clone(),
+            })
+        })
+        .collect();
+    Binding::of_imports(merge_imports(imports))
+        .unwrap_or_else(|| Binding::Unresolved(scope.clone()))
 }
 
 /// 한 이름의 글롭 칸 `slots` 위에 명시 임포트 `explicit`을 얹는다 — 명시 임포트는 자기 이름공간의 글롭만 가린다.
 /// 이름공간을 정하지 못한 명시 임포트는 어느 이름공간을 차지하는지 모르니 그 이름의 글롭을 모두 가린다 —
 /// `use std::fmt::Result`가 글롭이 들인 로컬 `Result`를 가리는 것(이름공간을 나누기 전과 같다).
-fn shadow_globs(slots: &mut PerNs<Binding>, explicit: PerNs<Binding>) {
+///
+/// `own`은 칸마다 그 칸을 차지한 명시 `use`들의 자기 `#[cfg]`다. 조건 없는 명시 `use`가 있으면 그 칸의 글롭을 다
+/// 가린다. 모두 자기 `#[cfg]`를 달았으면 그 조건이 아닌 빌드에서는 글롭의 이름이 보이므로 글롭 칸과 합친다
+/// ([`merge_slot`] — 명시 임포트가 첫 원소) — 다만 글롭 임포트의 조건이 명시 `use`의 조건을 함축하면(글롭이 보이는
+/// 빌드에서는 늘 명시 `use`도 있으면) 그 글롭 임포트는 가린다(`#[cfg(feature = "x")] use a::*;` 옆
+/// `#[cfg(feature = "x")] use b::f;`의 `a::f`). `use a::*;` 옆 `#[cfg(test)] use a::f;`는 같은 대상이라 약한
+/// 조건(조건 없음)으로 합쳐지고, `use real::*;` 옆 `#[cfg(test)] use mock::Clock;`은 두 대안으로 남는다. 예전에는 늘
+/// 가려, 테스트가 아닌 빌드에서 쓰이는 글롭 쪽 이름에 `cfg(test)`가 붙거나 간선이 아예 없었다. 남는 글롭 쪽은 자기
+/// 조건을 그대로 싣는다(명시 `use` 조건의 부정을 더하지 않는다 — 간선을 남기는 쪽이다).
+fn shadow_globs(
+    slots: &mut PerNs<Binding>,
+    explicit: PerNs<Binding>,
+    own: &PerNs<Vec<Option<String>>>,
+) {
     let PerNs {
         types,
         values,
         macros,
         undetermined,
     } = explicit;
-    if undetermined.is_some() {
-        *slots = PerNs {
-            undetermined,
-            ..PerNs::default()
-        };
-    }
-    for (slot, binding) in [
-        (&mut slots.types, types),
-        (&mut slots.values, values),
-        (&mut slots.macros, macros),
-    ] {
-        if binding.is_some() {
-            *slot = binding;
+    // 조건을 모르는 칸(`_` — `own`에 없다)은 아무것도 가리지 않는다. 조건 없는 명시 `use`가 있으면 다 가린다.
+    if let Some(binding) = undetermined {
+        match own.undetermined.as_deref() {
+            Some(conditions) if conditions.iter().any(Option::is_none) => {
+                *slots = PerNs {
+                    undetermined: Some(binding),
+                    ..PerNs::default()
+                };
+            }
+            _ => merge_slot(&mut slots.undetermined, binding),
         }
     }
+    for (slot, binding, conditions) in [
+        (&mut slots.types, types, own.types.as_deref()),
+        (&mut slots.values, values, own.values.as_deref()),
+        (&mut slots.macros, macros, own.macros.as_deref()),
+    ] {
+        let Some(binding) = binding else {
+            continue;
+        };
+        let conditional: Option<Vec<&str>> = conditions
+            .unwrap_or_default()
+            .iter()
+            .map(Option::as_deref)
+            .collect();
+        match conditional {
+            Some(conditions) => {
+                *slot = slot.take().and_then(|glob| unshadowed(glob, &conditions));
+                merge_slot(slot, binding);
+            }
+            None => *slot = Some(binding),
+        }
+    }
+}
+
+/// 글롭 칸 `glob`에서 조건이 `conditions`(명시 `use`들의 자기 조건) 가운데 하나를 함축하는 임포트를 뺀 것 — 그
+/// 글롭 임포트가 보이는 빌드에는 늘 그 명시 `use`도 있어 가려진다. 해석되지 않는 이름은 조건을 모르니 그대로 둔다.
+fn unshadowed(glob: Binding, conditions: &[&str]) -> Option<Binding> {
+    if glob.imports().is_empty() {
+        return Some(glob);
+    }
+    let kept = glob
+        .imports()
+        .iter()
+        .filter(|imp| !conditions.iter().any(|c| implies(&imp.cfg, c)))
+        .cloned()
+        .collect();
+    Binding::of_imports(kept)
+}
+
+/// 조건 `cfg`가 조건 `condition`을 함축하는가 — `condition`의 조건들(맨 위 `all(..)`을 펼친 것)이 모두 `cfg`에 있다.
+fn implies(cfg: &Option<String>, condition: &str) -> bool {
+    let Some(cfg) = cfg else {
+        return false;
+    };
+    let (mut have, mut need) = (BTreeSet::new(), BTreeSet::new());
+    push_conjuncts(cfg.trim(), &mut have);
+    push_conjuncts(condition.trim(), &mut need);
+    !need.is_empty() && need.is_subset(&have)
+}
+
+/// 정점 `target`이 스스로 `#[cfg]`를 단 것인가 — `#[cfg]`를 단 `mod`이거나, 선언한 모듈에서 모든 선언이 `#[cfg]`를 단
+/// 아이템([`Module::cfg_gated`])이다.
+fn gated_vertex(tree: &ModTree, target: &str) -> bool {
+    if tree.modules.get(target).is_some_and(|m| m.cfg.is_some()) {
+        return true;
+    }
+    target.rsplit_once("::").is_some_and(|(owner, name)| {
+        tree.modules
+            .get(owner)
+            .is_some_and(|m| m.cfg_gated.contains_key(name))
+    })
+}
+
+/// 조건들이 함께 성립할 수 없음이 글자로 보이는가 — 어떤 조건 `not (Q)`의 Q를 맨 위 `all(..)`로 펼친 조건이 모두
+/// 다른 조건들 가운데 있다(`unix`와 `not (unix)`, `test`·`loom`과 `not (all (test , loom))`). 공백은 무시한다. 그 밖의
+/// 모순(`unix`와 `windows`, `any`의 부정)은 보지 않는다 — 이것으로 지우는 간선은 어느 빌드에도 없는 것뿐이다.
+pub fn cfg_contradicts<'a>(conditions: impl IntoIterator<Item = &'a str>) -> bool {
+    let squash = |c: &str| {
+        c.chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>()
+    };
+    let mut all = BTreeSet::new();
+    for condition in conditions {
+        push_conjuncts(&squash(condition), &mut all);
+    }
+    all.iter().any(|conjunct| {
+        let Some(inner) = call_arguments(conjunct, "not") else {
+            return false;
+        };
+        let mut need = BTreeSet::new();
+        push_conjuncts(inner, &mut need);
+        !need.is_empty() && need.is_subset(&all)
+    })
+}
+
+/// 모듈 `path`(=`module`)에서 `#[cfg]`를 단 로컬 아이템([`Module::cfg_gated`])이 없는 빌드의 대안 임포트를 고른다
+/// ([`Module::local_alternatives`]) — 같은 이름공간의 명시 `use`(`explicit`)는 늘, 글롭 이름(`globbed`)은 아이템의
+/// 선언이 하나이고 글롭의 대상이 스스로 `#[cfg]`를 달지 않았을 때만 그 조건의 부정을 달고 대안이다. 그 글롭이 보이는
+/// 빌드에 늘 아이템이 있거나(글롭의 조건이 아이템의 조건을 함축 — 같은 `#[cfg(feature = "x")]`), 아이템이 없는
+/// 빌드에서 같은 칸의 명시 `use`(자기 조건은 `conditions_of`)가 그 글롭을 가리면(`#[cfg(not(unix))] use crate::b::sys;`
+/// 옆 `#[cfg(unix)] fn sys`) 그 글롭은 대안이 아니다 — 어느 빌드에서도 보이지 않는 이름으로 가는 거짓 간선이 된다.
+/// 대상이 조건부면
+/// (`#[cfg(any(test, kani))] mod tests` 옆 `use crate::*`가 들인 루트의 `#[cfg(test)] mod tests`) 그 조건이 부정과
+/// 겹치는지 알 수 없어 대안으로 두지 않는다(거짓 간선이 될 수 있다).
+fn local_alternatives(
+    tree: &ModTree,
+    module: &Module,
+    path: &str,
+    explicit: &BTreeMap<String, PerNs<Binding>>,
+    conditions_of: &BTreeMap<String, PerNs<Vec<Option<String>>>>,
+    globbed: &BTreeMap<String, PerNs<Binding>>,
+) -> BTreeMap<String, PerNs<Binding>> {
+    let mut out: BTreeMap<String, PerNs<Binding>> = BTreeMap::new();
+    for (name, spaces) in &module.cfg_gated {
+        for (ns, conditions) in spaces {
+            let mut slot = explicit
+                .get(name)
+                .and_then(|bindings| bindings.get(*ns))
+                .filter(|binding| !binding.imports().is_empty())
+                .cloned();
+            if let ([condition], Some(glob)) = (
+                conditions.as_slice(),
+                globbed.get(name).and_then(|bindings| bindings.get(*ns)),
+            ) {
+                let absent = Some(format!("not ({condition})"));
+                // 같은 칸의 명시 `use`들의 자기 조건 — 조건 없는 것이 있으면(`None`) 글롭은 늘 가려진다.
+                let own: Option<Vec<&str>> = conditions_of
+                    .get(name)
+                    .and_then(|own| own.get(*ns))
+                    .map_or(Some(Vec::new()), |own| {
+                        own.iter().map(Option::as_deref).collect()
+                    });
+                let imports: Vec<Import> = glob
+                    .imports()
+                    .iter()
+                    .filter(|imp| imp.target != format!("{path}::{name}"))
+                    .filter(|imp| !gated_vertex(tree, &imp.target))
+                    // 글롭의 조건이 아이템의 조건을 함축하면 글롭이 보이는 빌드에는 늘 아이템도 있다.
+                    .filter(|imp| !implies(&imp.cfg, condition))
+                    .map(|imp| Import {
+                        cfg: with_import_cfg(&imp.cfg, &absent),
+                        ..imp.clone()
+                    })
+                    // 아이템이 없는 빌드에서도 같은 칸의 명시 `use`가 그 글롭을 가리면 대안이 아니다.
+                    .filter(|imp| {
+                        own.as_ref()
+                            .is_some_and(|own| !own.iter().any(|c| implies(&imp.cfg, c)))
+                    })
+                    .collect();
+                if let Some(glob) = Binding::of_imports(imports) {
+                    // 명시 `use`가 첫 원소다.
+                    let explicit_side = slot.replace(glob);
+                    if let Some(binding) = explicit_side {
+                        merge_slot(&mut slot, binding);
+                    }
+                }
+            }
+            if let Some(binding) = slot {
+                *out.entry(name.clone()).or_default().slot(*ns) = Some(binding);
+            }
+        }
+    }
+    out
 }
 
 /// 모듈 `importer`의 글롭 `use full::*`(조건 `cfg`, 가시성 `scope`)이 `full`(=`target`)에서 들이는 이름 —
@@ -1286,7 +1860,15 @@ fn glob_bindings(
             continue;
         }
         for ns in spaces {
-            *slots.slot(ns) = Some(binding.clone());
+            // 선언 아이템이 같은 이름공간의 재노출을 이긴다 — `#[cfg]`를 단 아이템이 없는 빌드의 대안
+            // ([`Module::local_alternatives`])만 함께 들인다(아이템이 첫 원소).
+            let alternatives = target
+                .local_alternatives
+                .get(name)
+                .and_then(|bindings| bindings.get(ns))
+                .and_then(|alt| reexported(alt, importer, cfg, scope));
+            *slots.slot(ns) = alternatives;
+            merge_slot(slots.slot(ns), binding.clone());
         }
     }
     out
@@ -1301,19 +1883,25 @@ fn reexported(
     scope: &Scope,
 ) -> Option<Binding> {
     match binding {
-        Binding::Resolved(imp) if imp.scope.includes(importer) => Some(Binding::Resolved(Import {
-            target: imp.target.clone(),
-            cfg: conjoin_cfg(cfg, &imp.cfg),
-            scope: scope.narrower(&imp.scope),
-        })),
-        Binding::Unresolved(seen) if seen.includes(importer) => {
-            Some(Binding::Unresolved(scope.narrower(seen)))
-        }
-        _ => None,
+        Binding::Unresolved(seen) => seen
+            .includes(importer)
+            .then(|| Binding::Unresolved(scope.narrower(seen))),
+        resolved => Binding::of_imports(
+            resolved
+                .imports()
+                .iter()
+                .filter(|imp| imp.scope.includes(importer))
+                .map(|imp| Import {
+                    target: imp.target.clone(),
+                    cfg: conjoin_cfg(cfg, &imp.cfg),
+                    scope: scope.narrower(&imp.scope),
+                })
+                .collect(),
+        ),
     }
 }
 
-/// 글롭이 펼친 이름 하나를 이름공간마다(이름공간을 정하지 못한 칸 포함) 심는다([`merge_glob_slot`]).
+/// 글롭이 펼친 이름 하나를 이름공간마다(이름공간을 정하지 못한 칸 포함) 심는다([`merge_slot`]).
 fn merge_glob(globbed: &mut PerNs<Binding>, bindings: PerNs<Binding>) {
     let PerNs {
         types,
@@ -1328,29 +1916,53 @@ fn merge_glob(globbed: &mut PerNs<Binding>, bindings: PerNs<Binding>) {
         (&mut globbed.undetermined, undetermined),
     ] {
         if let Some(binding) = binding {
-            merge_glob_slot(slot, binding);
+            merge_slot(slot, binding);
         }
     }
 }
 
-/// 글롭이 펼친 칸 하나를 심는다. 여러 글롭이 같은 대상을 들이면 하나로 합친다 — 가시성은 넓은 쪽, 조건은 둘 중
-/// 약한 쪽(어느 글롭으로든 들어오면 임포트가 있다). 대상이 다르면 지금처럼 뒤의 글롭이 이긴다(rustc에서는 쓰면
-/// 모호성 오류다).
-fn merge_glob_slot(slot: &mut Option<Binding>, binding: Binding) {
+/// 한 이름공간의 칸 하나에 소스 순서상 뒤의 임포트 `binding`을 심는다 — 명시 `use`끼리, 글롭끼리 같은 규칙이다
+/// (명시 `use`가 글롭을 가리는 것은 [`shadow_globs`]). 해석된 임포트끼리는 대상마다 하나로 합치고(같은 대상이면
+/// 가시성은 넓은 쪽, 조건은 둘 중 약한 쪽 — 어느 쪽으로든 들어오면 그 이름이 있다), 대상이 다르면 둘 다 남긴다
+/// ([`Binding::Alternatives`] — rustc는 한 빌드에 둘을 두지 않으니 `#[cfg]`로 갈린 대안이다). 첫 원소는 뒤의
+/// 것이라 대상 하나를 고르는 해석은 예전처럼 뒤의 것을 고른다. 해석되지 않는 이름끼리는 넓은 가시성으로 합친다.
+/// 해석된 것과 해석되지 않는 것이 만나면 소스 순서와 무관하게 해석된 쪽을 남긴다 — 해석되지 않는 쪽(std 경로)은
+/// 간선을 낼 대상이 없고, 그것을 남기면 `#[cfg(feature = "pl")] use extdep::Mutex;` 뒤의 `#[cfg(not(..))] use
+/// std::sync::Mutex;`가 외부 크레이트 사용 증거를 지워 `deps`가 쓰는 의존을 unused로 냈다.
+fn merge_slot(slot: &mut Option<Binding>, binding: Binding) {
     let merged = match (slot.take(), binding) {
-        (Some(Binding::Resolved(seen)), Binding::Resolved(imp)) if seen.target == imp.target => {
-            Binding::Resolved(Import {
-                cfg: weaker_cfg(&seen.cfg, &imp.cfg),
-                scope: seen.scope.wider(&imp.scope),
-                target: imp.target,
-            })
-        }
         (Some(Binding::Unresolved(seen)), Binding::Unresolved(scope)) => {
             Binding::Unresolved(seen.wider(&scope))
         }
-        (_, binding) => binding,
+        (Some(seen), binding) => {
+            let imports: Vec<Import> = binding
+                .imports()
+                .iter()
+                .chain(seen.imports())
+                .cloned()
+                .collect();
+            // 둘 다 해석되지 않는 경우는 위 팔이 받았으니 합친 목록은 비지 않는다 — `unwrap_or`는 닿지 않는 자리다.
+            Binding::of_imports(merge_imports(imports)).unwrap_or(binding)
+        }
+        (None, binding) => binding,
     };
     *slot = Some(merged);
+}
+
+/// 우선 순위 순의 임포트에서 같은 대상을 하나로 합친다 — 자리는 처음 나온 곳, 가시성은 넓은 쪽, 조건은 둘 중
+/// 약한 쪽이다.
+fn merge_imports(imports: Vec<Import>) -> Vec<Import> {
+    let mut out: Vec<Import> = Vec::with_capacity(imports.len());
+    for imp in imports {
+        match out.iter_mut().find(|seen| seen.target == imp.target) {
+            Some(seen) => {
+                seen.cfg = weaker_cfg(&seen.cfg, &imp.cfg);
+                seen.scope = seen.scope.wider(&imp.scope);
+            }
+            None => out.push(imp),
+        }
+    }
+    out
 }
 
 /// [`fill_imports_settled`]가 돌리는 해석 바퀴의 상한.
@@ -1361,31 +1973,151 @@ pub const MAX_IMPORT_PASSES: usize = 32;
 /// 한 바퀴로는 처리 순서상 뒤에 오는 모듈의 재노출(`pub use zz::Tr`이 거치는 `zz`의 `pub use`)을
 /// 못 본다. 바퀴는 [`MAX_IMPORT_PASSES`]까지 — 돌려주는 값은 마지막 바퀴에서도 임포트 표가 바뀐
 /// 모듈 수다(0이면 수렴). 호출자는 0이 아니면 limitation으로 센다.
+///
+/// 앞 바퀴의 해석이 나중에 거둬지면(다른 모듈의 글롭이 아직 펼쳐지지 않아 크레이트 루트로 넘어간 `pub use foo::bar`가
+/// 다음 바퀴에 제 대상을 찾으면) 거둔 대상이 서로를 글롭으로 들이는 모듈 사이를 돌며 수렴한 표에 남는다 — 대안
+/// 임포트를 남기는 표에서는 거짓 대안이 된다. 그런 일이 있었으면 수렴한 표를 얼려 두고, 모든 모듈의 표를 비워 다시
+/// 쌓는다 — 명시 `use`와 글롭 대상은 언 표로 해석하고 글롭이 펼치는 이름만 새로 쌓으니, 근거 없이 서로만 받치던 대상은
+/// 다시 생기지 않는다. 그 다음 지금 표로 한 번 더 수렴시켜(대개 한 바퀴) 거두는 것이 없으면 끝이다 — 언 표로 해석한
+/// 재노출 사슬의 고리가 남아 거두면 다시 쌓는다. 이것을 [`MAX_IMPORT_PASSES`]번까지 되풀이하고, 그래도 거두는 모듈 수는
+/// [`ModTree::stale_import_modules`]에 남긴다.
+///
+/// 2015 판 크레이트([`ModTree::edition_2015`])의 모듈은 거둔 것을 세지 않고, 다시 쌓을 때도 지금 표로 해석한다 — 그
+/// 판의 크레이트 기준 `use` 경로에서는 첫 바퀴에 크레이트 루트로 넘어간 대상이 제 대상일 수 있다. 빈 표에서 지금 표로
+/// 다시 쌓으면 그 모듈들은 처음과 같은 이른 대상을 다시 얻고, 이미 깨끗해진 의존 크레이트에서 들인 거둔 대상만 잃는다.
+/// 루트가 아닌 모듈의 `use` 경로가 크레이트 루트가 선언한 이름으로 시작하는 2015 판 크레이트는
+/// [`ModTree::edition_2015_crate_relative`]에 남긴다.
 pub fn fill_imports_settled(
     tree: &mut ModTree,
     modules: &[(String, Vec<&syn::Item>)],
     dep_crates: &DepCrates,
 ) -> usize {
-    let tables = |tree: &ModTree, path: &str| {
-        tree.modules
-            .get(path)
-            .map(|m| (m.imports.clone(), m.glob_targets.clone()))
-    };
+    fill_imports_settled_within(tree, modules, dep_crates, MAX_IMPORT_PASSES)
+}
+
+/// [`fill_imports_settled`]의 본체 — 다시 쌓기를 `max_rebuilds`번까지 한다(테스트가 상한을 낮춰 남은 수를 본다).
+fn fill_imports_settled_within(
+    tree: &mut ModTree,
+    modules: &[(String, Vec<&syn::Item>)],
+    dep_crates: &DepCrates,
+    max_rebuilds: usize,
+) -> usize {
+    tree.stale_import_modules = 0;
+    tree.edition_2015_crate_relative = crate_relative_2015(tree, modules);
+    let (mut changed, mut retracting) = settle_imports(tree, None, modules, dep_crates);
+    let mut rounds = 0;
+    while changed == 0 && retracting > 0 && rounds < max_rebuilds {
+        rounds += 1;
+        let frozen = tree.clone();
+        for (path, _) in modules {
+            if let Some(module) = tree.modules.get_mut(path) {
+                module.imports.clear();
+                module.glob_targets.clear();
+            }
+        }
+        changed = settle_imports(tree, Some(&frozen), modules, dep_crates).0;
+        if changed > 0 {
+            break;
+        }
+        // 깨끗하게 쌓은 표에서 지금 표로 다시 해석해 거두는 것이 없으면 끝이다 — 처음 수렴과 같은 판정이고, 대개
+        // 한 바퀴다(언 표로 해석한 재노출 사슬의 고리가 남아 있으면 거두므로 한 번 더 깨끗하게 쌓는다).
+        (changed, retracting) = settle_imports(tree, None, modules, dep_crates);
+    }
+    if changed == 0 && retracting > 0 {
+        tree.stale_import_modules = retracting;
+    }
+    changed
+}
+
+/// 루트가 아닌 모듈의 `use` 경로가 크레이트 루트가 선언한 이름(아이템·자식 모듈)으로 시작하는 2015 판 크레이트 —
+/// 그 판은 그 경로를 크레이트 루트부터 풀지만 이 해석기는 그 모듈부터 푼다. `crate::`·`self::`·`super::`·`::`로
+/// 시작하는 경로는 두 규칙이 같다.
+fn crate_relative_2015(tree: &ModTree, modules: &[(String, Vec<&syn::Item>)]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (path, items) in modules {
+        let krate = crate_of(path);
+        if *path == krate || !tree.edition_2015.contains(&krate) || out.contains(&krate) {
+            continue;
+        }
+        let Some(root) = tree.modules.get(&krate) else {
+            continue;
+        };
+        let mut found = false;
+        for item in items {
+            let syn::Item::Use(u) = item else {
+                continue;
+            };
+            if u.leading_colon.is_some() {
+                continue;
+            }
+            flatten_use(&u.tree, &mut Vec::new(), &mut |segs| {
+                let first = segs.first().map(String::as_str).unwrap_or_default();
+                found |= !matches!(first, "crate" | "self" | "super" | "*")
+                    && (root.items.contains(first) || root.children.contains_key(first));
+            });
+        }
+        if found {
+            out.insert(krate);
+        }
+    }
+    out
+}
+
+/// [`fill_imports_settled`]의 한 수렴 — 바퀴를 [`MAX_IMPORT_PASSES`]까지 돌려 (마지막 바퀴에서 표가 바뀐 모듈 수,
+/// 2015 판이 아니면서 어느 바퀴에서든 앞 바퀴의 해석된 대상을 거둔 모듈 수)를 돌려준다. `frozen`은
+/// [`fill_imports_from`]과 같되 2015 판 모듈은 늘 지금 표로 해석한다.
+fn settle_imports(
+    tree: &mut ModTree,
+    frozen: Option<&ModTree>,
+    modules: &[(String, Vec<&syn::Item>)],
+    dep_crates: &DepCrates,
+) -> (usize, usize) {
     let mut changed = 0;
+    let mut retracting: BTreeSet<&str> = BTreeSet::new();
     for _ in 0..MAX_IMPORT_PASSES {
         changed = 0;
         for (path, items) in modules {
-            let before = tables(tree, path);
-            fill_imports(tree, path, items, dep_crates);
-            if tables(tree, path) != before {
-                changed += 1;
+            let krate = crate_of(path);
+            let legacy = tree.edition_2015.contains(&krate);
+            let (imports, glob_targets) =
+                fill_imports_from(tree, frozen.filter(|_| !legacy), path, items, dep_crates);
+            let Some(module) = tree.modules.get(path) else {
+                continue;
+            };
+            if module.imports == imports && module.glob_targets == glob_targets {
+                continue;
+            }
+            changed += 1;
+            if !legacy && retracts(&imports, &module.imports) {
+                retracting.insert(path);
             }
         }
         if changed == 0 {
             break;
         }
     }
-    changed
+    (changed, retracting.len())
+}
+
+/// 모듈 임포트 표가 `before`에서 `after`로 바뀌며 해석된 대상을 거뒀는가 — 앞에 있던 (이름, 대상)이 뒤에 없다.
+/// 해석되지 않던 이름이 해석되는 것은 거두는 것이 아니다. 글롭 대상(`glob_targets`)은 보지 않는다 — 거둔 글롭 대상이
+/// 들이던 이름이 있었으면 그 이름이 여기서 잡히고, 없었으면 다른 모듈로 퍼질 것이 없다(글롭 대상 자신은 그 모듈의
+/// 의존 증거일 뿐 다른 모듈이 펼치지 않는다).
+fn retracts(
+    before: &BTreeMap<String, PerNs<Binding>>,
+    after: &BTreeMap<String, PerNs<Binding>>,
+) -> bool {
+    let targets = |bindings: &PerNs<Binding>| -> BTreeSet<String> {
+        bindings
+            .bound()
+            .flat_map(Binding::imports)
+            .map(|imp| imp.target.clone())
+            .collect()
+    };
+    before.iter().any(|(name, bindings)| {
+        let now = after.get(name).map(targets).unwrap_or_default();
+        !targets(bindings).is_subset(&now)
+    })
 }
 
 /// 두 `#[cfg]` 조건이 함께 성립해야 하는 조건 — 글롭 `use`의 조건과 그 글롭이 펼친 재노출의 조건.
@@ -1443,7 +2175,12 @@ fn push_conjuncts(cfg: &str, out: &mut BTreeSet<String>) {
 
 /// `all(..)`·`all (..)`이면 괄호 안 — 여는 괄호의 짝이 마지막 글자일 때만이다.
 fn all_arguments(cfg: &str) -> Option<&str> {
-    let inner = cfg.strip_prefix("all")?.trim_start().strip_prefix('(')?;
+    call_arguments(cfg, "all")
+}
+
+/// `name(..)`·`name (..)`이면 괄호 안 — 여는 괄호의 짝이 마지막 글자일 때만이다.
+fn call_arguments<'a>(cfg: &'a str, name: &str) -> Option<&'a str> {
+    let inner = cfg.strip_prefix(name)?.trim_start().strip_prefix('(')?;
     let mut depth = 1usize;
     let mut quoted = false;
     let mut escaped = false;
@@ -1564,10 +2301,12 @@ mod tests {
 
     /// 모듈 `module`이 이름공간 `ns`에서 `name`으로 들인 해석된 임포트.
     fn import_in<'a>(t: &'a ModTree, module: &str, name: &str, ns: Ns) -> Option<&'a Import> {
-        match t.modules[module].imports.get(name)?.get(ns)? {
-            Binding::Resolved(imp) => Some(imp),
-            Binding::Unresolved(_) => None,
-        }
+        t.modules[module]
+            .imports
+            .get(name)?
+            .get(ns)?
+            .imports()
+            .first()
     }
 
     /// 최소 트리: c 루트(items: f, S), c::m(items: g, 임포트 h→c::util::h).
@@ -1700,10 +2439,10 @@ mod tests {
         let targets: BTreeSet<(&str, &str)> = imports
             .iter()
             .flat_map(|(alias, bindings)| {
-                bindings.bound().filter_map(move |b| match b {
-                    Binding::Resolved(imp) => Some((alias.as_str(), imp.target.as_str())),
-                    Binding::Unresolved(_) => None,
-                })
+                bindings
+                    .bound()
+                    .flat_map(Binding::imports)
+                    .map(move |imp| (alias.as_str(), imp.target.as_str()))
             })
             .collect();
         assert_eq!(
@@ -1773,9 +2512,11 @@ mod tests {
     }
 
     /// 이름공간을 정하지 못한 임포트(`pub use ext_derive::Foo`가 해석되지 않은 것)는 같은 이름의 로컬 아이템이나
-    /// 이름공간이 정해진 임포트가 있으면 어느 자리에서도 이기지 못한다 — rustc에서 그 `use`는 그것들과 다른
-    /// 이름공간에 있다(E0255·E0252). 다른 후보가 없으면 그 `use`가 이름의 해석을 멈춘다(크레이트 루트로 넘어가지
-    /// 않는다). 자리를 모르는 해석은 정해진 임포트를 먼저 고른다.
+    /// 이름공간이 정해진 임포트가 있으면 타입·값 자리에서 이기지 못한다 — rustc에서 그 `use`는 그것들과 다른
+    /// 이름공간에 있다(E0255·E0252). 같은 근거로 매크로 자리에서는 그 `use`가 유일한 후보다 — 로컬 trait `Foo`와
+    /// 글롭이 들인 trait `Bar`는 매크로가 될 수 없다(`#[derive(Foo)]`는 derive 매크로다). 다른 후보가 없으면 그
+    /// `use`가 이름의 해석을 멈춘다(크레이트 루트로 넘어가지 않는다). 자리를 모르는 해석은 정해진 임포트를 먼저
+    /// 고른다.
     #[test]
     fn undetermined_import_yields_to_local_items_and_determined_imports() {
         let mut t = tree();
@@ -1796,7 +2537,7 @@ mod tests {
         m.imports.insert("Bar".to_string(), bar);
         // 다른 후보가 없는 `f` — 크레이트 루트에 `f`가 있어도 넘어가지 않는다.
         m.imports.insert("f".to_string(), undetermined());
-        for ns in Ns::ALL {
+        for ns in [Ns::Type, Ns::Value] {
             assert_eq!(
                 t.resolve_in("c::m", &["Foo".into()], &none, ns),
                 Some("c::m::Foo".to_string()),
@@ -1807,6 +2548,19 @@ mod tests {
                 Some("c::util::h".to_string()),
                 "{ns:?}"
             );
+        }
+        // 매크로 자리: 해석되지 않는 derive 재노출이 해석을 멈추고, 해석된 쪽은 그 외부 크레이트 정점이다(`--deps`).
+        assert_eq!(
+            t.resolve_in("c::m", &["Foo".into()], &none, Ns::Macro),
+            None
+        );
+        let mut deps = DepCrates::new();
+        deps.external.insert("ext".to_string());
+        assert_eq!(
+            t.resolve_in("c::m", &["Bar".into()], &deps, Ns::Macro),
+            Some("ext".to_string())
+        );
+        for ns in Ns::ALL {
             assert_eq!(t.resolve_in("c::m", &["f".into()], &none, ns), None);
         }
         assert_eq!(
@@ -1857,6 +2611,356 @@ mod tests {
                 Some(Binding::Resolved(_))
             ));
         }
+    }
+
+    /// `tree()`에 `c::alt`(`#[cfg(unix)] pub use crate::util::h as x;`와 `#[cfg(windows)] pub use crate::m::g as x;`)를
+    /// 더하고 그 `use`로 임포트 표를 채운다 — `h`·`g`는 값 아이템이다.
+    fn tree_with_split_reexport() -> ModTree {
+        let mut t = tree();
+        for (module, name) in [("c::util", "h"), ("c::m", "g")] {
+            t.modules
+                .get_mut(module)
+                .expect("fixture module")
+                .value_items
+                .insert(name.to_string());
+        }
+        t.modules
+            .get_mut("c")
+            .expect("fixture root")
+            .children
+            .insert("alt".to_string(), "c::alt".to_string());
+        t.modules.insert(
+            "c::alt".to_string(),
+            Module::new(PathBuf::from("alt.rs"), true, true),
+        );
+        let file: syn::File = syn::parse_str(
+            "#[cfg(unix)] pub use crate::util::h as x; #[cfg(windows)] pub use crate::m::g as x;",
+        )
+        .expect("valid use items");
+        let items: Vec<&syn::Item> = file.items.iter().collect();
+        fill_imports(&mut t, "c::alt", &items, &DepCrates::new());
+        t
+    }
+
+    /// 같은 이름공간에 같은 이름을 들이는 명시 `use` 둘이 다른 대상을 가리키면 둘 다 남는다 — 첫 원소는 소스
+    /// 순서상 뒤의 것이라 대상 하나를 고르는 해석(`resolve`)은 예전처럼 그것이고, `resolve_all`은 둘 다를 각자의
+    /// 조건과 함께 준다. 예전에는 뒤의 것만 남아 `crate::util::h`로 가는 간선이 사라졌다.
+    #[test]
+    fn cfg_split_explicit_imports_are_alternatives() {
+        let t = tree_with_split_reexport();
+        let none = DepCrates::new();
+        let slot = t.modules["c::alt"].imports["x"]
+            .get(Ns::Value)
+            .expect("x in the value namespace");
+        let targets: Vec<(&str, Option<&str>)> = slot
+            .imports()
+            .iter()
+            .map(|imp| (imp.target.as_str(), imp.cfg.as_deref()))
+            .collect();
+        assert_eq!(
+            targets,
+            [("c::m::g", Some("windows")), ("c::util::h", Some("unix"))]
+        );
+        let path = ["alt".to_string(), "x".to_string()];
+        assert_eq!(t.resolve("c", &path, &none), Some("c::m::g".to_string()));
+        let all = t.resolve_all("c", &path, &none, Some(Ns::Value));
+        assert_eq!(
+            all,
+            [
+                Resolved {
+                    target: "c::m::g".to_string(),
+                    cfg: Some("windows".to_string()),
+                },
+                Resolved {
+                    target: "c::util::h".to_string(),
+                    cfg: Some("unix".to_string()),
+                },
+            ]
+        );
+    }
+
+    /// 다른 모듈이 그 이름을 `use`하면 대안이 그대로 넘어가고, 각 임포트의 조건은 그 `use`의 조건과 거쳐 온
+    /// 재노출의 조건을 함께 싣는다.
+    #[test]
+    fn importing_a_split_reexport_keeps_each_alternative_with_its_cfg() {
+        let mut t = tree_with_split_reexport();
+        let file: syn::File =
+            syn::parse_str("#[cfg(feature = \"f\")] use crate::alt::x;").expect("valid use item");
+        let items: Vec<&syn::Item> = file.items.iter().collect();
+        fill_imports(&mut t, "c::m", &items, &DepCrates::new());
+        let slot = t.modules["c::m"].imports["x"]
+            .get(Ns::Value)
+            .expect("x in the value namespace");
+        let targets: Vec<(&str, Option<&str>)> = slot
+            .imports()
+            .iter()
+            .map(|imp| (imp.target.as_str(), imp.cfg.as_deref()))
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                ("c::m::g", Some("all(feature = \"f\" , windows)")),
+                ("c::util::h", Some("all(feature = \"f\" , unix)")),
+            ]
+        );
+    }
+
+    /// 대상 하나를 고르는 해석은 우선 순위가 가장 높은 대안에서 경로가 끊기면 다음 대안으로 넘어간다 — `x::y`의
+    /// `y`가 뒤의 대안(`c::m`)에는 없고 앞의 대안(`c::util`)에만 있다.
+    #[test]
+    fn resolve_falls_back_to_the_next_alternative_when_the_first_path_ends() {
+        let mut t = tree();
+        let none = DepCrates::new();
+        t.modules
+            .get_mut("c::util")
+            .expect("fixture module")
+            .items
+            .insert("y".to_string());
+        // `util`도 루트의 자식 모듈이어야 두 별칭이 같은 타입 이름공간의 대안이 된다.
+        t.modules
+            .get_mut("c")
+            .expect("fixture root")
+            .children
+            .insert("util".to_string(), "c::util".to_string());
+        let file: syn::File =
+            syn::parse_str("#[cfg(unix)] use crate::util as x; #[cfg(windows)] use crate::m as x;")
+                .expect("valid use items");
+        let items: Vec<&syn::Item> = file.items.iter().collect();
+        fill_imports(&mut t, "c", &items, &none);
+        let path = ["x".to_string(), "y".to_string()];
+        assert_eq!(t.resolve("c", &path, &none), Some("c::util::y".to_string()));
+        assert_eq!(
+            t.resolve_all("c", &path, &none, None),
+            [Resolved {
+                target: "c::util::y".to_string(),
+                cfg: Some("unix".to_string()),
+            }]
+        );
+    }
+
+    /// 같은 대상을 들이는 명시 `use` 둘은 하나로 합친다 — 조건은 약한 쪽(비교할 수 없으면 조건 없음), 가시성은
+    /// 넓은 쪽이다. 예전에는 뒤의 `use`의 조건으로 덮어 `--target`이 앞의 빌드에서도 그 `uses` 간선을 지웠다.
+    #[test]
+    fn same_target_explicit_imports_merge_to_the_weaker_cfg() {
+        let mut t = tree();
+        let file: syn::File = syn::parse_str(
+            "#[cfg(unix)] use crate::util::h; #[cfg(windows)] pub(crate) use crate::util::h;",
+        )
+        .expect("valid use items");
+        let items: Vec<&syn::Item> = file.items.iter().collect();
+        fill_imports(&mut t, "c::m", &items, &DepCrates::new());
+        let binding = t.modules["c::m"].imports["h"]
+            .undetermined
+            .as_ref()
+            .expect("h has no namespace table in this fixture");
+        assert_eq!(
+            binding,
+            &Binding::Resolved(Import {
+                target: "c::util::h".to_string(),
+                cfg: None,
+                scope: Scope::Within("c".to_string()),
+            })
+        );
+    }
+
+    /// `(모듈 경로, 소스)`로 트리를 만들고 아이템 표를 채운다 — 자식 관계는 경로로 잇는다. 돌려주는 파일은 임포트
+    /// 해석의 입력이다.
+    fn tree_from(modules: &[(&str, &str)]) -> (ModTree, Vec<(String, syn::File)>) {
+        let mut t = ModTree::default();
+        let mut files = Vec::new();
+        for (path, src) in modules {
+            t.modules.insert(
+                path.to_string(),
+                Module::new(PathBuf::from(format!("{path}.rs")), true, true),
+            );
+            if let Some((parent, name)) = path.rsplit_once("::") {
+                t.modules
+                    .get_mut(parent)
+                    .expect("parents come first")
+                    .children
+                    .insert(name.to_string(), path.to_string());
+            }
+            files.push((
+                path.to_string(),
+                syn::parse_str::<syn::File>(src).expect("valid items"),
+            ));
+        }
+        for (path, file) in &files {
+            let items: Vec<&syn::Item> = file.items.iter().collect();
+            fill_items(&mut t, path, &items);
+        }
+        (t, files)
+    }
+
+    /// `#[cfg]` 로컬 아이템 옆 글롭 이름이 어느 빌드에서도 보이지 않으면 표에 대안으로 두지 않는다 — 글롭의 조건이
+    /// 아이템의 조건을 함축하거나(같은 `#[cfg(feature = "x")]`), 글롭 대상이 스스로 조건부다(`#[cfg(test)] mod tests`).
+    /// 조건 없는 글롭과 조건 없는 대상이면 부정 조건을 달고 대안이다.
+    #[test]
+    fn glob_alternatives_skip_globs_that_are_never_visible() {
+        let alternatives = |m_src: &str| {
+            let (mut t, files) = tree_from(&[
+                ("c", "mod plat {} #[cfg(test)] mod tests {} mod m {}"),
+                ("c::plat", "pub fn sys() {}"),
+                ("c::tests", "pub fn helper() {}"),
+                ("c::m", m_src),
+            ]);
+            let uses: Vec<(String, Vec<&syn::Item>)> = files
+                .iter()
+                .map(|(path, file)| (path.clone(), file.items.iter().collect()))
+                .collect();
+            fill_imports_settled(&mut t, &uses, &DepCrates::new());
+            let m = &t.modules["c::m"];
+            m.local_alternatives
+                .values()
+                .flat_map(|b| {
+                    b.bound()
+                        .flat_map(Binding::imports)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .map(|imp| (imp.target, imp.cfg))
+                .collect::<Vec<_>>()
+        };
+        let same_gate =
+            "#[cfg(feature = \"x\")] use crate::plat::*; #[cfg(feature = \"x\")] fn sys() {}";
+        assert_eq!(alternatives(same_gate), []);
+        let gated_target = "use crate::*; #[cfg(any(test, kani))] mod tests {}";
+        assert_eq!(alternatives(gated_target), []);
+        let open = "use crate::plat::*; #[cfg(unix)] fn sys() {}";
+        assert_eq!(
+            alternatives(open),
+            [("c::plat::sys".to_string(), Some("not (unix)".to_string()))]
+        );
+    }
+
+    /// 다시 쌓기 상한 안에서 거둔 대상이 다 지워지지 않으면 그렇게 남은 모듈 수를 [`ModTree::stale_import_modules`]에
+    /// 남긴다 — 재노출 사슬(`w1`·`w2`·`w3`)은 한 번에 한 고리씩 깨끗해지므로 상한 한 번으로는 남고, 기본 상한으로는
+    /// 0이다.
+    #[test]
+    fn stale_import_modules_counts_what_the_rebuild_limit_left() {
+        let modules: &[(&str, &str)] = &[
+            (
+                "c",
+                "mod x {} mod y {} mod foo {} mod real {} mod z {} mod w1 {} mod w2 {} mod w3 {}",
+            ),
+            ("c::x", "pub use crate::z::*; pub use crate::y::*;"),
+            ("c::y", "pub use crate::x::*;"),
+            ("c::foo", "pub fn bar() {}"),
+            ("c::real", "pub mod foo {}"),
+            ("c::real::foo", "pub fn bar() {}"),
+            ("c::z", "use crate::real::*; pub use foo::bar;"),
+            ("c::w1", "pub use crate::x::bar;"),
+            ("c::w2", "pub use crate::w1::bar;"),
+            ("c::w3", "pub use crate::w2::bar;"),
+        ];
+        let settle = |limit: usize| {
+            let (mut t, files) = tree_from(modules);
+            let uses: Vec<(String, Vec<&syn::Item>)> = files
+                .iter()
+                .map(|(path, file)| (path.clone(), file.items.iter().collect()))
+                .collect();
+            assert_eq!(
+                fill_imports_settled_within(&mut t, &uses, &DepCrates::new(), limit),
+                0
+            );
+            let w3 = t.modules["c::w3"].imports["bar"].get(Ns::Value).map(|b| {
+                b.imports()
+                    .iter()
+                    .map(|i| i.target.clone())
+                    .collect::<Vec<_>>()
+            });
+            (t.stale_import_modules, w3)
+        };
+        let (stale, _) = settle(1);
+        assert!(stale > 0, "one rebuild should leave a stale chain link");
+        assert_eq!(
+            settle(MAX_IMPORT_PASSES),
+            (0, Some(vec!["c::real::foo::bar".to_string()]))
+        );
+    }
+
+    /// 2015 판 크레이트의 루트가 아닌 모듈에서 크레이트 루트가 선언한 이름으로 시작하는 `use` 경로를 센다 — `crate::`·
+    /// `self::`·`super::`·`::`로 시작하거나 루트에 없는 이름이면 두 판의 규칙이 같아 세지 않는다.
+    #[test]
+    fn crate_relative_use_paths_are_counted_for_edition_2015_only() {
+        let count = |use_line: &str, edition_2015: bool| {
+            let (mut t, files) = tree_from(&[
+                ("c", "mod foo {} mod z {}"),
+                ("c::foo", "pub fn bar() {}"),
+                ("c::z", use_line),
+            ]);
+            if edition_2015 {
+                t.edition_2015.insert("c".to_string());
+            }
+            let uses: Vec<(String, Vec<&syn::Item>)> = files
+                .iter()
+                .map(|(path, file)| (path.clone(), file.items.iter().collect()))
+                .collect();
+            fill_imports_settled(&mut t, &uses, &DepCrates::new());
+            t.edition_2015_crate_relative.len()
+        };
+        assert_eq!(count("pub use foo::bar;", true), 1);
+        assert_eq!(count("pub use foo::bar;", false), 0);
+        for same in [
+            "pub use crate::foo::bar;",
+            "pub use super::foo::bar;",
+            "pub use ::std::fmt;",
+            "pub use std::fmt;",
+        ] {
+            assert_eq!(count(same, true), 0, "{same}");
+        }
+    }
+
+    /// 같은 모듈을 두 번 채우면(아이템 묶음이 둘) 선언을 합친다 — 앞이든 뒤든 조건 없는 선언이 있는 이름공간은
+    /// 조건부가 아니고, 둘 다 `#[cfg]`를 달았으면 두 조건을 다 적는다. 자식 모듈 표는 앞선 선언으로 보지 않는다.
+    #[test]
+    fn filling_a_module_twice_merges_gated_declarations() {
+        let gated = |first: &str, second: &str| {
+            let mut t = tree();
+            t.modules
+                .get_mut("c::m")
+                .expect("fixture module")
+                .children
+                .insert("k".to_string(), "c::m::k".to_string());
+            for src in [first, second] {
+                let file: syn::File = syn::parse_str(src).expect("valid items");
+                let items: Vec<&syn::Item> = file.items.iter().collect();
+                fill_items(&mut t, "c::m", &items);
+            }
+            let m = &t.modules["c::m"];
+            (
+                m.cfg_gated
+                    .get("sum")
+                    .and_then(|s| s.get(&Ns::Value))
+                    .cloned(),
+                m.cfg_gated.get("k").and_then(|s| s.get(&Ns::Type)).cloned(),
+            )
+        };
+        let a = "#[cfg(unix)] fn sum() {} #[cfg(feature = \"k\")] mod k {}";
+        assert_eq!(gated(a, "fn sum() {}").0, None);
+        assert_eq!(gated("fn sum() {}", a).0, None);
+        assert_eq!(
+            gated(a, "#[cfg(windows)] fn sum() {}").0,
+            Some(vec!["unix".to_string(), "windows".to_string()])
+        );
+        assert_eq!(gated(a, "").1, Some(vec!["feature = \"k\"".to_string()]));
+    }
+
+    /// 임포트의 조건은 간선의 조건에 더해진다 — 이미 같은 조건이 있으면 표기를 바꾸지 않는다.
+    #[test]
+    fn import_cfg_joins_the_edge_cfg() {
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(with_import_cfg(&None, &None), None);
+        assert_eq!(with_import_cfg(&some("unix"), &None), some("unix"));
+        assert_eq!(with_import_cfg(&None, &some("unix")), some("unix"));
+        assert_eq!(
+            with_import_cfg(&some("all (unix , test)"), &some("test")),
+            some("all (unix , test)")
+        );
+        assert_eq!(
+            with_import_cfg(&some("windows"), &some("feature = \"x\"")),
+            some("all(feature = \"x\" , windows)")
+        );
     }
 
     #[test]
