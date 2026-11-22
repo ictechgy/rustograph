@@ -154,6 +154,15 @@ pub struct Vertex {
     pub unsafe_: bool,
 }
 
+impl Vertex {
+    /// 이름 없는 상수(`const _: T = ..;`)인가 — 이름으로 쓸 수 없고 컴파일러가 늘 평가해 수확이 보존 루트로 싣는다.
+    /// 같은 모듈에 여럿이면 소스 인스턴스 ID(`c::@src/lib.rs#45#Const#c::_`)가 되지만 그것도 `::_`로 끝난다.
+    /// 루트 없는 lib 판정은 이 루트를 세지 않는다 — 정적 단언은 공개 API의 호출자가 아니다.
+    pub fn is_anonymous_const(&self) -> bool {
+        self.kind == Kind::Const && self.id.ends_with("::_")
+    }
+}
+
 /// 방향 간선. from→to. 의존 계열은 "from이 to를 필요로 한다"로 읽는다.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Edge {
@@ -817,6 +826,26 @@ fn chain_dropped(
             .get(id)
             .is_some_and(|vars| variant_eval(vars, facts) == Some(false))
     })
+}
+
+/// `vertices` 가운데 테스트 빌드에만 있는 이름 없는 상수(`#[cfg(test)] const _`, `#[cfg(test)] mod tests` 안의
+/// `const _`)의 ID — 자기 조건이나 조상 모듈의 조건이 test=false에서 거짓이다([`Document::without_tests`]가 지우는
+/// 정점과 같은 판정). 수확은 그런 상수를 `#[test]` 함수처럼 `--tests`일 때만 보존 루트로 싣는다 — 테스트가 아닌
+/// 빌드에는 그 상수가 없어 그 안에서만 쓰는 아이템을 rustc도 미사용으로 경고한다.
+pub(crate) fn test_only_anonymous_consts(vertices: &[Vertex]) -> BTreeSet<&str> {
+    let facts = crate::cfgeval::Facts::test_off();
+    let mut cfg_of: BTreeMap<&str, Vec<Option<&str>>> = BTreeMap::new();
+    for v in vertices {
+        cfg_of
+            .entry(v.id.as_str())
+            .or_default()
+            .push(v.cfg.as_deref());
+    }
+    vertices
+        .iter()
+        .filter(|v| v.is_anonymous_const() && chain_dropped(v, &cfg_of, &facts))
+        .map(|v| v.id.as_str())
+        .collect()
 }
 
 /// 살아남은 정점이 미지 조건을 품는가 — 자신 또는 조상 변형의 평가가

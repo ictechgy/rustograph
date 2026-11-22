@@ -89,7 +89,8 @@ rustograph cycles --level symbol --strict
 rustograph cycles --level module --exclude-nested-modules  # leave out parent/child-only module cycles
 
 # Report symbols unreachable from retention roots (fn main, #[no_mangle]/#[unsafe(no_mangle)],
-# #[export_name], #[used] and #[global_allocator] statics, #[proc_macro*] entry points)
+# #[export_name], #[used] and #[global_allocator] statics, #[proc_macro*] entry points,
+# anonymous `const _` items — test-only ones under --tests)
 rustograph dead                           # symbol level, always
 rustograph dead --retain-public           # libraries: keep exported API
 rustograph dead --tests                   # also retain #[test]/#[bench]
@@ -206,6 +207,28 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
 - `Self` in an impl body or signature resolves to the impl's self type.
   `<T as Tr>::m()` calls `T`'s impl method, `<T>::m()` and an associated
   function passed as a value (`.map(T::new)`) reach `T`'s same-name method.
+  A call through a type path (`T::new()`, a tuple variant `E::V(1)`, a
+  derived `T::default()`) also gets a `references` edge to the type itself,
+  as a non-call path (`E::W`, `.map(T::new)`) does: rustc counts the path as
+  a use of the type, so a struct or enum used only that way is not
+  unreachable. The prefix links only when it names a type item (struct,
+  enum, union, trait, type alias): when nothing is bound in the type
+  namespace, resolution falls back to other namespaces, and a local
+  `fn process` beside `use std::process;` is not what `process::exit()`
+  names, nor is `fn u32` what `u32::MAX` names. A module prefix, in a call
+  (`m::generated()`) or a non-call path (`let f = m::gen;`), gets no
+  same-name method candidates from the module's types, and a call also gets
+  no type edge. A `mod gone;` whose file is missing is never a target. Such
+  paths count as unresolved. A path whose prefix is a type is unresolved
+  when a workspace method of that name exists but none under that type was
+  linked (a trait's default method called through the type, `S::d()`, or a
+  call through a type alias, `A::new()`). It is resolved when it linked a
+  method, or when no workspace method has that name (a variant `E::V(1)`, a
+  derived `T::default()`). Type positions (`-> u8`, `x: u8`, `<u64>::max`)
+  still fall back to a same-named local `fn` when nothing is bound in the
+  type namespace: const generic arguments and array lengths (`[u8; N]`,
+  `Buf<N>`) parse as type paths but name consts, so that fallback stays
+  until the tree records which value items are functions.
 - A `macro_rules!` definition gets tentative `references` edges to the
   multi-segment paths in its body (`$crate::m::f`); a macro call whose
   arguments are not a comma-separated expression list (`json!({..})`) gets
@@ -225,6 +248,12 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
   out of `cycles` and `rules`.
 - Items inside a function body (a nested `fn`, a local `impl` or
   `macro_rules!`) have no vertex; their edges belong to the enclosing body.
+  The same holds inside a `const _: () = { .. };` block: what an item nested
+  there (`fn`, `struct`, `impl`) uses stays reachable through that retention
+  root even where rustc reports the nested item unused, because rustc treats
+  it as its own item. The edges stay on the constant because the initializer
+  may call a nested `const fn`, which rustc counts as used; `limitations`
+  counts the `const _` roots that contain nested items.
 - An impl whose self type is not a workspace vertex (`impl Tr for String`,
   blanket `impl<T: Tr> Ext for T`, `impl Tr for &Local`) has no method
   vertices. The firm edges of its method bodies belong to the module that
@@ -232,7 +261,14 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
   actually leaves. When the impl implements a workspace trait that declares
   the method, that declared method also gets `tentative` edges to what the
   body calls (reachability only, like name fan-out) and a `references` edge
-  to the trait, so callers of the trait method reach the body. A module is a
+  to the trait, so callers of the trait method reach the body. Every method
+  the trait declares gets that `references` edge, including default methods
+  the impl does not override (`impl T1 for u8 {}` with `1u8.t1()`), because
+  rustc counts a trait as used when one of its items is. An override that
+  carries its own `#[cfg]` leaves the default method's edge in place, since
+  the default is used where that condition is false. A trait path that
+  goes through `#[cfg]`-split imports gets this for each alternative trait,
+  under that import's condition, as `implements` edges do. A module is a
   retention root only under `--retain-public` (a `pub mod`); then the
   module-owned edges widen `dead` too. `limitations` counts such impl blocks.
 - Name fan-out: a method call `x.m()` whose receiver type is unknown gets
@@ -668,6 +704,8 @@ the crates, and points at `--retain-public` for libraries used outside the
 workspace. For a library used only inside the workspace these items really
 have no caller, and `--retain-public` would hide them. Exported items of
 crates that have a root, such as `pub` items of a binary, are not counted.
+An anonymous `const _` root does not count as one: a static assertion is not a
+caller of the library's API.
 
 Only lib and bin targets of workspace members are harvested — a `[lib]
 crate-type` such as `cdylib`, `staticlib`, or `rlib`, and a proc-macro lib,

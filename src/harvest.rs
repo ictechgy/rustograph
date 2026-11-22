@@ -379,6 +379,20 @@ pub(crate) fn decls_with_markers<'a>(
                     let unsafe_ = body_has_unsafe(body);
                     out.vertices
                         .push(v(id.clone(), Kind::Const, is_pub(&c.vis), unsafe_));
+                    // 이름 없는 상수(`const _: () = assert!(..);`)는 아무도 이름으로 부를 수 없고 컴파일러가
+                    // 늘 평가한다 — rustc는 그것도 그 초기식이 쓰는 아이템도 미사용으로 경고하지 않는다.
+                    // 보존 루트가 아니면 정적 단언과 그 안에서만 쓰는 const fn·타입이 전부 unreachable이었다.
+                    // 테스트 빌드에만 있는 것은 source가 --tests일 때만 루트로 남긴다.
+                    if is_anonymous_const(c) {
+                        out.entry_roots.push(id.clone());
+                        identities.note_root(
+                            &id,
+                            module_path,
+                            false,
+                            file,
+                            c.span().byte_range().start,
+                        );
+                    }
                     out.bodies.push(BodyItem {
                         generic_scopes: Vec::new(),
                         id,
@@ -566,10 +580,28 @@ pub(crate) struct ImplParts<'a> {
     pub bodies: Vec<BodyItem<'a>>,
     /// `#[no_mangle]` 같은 진입점 속성이 붙은 impl 메서드 — 항상 보존 루트다.
     pub entry_roots: Vec<String>,
-    /// self 타입이 워크스페이스 정점이 아닌 impl의 메서드 본문 — 소유자는 구현한 워크스페이스
-    /// 트레이트의 선언 메서드나 impl이 선언된 모듈이다([`foreign_impl_bodies`]). 호출자는 소유자가
-    /// 정점으로 남았는지 확인한 뒤 쓴다.
+    /// self 타입이 워크스페이스 정점이 아닌 impl의 메서드 본문 — 소유자는 impl이 선언된 모듈이거나, 구현한
+    /// 워크스페이스 트레이트의 선언 메서드다([`foreign_impl_bodies`] — 메서드마다 모듈 소유 하나와 트레이트
+    /// 대안마다 선언 메서드 소유 하나). 호출자는 선언 메서드 소유자가 정점으로 남았는지 확인한 뒤 쓴다.
     pub foreign_bodies: Vec<BodyItem<'a>>,
+    /// 그런 impl이 구현한 워크스페이스 트레이트의 선언 메서드 — 메서드에서 트레이트로 가는 references 간선의
+    /// 후보다([`ForeignTraitMethod`]).
+    pub foreign_trait_methods: Vec<ForeignTraitMethod>,
+}
+
+/// self 타입이 워크스페이스 정점이 아닌 impl(`impl Tr for String`)이 구현한 워크스페이스 트레이트의 선언 메서드
+/// 하나. self 타입 정점이 없어 implements 간선을 둘 수 없으니 호출자가 선언 메서드에서 트레이트로 references
+/// 간선을 둔다 — 그 메서드를 부르면(이름 팬아웃 포함) 이 impl을 거쳐 트레이트를 쓰는 것이다. impl이 재정의한
+/// 메서드와 재정의하지 않아 기본 구현을 쓰는 메서드 모두다. 이것이 없으면 워크스페이스 밖 타입에만 구현한 확장
+/// 트레이트가 메서드를 써도 unreachable이었다. 두 정점이 남았는지는 호출자가 본다(소스 인스턴스 ID로 바뀐
+/// 선언은 남지 않는다 — 유령 정점 금지).
+pub(crate) struct ForeignTraitMethod {
+    /// 트레이트의 선언 메서드 ID(`Tr::m`).
+    pub method: String,
+    /// 트레이트 정점 ID — 트레이트 경로가 `#[cfg]`로 갈린 대안 임포트를 지나면 대안마다 하나씩이다.
+    pub trait_id: String,
+    /// 간선 조건 — impl(재정의한 메서드면 그 메서드도)의 `#[cfg]`와 트레이트에 닿은 임포트의 조건을 합친 것.
+    pub cfg: Option<String>,
 }
 
 /// 소스 수확의 전역 충돌 판정에 선언 위치를 넘긴다. 공개 수확 API는 그대로 둔다.
@@ -590,6 +622,7 @@ pub(crate) fn impls_with_identities<'a>(
         bodies: Vec::new(),
         entry_roots: Vec::new(),
         foreign_bodies: Vec::new(),
+        foreign_trait_methods: Vec::new(),
     };
     for b in blocks {
         // self 타입을 해석한다 — 모듈 로컬이면 정점이 있다. `#[cfg]`로 갈린 대안 임포트(`#[cfg(unix)] use
@@ -611,6 +644,7 @@ pub(crate) fn impls_with_identities<'a>(
                 methods,
                 harvest,
                 &mut parts.attr_refs,
+                &mut parts.foreign_trait_methods,
             ));
             continue;
         }
@@ -780,31 +814,33 @@ fn impl_block_parts<'a>(
 /// 그런 impl(`impl Render for String`, blanket `impl<T: Tr> Greet for T`, `impl Tr for &Local`)의
 /// 메서드에는 정점이 없다 — 예전에는 본문을 통째로 버려, 그 안에서만 부르는 함수가 unreachable로
 /// 보였고 본문이 다른 모듈을 부르는 의존이 레이어 규칙에서 사라졌다. 확정 간선은 impl이 선언된
-/// 모듈이 소유한다 — 의존이 실제로 나가는 곳이라 규칙·순환이 그 모듈의 의존으로 본다. 구현한
-/// 트레이트가 워크스페이스 트레이트이고 그 메서드를 선언했으면, 반환하는 항목의 `id`는 선언
-/// 메서드(`Trait::m`)다 — 호출자([`crate::source`])가 그 소유로 같은 본문을 한 번 더 풀어 추정 간선으로
-/// 싣는다. 그 메서드를 부르는 곳(이름 팬아웃 포함)에서 본문의 호출이 닿되, 트레이트 모듈에서 impl
-/// 모듈로 가는 의존은 규칙·순환의 증거가 되지 않는다. 모듈은 `--retain-public`이면 `pub mod`가 보존
-/// 루트라 그때는 모듈이 소유한 간선도 dead 판정을 넓힌다. impl 메서드의 `Self`는 워크스페이스 밖
-/// 타입이라 바꾸지 않는다. 속성 경로 참조는 확정 의존이라 impl 모듈이 소유한다.
+/// 모듈이 소유한다 — 의존이 실제로 나가는 곳이라 규칙·순환이 그 모듈의 의존으로 본다. 그래서 메서드마다
+/// `id`가 impl 모듈인 항목이 하나 있다. 구현한 트레이트가 워크스페이스 트레이트이고 그 메서드를 선언했으면
+/// 같은 본문을 `id`가 선언 메서드(`Trait::m`)인 항목으로 하나 더 준다 — 호출자([`crate::source`])가 그 소유로
+/// 다시 풀어 추정 간선으로 싣는다. 그 메서드를 부르는 곳(이름 팬아웃 포함)에서 본문의 호출이 닿되, 트레이트
+/// 모듈에서 impl 모듈로 가는 의존은 규칙·순환의 증거가 되지 않는다. 모듈은 `--retain-public`이면 `pub mod`가
+/// 보존 루트라 그때는 모듈이 소유한 간선도 dead 판정을 넓힌다. impl 메서드의 `Self`는 워크스페이스 밖 타입이라
+/// 바꾸지 않는다. 속성 경로 참조는 확정 의존이라 impl 모듈이 소유한다.
+///
+/// 트레이트 경로가 `#[cfg]`로 갈린 대안 임포트를 지나면(`#[cfg(unix)] use crate::unix::Tr;`와 windows 쪽 옆의
+/// `impl Tr for String`) 대안 트레이트마다 선언 메서드 소유 항목을 주고 그 조건에 임포트의 조건을 더한다 —
+/// self 타입이 워크스페이스 타입인 impl의 implements 간선과 같은 규칙이다. 예전에는 대안 하나만 이어 다른 빌드의
+/// 트레이트가 거짓 unreachable이었다. 대안 트레이트마다 선언 메서드를 `trait_methods`에 더한다([`ForeignTraitMethod`]).
 fn foreign_impl_bodies<'a>(
     b: &ImplBlock<'a>,
     tree: &ModTree,
     methods: &BTreeSet<String>,
     harvest: &mut Harvest,
     attr_refs: &mut Vec<AttrRef>,
+    trait_methods: &mut Vec<ForeignTraitMethod>,
 ) -> Vec<BodyItem<'a>> {
-    let trait_id = b
+    let traits = b
         .trait_path
         .as_ref()
-        .and_then(|tp| tree.resolve_in(&b.items_module, tp, &DepCrates::new(), Ns::Type));
+        .map(|tp| tree.resolve_all(&b.items_module, tp, &DepCrates::new(), Some(Ns::Type)))
+        .unwrap_or_default();
     let mut bodies = Vec::new();
     for &m in &b.methods {
-        let owner = trait_id
-            .as_ref()
-            .map(|t| format!("{t}::{}", m.sig.ident))
-            .filter(|declared| methods.contains(declared))
-            .unwrap_or_else(|| b.items_module.clone());
         let own_cfg = cfg_of(&m.attrs);
         harvest.cfg_items += usize::from(own_cfg.is_some());
         let mcfg = match own_cfg {
@@ -819,20 +855,77 @@ fn foreign_impl_bodies<'a>(
             &mcfg,
             attr_refs,
         );
-        bodies.push(BodyItem {
+        let body = BodyItem {
             generic_scopes: generic_scopes([b.generics, &m.sig.generics]),
-            id: owner,
+            id: b.items_module.clone(),
             module: b.items_module.clone(),
             self_ty: None,
             body: Body::Stmts(&m.block.stmts),
             params: locals::param_bindings(&m.sig),
             signature_surface: fn_signature_types(&m.sig),
-            cfg: mcfg,
+            cfg: mcfg.clone(),
             file: b.file.clone(),
             range: m.span().byte_range(),
-        });
+        };
+        for tr in &traits {
+            let declared = format!("{}::{}", tr.target, m.sig.ident);
+            if !methods.contains(&declared) {
+                continue;
+            }
+            let cfg = with_import_cfg(&mcfg, &tr.cfg);
+            trait_methods.push(ForeignTraitMethod {
+                method: declared.clone(),
+                trait_id: tr.target.clone(),
+                cfg: cfg.clone(),
+            });
+            bodies.push(BodyItem {
+                id: declared,
+                cfg,
+                ..body.clone()
+            });
+        }
+        bodies.push(body);
+    }
+    for tr in &traits {
+        inherited_trait_methods(b, tr, methods, trait_methods);
     }
     bodies
+}
+
+/// impl 블록 `b`가 재정의하지 않은 트레이트 `tr`의 선언 메서드 — 기본 구현을 그대로 쓰는 메서드다. 그 메서드를
+/// 부르면 이 impl을 거쳐 트레이트를 쓰니 재정의한 메서드처럼 [`ForeignTraitMethod`]로 더한다(조건은 impl의 것과
+/// 임포트의 것). `impl T1 for u8 {}` 옆의 `1u8.t1()`이 기본 메서드 `T1::t1`에만 닿아 트레이트 `T1`이 unreachable이던
+/// 것을 막는다 — rustc는 쓰인 트레이트 아이템의 트레이트를 쓰인 것으로 본다.
+///
+/// 재정의가 모두 자기 `#[cfg]`를 달면(`#[cfg(unix)] fn m`) 그 조건이 거짓인 빌드에서는 기본 구현이 쓰이니 재정의하지
+/// 않은 것으로 본다 — 재정의 쪽 간선만 남기면 그 조건을 단 간선뿐이라 `--target` windows가 쓰이는 트레이트를 냈다.
+/// 조건 없는 재정의가 하나라도 있으면 기본 구현은 어느 빌드에서도 이 impl에 쓰이지 않는다.
+fn inherited_trait_methods(
+    b: &ImplBlock<'_>,
+    tr: &Resolved,
+    methods: &BTreeSet<String>,
+    trait_methods: &mut Vec<ForeignTraitMethod>,
+) {
+    let prefix = format!("{}::", tr.target);
+    let cfg = with_import_cfg(&b.cfg, &tr.cfg);
+    let declared = methods
+        .range(prefix.clone()..)
+        .take_while(|id| id.starts_with(&prefix));
+    for method in declared {
+        let name = &method[prefix.len()..];
+        let always_overridden = b
+            .methods
+            .iter()
+            .any(|m| m.sig.ident == name && cfg_of(&m.attrs).is_none());
+        if name.contains("::") || always_overridden {
+            continue;
+        }
+        trait_methods.push(ForeignTraitMethod {
+            method: method.clone(),
+            trait_id: tr.target.clone(),
+            cfg: cfg.clone(),
+        });
+    }
 }
 
 /// 시그니처 표면(파라미터·반환·where)의 타입 목록.
@@ -1523,18 +1616,55 @@ impl BodyVisitor<'_> {
             .is_some_and(|m| m.value_items.contains(name))
     }
 
+    /// 정점 `id`가 부모 모듈의 타입 이름공간 아이템(struct·enum·union·trait·타입 별칭·`mod`)인가 — [`Self::value_item`]의
+    /// 짝이다.
+    fn type_item(&self, id: &str) -> bool {
+        let Some((parent, name)) = id.rsplit_once("::") else {
+            return false;
+        };
+        self.tree
+            .modules
+            .get(parent)
+            .is_some_and(|m| m.type_items.contains(name))
+    }
+
+    /// 타입 상대 경로(`Type::assoc`, `E::V`, `m::X`)의 앞부분을 타입 이름공간에서 해석한 대상 가운데 그 자리에 올 수
+    /// 있는 것 — 타입 이름공간 아이템·모듈(크레이트 루트 포함)·외부 크레이트 정점이다. 타입 이름공간에 묶인 것이
+    /// 없으면 해석은 다른 이름공간으로 넘어가는데([`ModTree::resolve_in`]), 그러면 `use std::process;` 옆의 로컬
+    /// `fn process`가 `process::exit`의 앞부분으로 잡혔다. 함수·상수·static은 경로 앞부분이 될 수 없으니 버린다 —
+    /// 이으면 rustc가 미사용으로 경고하는 그 fn이 살아 있고, 같은 이름의 재노출(`pub use crate::a::env`) 옆
+    /// `env::var(..)`는 거짓 심볼 순환이 됐다. 정점 없이 건너뛴 `mod` 선언(파일이 없는 `mod target;` —
+    /// [`ModTree::unloaded_mods`], 순환·깊이로 건너뛴 [`ModTree::skipped_mods`])도 아이템 표의 타입 이름이지만 정점이
+    /// 없으니 버린다 — 이으면 유령 정점으로 가는 간선이었다.
+    fn path_prefix_owners(&mut self, prefix: &[String]) -> Vec<Resolved> {
+        let found = self.resolve_in(prefix, Ns::Type);
+        found
+            .into_iter()
+            .filter(|r| {
+                self.tree.modules.contains_key(&r.target)
+                    || (self.type_item(&r.target)
+                        && !self.tree.skipped_mods.contains_key(&r.target)
+                        && !self.tree.unloaded_mods.contains(&r.target))
+                    || self.dep_crates.external.contains(r.target.as_str())
+            })
+            .collect()
+    }
+
     /// 타입 `owner` 범위에서 이름이 `name`인 메서드(고유·트레이트 impl)로 references 간선을 단다 —
     /// 연관 함수를 값으로 넘긴 경로(`Type::new`)다. 같은 이름 메서드가 없으면(배리언트·연관 상수)
-    /// 아무것도 하지 않는다. 간선은 타입에 닿으려고 거친 임포트의 조건을 싣는다.
-    fn push_associated(&mut self, owner: &Resolved, name: &str) {
+    /// 아무것도 하지 않는다. 간선은 타입에 닿으려고 거친 임포트의 조건을 싣는다. 반환: 간선을 달았는가.
+    fn push_associated(&mut self, owner: &Resolved, name: &str) -> bool {
         let index = self.method_index;
         let Some(ids) = index.get(name) else {
-            return;
+            return false;
         };
         let prefix = owner_prefix(&owner.target);
+        let mut hit = false;
         for mid in ids.iter().filter(|mid| mid.starts_with(&prefix)) {
             self.push(mid.clone(), &owner.cfg, EdgeKind::References);
+            hit = true;
         }
+        hit
     }
 
     /// `<T as Tr>::m(..)`·`<T>::m(..)` — self 타입이 적힌 정적 호출이다. `T`가 워크스페이스 타입이면
@@ -1584,6 +1714,90 @@ impl BodyVisitor<'_> {
             }
         }
         false
+    }
+
+    /// 값 경로로 풀리지 않은 호출 `Type::assoc(..)`·`Enum::Variant(..)` — 마지막 세그먼트가 연관 함수나
+    /// 배리언트이고 앞부분이 타입이다. 앞부분을 타입 이름공간에서 해석해(`#[cfg]`로 갈린 대안 임포트면 대안
+    /// 타입마다) 그 타입 범위의 같은 이름 메서드로 call 간선을 단다.
+    ///
+    /// 타입 자체로도 references 간선을 단다 — 경로가 그 타입을 이름 붙인다. rustc는 `S::m()`의 `S`를
+    /// struct의 사용으로 보고 `E::V(..)`는 enum의 사용이다(둘 다 dead_code 경고가 없다). 메서드에만 잇던 때는
+    /// 그렇게만 쓰는 struct·enum이 unreachable이었다. 호출이 아닌 값 경로(`E::W`, `.map(Type::new)`)는
+    /// [`Visit::visit_expr_path`]가 같은 규칙으로 타입을 잇는다.
+    ///
+    /// 앞부분은 타입 이름공간 아이템일 때만 잇는다([`Self::path_prefix_owners`]에서 모듈을 뺀 것). 다른 이름공간으로
+    /// 넘어간 해석(`use std::process;` 옆 `fn process`의 `process::exit()`)은 거짓 확정 간선이었다. 앞부분이
+    /// 워크스페이스 모듈이면(매크로가 만든 함수 `m::generated()`) 타입도 메서드 후보도 잇지 않는다 — `m::gen()`은
+    /// `m` 안 아무 타입의 같은 이름 메서드(`m::S::gen`)를 부를 수 없다.
+    ///
+    /// 반환: 경로 전체가 풀렸는가 — 아니면 호출자가 미해석으로 센다([`Self::type_relative_resolved`]).
+    fn type_relative_call(&mut self, segs: &[String]) -> bool {
+        let Some((name, prefix_segs)) = segs.split_last().filter(|(_, p)| !p.is_empty()) else {
+            return false;
+        };
+        let types = self.path_prefix_types(prefix_segs);
+        let resolved = !types.is_empty();
+        let mut hit = false;
+        for ty in types {
+            if let Some(ids) = self.method_index.get(name) {
+                // 접두사는 대상 타입마다 한 번 — 후보마다 만들면 같은 이름 정의가
+                // 수천 개일 때 할당이 (호출 수 × 정의 수)다.
+                let prefix = owner_prefix(&ty.target);
+                for mid in ids {
+                    if mid.starts_with(&prefix) {
+                        self.push(mid.clone(), &ty.cfg, EdgeKind::Call);
+                        hit = true;
+                    }
+                }
+            }
+            self.push_resolved(ty, EdgeKind::References);
+        }
+        self.type_relative_resolved(resolved, hit, name)
+    }
+
+    /// 타입 상대 경로(`Type::name`)를 미해석으로 세지 않아도 되는가 — 앞부분이 타입으로 풀렸고(`resolved`), 그 타입의
+    /// 같은 이름 메서드에 닿았거나(`hit`) 워크스페이스에 그 이름의 메서드가 아예 없을 때다. 뒤의 것은 메서드 정점이
+    /// 없는 배리언트·derive가 만든 연관 함수·외부 트레이트 메서드(`E::V(1)`, `D::default()`)로, 타입 간선이 경로의
+    /// 워크스페이스 쪽 전부다. 같은 이름의 워크스페이스 메서드가 있는데 그 타입 아래에서 닿지 못했으면(트레이트 기본
+    /// 메서드를 타입으로 부른 `S::d()`, 타입 별칭을 거친 `A::new()`) 이은 것이 없는 워크스페이스 대상이라 센다 — 세지
+    /// 않으면 그렇게만 쓰는 메서드가 limitation 없이 unreachable이었다.
+    fn type_relative_resolved(&self, resolved: bool, hit: bool, name: &str) -> bool {
+        resolved && (hit || !self.method_index.contains_key(name))
+    }
+
+    /// 값 경로로 풀리지 않은 호출이 아닌 경로 `Type::name`·`E::W`·`m::X` — 앞부분 대상([`Self::path_prefix_owners`])으로
+    /// references 간선을 단다. 앞부분이 타입이면 그 타입 범위의 같은 이름 메서드도 잇는다 — `.map(Type::new)`·
+    /// `.ok_or_else(Type::err)`처럼 연관 함수를 값으로 넘긴 경로다(타입만 잇던 때는 그렇게만 쓰는 연관 함수가
+    /// unreachable이었다). 앞부분이 모듈이면 메서드 후보를 찾지 않는다 — `let f = m::gen;`(매크로가 만든 함수)은
+    /// `m::S::gen`이 아니다. 예전에는 그 메서드로 확정 간선이 붙어 rustc가 경고하는 `S::gen`이 살아 있고 그 메서드가
+    /// 부르는 함수 사이에 거짓 심볼 순환이 생겼다. 모듈로 가는 간선은 그대로 두되 이름은 풀리지 않았으니 센다 — 셈 기준은
+    /// 호출과 같다([`Self::type_relative_resolved`]).
+    fn type_relative_value(&mut self, prefix: &[String], name: &str) {
+        let mut resolved = false;
+        let mut hit = false;
+        for owner in self.path_prefix_owners(prefix) {
+            if self.dep_crates.external.contains(owner.target.as_str()) {
+                resolved = true;
+            } else if self.type_item(&owner.target)
+                && !self.tree.modules.contains_key(&owner.target)
+            {
+                resolved = true;
+                hit |= self.push_associated(&owner, name);
+            }
+            self.push_resolved(owner, EdgeKind::References);
+        }
+        if !self.type_relative_resolved(resolved, hit, name) {
+            self.unresolved += 1;
+        }
+    }
+
+    /// [`Self::path_prefix_owners`] 가운데 타입(모듈·외부 크레이트가 아닌 타입 이름공간 아이템)만 — 타입 상대 경로의
+    /// 메서드 후보와 타입 간선을 다는 대상이다.
+    fn path_prefix_types(&mut self, prefix: &[String]) -> Vec<Resolved> {
+        self.path_prefix_owners(prefix)
+            .into_iter()
+            .filter(|ty| self.type_item(&ty.target) && !self.tree.modules.contains_key(&ty.target))
+            .collect()
     }
 
     /// 본문을 아레나에서 바로 방문한다 — 최상위 문장 규칙은 [`body_edges`] 문서에 있다.
@@ -1739,27 +1953,7 @@ impl Visit<'_> for BodyVisitor<'_> {
                 // 지역 클로저·함수 값 호출 — 아이템 호출이 아니다.
                 ValueRes::Local => {}
                 ValueRes::Unresolved => {
-                    // Type::assoc_fn() — 마지막 세그먼트가 연관 함수다.
-                    // 앞부분이 타입 정점이면 그 타입의 메서드로 좁힌다. 타입이 `#[cfg]`로 갈린 대안
-                    // 임포트면 대안 타입마다 본다.
-                    let n = segs.len();
-                    let mut hit = false;
-                    if n >= 2 {
-                        for ty in self.resolve_in(&segs[..n - 1], Ns::Type) {
-                            if let Some(ids) = self.method_index.get(&segs[n - 1]) {
-                                // 접두사는 대상 타입마다 한 번 — 후보마다 만들면 같은 이름 정의가
-                                // 수천 개일 때 할당이 (호출 수 × 정의 수)다.
-                                let prefix = owner_prefix(&ty.target);
-                                for mid in ids {
-                                    if mid.starts_with(&prefix) {
-                                        self.push(mid.clone(), &ty.cfg, EdgeKind::Call);
-                                        hit = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if !hit {
+                    if !self.type_relative_call(&segs) {
                         self.unresolved += 1;
                     }
                 }
@@ -2001,18 +2195,8 @@ impl Visit<'_> for BodyVisitor<'_> {
             ValueRes::Unresolved => {
                 // E::V 형태 — 마지막 세그먼트가 열거형 배리언트/상수면
                 // 앞부분 타입에의 참조다. 그것도 안 되면 진짜 미해석.
-                if segs.len() >= 2 {
-                    let owners = self.resolve_in(&segs[..segs.len() - 1], Ns::Type);
-                    if owners.is_empty() {
-                        self.unresolved += 1;
-                    }
-                    for ty in owners {
-                        // `.map(Type::new)`·`.ok_or_else(Type::err)`처럼 연관 함수를 값으로 넘기면
-                        // 그 메서드의 참조다 — 타입만 잇던 때는 그렇게만 쓰는 연관 함수가
-                        // unreachable이었다. 호출(`Type::assoc()`)과 같은 타입 범위 후보를 쓴다.
-                        self.push_associated(&ty, &segs[segs.len() - 1]);
-                        self.push_resolved(ty, EdgeKind::References);
-                    }
+                if let Some((name, prefix)) = segs.split_last().filter(|(_, p)| !p.is_empty()) {
+                    self.type_relative_value(prefix, name);
                 }
             }
         }
@@ -2345,6 +2529,28 @@ pub(crate) fn text_has_generated_marker(src: &str) -> bool {
     })
 }
 
+/// 본문 안에 중첩 아이템(블록 안의 `fn`·`impl`·`struct` 등)이 있는가 — 매크로 토큰 안은 보지 않는다. 중첩
+/// 아이템에는 정점이 없어 그 간선은 바깥 본문이 소유한다. 보존 루트인 이름 없는 상수(`const _: () = { fn f() {..} };`)
+/// 에서는 그 아이템을 아무도 쓰지 않아도 그것이 쓰는 것이 닿은 것으로 남으므로 source가 이것으로 센다.
+pub(crate) fn has_nested_items(body: Body<'_>) -> bool {
+    struct Finder(bool);
+    impl Visit<'_> for Finder {
+        fn visit_item(&mut self, _i: &syn::Item) {
+            self.0 = true;
+        }
+    }
+    let mut f = Finder(false);
+    match body {
+        Body::Expr(e) => f.visit_expr(e),
+        Body::Stmts(stmts) => {
+            for stmt in stmts {
+                f.visit_stmt(stmt);
+            }
+        }
+    }
+    f.0
+}
+
 /// 본문 안에 `unsafe {}` 블록이 있는지 본다 — 재귀 방문. 본문 방문([`body_edges`])처럼 최상위
 /// 아이템은 보지 않는다. 매크로 토큰 안도 보지 않는다(syn 기본 순회는 토큰을 내리지 않는다).
 fn body_has_unsafe(body: Body<'_>) -> bool {
@@ -2414,6 +2620,11 @@ pub fn is_test_entry(attrs: &[syn::Attribute]) -> bool {
             .last()
             .is_some_and(|s| s.ident == "test" || s.ident == "bench")
     })
+}
+
+/// 이름 없는 상수(`const _: T = ..;`)인가 — 이름으로 쓸 수 없고 컴파일러가 늘 평가하니 보존 루트다.
+fn is_anonymous_const(c: &syn::ItemConst) -> bool {
+    c.ident == "_"
 }
 
 /// 링커·런타임·매크로 확장기가 부르는 진입점 속성 — 이 속성이 붙은 fn·static·impl 메서드는 그래프

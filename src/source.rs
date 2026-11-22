@@ -918,6 +918,7 @@ fn harvest(
         ));
     }
     push_skipped_mods(&tree.skipped_mods, &mut limitations);
+    push_unloaded_mods(&tree, &mut limitations);
     if !oversized.is_empty() {
         limitations.push(format!(
             "{} module files larger than {} MiB were not read; the items and submodules they \
@@ -1003,6 +1004,7 @@ fn harvest(
         .map(|v| v.id.clone())
         .collect();
     let mut foreign_bodies: Vec<BodyItem<'_>> = Vec::new();
+    let mut foreign_trait_methods: Vec<harvest::ForeignTraitMethod> = Vec::new();
     for block in &impls {
         let krate = modtree::crate_of(&block.items_module);
         let parts = harvest::impls_with_identities(
@@ -1019,6 +1021,7 @@ fn harvest(
         bodies.extend(parts.bodies);
         annotated_roots.extend(parts.entry_roots);
         foreign_bodies.extend(parts.foreign_bodies);
+        foreign_trait_methods.extend(parts.foreign_trait_methods);
     }
     let identities = identity_registry.identify(&mut vertices, &meta.workspace_root);
     drop(identity_registry);
@@ -1027,30 +1030,34 @@ fn harvest(
     for body in &mut bodies {
         body.id = identities.owner(&body.id, &body.module, &body.file, body.range.start);
     }
-    // 대신 소유시킨 본문은 소유자가 정점으로 남았을 때만 쓴다 — 같은 경로의 트레이트 선언이 여럿이라
-    // 선언 메서드가 소스 인스턴스 ID로 바뀌었으면 impl 모듈이 소유한다(유령 정점 금지).
+    // 대신 소유시킨 본문·간선은 선언 메서드와 트레이트가 정점으로 남았을 때만 쓴다 — 같은 경로의 트레이트
+    // 선언이 여럿이라 선언 메서드가 소스 인스턴스 ID로 바뀌었으면 impl 모듈 소유 본문만 남는다(유령 정점 금지).
     let vertex_ids: BTreeSet<&str> = vertices.iter().map(|v| v.id.as_str()).collect();
+    // 워크스페이스 밖 타입의 impl이 구현한 트레이트다. self 타입 정점이 없어 implements 간선을 둘 수 없으니 선언
+    // 메서드에서 트레이트로 references 간선을 둔다 — 워크스페이스 밖 타입에만 구현한 확장 트레이트(`impl ItemIdent
+    // for syn::Item`)는 이것이 없으면 메서드를 써도 트레이트 정점이 unreachable이었다.
+    for m in foreign_trait_methods {
+        if vertex_ids.contains(m.method.as_str()) && vertex_ids.contains(m.trait_id.as_str()) {
+            let mut e = Edge::new(m.method, m.trait_id, EdgeKind::References);
+            e.cfg = m.cfg;
+            edges.push(e);
+        }
+    }
     // 선언 메서드가 대신 소유할 본문 — 2패스 뒤에 그 소유로 다시 풀어 추정 간선으로만 싣는다.
     let mut proxy_bodies: Vec<BodyItem<'_>> = Vec::new();
-    for mut body in foreign_bodies {
-        let trait_id = (body.id != body.module && vertex_ids.contains(body.id.as_str()))
-            .then(|| body.id.rsplit_once("::").map(|(t, _)| t.to_string()))
-            .flatten()
-            .filter(|t| vertex_ids.contains(t.as_str()));
-        // 선언 메서드가 소유한 본문은 그 트레이트의 impl이다. self 타입 정점이 없어 implements
-        // 간선을 둘 수 없으니 소유 메서드에서 트레이트로 references 간선을 둔다 — 워크스페이스 밖
-        // 타입에만 구현한 확장 트레이트(`impl ItemIdent for syn::Item`)는 이것이 없으면 메서드를
-        // 써도 트레이트 정점이 unreachable이었다.
-        if let Some(trait_id) = trait_id {
-            let mut e = Edge::new(body.id.clone(), trait_id, EdgeKind::References);
-            e.cfg = body.cfg.clone();
-            edges.push(e);
-            proxy_bodies.push(body.clone());
+    for body in foreign_bodies {
+        if body.id == body.module {
+            // 확정 간선은 impl이 선언된 모듈이 소유한다 — 의존이 실제로 나가는 곳이다. 선언 메서드가
+            // 소유하면 트레이트 모듈에서 impl 모듈로 가는 거짓 의존이 규칙 위반·순환으로 보였다.
+            bodies.push(body);
+        } else if vertex_ids.contains(body.id.as_str())
+            && body
+                .id
+                .rsplit_once("::")
+                .is_some_and(|(trait_id, _)| vertex_ids.contains(trait_id))
+        {
+            proxy_bodies.push(body);
         }
-        // 확정 간선은 impl이 선언된 모듈이 소유한다 — 의존이 실제로 나가는 곳이다. 선언 메서드가
-        // 소유하면 트레이트 모듈에서 impl 모듈로 가는 거짓 의존이 규칙 위반·순환으로 보였다.
-        body.id = body.module.clone();
-        bodies.push(body);
     }
     for span in &mut item_spans {
         let module = span
@@ -1222,11 +1229,13 @@ fn harvest(
     }
     push_limitations(&harvest, &mut limitations);
 
-    // 보존 루트 — 존재하는 정점만 루트가 된다.
+    // 보존 루트 — 존재하는 정점만 루트가 된다. 테스트 빌드에만 있는 이름 없는 상수는 `#[test]`처럼 --tests일 때만
+    // 루트다([`graph::test_only_anonymous_consts`]).
     let ids: BTreeSet<&str> = vertices.iter().map(|v| v.id.as_str()).collect();
+    let test_only = graph::test_only_anonymous_consts(&vertices);
     let mut root_set: BTreeSet<String> = BTreeSet::new();
     for r in entry_roots {
-        if ids.contains(r.as_str()) {
+        if ids.contains(r.as_str()) && (opts.tests || !test_only.contains(r.as_str())) {
             root_set.insert(r);
         }
     }
@@ -1259,6 +1268,7 @@ fn harvest(
             missing_roots.len(), missing_roots.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
+    limitations.extend(anonymous_roots_with_items(&vertices, &bodies, &root_set));
 
     let level = if opts.symbol_level {
         Level::Symbol
@@ -1291,6 +1301,33 @@ fn harvest(
         ),
         uses_include,
     ))
+}
+
+/// 중첩 아이템을 품은 이름 없는 상수 루트를 센 limitation — 셀 것이 없으면 없다. 블록 안 아이템(`const _: () = { fn
+/// f() { helper() } };`)에는 정점이 없어 함수 안 아이템처럼 그 간선을 상수가 소유하고, 상수는 늘 보존 루트라 그 아이템을
+/// 아무도 쓰지 않아도 그것이 쓰는 것(`helper`)이 닿은 것으로 남는다 — rustc는 중첩 아이템을 따로 보고 경고한다. 상수의
+/// 초기식이 부르는 중첩 `const fn`은 실제로 쓰이니 간선을 떼지 않고 센다. 이번 실행의 루트인 것만 센다(테스트 전용
+/// 상수는 `--tests`일 때만 루트다).
+fn anonymous_roots_with_items(
+    vertices: &[Vertex],
+    bodies: &[BodyItem<'_>],
+    roots: &BTreeSet<String>,
+) -> Option<String> {
+    let anonymous: BTreeSet<&str> = vertices
+        .iter()
+        .filter(|v| v.is_anonymous_const())
+        .map(|v| v.id.as_str())
+        .collect();
+    let count = bodies
+        .iter()
+        .filter(|b| anonymous.contains(b.id.as_str()) && roots.contains(&b.id))
+        .filter(|b| harvest::has_nested_items(b.body))
+        .count();
+    (count > 0).then(|| {
+        format!(
+            "{count} `const _` retention roots contain nested items (fn, impl, ...); like items in a function body they have no vertex and their edges belong to the constant, so what they use stays reachable even where the nested item itself is never used"
+        )
+    })
 }
 
 /// 정점별 소스 범위를 모은다 — 본문 아이템(fn·메서드·const·static·
@@ -1865,6 +1902,11 @@ fn harvest_module<'a>(
         .map(|imp| (&imp.target, &imp.cfg))
         .collect();
     for (target, cfg) in imports.into_iter().chain(&module.glob_targets) {
+        // 정점 없이 건너뛴 `mod`(파일 없음·순환·깊이)는 아이템 표에 이름만 있다 — 그리로 가는 uses는 유령 간선이고,
+        // 소유 모듈로 돌리면 없는 의존이 생긴다. 그 선언은 limitation이 센다.
+        if tree.unloaded_mods.contains(target) || tree.skipped_mods.contains_key(target) {
+            continue;
+        }
         let to = if tree.item_exists(target) {
             target.clone()
         } else if dep_vertices.contains(target.as_str()) {
@@ -1995,6 +2037,23 @@ fn push_skipped_mods(
         if n > 0 {
             limitations.push(format!("{n} mod declarations were skipped because {why}"));
         }
+    }
+}
+
+/// 파일을 찾지 못해 싣지 않은 `mod` 선언([`modtree::ModTree::unloaded_mods`])을 센 limitation — 셀 것이 없으면 조용하다.
+/// 그 모듈은 정점이 없고 그 안을 가리키는 경로는 풀리지 않는다. `#[cfg]` 뒤 선언(`#[cfg(windows)] mod imp;`, 꺼진
+/// feature), 빌드 스크립트가 만드는 파일, 수확이 따르지 않는 `#[cfg_attr(.., path = ..)]`가 흔한 이유다 — 예전에는
+/// 셈 없이 조용했고, `#[cfg]`를 단 선언은 "modules behind #[cfg] were included"로 실린 것처럼 셌다.
+fn push_unloaded_mods(tree: &ModTree, limitations: &mut Vec<String>) {
+    let n = tree
+        .unloaded_mods
+        .iter()
+        .filter(|path| !tree.modules.contains_key(*path))
+        .count();
+    if n > 0 {
+        limitations.push(format!(
+            "{n} mod declarations were not loaded because their file was not found (behind #[cfg], generated by a build script, or under #[cfg_attr(.., path = ..)]); they have no vertices and paths into them stay unresolved"
+        ));
     }
 }
 

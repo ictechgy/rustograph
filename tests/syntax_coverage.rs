@@ -722,6 +722,585 @@ fn main() {
     assert_reported(&report, &["assocvalue::Item::unused_assoc"]);
 }
 
+/// 호출 경로 `Type::assoc()`·`Enum::Variant(..)`는 메서드(있으면)와 함께 타입 자체를 references로 잇는다 — rustc는
+/// `S::m()`의 `S`를 struct의 사용으로, `E::V(1)`을 enum의 사용으로 본다(이 fixture의 `cargo check` 경고는 `Unused`와
+/// 배리언트 필드뿐이다). 예전에는 메서드에만 잇거나(`S::m()`) 아무것도 잇지 않아(`E::V(1)`, derive가 만든
+/// `D::default()`) 그렇게만 쓰는 타입이 unreachable이었다. 앞부분이 모듈이면(매크로가 만든 `gen::generated()`) 모듈로
+/// 잇지 않는다. 미해석으로 세는 것은 그 하나다 — 타입으로 풀린 `E::V(1)`·`D::default()`는 값 경로 `E::W`처럼 세지
+/// 않는다.
+#[test]
+fn associated_calls_and_tuple_variants_reference_their_type() {
+    let ws = Workspace::new(
+        "assoc-call",
+        &[
+            ("Cargo.toml", &manifest("assoccall")),
+            (
+                "src/main.rs",
+                r#"
+mod imp {
+    pub struct S;
+    impl S { pub fn m() -> u8 { 1 } }
+    pub enum E { V(u8) }
+    #[derive(Default)]
+    pub struct D;
+    pub struct Unused;
+}
+mod gen {
+    macro_rules! make { () => { pub fn generated() {} }; }
+    make!();
+}
+struct Local;
+impl Local { fn make() -> u8 { 4 } }
+fn main() {
+    let _ = imp::S::m();
+    let _ = imp::E::V(1);
+    let _ = Local::make();
+    let _ = imp::D::default();
+    gen::generated();
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    for ty in ["imp::S", "imp::E", "imp::D", "Local"] {
+        assert!(
+            has_edge(
+                &doc,
+                "assoccall::main",
+                &format!("assoccall::{ty}"),
+                EdgeKind::References
+            ),
+            "main must reference {ty}"
+        );
+    }
+    assert!(has_edge(
+        &doc,
+        "assoccall::main",
+        "assoccall::imp::S::m",
+        EdgeKind::Call
+    ));
+    assert!(!doc
+        .edges
+        .iter()
+        .any(|e| e.from == "assoccall::main" && e.to == "assoccall::gen"));
+    let report = analysis::dead(&doc).unwrap();
+    assert_not_reported(
+        &report,
+        &[
+            "assoccall::imp::S",
+            "assoccall::imp::E",
+            "assoccall::imp::D",
+            "assoccall::Local",
+        ],
+    );
+    assert_reported(&report, &["assoccall::imp::Unused"]);
+    assert!(
+        doc.limitations
+            .iter()
+            .any(|l| l.starts_with("1 path references could not be resolved")),
+        "{:?}",
+        doc.limitations
+    );
+}
+
+/// 경로 앞부분(`process::exit`의 `process`)은 타입 이름공간 아이템이나 모듈일 때만 잇는다 — 타입 이름공간에 묶인 것이
+/// 없을 때(`use std::process;`는 그래프 밖) 해석이 다른 이름공간으로 넘어가 같은 이름의 로컬 `fn process`·`fn fmt`를
+/// 잡았고, 호출(`process::exit(1)`)·값(`let exit = process::exit;`) 모두 그 fn으로 확정 간선을 냈다. rustc는 셋을
+/// 미사용으로 경고한다(이 fixture의 `cargo check` 경고는 `process`·`helper`·`fmt`).
+#[test]
+fn path_prefix_never_resolves_to_a_same_named_fn() {
+    let ws = Workspace::new(
+        "prefix-fn",
+        &[
+            ("Cargo.toml", &manifest("prefixfn")),
+            (
+                "src/main.rs",
+                r#"
+use std::process;
+use std::fmt;
+fn process() -> u8 { helper() }
+fn helper() -> u8 { 1 }
+fn fmt() -> u8 { 2 }
+fn main() {
+    let _ = fmt::format(format_args!("x"));
+    let exit: fn(i32) -> ! = process::exit;
+    if std::env::args().count() > 99 { process::exit(1); }
+    if std::env::args().count() > 100 { exit(1) }
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(!doc
+        .edges
+        .iter()
+        .any(|e| e.from == "prefixfn::main"
+            && (e.to == "prefixfn::process" || e.to == "prefixfn::fmt")));
+    let report = analysis::dead(&doc).unwrap();
+    assert_eq!(
+        unreachable_ids(&report),
+        ["prefixfn::fmt", "prefixfn::helper", "prefixfn::process"]
+    );
+}
+
+/// 모듈 앞부분의 호출(`m::gen()` — 매크로가 만든 함수)은 `m` 안 아무 타입의 같은 이름 메서드(`m::S::gen`)를 부를 수
+/// 없고, 원시 타입 경로(`u32::MAX`)는 같은 이름의 로컬 `fn u32`가 아니다. 예전에는 둘 다 확정 간선이라 rustc가
+/// 경고하는 `S::gen`·`u32`가 살아 있었다(이 fixture의 `cargo check` 경고는 `u32`·`S`·`gen`).
+#[test]
+fn module_and_primitive_prefixes_pick_no_same_named_candidates() {
+    let ws = Workspace::new(
+        "prefix-module",
+        &[
+            ("Cargo.toml", &manifest("modprefix")),
+            (
+                "src/main.rs",
+                r#"
+mod m {
+    pub struct S;
+    impl S { pub fn gen() -> u8 { 1 } }
+    macro_rules! make { () => { pub fn gen() -> u8 { 2 } }; }
+    make!();
+}
+fn u32() -> u8 { 3 }
+fn main() {
+    let _ = m::gen();
+    let _ = u32::MAX;
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(!doc.edges.iter().any(|e| e.from == "modprefix::main"
+        && (e.to == "modprefix::m::S::gen" || e.to == "modprefix::u32")));
+    let report = analysis::dead(&doc).unwrap();
+    assert_reported(
+        &report,
+        &["modprefix::m::S", "modprefix::m::S::gen", "modprefix::u32"],
+    );
+}
+
+/// 같은 이름의 재노출이 있는 모듈의 `env::var(..)`(`use std::env;` 옆 `pub use crate::a::env;`)는 재노출된 fn이 아니다 —
+/// 그 fn이 이 모듈 함수를 부르면 거짓 심볼 순환이 되어 `cycles --level symbol --strict`가 실패했다(rustc 경고 없음).
+#[test]
+fn path_prefix_through_a_same_named_reexport_makes_no_cycle() {
+    let ws = Workspace::new(
+        "prefix-cycle",
+        &[
+            ("Cargo.toml", &manifest("prefixcycle")),
+            (
+                "src/main.rs",
+                r#"
+mod a {
+    pub fn env() -> String { crate::b::get() }
+}
+mod b {
+    use std::env;
+    pub use crate::a::env;
+    pub fn get() -> String { env::var("HOME").unwrap_or_default() }
+}
+fn main() { let _ = b::env(); }
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(!has_edge(
+        &doc,
+        "prefixcycle::b::get",
+        "prefixcycle::a::env",
+        EdgeKind::References
+    ));
+    assert!(analysis::cycles(&doc).cycles.is_empty());
+    assert!(analysis::dead(&doc).unwrap().findings.is_empty());
+}
+
+/// 파일이 없는 `mod gone;`(지운 파일·빌드 스크립트가 만드는 파일)의 이름은 아이템 표에 있지만 정점이 없다 — 경로
+/// 앞부분이 거기 닿아도(`crate::gone::removed()`, `crate::gone::OTHER`) 간선을 두지 않고 미해석으로 센다. 예전에는
+/// 호출(이 브랜치의 앞 커밋)과 값 경로(main부터)가 그 유령 경로로 references 간선을 냈다. rustc는 이 코드를 컴파일하지
+/// 않지만(E0583) change-impact의 작업 트리처럼 파일을 지운 상태를 수확한다.
+#[test]
+fn missing_module_files_get_no_prefix_edges() {
+    let ws = Workspace::new(
+        "prefix-missing-mod",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname='gonemod'\nversion='0.1.0'\nedition='2021'\n[lib]\npath='src/lib.rs'\n[workspace]\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub mod gone;\npub fn caller() -> u8 { crate::gone::removed(); crate::gone::OTHER }\n",
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    let ids: std::collections::BTreeSet<&str> =
+        doc.vertices.iter().map(|v| v.id.as_str()).collect();
+    assert!(!ids.contains("gonemod::gone"));
+    for e in &doc.edges {
+        assert!(
+            ids.contains(e.to.as_str()),
+            "edge to a missing vertex: {e:?}"
+        );
+    }
+    assert!(
+        doc.limitations
+            .iter()
+            .any(|l| l.starts_with("2 path references could not be resolved")),
+        "{:?}",
+        doc.limitations
+    );
+}
+
+/// 타입 상대 호출의 미해석 셈은 진실해야 한다 — 앞부분이 타입으로 풀려도 같은 이름의 워크스페이스 메서드가 있는데 그
+/// 타입 아래에서 닿지 못하면(트레이트 기본 메서드를 타입으로 부른 `c::S::d()`, 타입 별칭을 거친 `a::A::new()`) 이은 것이
+/// 없는 워크스페이스 대상이라 센다. 이 fixture는 `cargo check` 경고가 없는데 `dead`는 `c::Tr::d`·`a::S::new`를 낸다 —
+/// 셈이 없으면 그 거짓 dead가 아무 경고 없이 나왔다.
+#[test]
+fn type_relative_calls_missing_a_workspace_method_are_counted() {
+    let ws = Workspace::new(
+        "prefix-count",
+        &[
+            ("Cargo.toml", &manifest("prefixcount")),
+            (
+                "src/main.rs",
+                r#"
+mod c {
+    pub trait Tr { fn d() -> u8 where Self: Sized { 0 } }
+    pub struct S;
+    impl Tr for S {}
+}
+mod a {
+    pub struct S;
+    impl S { pub fn new() -> S { S } }
+    pub type A = S;
+}
+fn main() { use c::Tr as _; let _ = c::S::d(); let _ = a::A::new(); }
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(
+        doc.limitations
+            .iter()
+            .any(|l| l.starts_with("2 path references could not be resolved")),
+        "{:?}",
+        doc.limitations
+    );
+}
+
+/// 호출이 아닌 모듈 앞부분 경로(`let f = m::gen;` — 매크로가 만든 함수)도 `m` 안 타입의 같은 이름 메서드(`m::S::gen`)가
+/// 아니다 — 예전에는 그 메서드로 확정 간선이 붙어 rustc가 경고하는 `S::gen`이 살아 있고, 그 메서드가 부르는 `back`과
+/// 거짓 심볼 순환 `back -> m::S::gen`이 생겼다(`cargo check` 경고는 `S`·`gen`). 호출처럼 미해석으로 센다.
+#[test]
+fn module_prefix_value_paths_pick_no_same_named_methods() {
+    let ws = Workspace::new(
+        "prefix-value-module",
+        &[
+            ("Cargo.toml", &manifest("valuemodule")),
+            (
+                "src/main.rs",
+                r#"
+macro_rules! gen_fn { () => { pub fn gen() -> u8 { 0 } } }
+mod m {
+    pub struct S;
+    impl S { pub fn gen() -> u8 { crate::back() } }
+    gen_fn!();
+}
+fn back() -> u8 { let f = m::gen; f() }
+fn main() { let _ = m::gen(); back(); }
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(!doc
+        .edges
+        .iter()
+        .any(|e| e.from == "valuemodule::back" && e.to == "valuemodule::m::S::gen"));
+    assert!(analysis::cycles(&doc).cycles.is_empty());
+    assert_reported(
+        &analysis::dead(&doc).unwrap(),
+        &["valuemodule::m::S", "valuemodule::m::S::gen"],
+    );
+    assert!(
+        doc.limitations
+            .iter()
+            .any(|l| l.starts_with("2 path references could not be resolved")),
+        "{:?}",
+        doc.limitations
+    );
+}
+
+/// 파일을 찾지 못해 싣지 않은 `mod` 선언(`#[cfg_attr(unix, path = ..)] mod backend;` — 수확은 `cfg_attr` 안의 `path`를 따르지
+/// 않는다, `#[cfg(any())] mod missing;`)은 limitation으로 세고, 그리로 가는 `uses` 간선(정점 없는 경로)을 내지 않는다.
+/// 예전에는 셈 없이 조용했고 `#[cfg]`를 단 선언은 "modules behind #[cfg] were included"로 실린 것처럼 셌다.
+#[test]
+fn unloaded_mod_declarations_are_counted_and_get_no_edges() {
+    let ws = Workspace::new(
+        "unloaded-mods",
+        &[
+            ("Cargo.toml", &manifest("unloaded")),
+            (
+                "src/main.rs",
+                r#"
+#[cfg_attr(unix, path = "imp_unix.rs")]
+mod backend;
+#[cfg(any())] mod missing;
+mod user {
+    use crate::backend;
+    use crate::backend::Thing;
+    pub fn f() -> u8 { let _ = Thing; backend::g() + backend::Thing::k() }
+}
+fn main() { user::f(); }
+"#,
+            ),
+            (
+                "src/imp_unix.rs",
+                "pub fn g() -> u8 { 1 }\npub struct Thing;\nimpl Thing { pub fn k() -> u8 { 2 } }\n",
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    let ids: std::collections::BTreeSet<&str> =
+        doc.vertices.iter().map(|v| v.id.as_str()).collect();
+    for e in &doc.edges {
+        assert!(
+            ids.contains(e.from.as_str()) && ids.contains(e.to.as_str()),
+            "edge to a missing vertex: {e:?}"
+        );
+    }
+    assert!(
+        doc.limitations.iter().any(|l| l
+            .starts_with("2 mod declarations were not loaded because their file was not found")),
+        "{:?}",
+        doc.limitations
+    );
+    assert!(!doc
+        .limitations
+        .iter()
+        .any(|l| l.contains("modules behind #[cfg] were included")));
+}
+
+/// 이름 없는 상수(`const _: () = assert!(..);`)는 보존 루트다 — 컴파일러가 늘 평가하고 rustc는 그것도 그 초기식이
+/// 쓰는 아이템도 미사용으로 경고하지 않는다(이 fixture의 `cargo check` 경고는 `never` 하나다). 예전에는 상수 셋과
+/// 그 안에서만 쓰는 `only_in_anon`·`Marker`·`Check`·`inner::deep`이 unreachable이었다. 같은 모듈의 둘은 소스
+/// 인스턴스 ID로 따로 루트다.
+#[test]
+fn anonymous_consts_are_retention_roots() {
+    let ws = Workspace::new(
+        "anon-const",
+        &[
+            ("Cargo.toml", &manifest("anonconst")),
+            (
+                "src/main.rs",
+                r#"
+const fn only_in_anon() -> bool { true }
+const _: () = assert!(only_in_anon());
+struct Marker;
+trait Check { const OK: bool; }
+impl Check for Marker { const OK: bool = true; }
+const _: () = { assert!(<Marker as Check>::OK); };
+mod inner {
+    pub const fn deep() -> usize { 3 }
+    const _: usize = deep();
+}
+const fn never() -> bool { false }
+fn main() {}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    let anonymous: Vec<&String> = doc.roots.iter().filter(|r| r.ends_with("::_")).collect();
+    assert_eq!(anonymous.len(), 3, "{:?}", doc.roots);
+    assert!(doc.roots.iter().any(|r| r == "anonconst::inner::_"));
+    let report = analysis::dead(&doc).unwrap();
+    assert_eq!(unreachable_ids(&report), ["anonconst::never"]);
+    assert!(!doc
+        .limitations
+        .iter()
+        .any(|l| l.contains("retention roots contain nested items")));
+}
+
+/// 테스트 빌드에만 있는 이름 없는 상수(`#[cfg(test)] const _`, `#[cfg(test)] mod tests` 안의 것)는 `#[test]` 함수처럼
+/// `--tests`일 때만 보존 루트다 — 테스트가 아닌 빌드에는 그 상수가 없어 rustc도 그 안에서만 쓰는 `only_test`·
+/// `helper_for_mod`를 미사용으로 경고한다(`cargo check`는 경고, `cargo check --tests`는 경고 없음).
+#[test]
+fn test_only_anonymous_consts_are_roots_only_with_tests() {
+    let ws = Workspace::new(
+        "anon-const-test",
+        &[
+            ("Cargo.toml", &manifest("anontest")),
+            (
+                "src/main.rs",
+                r#"
+const fn only_test() -> bool { true }
+#[cfg(test)]
+const _: () = assert!(only_test());
+const fn helper_for_mod() -> bool { true }
+#[cfg(test)]
+mod tests {
+    const _: () = assert!(super::helper_for_mod());
+}
+fn main() {}
+"#,
+            ),
+        ],
+    );
+    let load = |tests: bool| {
+        source::load(
+            ws.path(),
+            &source::Options {
+                symbol_level: true,
+                tests,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let without = analysis::dead(&load(false)).unwrap();
+    assert_reported(
+        &without,
+        &[
+            "anontest::only_test",
+            "anontest::helper_for_mod",
+            "anontest::tests::_",
+        ],
+    );
+    let with = load(true);
+    assert!(with.roots.iter().any(|r| r == "anontest::tests::_"));
+    assert!(analysis::dead(&with).unwrap().findings.is_empty());
+}
+
+/// 중첩 아이템을 품은 `const _` 루트는 limitation으로 센다 — 블록 안 아이템에는 정점이 없어 그 간선을 상수가 소유하니,
+/// rustc가 다섯 모두 미사용으로 경고하는 이 fixture에서도(`nested_unused`·`only_in_unused_nested`·`Hidden`·`go`·
+/// `helper`) 닿은 것으로 남는다. 간선을 떼지 않는 것은 상수 초기식이 부르는 중첩 `const fn`(`check()`)은 실제로 쓰여
+/// rustc가 `helper`를 경고하지 않기 때문이다. 중첩 아이템이 없는 상수는 세지 않는다.
+#[test]
+fn anonymous_const_roots_with_nested_items_are_counted() {
+    let ws = Workspace::new(
+        "anon-const-nested",
+        &[
+            ("Cargo.toml", &manifest("anonnested")),
+            (
+                "src/main.rs",
+                r#"
+fn only_in_unused_nested() -> u8 { 1 }
+const _: () = {
+    fn nested_unused() -> u8 { only_in_unused_nested() }
+};
+mod m {
+    pub fn helper() -> u8 { 2 }
+    const _: () = {
+        struct Hidden;
+        impl Hidden { fn go() -> u8 { super::m::helper() } }
+    };
+}
+const fn checked() -> bool { true }
+const _: () = assert!(checked());
+fn main() {}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(
+        doc.limitations
+            .iter()
+            .any(|l| l
+                .starts_with("2 `const _` retention roots contain nested items (fn, impl, ...)")),
+        "{:?}",
+        doc.limitations
+    );
+}
+
+/// 루트가 이름 없는 상수뿐인 lib은 여전히 루트 없는 크레이트다 — 정적 단언은 공개 API의 호출자가 아니라
+/// `--retain-public`을 알리는 limitation이 그대로 남아야 한다(상수가 쓰는 `size`는 닿는다).
+#[test]
+fn anonymous_const_roots_keep_the_rootless_library_limitation() {
+    let ws = Workspace::new(
+        "anon-const-lib",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname='anonlib'\nversion='0.1.0'\nedition='2021'\n[lib]\npath='src/lib.rs'\n[workspace]\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn api() {}\npub const fn size() -> usize { 8 }\nconst _: () = assert!(size() == 8);\n",
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    let report = analysis::dead(&doc).unwrap();
+    assert_eq!(unreachable_ids(&report), ["anonlib::api"]);
+    assert!(
+        report.limitations.iter().any(|l| l.starts_with(
+            "1 unreachable symbols are exported items of crates with no retention root (anonlib)"
+        )),
+        "{:?}",
+        report.limitations
+    );
+}
+
+/// 워크스페이스 밖 타입의 impl이 재정의하지 않은 기본 메서드도 그 트레이트의 사용 증거다 — `impl T1 for u8 {}`
+/// 옆의 `1u8.t1()`은 기본 메서드 `T1::t1`에만 닿는데, 예전에는 거기서 트레이트로 가는 간선이 없어 `T1`이
+/// unreachable이었다(rustc는 쓰인 트레이트 아이템의 트레이트를 쓰인 것으로 본다). rustc가 경고하는 것 — 부르지 않는
+/// 트레이트 `T2`, 부르지 않는 선언 `T3::t3` — 은 그대로 낸다(이 fixture의 `cargo check` 경고와 같다).
+#[test]
+fn foreign_impl_default_methods_keep_their_trait_reachable() {
+    let ws = Workspace::new(
+        "foreign-default",
+        &[
+            ("Cargo.toml", &manifest("foreigndefault")),
+            (
+                "src/main.rs",
+                r#"
+mod ext {
+    pub trait T1 { fn t1(&self) -> u8 { 1 } }
+    impl T1 for u8 {}
+    pub trait T2 { fn t2(&self) -> u8 { 2 } }
+    impl T2 for u8 {}
+    pub trait T3 {
+        fn t3(&self) -> u8;
+        fn t3_default(&self) -> u8 { only_from_default() }
+    }
+    impl T3 for u8 { fn t3(&self) -> u8 { 3 } }
+    fn only_from_default() -> u8 { 4 }
+}
+use ext::T1 as _;
+use ext::T3 as _;
+fn main() {
+    let _ = 1u8.t1();
+    let _ = 1u8.t3_default();
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(has_edge(
+        &doc,
+        "foreigndefault::ext::T1::t1",
+        "foreigndefault::ext::T1",
+        EdgeKind::References
+    ));
+    let report = analysis::dead(&doc).unwrap();
+    assert_eq!(
+        unreachable_ids(&report),
+        [
+            "foreigndefault::ext::T2",
+            "foreigndefault::ext::T2::t2",
+            "foreigndefault::ext::T3::t3",
+        ]
+    );
+}
+
 /// 표현식 목록으로 파싱되지 않는 매크로 인자(`json!({"k": f()})` 같은 독자 문법)의 이름은 아이템으로
 /// 해석되면 추정 간선이 된다 — 예전에는 그 안에서만 쓰는 함수·상수가 unreachable이었다. 지역 묶음과
 /// 같은 이름은 아이템으로 읽지 않는다.

@@ -3,7 +3,209 @@
 세션을 이어받는 에이전트가 먼저 읽는 문서입니다. 아래 "현재 상태"만 지금의 지시이고, 그 아래 날짜가 붙은 절은
 당시 기록입니다 — 거기 적힌 "릴리스 준비"·"다음 단계"를 지금 할 일로 되살리지 마세요.
 
-## 현재 상태 (2026-11-22) — cfg 대안 임포트·임포트 조건 전파·매크로 자리 브랜치
+## 현재 상태 (2026-11-22, 4차) — 타입 경로 호출의 타입 참조·`const _` 루트·워크스페이스 밖 impl 트레이트 브랜치
+
+- 발행본은 [v0.7.0](https://github.com/ictechgy/rustograph/releases/tag/v0.7.0)(2026-11-03, 자산 6개)이다.
+  v0.6.0은 2026-10-25, v0.5.0은 2026-10-13에 발행됐다. v0.4.2는 태그 없이 v0.5.0으로 이어졌다.
+- 3차 브랜치(cfg 대안 임포트·임포트 조건 전파·매크로 자리)는 [PR #57](https://github.com/ictechgy/rustograph/pull/57)로
+  `main`에 스쿼시 머지됐다(`54b4224`, 아래 그 날짜 절).
+- **브랜치 `ccr-37904670-hxdjsx`**(`origin/main` `54b4224` 위에서 다시 시작)에 아래 커밋이 있다. `ef2edb6`까지와 독립
+  리뷰 반영(`91bae91`까지)은 코디네이터가 [PR #58](https://github.com/ictechgy/rustograph/pull/58)로 push했고(CI 7개 성공),
+  델타 리뷰 반영(`9ce0e99`부터)은 push하지 않았다. 사용자 변화는 CHANGELOG `[Unreleased]`, 공개 Rust API 변화(더하기만)는
+  [0.8 migration](docs/MIGRATING-0.8.md)에 있다. 셋 다 보존을 넓히는 쪽(간선·루트를 더함)이다.
+  - `b375d62` fix(harvest): 값 경로로 풀리지 않은 호출 `T::m()`·`E::V(1)`·`T::default()`가 앞부분 타입으로
+    references 간선을 단다(`BodyVisitor::type_relative_call`). 이전에는 메서드에만 잇거나(배리언트·derive 연관 함수는
+    메서드 정점이 없어) 아무것도 잇지 않았다 — 호출이 아닌 값 경로(`visit_expr_path`)는 이미 타입을 이었다. 앞부분이
+    워크스페이스 모듈이면 잇지 않는다(앞부분 대상과 미해석 셈은 아래 리뷰 반영에서 다시 정했다).
+  - `44a4816` fix(harvest): 이름 없는 상수 `const _`가 보존 루트다(`#[used]` static과 같은 `entry_roots`). 테스트 빌드에만
+    있는 것(자기나 조상 모듈 `#[cfg]`가 test=false에서 거짓)은 `--tests`일 때만(`graph::test_only_anonymous_consts`).
+    루트 없는 lib limitation은 이 루트를 세지 않는다(`graph::Vertex::is_anonymous_const` — 공개 API에 더함).
+  - `5d2cbb8` fix(harvest): self 타입이 워크스페이스 밖인 impl의 트레이트 경로를 `resolve_all`로 풀어 대안 트레이트마다
+    선언 메서드가 본문을 대신 소유하고(추정 간선, 임포트 조건) 트레이트로 references 간선을 둔다. 재정의하지 않은 기본
+    메서드도 그 간선을 갖는다(`inherited_trait_methods`). `foreign_impl_bodies`는 메서드마다 모듈 소유 본문 하나와
+    대안마다 선언 메서드 소유 본문을 주고, 트레이트 간선 후보는 `ImplParts::foreign_trait_methods`(`ForeignTraitMethod`)로
+    넘긴다 — source가 두 정점이 남았는지 보고 간선을 둔다(유령 정점 금지). 공개 `harvest::impls`의 결과는 그대로다.
+  - `bf8909a` docs: README·README.ko 그래프 모델과 보존 루트, AGENTS.md 수확 의미론, CHANGELOG, 0.8 migration.
+  - 이 HANDOFF 커밋.
+- **독립 리뷰(PR #58, `ef2edb6` 대상 — push됨, CI 7개 성공) 반영** — 리뷰어 fixture(스크래치 `r4-review-rustograph/fx/`)를
+  `cargo check`로 다시 확인하고 main(`54b4224`)·`ef2edb6`·고친 뒤 바이너리로 대조했다.
+  - `48bf761` fix(harvest) — BLOCKER: 경로 앞부분이 함수로 넘어간 해석이면 잇지 않는다. 타입 이름공간에 묶인 것이 없으면
+    `resolve_in`이 다른 이름공간으로 넘어가 `use std::process;` 옆 로컬 `fn process`가 `process::exit(1)`의 앞부분이 됐다.
+    fx1(rustc 경고 `process`·`helper`·`fmt`): main 3건, ef2 0건(거짓 간선 `main → process`·`fmt`), 고친 뒤 3건. fx8(같은
+    이름 재노출 옆 `env::var(..)`, rustc 경고 없음): main 0 순환, ef2 `cycle: fx8::a::env -> fx8::b::get`(`--strict` 1),
+    고친 뒤 0. 값 경로 `let f = process::exit;`(fx12, rustc 경고 `process`)는 main부터 거짓이었다 — main·ef2 0건, 고친 뒤
+    `process`. 앞부분은 부모 모듈의 `type_items`(`type_item()`)·모듈·외부 크레이트일 때만 쓴다(`path_prefix_owners`, 호출과
+    값 경로 둘 다). 호출의 모듈 앞부분(`m::gen()`)은 메서드 후보도 잇지 않는다(main부터 `m::S::gen`으로 가던 거짓 call).
+    말뭉치에서 잃은 간선은 getrandom `util::truncate → u32`·`u64` 둘뿐이다 — `u32::MAX`·`u64::from(..)`(원시 타입)이
+    루트의 `fn u32`·`fn u64`로 가던 것(`→ u32`는 main부터). `t-modprefix`(rustc 경고 `u32`·`S`·`S::gen`)로 고정했다
+    (`2404184` test).
+  - `d35b31a` fix(harvest) — SHOULD-FIX 2: 재정의가 모두 자기 `#[cfg]`를 달면 기본 메서드의 트레이트 간선도 둔다. fx10
+    (`impl Tr for u8 { #[cfg(unix)] fn m }` + `1u8.m()`, windows `cargo check` 경고 없음): `--target` windows에서 main·ef2
+    `Tr`, 고친 뒤 0건.
+  - `d19779f` fix(source) — SHOULD-FIX 1: 중첩 아이템을 품은 `const _` 루트를 limitation으로 센다("N `const _` retention
+    roots contain nested items ..."). fx6(rustc 다섯 모두 경고): main 4건(상수 둘은 거짓), ef2·고친 뒤 0건 + limitation 2.
+    간선을 상수에서 떼지 않은 근거: `const _: () = { const fn check() -> bool { helper() } assert!(check()); };`는 rustc
+    경고가 없다(`t-nested`) — 떼면 `helper`가 거짓 dead다. 말뭉치에서 11개(ra_ap_hir_ty 7·zerocopy 3·rustix 1).
+  - `9740c02` fix(harvest) — 리뷰 밖에서 찾은 것: 파일 없는 `mod gone;`의 이름이 아이템 표에 있어 `crate::gone::f()`(ef2)·
+    `crate::gone::X`(main부터)가 정점 없는 경로로 references 간선을 냈다(유령 정점). change-impact 테스트(작업 트리에서
+    지운 `src/target.rs`)가 다음 커밋의 셈 변경으로 드러냈다. `ModTree::unloaded_mods`(공개 필드 추가)가 그 경로를 적고
+    앞부분 대상에서 뺀다.
+  - `1fba4db` fix(harvest) — nit: 타입으로 풀린 타입 경로 호출(`E::V(1)`, `D::default()`)은 값 경로 `E::W`처럼 미해석으로
+    세지 않는다. 말뭉치 합계 25,411 → 22,814(main·ef2는 같았다). 함수로 넘어간 앞부분·유령 경로·모듈 앞부분 호출은 센다.
+  - `e64e90a` docs: README·README.ko·AGENTS.md·CHANGELOG·0.8 migration, 그리고 이 HANDOFF 커밋.
+  - 별칭 우변(`type A = B; A::new()`가 `A`에만 닿음, fx4)은 기존 후속 후보 그대로다. fx2·fx3·fx9·fx11의 남은 거짓 dead
+    (`Gen::mk`, `Self::Assoc::new()`의 `U`, 함수 안 타입이 가리는 모듈 타입, 제네릭 연관 타입)는 main부터 같다.
+- **델타 리뷰(`ef2edb6..91bae91` — push됨, CI 7개 성공) 반영** — 리뷰어 fixture(스크래치 `r4-review2-rustograph/fx/`)를
+  `cargo check`로 다시 확인하고 main·`91bae91`·고친 뒤로 대조했다(blocker 없음 판정).
+  - `9ce0e99` fix(harvest) — S1: `1fba4db`가 타입으로 풀린 호출을 모두 셈에서 빼, 트레이트 기본 메서드를 타입으로 부른
+    `c::S::d()`·별칭을 거친 `a::A::new()`(p2, rustc 경고 없음 — 세 버전 모두 `c::Tr::d`·`a::S`·`a::S::new`를 거짓 dead로
+    냄)의 미해석 셈이 ef2 2 → 91bae91 0이 됐다. 이제 같은 이름 메서드에 닿았거나 그 이름의 워크스페이스 메서드가 없을 때만
+    풀린 것으로 본다(`type_relative_resolved`) — p2는 다시 2.
+  - `8cae59c` fix(harvest) — S2: 호출이 아닌 모듈 앞부분 경로(`let f = m::gen;`)가 `push_associated`로 `m::S::gen`을 이었다
+    (p3, rustc 경고 `S`·`gen`: 세 버전 모두 `S::gen`을 살리고 거짓 순환 `back -> m::S::gen`, `--strict` 1). 이제 타입
+    앞부분에서만 메서드 후보를 찾고 모듈 앞부분은 미해석으로 센다(`type_relative_value`) — `S::gen` 보고, 순환 0.
+  - `edfe39a` fix(source) — nit (a): 싣지 않은 `mod`(p11 `#[cfg_attr(unix, path = ..)] mod backend;`, p4·p12
+    `#[cfg(any())] mod missing;`)를 "N mod declarations were not loaded because their file was not found ..."로 세고, 그리로
+    가는 `uses` 간선을 내지 않는다. `#[cfg]` 모듈 셈("modules behind #[cfg] were included")은 실은 모듈만이다(p4는 예전에
+    싣지 않은 `missing`을 included로 셌다).
+  - nit (b)는 기록만 했다: 타입 자리 해석에서 값 이름공간에만 있는 아이템을 빼는 `ModTree::resolve_want` 거르기를 만들어
+    p9(rustc 경고 `u8`·`u16`·`u64`·`i32`·`process`)·p10(거짓 순환 `g -> u8`)을 고쳤지만, 말뭉치에서 참 간선을 잃었다 —
+    tokio `WakeList → NUM_WAKERS`(필드 `[MaybeUninit<Waker>; NUM_WAKERS]`), zerocopy `Aligned64kAllocation → _64K`
+    (`[u8; _64K]`), 그리고 zerocopy type 레벨 순환 하나가 사라졌다. 배열 길이·const 제네릭 인자(`Buf<N>`)가 타입 경로로
+    파싱되면서 상수를 가리키니 그 폴백이 필요하다 — 함수만 빼려면 트리가 값 아이템 가운데 함수를 따로 알아야 한다. 그
+    커밋은 히스토리에서 뺐다. nit (c)(모든 빌드를 덮는 `#[cfg]` 재정의 옆에도 기본 메서드 간선 — 보존이 넓기만 함)도 기록.
+  - 말뭉치(`91bae91` 대비): 정점 ID 같음, 잃은 간선 89개 — 모두 rustix의 `uses → rustix::backend`(정점 없는 경로), 새 간선
+    0, dead 여섯 변형 모두 변화 0, 순환 그대로. 미해석 합계 22,814 → 23,274, 싣지 않은 mod 2개(rustix), 정점 없는 경로로
+    가는 간선 89 → 0. main 대비 누적: 잃은 간선 90(rustix 89 + getrandom `truncate → u32`, 둘 다 거짓), 새 간선 3,898, 새
+    루트 72, 새로 낸 dead 0, 사라진 dead는 기본 321·`--tests` 103·`--retain-public` 72·리눅스 72·windows 68.
+  - `11de8d6` docs: README·README.ko·CHANGELOG·0.8 migration, 그리고 이 HANDOFF 커밋.
+  - 새 테스트 3개는 `91bae91`의 `src/`로 돌리면 3개 모두 실패하고, 변이 7개(이름 무시하고 타입이면 풀림·메서드에 닿을
+    때만 풀림·모듈 앞부분에도 메서드 후보·모듈 앞부분 안 세기·싣지 않은 mod limitation 끄기·그리로 가는 uses 남기기·
+    `#[cfg]` 모듈 셈에 싣지 않은 것도 넣기)를 모두 잡았다.
+- **재현과 근거**(스크래치 fixture, 모두 `cargo check` 통과 — rustc 경고와 대조):
+  - a1·t1: `imp::S::m()`·`imp::E::V(1)`·`Local::make()`·`imp::D::default()`. rustc 경고는 `Unused`와 배리언트 필드뿐인데
+    main은 `S`·`E`·`D`·`Local`(·a1의 `U` — `Self::helper()`만 부르는 `U::other()`)을 unreachable로 냈다. 고친 뒤 `Unused`만(두 바이너리 모두 내는 아이템 위치 매크로 `gen::make`는 기존
+    한계).
+  - a3: `const _: () = assert!(only_in_anon());`, `const _: () = { assert!(<Marker as Check>::OK); };`, `mod inner { const _: usize =
+    deep(); }`. rustc 경고는 `never` 하나인데 main은 8개(상수 셋·`only_in_anon`·`Marker`·`Check`·`inner::deep`·`never`)를
+    냈다. 고친 뒤 `never`만. t5: `#[cfg(test)] const _`와 `#[cfg(test)] mod tests` 안 `const _` — `cargo check`는
+    `only_test`·`helper_for_mod`를 경고하고 `--tests`는 경고 없음. 고친 뒤 `dead`는 그 둘과 상수를, `dead --tests`는 0건.
+  - a2: `#[cfg(unix)] use crate::plat_unix::Tr;`/windows 쪽 + `impl Tr for String`. rustc 리눅스는 `plat_win::Tr`, windows는
+    `plat_unix::Tr`을 경고하는데 main은 기본·리눅스·windows 모두 `plat_unix::Tr`(리눅스에서는 거짓)을 냈다. 고친 뒤 기본 0건,
+    리눅스 `plat_win::Tr`, windows `plat_unix::Tr`. t3: `impl T1 for u8 {}` + `1u8.t1()`, 부르지 않는 `T2`, 재정의한 `T3::t3`
+    + 기본 `t3_default` — rustc 경고 `T2`·`t3`. main은 `T1`·`T3`도 냈고, 고친 뒤 `T2`·`T2::t2`·`T3::t3`.
+  - 말뭉치에서 사라진 dead 가운데 `const _`가 아닌 것을 rustc로 확인: rustix 1.1.5 `path::dec_int::I64_MAX_STR_LEN`(`const _`
+    단언에서만 씀)·zerocopy 0.8.50 `pointer::is_zeroed`(`const _` 블록의 매크로 인자에서만 씀) — 두 크레이트 `cargo check`
+    경고 0. ra_ap_hir_def `ExpandProcAttrMacros`(`pub(crate)`, `ExpandProcAttrMacros::get(db)`로만 씀)·ra_ap_hir_ty
+    `infer::closure::analysis::UpvarArgs`(비공개 enum, `UpvarArgs::Closure(args)`로 만듦)는 코드로 확인했다(그 크레이트
+    `cargo check`는 의존이 무거워 돌리지 않았다).
+- **적대적 입력**(스크래치 `r4-rustograph/fx/adv1`~`adv4`, 리눅스·windows `cargo check`와 대조, main·새 바이너리 비교 —
+  `dead` 기본·`--tests`·`--target` 리눅스/windows, `cycles` symbol·type·module):
+  - adv1: impl 안 `Self::helper()`, 제네릭 `T::default()` 옆의 같은 이름 struct `T`(간선이 붙지 않는다 — 그대로 dead),
+    트레이트 정적 호출 `Tr::m(self)`·`<Self as Tr>::m(self)`, 별칭을 거친 배리언트 `A::V(1)`, `Self::V(3)`. main은 `A`·
+    `OnlyAlias`·`S`도 냈고 새것은 내지 않는다. `OnlyAlias::W(2)`로만 쓰는 `Only`는 rustc 경고가 없는데 main·새것 모두
+    dead다 — 타입 별칭 우변(`type OnlyAlias = Only;`)에 간선이 없는 기존 한계(후속 후보). 순환은 모든 레벨 0.
+  - adv2: 갈린 임포트 `S::m()`(리눅스 `w::S`·`w::S::m`만 — rustc와 같음), `use colors::Color::*;` 옆 `Red(1)`(`Color`는
+    main·새것 모두 dead — 글롭 배리언트는 따로 남은 한계), 함수 안 `struct L`이 모듈의 `L`을 가리는 경우(main·새것 모두
+    모듈 `L`을 닿은 것으로 본다 — rustc는 경고. 지역 impl의 self 타입 경로가 모듈 `L`로 풀리는 기존 한계).
+  - adv3: `#[cfg(test)] const _`, `pub const _`, `const _: fn() = helper`, `const _X`·`const __`(루트가 아니다 — 그대로 dead),
+    `const _: () = { impl Marker for Wrapped { .. } };`, 켜지지 않는 feature 뒤 `const _`. rustc는 중첩 impl만 쓰는
+    `Wrapped`·`inside_impl`·`Marker`를 경고하는데 새것은 `Marker`만 낸다 — 블록 안 아이템을 그 상수가 소유하는 근사(함수 안
+    아이템과 같은 규칙)로 보존이 넓다. 말뭉치에서 블록 안에 아이템을 둔 `const _`는 `is_copy` 단언 같은 형태뿐이었다.
+  - adv4: blanket `impl<T: Display> Shout for T {}`(기본 메서드만 — 새것은 `Shout`을 내지 않는다, rustc 경고 없음),
+    `#[cfg(unix)]`/`#[cfg(not(unix))]`로 두 번 선언한 트레이트(소스 인스턴스 ID라 간선이 붙지 않는다 — main·새것 모두
+    dead, 기존 한계), `#[cfg]`로 갈린 재정의 메서드, 글롭 대안 `use crate::gu::*;`/`gw::*` 옆 `impl G2 for i64 {}`(리눅스
+    `gw::G2`, windows `gu::G2` — rustc와 같음). 순환은 모든 레벨 0.
+- **리뷰 반영 뒤 반례 말뭉치**(같은 17개, `ef2edb6` 바이너리 대 마지막 바이너리): 정점 ID 같음, 잃은 간선 2(getrandom
+  `util::truncate → u32`·`u64` — 위 BLOCKER), 새 (from,to,kind,tentative) 간선 0, 새로 낸 dead 0·사라진 dead 0(여섯 변형
+  모두), 순환은 세 레벨 모두 그대로. limitation: 미해석 경로 합계 25,411 → 22,814(타입으로 풀린 호출), 중첩 아이템을 품은
+  `const _` 루트 11개를 새로 센다. main 대비 누적: 잃은 간선 1(getrandom `truncate → u32`, 원시 타입 `u32::MAX` — 거짓),
+  새 간선 3,898, 새 루트 72, 새로 낸 dead 0, 사라진 dead는 아래와 같다(기본 321·`--tests` 103·`--retain-public` 72·리눅스
+  72·windows 68), type 레벨 큰 강연결 요소 변화(아래) 말고 순환 그대로.
+- **반례 말뭉치**(3차와 같은 크레이트 17개: syn 2.0.119·tokio 1.53.1·regex-syntax 0.8.11·ra_ap_hir_def/hir_ty 0.0.349·rowan
+  0.17.0·serde/serde_derive 1.0.229·clap_builder 4.6.7·zerocopy 0.8.50·rustix 1.1.5·mio 1.2.3·getrandom 0.3.4·
+  parking_lot_core 0.9.12·crossbeam-utils 0.8.23·hashbrown 0.16.1·이 저장소 `54b4224` 사본. `origin/main` 바이너리와 이
+  브랜치 바이너리로 `graph --level symbol --tests`, `dead`(기본·`--tests`·`--retain-public`·`--tests --retain-public`·
+  `--retain-public --target` 리눅스/windows), `cycles`(symbol·type·module, `--tests` 유무)를 돌려 비교 — 스크립트는 스크래치
+  `r4-rustograph/scripts/`):
+  - 정점 ID는 17개 모두 같다. (from,to,kind,tentative)로 잃은 간선 0, 새 간선 3,899개(모두 references — 추정 31개는 대신
+    소유 본문 안의 타입 참조), 새 루트 72개(모두 `const _`: zerocopy 53·ra_ap_hir_ty 9·ra_ap_hir_def 7·rustix 3). syn의
+    1개는 같은 쌍이 다른 조건으로 더해진 것이다(`impl ParseQuote for Vec<Attribute>`의 `ParseQuote::parse(input)`).
+  - 커밋마다 나누면(커밋 하나씩 쌓은 바이너리로 같은 비교): `b375d62` 간선 +3,798·`dead --tests` −8·`--retain-public` −2,
+    type 레벨 강연결 요소 변화(아래)도 이 커밋이다. `44a4816` 간선 변화 없음·루트 +72·기본 −321·`--tests` −93·
+    `--retain-public` −70. `5d2cbb8` 간선 +101·`dead --tests` −2. 셋 모두 잃은 간선·새로 낸 dead 0.
+  - 새로 낸 dead 0(여섯 변형 모두). 사라진 것: 기본 321, `--tests` 103, `--retain-public` 72, `--tests --retain-public` 72,
+    리눅스 72, windows 68 — 크레이트별은 ra_ap_hir_def·ra_ap_hir_ty·rustix·zerocopy·clap_builder(`--tests` 2). 사라진 것이
+    바꾼 limitation 문장은 셈만 바뀐다(루트 없는 lib의 공개 아이템 수가 줄고, 새로 닿은 타입의 외부 트레이트 impl 메서드 수가
+    늘어난다).
+  - 심볼·module 레벨 순환은 17개 모두 그대로다. type 레벨 순환 수도 그대로이고 ra_ap_hir_ty의 큰 강연결 요소가 325 →
+    330개로 커졌다 — 새로 든 다섯(`autoderef` 모듈 단위·`AutoderefSnapshot`·`GeneralAutoderef`·`UpvarArgs`·`TlsData`)은
+    `UpvarArgs::Closure(args)`·`TlsData::default()`·`GeneralAutoderef::new_from_inference_context(..)` 같은 실제 참조다.
+  - tokio의 모순 조건 간선 limitation이 34 → 39개다 — 새 타입 참조 가운데 출발 모듈 조건과 모순인 것(같은 대안을 거친
+    call 간선은 이미 지워지던 것)도 지운다.
+  - 같은 크레이트에서 두 번 돌린 `graph`는 바이트 단위로 같았다(rustix·zerocopy).
+- **검증**(2026-11-22, 로컬 cargo 1.97, `CARGO_PROFILE_DEV_DEBUG=0`·`-j 2`, `CARGO_TARGET_DIR`는 스크래치): `cargo fmt --check`,
+  `cargo clippy --locked --all-targets -- -D warnings` 0, `cargo test --locked`(26개 실행 단위 593개 통과 — 이 브랜치의 새
+  통합 테스트 15개, 델타 리뷰 반영 뒤 다시 잼), `scripts/coverage.sh` 94.85%(게이트 90%, 그 안의 테스트 실패 0 — 델타 리뷰 반영 뒤 다시 잼), `scripts/verify-cli-
+  contract.sh <바이너리>` OK, `rules --strict` 0, `cycles --level symbol --strict` 0(type 23·module 2 — 변경 전과 같음),
+  `scripts/verify-self-dead.sh <바이너리>` 0건 일치. 리뷰 반영의 새 테스트 6개와 셈을 바꾼 1개는 `ef2edb6`의 `src/`로 돌리면
+  7개 모두 실패하고, 리뷰 반영 변이 9개(앞부분 거르기 빼기·값 경로만/호출만 거르지 않기·모듈 앞부분 메서드 후보 되살리기·
+  재정의가 하나라도 있으면 기본 메서드 빼기·중첩 아이템 limitation 끄기·중첩 아이템 없는 상수도 세기·파일 없는 mod 거르기
+  빼기·메서드에 닿았는지로 세기)를 모두 잡았다(호출만 거르지 않는 변이는 함수 앞부분에서는 `type_item` 거르기와 같은 동작이라
+  파일 없는 mod 테스트가 잡는다). 4차 첫 테스트 6개는 `origin/main`의 `src/`로 돌리면 6개 모두 실패한다. 변이 10개(타입 간선
+  빼기·모듈에도 잇기·타입이 풀리면 미해석으로 안 세기, `const _` 루트 끄기·루트 있는 크레이트로 세기·테스트 전용도 늘 루트·
+  테스트 전용은 절대 루트 아님, 첫 트레이트 대안만·대신 소유 본문의 임포트 조건 버리기·기본 메서드 간선 끄기)를 모두 해당
+  테스트가 잡았다.
+  **실행하지 않음**: `--features semantic` test·clippy(지시에 따라 빌드하지 않았다 — sem.rs는 `cargo_meta`·`fanout`·`graph`만
+  쓰고 이 변경은 `graph`에 메서드·crate 안 함수를 더할 뿐 sem이 쓰는 것을 바꾸지 않는다. CI `semantic-lint`), MSRV 1.96
+  check(로컬 툴체인 없음 — CI `msrv`. 새로 쓴 표준 API는 `BTreeSet::range`·`Option::is_some_and` 정도로 오래전 안정화),
+  GLM 리뷰(`packet-ask` 없음).
+- **주의(작업 방식)**: 변이 검사용 스크래치 사본은 대상 디렉터리를 따로 쓴다(리뷰 반영에서는 `target-mut`). 같은 `CARGO_TARGET_DIR`로 빌드하면, cargo의 메타데이터
+  해시가 워크스페이스 기준 상대 경로라 둘이 같은 산출물을 나눠 쓴다 — 사본을 빌드한 뒤 본 체크아웃을 그대로 빌드하면
+  사본의(변이된) 라이브러리를 신선하다고 보고 재사용한다. 이번에 한 번 그렇게 틀린 테스트 결과를 봤다. 사본 빌드 뒤에는 본
+  체크아웃의 `src`·`tests`를 `touch`하거나 대상 디렉터리를 나눠라.
+- 자기 분석 기준(`rules --strict` 0, `cycles --level symbol --strict` 0, type 레벨 23·module 레벨 2, `self-dead.expected`
+  0건), 하지 않기로 한 것(`query` 스키마 맞추기·`edge_evidence` 이름 바꾸기, 토큰·릴리스), persistence `relation-use`
+  생산자 목록은 아래 2026-11-15 절 그대로 유효하다.
+
+### 다음 할 일
+
+1. 코디네이터가 이 브랜치를 push하고 PR을 연다(템플릿 제목 Change / Verification / Contract and policy — 본문 초안은 이
+   세션의 스크래치 `pr/rustograph-r4.md`). CI(특히 `msrv`·`semantic-lint`·coverage)를 확인한다.
+2. **0.8.0 릴리스**(사용자 결정): `[Unreleased]`가 Rust 라이브러리 호출자를 깨는 변경을 담으므로 마이너 버전이다. 절차는
+   아래 3차 절 "다음 할 일" 2번과 같다.
+3. isthmus `compatibility.json`의 rustograph 핀(현재 0.4.1) 갱신을 isthmus 쪽에 알린다.
+
+### 후속 후보 (사용자가 고른다)
+
+- 아래 3차 절의 후속 후보 가운데 이번에 고친 것은 셋이다 — 밖 타입 impl의 트레이트 해석이 대상 하나이던 것
+  (`foreign_impl_bodies`), `Type::assoc()`만으로 쓰인 struct, 메서드가 모두 기본 구현인 트레이트(`impl T1 for u8 {}`).
+  나머지(판 모델과 2018 판 이후의 크레이트 루트 폴백, routes의 대상 하나, 글자로 보이는 모순만 거르기, `_` 이름, 추정 간선
+  note 문구, 이름공간 폴백, 그룹 안 `{self}`, 큰 글롭 고리의 다시 쌓기 비용, 글롭 쪽 조건 부정, 그래프 밖 대안)는 그 절의
+  설명대로 유효하다. 고르지 않은 이유: 판 모델·폴백·`_`·폴백 좁히기는 보존을 좁혀 반례 말뭉치와 실제 프로젝트 근거가
+  필요하고, note 문구는 텍스트 출력을 바꾼다.
+- **타입 자리의 값 이름공간 폴백**(델타 리뷰 nit b): 타입 이름공간에 묶인 것이 없으면 `-> u8`·`x: u8`·`<u64>::max`가
+  같은 이름의 로컬 `fn u8`로 간다(리뷰어 p9·p10 — 거짓 dead 누락과 거짓 순환, main부터). 값 이름공간 전부를 빼면 배열
+  길이·const 제네릭 인자의 상수 참조(tokio `NUM_WAKERS`, zerocopy `_64K`)를 잃는다. `Module`에 함수 이름 표(또는 아이템
+  종류)를 더해 함수·static만 빼면 된다 — 공개 필드가 늘어난다.
+- **모든 빌드를 덮는 `#[cfg]` 재정의**(nit c): `#[cfg(unix)] fn m`·`#[cfg(not(unix))] fn m` 둘이 기본 메서드를 늘 가려도
+  기본 메서드 간선을 둔다 — 보존이 넓기만 하다.
+- **트레이트 기본 메서드를 타입으로 부른 호출·별칭을 거친 호출**(`S::d()`, `A::new()`): 앞부분 타입 아래에서 메서드를 찾지
+  못해 그 메서드가 거짓 dead일 수 있다(리뷰어 p2 — 이제 미해석으로 센다). 구현한 트레이트의 선언 메서드와 별칭 우변을
+  따라가면 고쳐진다.
+- **타입 별칭 우변**: `type A = B;`에 `A → B` 간선이 없다 — `A::V(..)`·`A`로만 쓰는 `B`가 dead에 나온다(adv1의 `Only`,
+  rustc 경고 없음). 별칭 선언을 필드처럼 `DeclRef`로 수확하면 된다(간선이 늘어나는 쪽 — 별칭이 많은 크레이트의 type 레벨
+  순환은 말뭉치로 확인할 것).
+- **`use E::*`로 들인 배리언트**(`Red(1)`): 글롭이 enum 배리언트를 펼치지 않아 `Color`가 dead에 나온다(adv2, rustc 경고
+  없음). 9a79ce5부터 같다.
+- **`const _` 블록 안 아이템**: 함수 안 아이템처럼 그 상수가 간선을 소유해, rustc가 중첩 아이템만 따로 미사용으로 보는
+  경우(adv3의 `Wrapped`·`inside_impl`, 리뷰어 fx6)에도 닿은 것으로 남는다 — 이제 limitation으로 센다. 정확히 하려면 중첩
+  아이템에 정점을 주고 초기식이 그것을 부르는지 봐야 한다(간선만 모듈로 옮기면 초기식이 부르는 중첩 `const fn`이 쓰는 것이
+  거짓 dead가 된다). 함수 루트(`fn main` 안 아이템)도 같은 근사인데 세지 않는다.
+- **두 번 선언한 트레이트의 밖 타입 impl**: `#[cfg(unix)] trait Dup`/`#[cfg(not(unix))] trait Dup` 옆 `impl Dup for u8 {}`는
+  선언이 소스 인스턴스 ID라 대신 소유·트레이트 간선이 붙지 않는다(adv4 — main부터 같다).
+
+## cfg 대안 임포트·임포트 조건 전파·매크로 자리 브랜치 (2026-11-22) — PR #57로 머지됨(`54b4224`)
 
 - 발행본은 [v0.7.0](https://github.com/ictechgy/rustograph/releases/tag/v0.7.0)(2026-11-03, 자산 6개)이다.
   v0.6.0은 2026-10-25, v0.5.0은 2026-10-13에 발행됐다. v0.4.2는 태그 없이 v0.5.0으로 이어졌다.

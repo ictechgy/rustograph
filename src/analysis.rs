@@ -1386,6 +1386,8 @@ fn dead_with(
 /// unreachable이다. 워크스페이스 안에서만 쓰는 lib이면 그 아이템은 정말 호출자가 없다 — 그래서 문장은
 /// 조건부로 `--retain-public`을 알린다(따르면 진짜 미사용이 가려질 수 있다). 루트가 있는
 /// 크레이트(bin, `--root`를 준 크레이트)의 `pub` 아이템은 그 크레이트 밖 호출자가 없으니 세지 않는다.
+/// 이름 없는 상수(`const _`) 루트는 크레이트를 루트가 있는 것으로 만들지 않는다 — 정적 단언은 컴파일러가
+/// 평가할 뿐 공개 API의 호출자가 아니라, lib의 `const _: () = assert!(..)` 하나로 이 문장이 사라지면 안 된다.
 /// 공개 아이템을 루트로 삼으면(`--retain-public`) 공개 미도달이 없어 조용하다.
 fn rootless_api_limitation(
     doc: &Document,
@@ -1396,7 +1398,7 @@ fn rootless_api_limitation(
     let rooted: BTreeSet<&str> = doc
         .vertices
         .iter()
-        .filter(|v| roots.contains(v.id.as_str()))
+        .filter(|v| roots.contains(v.id.as_str()) && !v.is_anonymous_const())
         .map(|v| v.krate.as_str())
         .collect();
     let mut crates = BTreeSet::new();
