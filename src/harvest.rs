@@ -1727,8 +1727,9 @@ impl BodyVisitor<'_> {
     /// 워크스페이스 모듈이면(매크로가 만든 함수 `m::generated()`) 타입도 메서드 후보도 잇지 않는다 — `m::gen()`은
     /// `m` 안 아무 타입의 같은 이름 메서드(`m::S::gen`)를 부를 수 없다.
     ///
-    /// 반환: 같은 이름 메서드에 닿았는가 — 닿지 않았으면 호출자가 미해석으로 센다(배리언트·derive가 만든
-    /// 연관 함수는 메서드 정점이 없다).
+    /// 반환: 앞부분이 타입으로 풀렸는가 — 아니면 호출자가 미해석으로 센다. 호출이 아닌 값 경로(`E::W`)와 같은
+    /// 기준이라, 메서드 정점이 없는 배리언트·derive 연관 함수(`E::V(1)`, `D::default()`)도 타입 간선을 얻은 경로로
+    /// 셈에서 빠진다(예전에는 같은 이름 메서드에 닿았는지로 세어, 타입 간선이 있는데도 미해석으로 셌다).
     fn type_relative_call(&mut self, segs: &[String]) -> bool {
         let Some((name, prefix_segs)) = segs.split_last().filter(|(_, p)| !p.is_empty()) else {
             return false;
@@ -1738,7 +1739,7 @@ impl BodyVisitor<'_> {
             .into_iter()
             .filter(|ty| self.type_item(&ty.target) && !self.tree.modules.contains_key(&ty.target))
             .collect();
-        let mut hit = false;
+        let resolved = !types.is_empty();
         for ty in types {
             if let Some(ids) = self.method_index.get(name) {
                 // 접두사는 대상 타입마다 한 번 — 후보마다 만들면 같은 이름 정의가
@@ -1747,13 +1748,12 @@ impl BodyVisitor<'_> {
                 for mid in ids {
                     if mid.starts_with(&prefix) {
                         self.push(mid.clone(), &ty.cfg, EdgeKind::Call);
-                        hit = true;
                     }
                 }
             }
             self.push_resolved(ty, EdgeKind::References);
         }
-        hit
+        resolved
     }
 
     /// 본문을 아레나에서 바로 방문한다 — 최상위 문장 규칙은 [`body_edges`] 문서에 있다.

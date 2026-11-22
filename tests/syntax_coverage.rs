@@ -726,7 +726,8 @@ fn main() {
 /// `S::m()`의 `S`를 struct의 사용으로, `E::V(1)`을 enum의 사용으로 본다(이 fixture의 `cargo check` 경고는 `Unused`와
 /// 배리언트 필드뿐이다). 예전에는 메서드에만 잇거나(`S::m()`) 아무것도 잇지 않아(`E::V(1)`, derive가 만든
 /// `D::default()`) 그렇게만 쓰는 타입이 unreachable이었다. 앞부분이 모듈이면(매크로가 만든 `gen::generated()`) 모듈로
-/// 잇지 않고, 미해석 계수(메서드 정점이 없는 셋)는 그대로다.
+/// 잇지 않는다. 미해석으로 세는 것은 그 하나다 — 타입으로 풀린 `E::V(1)`·`D::default()`는 값 경로 `E::W`처럼 세지
+/// 않는다.
 #[test]
 fn associated_calls_and_tuple_variants_reference_their_type() {
     let ws = Workspace::new(
@@ -797,7 +798,7 @@ fn main() {
     assert!(
         doc.limitations
             .iter()
-            .any(|l| l.starts_with("3 path references could not be resolved")),
+            .any(|l| l.starts_with("1 path references could not be resolved")),
         "{:?}",
         doc.limitations
     );
