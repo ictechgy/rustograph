@@ -1053,6 +1053,59 @@ fn main() {
     }
 }
 
+/// impl의 트레이트 경로가 `#[cfg]`로 갈린 대안 임포트를 지나면(`use unix_impl as plat;`·`use win_impl as plat;` 옆의
+/// `impl plat::Tr for X`) 대안마다 implements 간선이다 — 예전에는 뒤의 것(windows)만 이어 기본 `dead`와 `--target`
+/// 리눅스가 `unix_impl::Tr`을 냈다. 이제 리눅스에서는 rustc처럼 `win_impl::Tr`만 낸다.
+#[test]
+fn split_trait_path_gets_an_implements_edge_per_alternative() {
+    let doc = harvest(
+        "splittrait",
+        "",
+        r#"
+mod unix_impl {
+    pub trait Tr {
+        fn t(&self) -> u32;
+    }
+}
+mod win_impl {
+    pub trait Tr {
+        fn t(&self) -> u32;
+    }
+}
+#[cfg(unix)]
+use crate::unix_impl as plat;
+#[cfg(windows)]
+use crate::win_impl as plat;
+struct X;
+impl plat::Tr for X {
+    fn t(&self) -> u32 {
+        1
+    }
+}
+fn run<T: plat::Tr>(x: &T) -> u32 {
+    x.t()
+}
+fn main() {
+    let _ = run(&X);
+}
+"#,
+    );
+    let x = "splittrait::X";
+    assert_eq!(
+        edge_cfg(&doc, x, "splittrait::unix_impl::Tr", EdgeKind::Implements),
+        under("unix")
+    );
+    assert_eq!(
+        edge_cfg(&doc, x, "splittrait::win_impl::Tr", EdgeKind::Implements),
+        under("windows")
+    );
+    assert!(dead_ids(&doc).is_empty(), "{:?}", dead_ids(&doc));
+    assert_eq!(
+        dead_ids(&for_target(&doc, LINUX)),
+        ["splittrait::win_impl::Tr"]
+    );
+}
+
 /// 같은 조건의 글롭과 명시 `use`는 늘 함께 있어 명시 `use`가 글롭을 가린다 — `#[cfg(feature = "x")] use a::*;` 옆
 /// `#[cfg(feature = "x")] use b::f;`의 `f()`는 `b::f`뿐이다(rustc `--features x`는 `a::f`를 쓰이지 않는다고 경고한다).
 #[test]
@@ -1164,4 +1217,44 @@ fn main() {
         Some(None)
     );
     assert!(!dead_ids(&doc).contains(&"condstd::real::Clock::now".to_string()));
+}
+
+/// 대안마다 수확하는 impl도 수확 계수(cfg 아이템)는 블록마다 한 번이다 — `#[cfg(test)]` 메서드 하나는 한 번 센다.
+#[test]
+fn split_impl_counts_harvest_statistics_once() {
+    let doc = harvest(
+        "countimpl",
+        "",
+        r#"
+mod unix_impl {
+    pub struct Sys;
+}
+mod win_impl {
+    pub struct Sys;
+}
+#[cfg(unix)]
+use crate::unix_impl::Sys;
+#[cfg(windows)]
+use crate::win_impl::Sys;
+impl Sys {
+    #[cfg(test)]
+    pub fn probe() -> u32 {
+        0
+    }
+    pub fn extra() -> u32 {
+        7
+    }
+}
+fn main() {
+    let _ = Sys::extra();
+}
+"#,
+    );
+    assert!(
+        doc.limitations
+            .iter()
+            .any(|l| l.starts_with("1 items behind #[cfg]")),
+        "{:?}",
+        doc.limitations
+    );
 }

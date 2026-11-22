@@ -672,14 +672,19 @@ fn impl_block_parts<'a>(
 ) {
     let self_id = &site.self_id;
     if let Some(tp) = &b.trait_path {
-        if let Some(trait_id) = tree.resolve_in(&b.items_module, tp, &DepCrates::new(), Ns::Type) {
+        // 트레이트 경로가 `#[cfg]`로 갈린 대안 임포트를 지나면(`#[cfg(unix)] use unix_impl as plat;`와 windows 쪽 옆의
+        // `impl plat::Tr for X`) 대안마다 implements 간선이고 그 임포트의 조건을 싣는다 — 하나만 이으면 다른 빌드의
+        // 트레이트가 거짓 unreachable이었다. 메서드 ID는 트레이트 경로의 마지막 세그먼트만 쓰니 그대로다.
+        let traits = tree.resolve_all(&b.items_module, tp, &DepCrates::new(), Some(Ns::Type));
+        if traits.is_empty() && site.first {
+            harvest.unresolved_paths += 1;
+        }
+        for trait_res in traits {
             // unsafe impl의 implements는 경계의 일부다.
-            let mut e = Edge::new(self_id.clone(), trait_id, EdgeKind::Implements);
-            e.cfg = site.cfg.clone();
+            let mut e = Edge::new(self_id.clone(), trait_res.target, EdgeKind::Implements);
+            e.cfg = with_import_cfg(&site.cfg, &trait_res.cfg);
             e.unsafe_ = b.unsafe_;
             parts.edges.push(e);
-        } else if site.first {
-            harvest.unresolved_paths += 1;
         }
     }
     for &m in &b.methods {
