@@ -879,6 +879,44 @@ fn main() { let _ = b::env(); }
     assert!(analysis::dead(&doc).unwrap().findings.is_empty());
 }
 
+/// 파일이 없는 `mod gone;`(지운 파일·빌드 스크립트가 만드는 파일)의 이름은 아이템 표에 있지만 정점이 없다 — 경로
+/// 앞부분이 거기 닿아도(`crate::gone::removed()`, `crate::gone::OTHER`) 간선을 두지 않고 미해석으로 센다. 예전에는
+/// 호출(이 브랜치의 앞 커밋)과 값 경로(main부터)가 그 유령 경로로 references 간선을 냈다. rustc는 이 코드를 컴파일하지
+/// 않지만(E0583) change-impact의 작업 트리처럼 파일을 지운 상태를 수확한다.
+#[test]
+fn missing_module_files_get_no_prefix_edges() {
+    let ws = Workspace::new(
+        "prefix-missing-mod",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname='gonemod'\nversion='0.1.0'\nedition='2021'\n[lib]\npath='src/lib.rs'\n[workspace]\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub mod gone;\npub fn caller() -> u8 { crate::gone::removed(); crate::gone::OTHER }\n",
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    let ids: std::collections::BTreeSet<&str> =
+        doc.vertices.iter().map(|v| v.id.as_str()).collect();
+    assert!(!ids.contains("gonemod::gone"));
+    for e in &doc.edges {
+        assert!(
+            ids.contains(e.to.as_str()),
+            "edge to a missing vertex: {e:?}"
+        );
+    }
+    assert!(
+        doc.limitations
+            .iter()
+            .any(|l| l.starts_with("2 path references could not be resolved")),
+        "{:?}",
+        doc.limitations
+    );
+}
+
 /// 이름 없는 상수(`const _: () = assert!(..);`)는 보존 루트다 — 컴파일러가 늘 평가하고 rustc는 그것도 그 초기식이
 /// 쓰는 아이템도 미사용으로 경고하지 않는다(이 fixture의 `cargo check` 경고는 `never` 하나다). 예전에는 상수 셋과
 /// 그 안에서만 쓰는 `only_in_anon`·`Marker`·`Check`·`inner::deep`이 unreachable이었다. 같은 모듈의 둘은 소스

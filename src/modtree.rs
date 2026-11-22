@@ -442,6 +442,10 @@ pub struct ModTree {
     /// 정점 없이 건너뛴 `mod` 선언 — 모듈 경로 → 사유. limitation으로 올린다.
     /// 경로가 키라 병합 루트(lib+같은 이름 bin)를 두 타깃이 다시 훑어도 한 번만 센다.
     pub skipped_mods: BTreeMap<String, SkippedMod>,
+    /// 파일을 찾지 못해 정점 없이 건너뛴 `mod x;` 선언의 모듈 경로(조건부·빌드 스크립트가 만드는 파일, 지운 파일).
+    /// 그 이름은 부모의 아이템 표(타입 이름공간)에 있지만 정점이 없다 — 경로 해석이 그 이름에 닿아도 간선의 대상으로
+    /// 쓰면 유령 정점이다.
+    pub unloaded_mods: BTreeSet<String>,
     /// 2015 판 타깃의 루트 모듈(크레이트) 경로 — 호출자가 채운다. 이 해석기는 2018 판 이후의 경로 규칙이라, 2015 판의
     /// 크레이트 기준 `use` 경로(`use foo::bar`가 `crate::foo::bar`)를 모른다. 그런 크레이트의 모듈에서는
     /// [`fill_imports_settled`]가 앞 바퀴의 대상을 거둬 지우지 않는다(거둔 쪽이 2015 판의 제 대상일 수 있다).
@@ -1186,6 +1190,7 @@ pub(crate) fn collect_target_submodules(
         }
         // 파일 없는 mod(조건부·생성) — 정점 없이 limitation만.
         let Some((file, is_file_module, dir)) = resolved else {
+            tree.unloaded_mods.insert(path);
             continue;
         };
         let public = matches!(m.vis, syn::Visibility::Public(_));

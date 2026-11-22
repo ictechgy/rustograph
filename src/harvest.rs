@@ -1633,14 +1633,18 @@ impl BodyVisitor<'_> {
     /// 없으면 해석은 다른 이름공간으로 넘어가는데([`ModTree::resolve_in`]), 그러면 `use std::process;` 옆의 로컬
     /// `fn process`가 `process::exit`의 앞부분으로 잡혔다. 함수·상수·static은 경로 앞부분이 될 수 없으니 버린다 —
     /// 이으면 rustc가 미사용으로 경고하는 그 fn이 살아 있고, 같은 이름의 재노출(`pub use crate::a::env`) 옆
-    /// `env::var(..)`는 거짓 심볼 순환이 됐다.
+    /// `env::var(..)`는 거짓 심볼 순환이 됐다. 정점 없이 건너뛴 `mod` 선언(파일이 없는 `mod target;` —
+    /// [`ModTree::unloaded_mods`], 순환·깊이로 건너뛴 [`ModTree::skipped_mods`])도 아이템 표의 타입 이름이지만 정점이
+    /// 없으니 버린다 — 이으면 유령 정점으로 가는 간선이었다.
     fn path_prefix_owners(&mut self, prefix: &[String]) -> Vec<Resolved> {
         let found = self.resolve_in(prefix, Ns::Type);
         found
             .into_iter()
             .filter(|r| {
                 self.tree.modules.contains_key(&r.target)
-                    || self.type_item(&r.target)
+                    || (self.type_item(&r.target)
+                        && !self.tree.skipped_mods.contains_key(&r.target)
+                        && !self.tree.unloaded_mods.contains(&r.target))
                     || self.dep_crates.external.contains(r.target.as_str())
             })
             .collect()
