@@ -896,6 +896,10 @@ fn foreign_impl_bodies<'a>(
 /// 부르면 이 impl을 거쳐 트레이트를 쓰니 재정의한 메서드처럼 [`ForeignTraitMethod`]로 더한다(조건은 impl의 것과
 /// 임포트의 것). `impl T1 for u8 {}` 옆의 `1u8.t1()`이 기본 메서드 `T1::t1`에만 닿아 트레이트 `T1`이 unreachable이던
 /// 것을 막는다 — rustc는 쓰인 트레이트 아이템의 트레이트를 쓰인 것으로 본다.
+///
+/// 재정의가 모두 자기 `#[cfg]`를 달면(`#[cfg(unix)] fn m`) 그 조건이 거짓인 빌드에서는 기본 구현이 쓰이니 재정의하지
+/// 않은 것으로 본다 — 재정의 쪽 간선만 남기면 그 조건을 단 간선뿐이라 `--target` windows가 쓰이는 트레이트를 냈다.
+/// 조건 없는 재정의가 하나라도 있으면 기본 구현은 어느 빌드에서도 이 impl에 쓰이지 않는다.
 fn inherited_trait_methods(
     b: &ImplBlock<'_>,
     tr: &Resolved,
@@ -909,7 +913,11 @@ fn inherited_trait_methods(
         .take_while(|id| id.starts_with(&prefix));
     for method in declared {
         let name = &method[prefix.len()..];
-        if name.contains("::") || b.methods.iter().any(|m| m.sig.ident == name) {
+        let always_overridden = b
+            .methods
+            .iter()
+            .any(|m| m.sig.ident == name && cfg_of(&m.attrs).is_none());
+        if name.contains("::") || always_overridden {
             continue;
         }
         trait_methods.push(ForeignTraitMethod {

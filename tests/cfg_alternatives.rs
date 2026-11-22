@@ -1175,6 +1175,46 @@ fn main() {
     );
 }
 
+/// 워크스페이스 밖 타입 impl의 재정의가 자기 `#[cfg]`만 달면(`#[cfg(unix)] fn m`) 그 조건이 거짓인 빌드에서는 기본
+/// 구현이 쓰인다 — 기본 메서드에서 트레이트로 가는 간선도 남아야 한다. 예전에는 `cfg: unix`인 재정의 간선뿐이라
+/// `--target` windows가 `Tr`을 냈다(`cargo check --target x86_64-pc-windows-msvc` 경고 없음).
+#[test]
+fn cfg_gated_override_keeps_the_inherited_default_edge() {
+    let doc = harvest(
+        "gatedoverride",
+        "",
+        r#"
+trait Tr {
+    fn m(&self) -> u8 {
+        1
+    }
+}
+impl Tr for u8 {
+    #[cfg(unix)]
+    fn m(&self) -> u8 {
+        2
+    }
+}
+fn main() {
+    let _ = 1u8.m();
+}
+"#,
+    );
+    let (method, tr) = ("gatedoverride::Tr::m", "gatedoverride::Tr");
+    assert_eq!(edge_cfg(&doc, method, tr, EdgeKind::References), Some(None));
+    assert!(doc
+        .edges
+        .iter()
+        .any(|e| e.from == method && e.to == tr && e.cfg.as_deref() == Some("unix")));
+    for triple in [LINUX, WINDOWS] {
+        assert!(
+            dead_ids(&for_target(&doc, triple)).is_empty(),
+            "{triple}: {:?}",
+            dead_ids(&for_target(&doc, triple))
+        );
+    }
+}
+
 /// 2015 판 크레이트에서는 `use foo::bar`가 크레이트 기준이라 수렴 중 거둔 대상(크레이트 루트 `foo::bar`)이 제 대상일 수
 /// 있다 — 거둔 대상을 지우지 않는다(187163b와 같다 — 826e20b는 그것을 지워 2015 판 rustc가 쓰는 루트 `foo::bar`를
 /// `dead`로 냈다). 해석은 2018 판 규칙이라 크레이트 기준 `use` 경로를 가진 2015 판 크레이트는 거둔 것이 없어도(로컬
