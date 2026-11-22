@@ -803,6 +803,82 @@ fn main() {
     );
 }
 
+/// 경로 앞부분(`process::exit`의 `process`)은 타입 이름공간 아이템이나 모듈일 때만 잇는다 — 타입 이름공간에 묶인 것이
+/// 없을 때(`use std::process;`는 그래프 밖) 해석이 다른 이름공간으로 넘어가 같은 이름의 로컬 `fn process`·`fn fmt`를
+/// 잡았고, 호출(`process::exit(1)`)·값(`let exit = process::exit;`) 모두 그 fn으로 확정 간선을 냈다. rustc는 셋을
+/// 미사용으로 경고한다(이 fixture의 `cargo check` 경고는 `process`·`helper`·`fmt`).
+#[test]
+fn path_prefix_never_resolves_to_a_same_named_fn() {
+    let ws = Workspace::new(
+        "prefix-fn",
+        &[
+            ("Cargo.toml", &manifest("prefixfn")),
+            (
+                "src/main.rs",
+                r#"
+use std::process;
+use std::fmt;
+fn process() -> u8 { helper() }
+fn helper() -> u8 { 1 }
+fn fmt() -> u8 { 2 }
+fn main() {
+    let _ = fmt::format(format_args!("x"));
+    let exit: fn(i32) -> ! = process::exit;
+    if std::env::args().count() > 99 { process::exit(1); }
+    if std::env::args().count() > 100 { exit(1) }
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(!doc
+        .edges
+        .iter()
+        .any(|e| e.from == "prefixfn::main"
+            && (e.to == "prefixfn::process" || e.to == "prefixfn::fmt")));
+    let report = analysis::dead(&doc).unwrap();
+    assert_eq!(
+        unreachable_ids(&report),
+        ["prefixfn::fmt", "prefixfn::helper", "prefixfn::process"]
+    );
+}
+
+/// 같은 이름의 재노출이 있는 모듈의 `env::var(..)`(`use std::env;` 옆 `pub use crate::a::env;`)는 재노출된 fn이 아니다 —
+/// 그 fn이 이 모듈 함수를 부르면 거짓 심볼 순환이 되어 `cycles --level symbol --strict`가 실패했다(rustc 경고 없음).
+#[test]
+fn path_prefix_through_a_same_named_reexport_makes_no_cycle() {
+    let ws = Workspace::new(
+        "prefix-cycle",
+        &[
+            ("Cargo.toml", &manifest("prefixcycle")),
+            (
+                "src/main.rs",
+                r#"
+mod a {
+    pub fn env() -> String { crate::b::get() }
+}
+mod b {
+    use std::env;
+    pub use crate::a::env;
+    pub fn get() -> String { env::var("HOME").unwrap_or_default() }
+}
+fn main() { let _ = b::env(); }
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(!has_edge(
+        &doc,
+        "prefixcycle::b::get",
+        "prefixcycle::a::env",
+        EdgeKind::References
+    ));
+    assert!(analysis::cycles(&doc).cycles.is_empty());
+    assert!(analysis::dead(&doc).unwrap().findings.is_empty());
+}
+
 /// 이름 없는 상수(`const _: () = assert!(..);`)는 보존 루트다 — 컴파일러가 늘 평가하고 rustc는 그것도 그 초기식이
 /// 쓰는 아이템도 미사용으로 경고하지 않는다(이 fixture의 `cargo check` 경고는 `never` 하나다). 예전에는 상수 셋과
 /// 그 안에서만 쓰는 `only_in_anon`·`Marker`·`Check`·`inner::deep`이 unreachable이었다. 같은 모듈의 둘은 소스

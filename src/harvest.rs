@@ -1608,6 +1608,36 @@ impl BodyVisitor<'_> {
             .is_some_and(|m| m.value_items.contains(name))
     }
 
+    /// 정점 `id`가 부모 모듈의 타입 이름공간 아이템(struct·enum·union·trait·타입 별칭·`mod`)인가 — [`Self::value_item`]의
+    /// 짝이다.
+    fn type_item(&self, id: &str) -> bool {
+        let Some((parent, name)) = id.rsplit_once("::") else {
+            return false;
+        };
+        self.tree
+            .modules
+            .get(parent)
+            .is_some_and(|m| m.type_items.contains(name))
+    }
+
+    /// 타입 상대 경로(`Type::assoc`, `E::V`, `m::X`)의 앞부분을 타입 이름공간에서 해석한 대상 가운데 그 자리에 올 수
+    /// 있는 것 — 타입 이름공간 아이템·모듈(크레이트 루트 포함)·외부 크레이트 정점이다. 타입 이름공간에 묶인 것이
+    /// 없으면 해석은 다른 이름공간으로 넘어가는데([`ModTree::resolve_in`]), 그러면 `use std::process;` 옆의 로컬
+    /// `fn process`가 `process::exit`의 앞부분으로 잡혔다. 함수·상수·static은 경로 앞부분이 될 수 없으니 버린다 —
+    /// 이으면 rustc가 미사용으로 경고하는 그 fn이 살아 있고, 같은 이름의 재노출(`pub use crate::a::env`) 옆
+    /// `env::var(..)`는 거짓 심볼 순환이 됐다.
+    fn path_prefix_owners(&mut self, prefix: &[String]) -> Vec<Resolved> {
+        let found = self.resolve_in(prefix, Ns::Type);
+        found
+            .into_iter()
+            .filter(|r| {
+                self.tree.modules.contains_key(&r.target)
+                    || self.type_item(&r.target)
+                    || self.dep_crates.external.contains(r.target.as_str())
+            })
+            .collect()
+    }
+
     /// 타입 `owner` 범위에서 이름이 `name`인 메서드(고유·트레이트 impl)로 references 간선을 단다 —
     /// 연관 함수를 값으로 넘긴 경로(`Type::new`)다. 같은 이름 메서드가 없으면(배리언트·연관 상수)
     /// 아무것도 하지 않는다. 간선은 타입에 닿으려고 거친 임포트의 조건을 싣는다.
@@ -1678,17 +1708,26 @@ impl BodyVisitor<'_> {
     /// 타입 자체로도 references 간선을 단다 — 경로가 그 타입을 이름 붙인다. rustc는 `S::m()`의 `S`를
     /// struct의 사용으로 보고 `E::V(..)`는 enum의 사용이다(둘 다 dead_code 경고가 없다). 메서드에만 잇던 때는
     /// 그렇게만 쓰는 struct·enum이 unreachable이었다. 호출이 아닌 값 경로(`E::W`, `.map(Type::new)`)는
-    /// [`Visit::visit_expr_path`]가 같은 규칙으로 타입을 잇는다. 앞부분이 워크스페이스 모듈이면(매크로가 만든
-    /// 함수 `m::generated()`) 잇지 않는다 — 모듈은 이름 붙일 아이템이 아니다.
+    /// [`Visit::visit_expr_path`]가 같은 규칙으로 타입을 잇는다.
+    ///
+    /// 앞부분은 타입 이름공간 아이템일 때만 잇는다([`Self::path_prefix_owners`]에서 모듈을 뺀 것). 다른 이름공간으로
+    /// 넘어간 해석(`use std::process;` 옆 `fn process`의 `process::exit()`)은 거짓 확정 간선이었다. 앞부분이
+    /// 워크스페이스 모듈이면(매크로가 만든 함수 `m::generated()`) 타입도 메서드 후보도 잇지 않는다 — `m::gen()`은
+    /// `m` 안 아무 타입의 같은 이름 메서드(`m::S::gen`)를 부를 수 없다.
     ///
     /// 반환: 같은 이름 메서드에 닿았는가 — 닿지 않았으면 호출자가 미해석으로 센다(배리언트·derive가 만든
-    /// 연관 함수는 메서드 정점이 없다). 미해석 계수는 타입 간선을 더하기 전과 같다.
+    /// 연관 함수는 메서드 정점이 없다).
     fn type_relative_call(&mut self, segs: &[String]) -> bool {
         let Some((name, prefix_segs)) = segs.split_last().filter(|(_, p)| !p.is_empty()) else {
             return false;
         };
+        let types: Vec<Resolved> = self
+            .path_prefix_owners(prefix_segs)
+            .into_iter()
+            .filter(|ty| self.type_item(&ty.target) && !self.tree.modules.contains_key(&ty.target))
+            .collect();
         let mut hit = false;
-        for ty in self.resolve_in(prefix_segs, Ns::Type) {
+        for ty in types {
             if let Some(ids) = self.method_index.get(name) {
                 // 접두사는 대상 타입마다 한 번 — 후보마다 만들면 같은 이름 정의가
                 // 수천 개일 때 할당이 (호출 수 × 정의 수)다.
@@ -1700,9 +1739,7 @@ impl BodyVisitor<'_> {
                     }
                 }
             }
-            if !self.tree.modules.contains_key(&ty.target) {
-                self.push_resolved(ty, EdgeKind::References);
-            }
+            self.push_resolved(ty, EdgeKind::References);
         }
         hit
     }
@@ -2103,7 +2140,9 @@ impl Visit<'_> for BodyVisitor<'_> {
                 // E::V 형태 — 마지막 세그먼트가 열거형 배리언트/상수면
                 // 앞부분 타입에의 참조다. 그것도 안 되면 진짜 미해석.
                 if segs.len() >= 2 {
-                    let owners = self.resolve_in(&segs[..segs.len() - 1], Ns::Type);
+                    // 함수·상수로 넘어간 앞부분은 버린다 — `let f = process::exit;`가 `use std::process;` 옆
+                    // `fn process`를 살려 두던 것([`BodyVisitor::path_prefix_owners`]).
+                    let owners = self.path_prefix_owners(&segs[..segs.len() - 1]);
                     if owners.is_empty() {
                         self.unresolved += 1;
                     }
