@@ -583,127 +583,190 @@ pub(crate) fn impls_with_identities<'a>(
     harvest: &mut Harvest,
     identities: &mut identity::Registry,
 ) -> ImplParts<'a> {
-    let mut vertices = Vec::new();
-    let mut edges = Vec::new();
-    let mut attr_refs = Vec::new();
-    let mut bodies = Vec::new();
-    let mut entry_roots = Vec::new();
-    let mut foreign_bodies = Vec::new();
+    let mut parts = ImplParts {
+        vertices: Vec::new(),
+        edges: Vec::new(),
+        attr_refs: Vec::new(),
+        bodies: Vec::new(),
+        entry_roots: Vec::new(),
+        foreign_bodies: Vec::new(),
+    };
     for b in blocks {
-        // self 타입을 해석한다 — 모듈 로컬이면 정점이 있다.
-        let Some(self_id) =
-            tree.resolve_in(&b.items_module, &b.self_ty, &DepCrates::new(), Ns::Type)
-        else {
+        // self 타입을 해석한다 — 모듈 로컬이면 정점이 있다. `#[cfg]`로 갈린 대안 임포트(`#[cfg(unix)] use
+        // unix_impl::Sys;`와 windows 쪽 옆의 `impl Sys {..}`)면 그 impl은 빌드마다 다른 타입의 것이라 대안마다 한 번씩
+        // 수확한다 — 메서드 정점은 그 대안 타입 아래이고 조건은 impl의 것과 그 임포트의 것이다. 하나만 수확하면
+        // (예전에는 뒤의 `use`) 다른 빌드에서 쓰이는 메서드가 `--target`에서 거짓 unreachable이 됐다.
+        let selves = tree.resolve_all(
+            &b.items_module,
+            &b.self_ty,
+            &DepCrates::new(),
+            Some(Ns::Type),
+        );
+        if selves.is_empty() {
             harvest.unresolved_paths += 1;
             harvest.foreign_self_impls += 1;
-            foreign_bodies.extend(foreign_impl_bodies(
+            parts.foreign_bodies.extend(foreign_impl_bodies(
                 b,
                 tree,
                 methods,
                 harvest,
-                &mut attr_refs,
+                &mut parts.attr_refs,
             ));
             continue;
-        };
-        if let Some(tp) = &b.trait_path {
-            if let Some(trait_id) =
-                tree.resolve_in(&b.items_module, tp, &DepCrates::new(), Ns::Type)
-            {
-                // unsafe impl의 implements는 경계의 일부다.
-                let mut e = Edge::new(self_id.clone(), trait_id.clone(), EdgeKind::Implements);
-                e.cfg = b.cfg.clone();
-                e.unsafe_ = b.unsafe_;
-                edges.push(e);
-            } else {
-                harvest.unresolved_paths += 1;
-            }
         }
-        for &m in &b.methods {
-            let own_cfg = cfg_of(&m.attrs);
-            harvest.cfg_items += usize::from(own_cfg.is_some());
-            let mcfg = match own_cfg {
-                Some(ref condition) => conjoin(&b.cfg, condition),
-                None => b.cfg.clone(),
-            };
-            // 트레이트 impl 메서드는 `Type::<Trait>::m` — 고유 선언과 충돌 안 함.
-            let mid = match &b.trait_path {
-                Some(tp) => {
-                    let tname = tp.last().cloned().unwrap_or_default();
-                    format!("{self_id}::<{tname}>::{}", m.sig.ident)
+        let split = selves.len() > 1;
+        for (i, self_res) in selves.into_iter().enumerate() {
+            let site = if split {
+                ImplSite {
+                    self_ty: canonical_path(&self_res.target, &b.items_module),
+                    cfg: with_import_cfg(&b.cfg, &self_res.cfg),
+                    self_id: self_res.target,
+                    first: i == 0,
                 }
-                None => format!("{self_id}::{}", m.sig.ident),
+            } else {
+                ImplSite {
+                    self_ty: b.self_ty.clone(),
+                    cfg: b.cfg.clone(),
+                    self_id: self_res.target,
+                    first: true,
+                }
             };
-            let body = Body::Stmts(&m.block.stmts);
-            // unsafe impl의 메서드, unsafe fn 메서드, unsafe 본문 모두 경계다.
-            let unsafe_ = b.unsafe_ || m.sig.unsafety.is_some() || body_has_unsafe(body);
-            vertices.push(Vertex {
-                id: mid.clone(),
-                kind: Kind::Method,
-                krate: krate.to_string(),
-                module: b.items_module.clone(),
-                position: Some(format!("{}:{}", b.file.display(), line_of(&m.sig.ident))),
-                exported: matches!(m.vis, syn::Visibility::Public(_)),
-                generated: b.generated,
-                cfg: mcfg.clone(),
-                unsafe_,
-            });
-            identities.note(
-                vertices.last().expect("method vertex was just inserted"),
-                &b.file,
-                m.span().byte_range().start,
-            );
-            if is_extern_entry(&m.attrs) {
-                entry_roots.push(mid.clone());
-                identities.note_root(
-                    &mid,
-                    &b.items_module,
-                    false,
-                    &b.file,
-                    m.span().byte_range().start,
-                );
+            impl_block_parts(b, &site, krate, tree, harvest, identities, &mut parts);
+        }
+    }
+    parts
+}
+
+/// impl 블록 하나를 self 타입 하나로 수확하는 자리 — `#[cfg]`로 갈린 대안 self 타입이면 대안마다 하나다.
+struct ImplSite {
+    /// self 타입 정점 ID.
+    self_id: String,
+    /// 본문의 `Self`가 가리키는 경로 — 대안이면 그 정점의 정규 경로다(소스 경로는 대안 모두로 풀린다).
+    self_ty: Vec<String>,
+    /// impl의 `#[cfg]`와 그 self 타입에 닿은 임포트의 조건을 합친 것.
+    cfg: Option<String>,
+    /// 이 블록의 첫 자리인가 — 수확 계수(cfg 아이템·미해석 경로)는 블록마다 한 번만 센다.
+    first: bool,
+}
+
+/// 정점 ID `target`을 모듈 `from`에서 다시 해석되는 경로로 — 같은 크레이트면 `crate::..`, 아니면 크레이트 루트
+/// 이름부터다(다른 워크스페이스 크레이트 루트로 걷는 해석이 받는다).
+fn canonical_path(target: &str, from: &str) -> Vec<String> {
+    let mut segs: Vec<String> = target.split("::").map(str::to_string).collect();
+    if segs.first().is_some_and(|root| *root == crate_of(from)) {
+        segs[0] = "crate".to_string();
+    }
+    segs
+}
+
+/// impl 블록 `b`를 자리 `site`의 self 타입으로 수확해 `parts`에 더한다 — implements 간선, 메서드 정점·contains 간선,
+/// 메서드 속성 참조, 본문.
+fn impl_block_parts<'a>(
+    b: &ImplBlock<'a>,
+    site: &ImplSite,
+    krate: &str,
+    tree: &ModTree,
+    harvest: &mut Harvest,
+    identities: &mut identity::Registry,
+    parts: &mut ImplParts<'a>,
+) {
+    let self_id = &site.self_id;
+    if let Some(tp) = &b.trait_path {
+        if let Some(trait_id) = tree.resolve_in(&b.items_module, tp, &DepCrates::new(), Ns::Type) {
+            // unsafe impl의 implements는 경계의 일부다.
+            let mut e = Edge::new(self_id.clone(), trait_id, EdgeKind::Implements);
+            e.cfg = site.cfg.clone();
+            e.unsafe_ = b.unsafe_;
+            parts.edges.push(e);
+        } else if site.first {
+            harvest.unresolved_paths += 1;
+        }
+    }
+    for &m in &b.methods {
+        let own_cfg = cfg_of(&m.attrs);
+        if site.first {
+            harvest.cfg_items += usize::from(own_cfg.is_some());
+        }
+        let mcfg = match own_cfg {
+            Some(ref condition) => conjoin(&site.cfg, condition),
+            None => site.cfg.clone(),
+        };
+        // 트레이트 impl 메서드는 `Type::<Trait>::m` — 고유 선언과 충돌 안 함.
+        let mid = match &b.trait_path {
+            Some(tp) => {
+                let tname = tp.last().cloned().unwrap_or_default();
+                format!("{self_id}::<{tname}>::{}", m.sig.ident)
             }
-            let mut contains = Edge::new(self_id.clone(), mid.clone(), EdgeKind::Contains);
-            contains.cfg = mcfg.clone();
-            contains.unsafe_ = b.unsafe_;
-            edges.push(contains);
-            // 메서드 속성의 경로 참조 — #[dep::attr] fn m()도 사용 증거다.
-            // impl과 메서드 자신의 cfg를 둘 다 물린다 — 둘 다 성립해야
-            // 이 참조가 존재한다.
-            let first_attr = attr_refs.len();
-            harvest.unparsed_attrs += collect_attr_refs(
-                &m.attrs,
+            None => format!("{self_id}::{}", m.sig.ident),
+        };
+        let body = Body::Stmts(&m.block.stmts);
+        // unsafe impl의 메서드, unsafe fn 메서드, unsafe 본문 모두 경계다.
+        let unsafe_ = b.unsafe_ || m.sig.unsafety.is_some() || body_has_unsafe(body);
+        parts.vertices.push(Vertex {
+            id: mid.clone(),
+            kind: Kind::Method,
+            krate: krate.to_string(),
+            module: b.items_module.clone(),
+            position: Some(format!("{}:{}", b.file.display(), line_of(&m.sig.ident))),
+            exported: matches!(m.vis, syn::Visibility::Public(_)),
+            generated: b.generated,
+            cfg: mcfg.clone(),
+            unsafe_,
+        });
+        identities.note(
+            parts
+                .vertices
+                .last()
+                .expect("method vertex was just inserted"),
+            &b.file,
+            m.span().byte_range().start,
+        );
+        if is_extern_entry(&m.attrs) {
+            parts.entry_roots.push(mid.clone());
+            identities.note_root(
                 &mid,
                 &b.items_module,
                 false,
-                &mcfg,
-                &mut attr_refs,
-            );
-            identities.note_attrs(
-                &attr_refs[first_attr..],
                 &b.file,
                 m.span().byte_range().start,
             );
-            bodies.push(BodyItem {
-                generic_scopes: generic_scopes([b.generics, &m.sig.generics]),
-                id: mid,
-                module: b.items_module.clone(),
-                self_ty: Some(b.self_ty.clone()),
-                body,
-                params: locals::param_bindings(&m.sig),
-                signature_surface: fn_signature_types(&m.sig),
-                cfg: mcfg,
-                file: b.file.clone(),
-                range: m.span().byte_range(),
-            });
         }
-    }
-    ImplParts {
-        vertices,
-        edges,
-        attr_refs,
-        bodies,
-        entry_roots,
-        foreign_bodies,
+        let mut contains = Edge::new(self_id.clone(), mid.clone(), EdgeKind::Contains);
+        contains.cfg = mcfg.clone();
+        contains.unsafe_ = b.unsafe_;
+        parts.edges.push(contains);
+        // 메서드 속성의 경로 참조 — #[dep::attr] fn m()도 사용 증거다.
+        // impl과 메서드 자신의 cfg를 둘 다 물린다 — 둘 다 성립해야
+        // 이 참조가 존재한다.
+        let first_attr = parts.attr_refs.len();
+        let unparsed = collect_attr_refs(
+            &m.attrs,
+            &mid,
+            &b.items_module,
+            false,
+            &mcfg,
+            &mut parts.attr_refs,
+        );
+        if site.first {
+            harvest.unparsed_attrs += unparsed;
+        }
+        identities.note_attrs(
+            &parts.attr_refs[first_attr..],
+            &b.file,
+            m.span().byte_range().start,
+        );
+        parts.bodies.push(BodyItem {
+            generic_scopes: generic_scopes([b.generics, &m.sig.generics]),
+            id: mid,
+            module: b.items_module.clone(),
+            self_ty: Some(site.self_ty.clone()),
+            body,
+            params: locals::param_bindings(&m.sig),
+            signature_surface: fn_signature_types(&m.sig),
+            cfg: mcfg,
+            file: b.file.clone(),
+            range: m.span().byte_range(),
+        });
     }
 }
 

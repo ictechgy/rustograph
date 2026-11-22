@@ -547,6 +547,65 @@ fn main() {
     assert!(dead_ids(&doc).is_empty(), "{:?}", dead_ids(&doc));
 }
 
+/// `#[cfg]`로 갈린 대안 임포트를 self 타입으로 쓴 impl(`impl Sys { .. }`)은 대안마다 수확한다 — 메서드 정점은 그
+/// 대안 타입 아래에 그 임포트의 조건을 달고 생긴다. 187163b는 뒤의 `use`(windows) 아래에만 정점을 두고 그리로 가는
+/// 유일한 간선에 `cfg(windows)`를 달아, `--target` 리눅스가 리눅스에서 쓰이는 `extra`를 unreachable로 냈다.
+#[test]
+fn impl_on_a_cfg_split_import_is_harvested_per_alternative() {
+    let doc = harvest(
+        "splitimpl",
+        "",
+        r#"
+mod unix_impl {
+    pub struct Sys;
+}
+mod win_impl {
+    pub struct Sys;
+}
+#[cfg(unix)]
+use crate::unix_impl::Sys;
+#[cfg(windows)]
+use crate::win_impl::Sys;
+impl Sys {
+    pub fn extra() -> u32 {
+        7
+    }
+}
+fn main() {
+    let _ = Sys::extra();
+    let _s = Sys;
+}
+"#,
+    );
+    let vertex_cfg = |id: &str| {
+        doc.vertices
+            .iter()
+            .find(|v| v.id == id)
+            .map(|v| v.cfg.clone())
+    };
+    assert_eq!(
+        vertex_cfg("splitimpl::unix_impl::Sys::extra"),
+        under("unix")
+    );
+    assert_eq!(
+        vertex_cfg("splitimpl::win_impl::Sys::extra"),
+        under("windows")
+    );
+    assert_eq!(
+        edge_cfg(
+            &doc,
+            "splitimpl::main",
+            "splitimpl::unix_impl::Sys::extra",
+            EdgeKind::Call
+        ),
+        under("unix")
+    );
+    let on_linux = dead_ids(&for_target(&doc, LINUX));
+    assert_eq!(on_linux, ["splitimpl::win_impl::Sys"]);
+    let on_windows = dead_ids(&for_target(&doc, WINDOWS));
+    assert_eq!(on_windows, ["splitimpl::unix_impl::Sys"]);
+}
+
 /// 해석되는 `use`와 해석되지 않는 `use`(std 경로)가 같은 칸을 다투면 소스 순서와 무관하게 해석되는 쪽이 남는다 —
 /// `#[cfg(feature = "pl")] use extdep::Mutex;` 뒤에 `#[cfg(not(..))] use std::sync::Mutex;`가 와도 `extdep`을 쓰는
 /// 증거가 남는다. 예전에는(9a79ce5·187163b 모두) 뒤의 std `use`가 이겨 `deps`가 `extdep`을 unused로 냈다.
