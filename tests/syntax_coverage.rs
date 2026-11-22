@@ -845,6 +845,43 @@ fn main() {
     );
 }
 
+/// 모듈 앞부분의 호출(`m::gen()` — 매크로가 만든 함수)은 `m` 안 아무 타입의 같은 이름 메서드(`m::S::gen`)를 부를 수
+/// 없고, 원시 타입 경로(`u32::MAX`)는 같은 이름의 로컬 `fn u32`가 아니다. 예전에는 둘 다 확정 간선이라 rustc가
+/// 경고하는 `S::gen`·`u32`가 살아 있었다(이 fixture의 `cargo check` 경고는 `u32`·`S`·`gen`).
+#[test]
+fn module_and_primitive_prefixes_pick_no_same_named_candidates() {
+    let ws = Workspace::new(
+        "prefix-module",
+        &[
+            ("Cargo.toml", &manifest("modprefix")),
+            (
+                "src/main.rs",
+                r#"
+mod m {
+    pub struct S;
+    impl S { pub fn gen() -> u8 { 1 } }
+    macro_rules! make { () => { pub fn gen() -> u8 { 2 } }; }
+    make!();
+}
+fn u32() -> u8 { 3 }
+fn main() {
+    let _ = m::gen();
+    let _ = u32::MAX;
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    assert!(!doc.edges.iter().any(|e| e.from == "modprefix::main"
+        && (e.to == "modprefix::m::S::gen" || e.to == "modprefix::u32")));
+    let report = analysis::dead(&doc).unwrap();
+    assert_reported(
+        &report,
+        &["modprefix::m::S", "modprefix::m::S::gen", "modprefix::u32"],
+    );
+}
+
 /// 같은 이름의 재노출이 있는 모듈의 `env::var(..)`(`use std::env;` 옆 `pub use crate::a::env;`)는 재노출된 fn이 아니다 —
 /// 그 fn이 이 모듈 함수를 부르면 거짓 심볼 순환이 되어 `cycles --level symbol --strict`가 실패했다(rustc 경고 없음).
 #[test]
