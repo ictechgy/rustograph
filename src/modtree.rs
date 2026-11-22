@@ -349,7 +349,7 @@ enum Found<'a> {
 
 /// 모듈 하나 — 파일 단위든 인라인 `mod x {}`든 동일하게 표현한다.
 /// 경로는 트리의 맵 키이므로 필드로 중복 저장하지 않는다.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Module {
     /// 이 모듈의 선언이 있는 파일(인라인 모듈은 부모와 같은 파일).
     pub file: PathBuf,
@@ -425,7 +425,7 @@ impl Module {
 }
 
 /// 크레이트 하나의 모듈 트리 전체.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ModTree {
     /// 경로 → 모듈.
     pub modules: BTreeMap<String, Module>,
@@ -1417,6 +1417,19 @@ fn derive_name(attr: &syn::Attribute) -> Option<String> {
 /// 이 모듈의 임포트 표([`Module::imports`])는 부를 때마다 그 모듈의 `use`로 새로 만든다 — 해석은 다른 모듈과
 /// 이 모듈의 지난 표를 읽고, 다 만든 표로 바꾼다. 그래서 글롭 대상이 바뀌면 지난번에 펼친 이름이 남지 않는다.
 pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_crates: &DepCrates) {
+    fill_imports_from(tree, None, path, items, dep_crates);
+}
+
+/// [`fill_imports`]의 본체 — `frozen`이 있으면 명시 `use`와 글롭 대상 경로를 그 트리(앞서 수렴한 임포트 표)로
+/// 해석하고, 글롭이 펼치는 이름만 `tree`의 지금 표에서 읽는다([`fill_imports_settled`]의 깨끗한 바퀴).
+fn fill_imports_from(
+    tree: &mut ModTree,
+    frozen: Option<&ModTree>,
+    path: &str,
+    items: &[&syn::Item],
+    dep_crates: &DepCrates,
+) {
+    let resolver: &ModTree = frozen.unwrap_or(tree);
     let derive_names = derive_macro_names(path, items);
     let mut uses: Vec<(Vec<String>, Option<String>, Scope)> = Vec::new();
     for item in items {
@@ -1451,7 +1464,7 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
             // `use super::harvest::*`가 그 fn을 대상으로 잡아 아무것도 들이지 않던 문제다.
             // 대상 경로가 `#[cfg]`로 갈린 대안 임포트를 지나면 대안마다 들인다(조건은 글롭의 것과 거쳐 온 임포트의
             // 것을 함께). 우선 순위가 낮은 대안부터 심어, 대상 하나를 고르는 해석의 대상이 칸의 첫 원소가 된다.
-            for full in tree
+            for full in resolver
                 .resolve_all(path, &clean, dep_crates, Some(Ns::Type))
                 .into_iter()
                 .rev()
@@ -1481,7 +1494,7 @@ pub fn fill_imports(tree: &mut ModTree, path: &str, items: &[&syn::Item], dep_cr
             .find(|s| s.starts_with("as "))
             .map(|s| s[3..].to_string())
             .unwrap_or_else(|| segs.last().unwrap().clone());
-        let targets = tree.resolve_use(path, &clean, dep_crates);
+        let targets = resolver.resolve_use(path, &clean, dep_crates);
         // 어디에도 묶이지 않는 `use`(std 경로 등)는 이름공간을 정하지 못한, 해석되지 않는 이름이다.
         let targets = if targets.is_empty() {
             PerNs::undetermined_only(vec![UseTarget {
@@ -1749,36 +1762,113 @@ fn merge_imports(imports: Vec<Import>) -> Vec<Import> {
 /// [`fill_imports_settled`]가 돌리는 해석 바퀴의 상한.
 pub const MAX_IMPORT_PASSES: usize = 32;
 
+/// [`fill_imports_settled`]가 깨끗한 표에서 다시 수렴시키는 횟수의 상한.
+const MAX_CLEAN_ROUNDS: usize = 4;
+
 /// 전 모듈의 `use`를 임포트 표가 더 바뀌지 않을 때까지 되풀이해 해석한다 — `modules`는 (모듈 경로,
 /// 그 모듈의 아이템). 재노출을 따라가는 해석([`ModTree::resolve`])은 다른 모듈의 임포트 표를 읽으므로,
 /// 한 바퀴로는 처리 순서상 뒤에 오는 모듈의 재노출(`pub use zz::Tr`이 거치는 `zz`의 `pub use`)을
 /// 못 본다. 바퀴는 [`MAX_IMPORT_PASSES`]까지 — 돌려주는 값은 마지막 바퀴에서도 임포트 표가 바뀐
 /// 모듈 수다(0이면 수렴). 호출자는 0이 아니면 limitation으로 센다.
+///
+/// 앞 바퀴의 해석이 나중에 거둬지면(다른 모듈의 글롭이 아직 펼쳐지지 않아 크레이트 루트로 넘어간 `pub use foo::bar`가
+/// 다음 바퀴에 제 대상을 찾으면) 거둔 대상이 서로를 글롭으로 들이는 모듈 사이를 돌며 수렴한 표에 남는다 — 대안
+/// 임포트를 남기는 표에서는 거짓 대안이 된다. 그런 일이 있었으면 수렴한 표를 얼려 두고, 빈 표에서 다시 수렴시킨다 —
+/// 명시 `use`와 글롭 대상은 언 표로 해석하고 글롭이 펼치는 이름만 새로 쌓으니, 근거 없이 서로만 받치던 대상은
+/// 다시 생기지 않는다. 다시 수렴한 표가 언 표와 같아질 때까지 [`MAX_CLEAN_ROUNDS`]번까지 되풀이한다.
 pub fn fill_imports_settled(
     tree: &mut ModTree,
     modules: &[(String, Vec<&syn::Item>)],
     dep_crates: &DepCrates,
 ) -> usize {
+    let (changed, mut retracted) = settle_imports(tree, None, modules, dep_crates);
+    if changed > 0 {
+        return changed;
+    }
+    let mut rounds = 0;
+    while retracted && rounds < MAX_CLEAN_ROUNDS {
+        rounds += 1;
+        let frozen = tree.clone();
+        for (path, _) in modules {
+            if let Some(module) = tree.modules.get_mut(path) {
+                module.imports.clear();
+                module.glob_targets.clear();
+            }
+        }
+        let (changed, _) = settle_imports(tree, Some(&frozen), modules, dep_crates);
+        if changed > 0 {
+            return changed;
+        }
+        retracted = modules.iter().any(|(path, _)| {
+            let tables = |t: &ModTree| {
+                t.modules
+                    .get(path)
+                    .map(|m| (m.imports.clone(), m.glob_targets.clone()))
+            };
+            tables(tree) != tables(&frozen)
+        });
+    }
+    if retracted {
+        // 깨끗한 바퀴로도 언 표와 같아지지 않았다 — 바뀐 모듈 수를 수렴하지 못한 것으로 센다.
+        return modules.len().max(1);
+    }
+    0
+}
+
+/// [`fill_imports_settled`]의 한 수렴 — 바퀴를 [`MAX_IMPORT_PASSES`]까지 돌려 (마지막 바퀴에서 표가 바뀐 모듈 수,
+/// 어느 바퀴에서든 모듈 표가 앞 바퀴의 해석된 대상을 거뒀는가)를 돌려준다. `frozen`은 [`fill_imports_from`]과 같다.
+fn settle_imports(
+    tree: &mut ModTree,
+    frozen: Option<&ModTree>,
+    modules: &[(String, Vec<&syn::Item>)],
+    dep_crates: &DepCrates,
+) -> (usize, bool) {
     let tables = |tree: &ModTree, path: &str| {
         tree.modules
             .get(path)
             .map(|m| (m.imports.clone(), m.glob_targets.clone()))
     };
     let mut changed = 0;
+    let mut retracted = false;
     for _ in 0..MAX_IMPORT_PASSES {
         changed = 0;
         for (path, items) in modules {
             let before = tables(tree, path);
-            fill_imports(tree, path, items, dep_crates);
-            if tables(tree, path) != before {
+            fill_imports_from(tree, frozen, path, items, dep_crates);
+            let after = tables(tree, path);
+            if after != before {
                 changed += 1;
+                retracted |= matches!((&before, &after), (Some(b), Some(a)) if retracts(b, a));
             }
         }
         if changed == 0 {
             break;
         }
     }
-    changed
+    (changed, retracted)
+}
+
+/// 모듈 하나의 임포트 표와 글롭 대상 — [`settle_imports`]가 바퀴 사이에 비교한다.
+type Tables = (
+    BTreeMap<String, PerNs<Binding>>,
+    BTreeMap<String, Option<String>>,
+);
+
+/// 모듈 표가 `before`에서 `after`로 바뀌며 해석된 대상을 거뒀는가 — 앞에 있던 (이름, 대상)이나 글롭 대상이 뒤에
+/// 없다. 해석되지 않던 이름이 해석되는 것은 거두는 것이 아니다.
+fn retracts(before: &Tables, after: &Tables) -> bool {
+    let targets = |bindings: &PerNs<Binding>| -> BTreeSet<String> {
+        bindings
+            .bound()
+            .flat_map(Binding::imports)
+            .map(|imp| imp.target.clone())
+            .collect()
+    };
+    let names_lost = before.0.iter().any(|(name, bindings)| {
+        let now = after.0.get(name).map(targets).unwrap_or_default();
+        !targets(bindings).is_subset(&now)
+    });
+    names_lost || before.1.keys().any(|target| !after.1.contains_key(target))
 }
 
 /// 두 `#[cfg]` 조건이 함께 성립해야 하는 조건 — 글롭 `use`의 조건과 그 글롭이 펼친 재노출의 조건.

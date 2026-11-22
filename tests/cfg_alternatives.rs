@@ -645,6 +645,52 @@ fn external_import_survives_a_later_unresolved_alternative() {
     assert!(unused.is_empty(), "{unused:?}");
 }
 
+/// 앞 바퀴의 해석이 뒤에 거둬진 대상(`z`의 `pub use foo::bar`가 첫 바퀴에 `z`의 글롭이 펼쳐지기 전이라 크레이트
+/// 루트 `foo::bar`로 읽힌 것)은 서로를 글롭으로 들이는 `x`·`y` 사이에 남지 않는다. 9a79ce5는 그 거짓 대상만,
+/// 187163b는 거짓 대상과 제 대상을 함께 이었다 — rustc는 루트의 `foo::bar`를 쓰이지 않는다고 경고한다.
+#[test]
+fn retracted_first_pass_target_does_not_survive_a_glob_cycle() {
+    let doc = harvest(
+        "stale",
+        "",
+        r#"
+mod x {
+    pub use crate::z::*;
+    #[allow(unused_imports)]
+    pub use crate::y::*;
+}
+mod y {
+    #[allow(unused_imports)]
+    pub use crate::x::*;
+}
+mod foo {
+    pub fn bar() {}
+}
+mod real {
+    pub mod foo {
+        pub fn bar() {}
+    }
+}
+mod z {
+    use crate::real::*;
+    pub use foo::bar;
+}
+fn main() {
+    x::bar();
+}
+"#,
+    );
+    assert_eq!(
+        edge_cfg(&doc, "stale::main", "stale::real::foo::bar", EdgeKind::Call),
+        Some(None)
+    );
+    assert_eq!(
+        edge_cfg(&doc, "stale::main", "stale::foo::bar", EdgeKind::Call),
+        None
+    );
+    assert_eq!(dead_ids(&doc), ["stale::foo::bar"]);
+}
+
 /// 명시 `use T as _`는 글롭이 들인 `_`(`pub use AExt as _`를 다시 들인 것)를 가리지 않는다 — 이름을 묶지 않는다.
 #[test]
 fn explicit_underscore_import_keeps_a_glob_underscore_import() {
