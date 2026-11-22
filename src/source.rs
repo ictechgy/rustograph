@@ -1214,6 +1214,12 @@ fn harvest(
         edges.extend(identities.edges(harvest::decl_edges(&decl_refs, &tree, &dep_crates), false));
     }
 
+    let impossible = drop_impossible_edges(&mut edges, &vertices, &tree);
+    if impossible > 0 {
+        limitations.push(format!(
+            "{impossible} edges were left out because their #[cfg] conditions contradict each other or those of their source item and its modules (for example `unix` and `not (unix)`); they exist in no build"
+        ));
+    }
     push_limitations(&harvest, &mut limitations);
 
     // 보존 루트 — 존재하는 정점만 루트가 된다.
@@ -1883,6 +1889,55 @@ fn harvest_module<'a>(
     }
 }
 
+/// 조건이 서로 모순인 간선(어느 빌드에도 없는 것)을 지우고 그 수를 돌려준다 — 간선 자신의 조건, 출발 정점의 조건,
+/// 출발 정점이 있는 모듈과 그 조상 모듈의 `mod` 조건을 함께 본다([`modtree::cfg_contradicts`] — 글자로 보이는 `P`와
+/// `not (P)`만). 대안 임포트를 거친 간선은 그 임포트의 조건을 싣는데, 쓰는 자리가 반대 조건 아래 있으면
+/// (`#[cfg(unix)] fn run() { sys() }`가 `#[cfg(not(unix))] use crate::plat::sys;`를 거침, tokio의 `#[cfg(all(test, loom))]
+/// mod mocked` 안에서 `not(all(test, loom))` 쪽 대안으로 가는 `uses`) 그런 간선이 생겨 거짓 순환을 만들었다. contains
+/// 간선은 구조라 그대로 둔다.
+fn drop_impossible_edges(edges: &mut Vec<Edge>, vertices: &[Vertex], tree: &ModTree) -> usize {
+    let by_id: BTreeMap<&str, &Vertex> = vertices.iter().map(|v| (v.id.as_str(), v)).collect();
+    let mut chains: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let before = edges.len();
+    edges.retain(|e| {
+        if e.kind == EdgeKind::Contains {
+            return true;
+        }
+        let Some(cfg) = e.cfg.as_deref() else {
+            return true;
+        };
+        let source = by_id.get(e.from.as_str());
+        let module = match source {
+            Some(v) if tree.modules.contains_key(&v.id) => v.id.as_str(),
+            Some(v) => v.module.as_str(),
+            None => e.from.as_str(),
+        };
+        let chain = chains
+            .entry(module.to_string())
+            .or_insert_with(|| module_cfg_chain(tree, module));
+        let own = source.and_then(|v| v.cfg.as_deref());
+        !modtree::cfg_contradicts(
+            std::iter::once(cfg)
+                .chain(own)
+                .chain(chain.iter().map(String::as_str)),
+        )
+    });
+    before - edges.len()
+}
+
+/// 모듈 `module`과 그 조상 모듈의 `mod` 선언에 단 `#[cfg]` 조건.
+fn module_cfg_chain(tree: &ModTree, module: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = Some(module.to_string());
+    while let Some(path) = cur {
+        if let Some(cfg) = tree.modules.get(&path).and_then(|m| m.cfg.clone()) {
+            out.push(cfg);
+        }
+        cur = modtree::parent_of(&path);
+    }
+    out
+}
+
 /// 임포트 표를 수렴시키며 남은 실측([`modtree::fill_imports_settled`])을 limitation으로 싣는다 — 다시 수렴시켜도
 /// 거둔 대상을 다 지우지 못한 모듈과, 2015 판이라 거둔 대상을 지우지 않은 크레이트.
 fn push_import_settling(tree: &ModTree, limitations: &mut Vec<String>) {
@@ -2076,6 +2131,7 @@ fn push_sem_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::cargo_meta::Metadata;
     use crate::graph::{document, Level};
 

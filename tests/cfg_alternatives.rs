@@ -1368,3 +1368,337 @@ fn main() {
         doc.limitations
     );
 }
+
+/// `#[cfg(unix)] fn sys` 옆 글롭 이름은 `#[cfg(not(unix))] use crate::b::sys;`가 있으면 아이템이 없는 빌드에서도 가려진다
+/// — 어느 빌드에도 보이지 않으니 대안이 아니다. d480194는 `m::run → a::sys`(`not (unix)`)를 이어 거짓 순환
+/// `a::sys → m::run`을 냈고(`--target` windows에서도) `a::sys`를 dead로 내지 못했다(rustc 리눅스·windows 모두 `a::sys`
+/// 미사용). 글롭과 아이템이 같은 조건이면(`#[cfg(feature = "x")]` 둘) 글롭이 보이는 빌드에는 늘 아이템이 있어 역시
+/// 대안이 아니다.
+#[test]
+fn glob_hidden_in_every_build_is_not_an_alternative() {
+    let doc = harvest(
+        "hidden",
+        "x = []",
+        r#"
+mod a {
+    pub(crate) fn sys() -> u32 {
+        #[cfg(windows)]
+        return crate::m::run();
+        #[cfg(not(windows))]
+        0
+    }
+}
+mod b {
+    pub(crate) fn sys() -> u32 {
+        2
+    }
+}
+mod m {
+    #[allow(unused_imports)]
+    use crate::a::*;
+    #[cfg(not(unix))]
+    use crate::b::sys;
+    #[cfg(unix)]
+    fn sys() -> u32 {
+        1
+    }
+    pub fn run() -> u32 {
+        sys()
+    }
+}
+mod plat {
+    pub(crate) fn sys() -> u32 {
+        #[cfg(feature = "x")]
+        return crate::n::run();
+        #[cfg(not(feature = "x"))]
+        0
+    }
+}
+mod n {
+    #[cfg(feature = "x")]
+    #[allow(unused_imports)]
+    use crate::plat::*;
+    #[cfg(feature = "x")]
+    fn sys() -> u32 {
+        1
+    }
+    #[cfg(feature = "x")]
+    pub fn run() -> u32 {
+        sys()
+    }
+}
+fn main() {
+    let _ = m::run();
+    #[cfg(feature = "x")]
+    let _ = n::run();
+    let _ = plat::sys();
+}
+"#,
+    );
+    for (from, to) in [
+        ("hidden::m::run", "hidden::a::sys"),
+        ("hidden::n::run", "hidden::plat::sys"),
+    ] {
+        assert!(
+            !doc.edges.iter().any(|e| e.from == from && e.to == to),
+            "{from} -> {to}"
+        );
+    }
+    assert_eq!(
+        edge_cfg(&doc, "hidden::m::run", "hidden::b::sys", EdgeKind::Call),
+        under("not (unix)")
+    );
+    assert!(analysis::cycles(&doc).cycles.is_empty());
+    assert_eq!(dead_ids(&doc), ["hidden::a::sys"]);
+    assert_eq!(
+        dead_ids(&for_target(&doc, WINDOWS).without_tests()),
+        ["hidden::a::sys"]
+    );
+}
+
+/// 대안의 조건과 그것을 쓰는 자리의 조건이 서로 모순이면(`#[cfg(not(unix))] use crate::plat::sys;`를 거친 간선이
+/// `#[cfg(unix)] fn run`에 있음 — 명시 `use` 둘이든 글롭이든) 그 간선은 어느 빌드에도 없다 — 지우고 그 수를
+/// limitation으로 싣는다. 187163b·d480194는 그 간선으로 거짓 순환 `m::run → plat::sys`를 냈다(rustc 리눅스는 `run`을
+/// 쓰이지 않는다고 경고한다).
+#[test]
+fn edges_whose_cfg_contradicts_their_use_site_are_dropped() {
+    let doc = harvest(
+        "contra",
+        "",
+        r#"
+mod a {
+    pub(crate) fn sys() -> u32 {
+        1
+    }
+}
+mod plat {
+    pub(crate) fn sys() -> u32 {
+        #[cfg(unix)]
+        return crate::m::run() + crate::g::run();
+        #[cfg(not(unix))]
+        0
+    }
+}
+mod m {
+    #[cfg(not(unix))]
+    use crate::plat::sys;
+    #[cfg(unix)]
+    use crate::a::sys;
+    #[cfg(unix)]
+    pub fn run() -> u32 {
+        sys()
+    }
+    pub fn other() -> u32 {
+        sys()
+    }
+}
+mod g {
+    #[allow(unused_imports)]
+    use crate::plat::*;
+    #[cfg(unix)]
+    fn sys() -> u32 {
+        1
+    }
+    #[cfg(unix)]
+    pub fn run() -> u32 {
+        sys()
+    }
+    pub fn other() -> u32 {
+        sys()
+    }
+}
+fn main() {
+    let _ = m::other() + g::other();
+}
+"#,
+    );
+    for from in ["contra::m::run", "contra::g::run"] {
+        assert!(
+            !doc.edges
+                .iter()
+                .any(|e| e.from == from && e.to == "contra::plat::sys"),
+            "{from}"
+        );
+    }
+    assert_eq!(
+        edge_cfg(
+            &doc,
+            "contra::m::other",
+            "contra::plat::sys",
+            EdgeKind::Call
+        ),
+        under("not (unix)")
+    );
+    assert!(analysis::cycles(&doc).cycles.is_empty());
+    assert!(
+        doc.limitations
+            .iter()
+            .any(|l| l
+                .starts_with("2 edges were left out because their #[cfg] conditions contradict")),
+        "{:?}",
+        doc.limitations
+    );
+}
+
+/// 모순은 출발 아이템이 있는 모듈과 그 조상 모듈의 `mod` 조건과도 본다 — tokio `loom`처럼 `#[cfg(all(test, feature =
+/// "x"))] mod mocked` 안에서 `crate::loom::sync::Mutex`가 `not(all(test, feature = "x"))` 쪽 대안으로 가는 간선은 그 모듈이
+/// 있는 빌드에 없다.
+#[test]
+fn edges_contradicting_an_ancestor_module_cfg_are_dropped() {
+    let doc = harvest(
+        "loomlike",
+        "x = []",
+        r#"
+mod loom {
+    #[cfg(not(all(test, feature = "x")))]
+    mod imp {
+        pub mod sync {
+            pub struct Mutex;
+        }
+    }
+    #[cfg(not(all(test, feature = "x")))]
+    pub use self::imp::*;
+    #[cfg(all(test, feature = "x"))]
+    mod mocked {
+        pub mod sync {
+            pub struct Mutex;
+        }
+        pub fn make() -> crate::loom::sync::Mutex {
+            crate::loom::sync::Mutex
+        }
+    }
+    #[cfg(all(test, feature = "x"))]
+    pub use self::mocked::*;
+}
+fn main() {
+    let _ = loom::sync::Mutex;
+}
+"#,
+    );
+    let make = "loomlike::loom::mocked::make";
+    assert!(!doc
+        .edges
+        .iter()
+        .any(|e| e.from == make && e.to == "loomlike::loom::imp::sync::Mutex"));
+    assert!(doc
+        .edges
+        .iter()
+        .any(|e| e.from == make && e.to == "loomlike::loom::mocked::sync::Mutex"));
+}
+
+/// 글롭의 조건이 명시 `use`의 조건을 함축할 때만 가린다 — 반대(`#[cfg(feature = "x")] use a::*;` 옆
+/// `#[cfg(all(feature = "x", feature = "y"))] use b::f;`)는 `x`만 켠 빌드에서 글롭의 `a::f`가 쓰인다(rustc `--features x`).
+#[test]
+fn glob_with_a_weaker_cfg_than_the_explicit_use_stays() {
+    let doc = harvest(
+        "weaker",
+        "x = []\ny = []",
+        r#"
+mod a {
+    pub fn f() -> u32 {
+        1
+    }
+}
+mod b {
+    pub fn f() -> u32 {
+        2
+    }
+}
+#[cfg(feature = "x")]
+#[allow(unused_imports)]
+use a::*;
+#[cfg(all(feature = "x", feature = "y"))]
+use b::f;
+fn main() {
+    #[cfg(feature = "x")]
+    let _ = f();
+}
+"#,
+    );
+    assert_eq!(
+        edge_cfg(&doc, "weaker::main", "weaker::a::f", EdgeKind::Call),
+        under("feature = \"x\"")
+    );
+    assert!(dead_ids(&doc).is_empty(), "{:?}", dead_ids(&doc));
+}
+
+/// 글롭의 대상이 스스로 조건부면(`#[cfg(any(test, kani))] mod tests` 옆 `use crate::*`가 들인 루트의 `#[cfg(test)] mod
+/// tests`) 대안으로 두지 않는다 — `m::run`의 `tests::helper()`는 `m::tests::helper`뿐이고, rustc `--tests`처럼 루트의
+/// `tests::helper`는 쓰이지 않는다.
+#[test]
+fn gated_glob_target_is_not_an_alternative() {
+    let manifest = "[package]\nname='kani'\nversion='0.1.0'\nedition='2021'\n[workspace]\n[lints.rust]\nunexpected_cfgs = 'allow'\n";
+    let main = r#"
+#[cfg(test)]
+pub(crate) mod tests {
+    pub(crate) fn helper() -> u32 {
+        0
+    }
+}
+pub mod m {
+    #[allow(unused_imports)]
+    use crate::*;
+    #[cfg(any(test, kani))]
+    pub(crate) mod tests {
+        pub(crate) fn helper() -> u32 {
+            1
+        }
+    }
+    #[cfg(any(test, kani))]
+    pub fn run() -> u32 {
+        tests::helper()
+    }
+}
+fn main() {
+    #[cfg(any(test, kani))]
+    let _ = m::run();
+}
+"#;
+    let doc = harvest_files("kani", &[("Cargo.toml", manifest), ("src/main.rs", main)]);
+    assert!(!doc
+        .edges
+        .iter()
+        .any(|e| e.from == "kani::m::run" && e.to == "kani::tests::helper"));
+    assert!(dead_ids(&doc).contains(&"kani::tests::helper".to_string()));
+}
+
+/// 조건부 글롭 대상을 대안으로 두지 않는 규칙은 쓰는 자리가 다른 조건(`#[cfg(kani)]`) 아래 있어도 지킨다 — `kani`만 켠
+/// 빌드에는 루트의 `#[cfg(test)] mod tests`가 없으니 `m::run`의 `tests::helper()`는 `m::tests::helper`뿐이다. 그 간선의
+/// 조건(`kani`와 `not (any (test , kani))`)은 글자로는 모순이 아니라 간선 거르기가 잡지 못한다. rustc `--tests`는 루트
+/// `tests::helper`를 쓰이지 않는다고 경고한다.
+#[test]
+fn gated_glob_target_stays_out_under_a_different_use_site_cfg() {
+    let manifest = "[package]\nname='kani2'\nversion='0.1.0'\nedition='2021'\n[workspace]\n[lints.rust]\nunexpected_cfgs = 'allow'\n";
+    let main = r#"
+#[cfg(test)]
+pub(crate) mod tests {
+    pub(crate) fn helper() -> u32 {
+        0
+    }
+}
+pub mod m {
+    #[allow(unused_imports)]
+    use crate::*;
+    #[cfg(any(test, kani))]
+    pub(crate) mod tests {
+        pub(crate) fn helper() -> u32 {
+            1
+        }
+    }
+    #[cfg(kani)]
+    pub fn run() -> u32 {
+        tests::helper()
+    }
+}
+fn main() {
+    #[cfg(kani)]
+    let _ = m::run();
+}
+"#;
+    let doc = harvest_files("kani2", &[("Cargo.toml", manifest), ("src/main.rs", main)]);
+    assert!(!doc
+        .edges
+        .iter()
+        .any(|e| e.from == "kani2::m::run" && e.to == "kani2::tests::helper"));
+    assert!(dead_ids(&doc).contains(&"kani2::tests::helper".to_string()));
+}

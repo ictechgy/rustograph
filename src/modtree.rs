@@ -1583,7 +1583,7 @@ fn fill_imports_from(
             .get_or_insert(Binding::Resolved(import));
     }
     let local_alternatives = match tree.modules.get(path) {
-        Some(module) => local_alternatives(tree, module, path, &explicit, &globbed),
+        Some(module) => local_alternatives(tree, module, path, &explicit, &conditions, &globbed),
         None => BTreeMap::new(),
     };
     let mut imports = globbed;
@@ -1717,9 +1717,36 @@ fn gated_vertex(tree: &ModTree, target: &str) -> bool {
     })
 }
 
+/// 조건들이 함께 성립할 수 없음이 글자로 보이는가 — 어떤 조건 `not (Q)`의 Q를 맨 위 `all(..)`로 펼친 조건이 모두
+/// 다른 조건들 가운데 있다(`unix`와 `not (unix)`, `test`·`loom`과 `not (all (test , loom))`). 공백은 무시한다. 그 밖의
+/// 모순(`unix`와 `windows`, `any`의 부정)은 보지 않는다 — 이것으로 지우는 간선은 어느 빌드에도 없는 것뿐이다.
+pub fn cfg_contradicts<'a>(conditions: impl IntoIterator<Item = &'a str>) -> bool {
+    let squash = |c: &str| {
+        c.chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>()
+    };
+    let mut all = BTreeSet::new();
+    for condition in conditions {
+        push_conjuncts(&squash(condition), &mut all);
+    }
+    all.iter().any(|conjunct| {
+        let Some(inner) = call_arguments(conjunct, "not") else {
+            return false;
+        };
+        let mut need = BTreeSet::new();
+        push_conjuncts(inner, &mut need);
+        !need.is_empty() && need.is_subset(&all)
+    })
+}
+
 /// 모듈 `path`(=`module`)에서 `#[cfg]`를 단 로컬 아이템([`Module::cfg_gated`])이 없는 빌드의 대안 임포트를 고른다
 /// ([`Module::local_alternatives`]) — 같은 이름공간의 명시 `use`(`explicit`)는 늘, 글롭 이름(`globbed`)은 아이템의
-/// 선언이 하나이고 글롭의 대상이 스스로 `#[cfg]`를 달지 않았을 때만 그 조건의 부정을 달고 대안이다. 대상이 조건부면
+/// 선언이 하나이고 글롭의 대상이 스스로 `#[cfg]`를 달지 않았을 때만 그 조건의 부정을 달고 대안이다. 그 글롭이 보이는
+/// 빌드에 늘 아이템이 있거나(글롭의 조건이 아이템의 조건을 함축 — 같은 `#[cfg(feature = "x")]`), 아이템이 없는
+/// 빌드에서 같은 칸의 명시 `use`(자기 조건은 `conditions_of`)가 그 글롭을 가리면(`#[cfg(not(unix))] use crate::b::sys;`
+/// 옆 `#[cfg(unix)] fn sys`) 그 글롭은 대안이 아니다 — 어느 빌드에서도 보이지 않는 이름으로 가는 거짓 간선이 된다.
+/// 대상이 조건부면
 /// (`#[cfg(any(test, kani))] mod tests` 옆 `use crate::*`가 들인 루트의 `#[cfg(test)] mod tests`) 그 조건이 부정과
 /// 겹치는지 알 수 없어 대안으로 두지 않는다(거짓 간선이 될 수 있다).
 fn local_alternatives(
@@ -1727,6 +1754,7 @@ fn local_alternatives(
     module: &Module,
     path: &str,
     explicit: &BTreeMap<String, PerNs<Binding>>,
+    conditions_of: &BTreeMap<String, PerNs<Vec<Option<String>>>>,
     globbed: &BTreeMap<String, PerNs<Binding>>,
 ) -> BTreeMap<String, PerNs<Binding>> {
     let mut out: BTreeMap<String, PerNs<Binding>> = BTreeMap::new();
@@ -1742,14 +1770,28 @@ fn local_alternatives(
                 globbed.get(name).and_then(|bindings| bindings.get(*ns)),
             ) {
                 let absent = Some(format!("not ({condition})"));
+                // 같은 칸의 명시 `use`들의 자기 조건 — 조건 없는 것이 있으면(`None`) 글롭은 늘 가려진다.
+                let own: Option<Vec<&str>> = conditions_of
+                    .get(name)
+                    .and_then(|own| own.get(*ns))
+                    .map_or(Some(Vec::new()), |own| {
+                        own.iter().map(Option::as_deref).collect()
+                    });
                 let imports: Vec<Import> = glob
                     .imports()
                     .iter()
                     .filter(|imp| imp.target != format!("{path}::{name}"))
                     .filter(|imp| !gated_vertex(tree, &imp.target))
+                    // 글롭의 조건이 아이템의 조건을 함축하면 글롭이 보이는 빌드에는 늘 아이템도 있다.
+                    .filter(|imp| !implies(&imp.cfg, condition))
                     .map(|imp| Import {
                         cfg: with_import_cfg(&imp.cfg, &absent),
                         ..imp.clone()
+                    })
+                    // 아이템이 없는 빌드에서도 같은 칸의 명시 `use`가 그 글롭을 가리면 대안이 아니다.
+                    .filter(|imp| {
+                        own.as_ref()
+                            .is_some_and(|own| !own.iter().any(|c| implies(&imp.cfg, c)))
                     })
                     .collect();
                 if let Some(glob) = Binding::of_imports(imports) {
@@ -2091,7 +2133,12 @@ fn push_conjuncts(cfg: &str, out: &mut BTreeSet<String>) {
 
 /// `all(..)`·`all (..)`이면 괄호 안 — 여는 괄호의 짝이 마지막 글자일 때만이다.
 fn all_arguments(cfg: &str) -> Option<&str> {
-    let inner = cfg.strip_prefix("all")?.trim_start().strip_prefix('(')?;
+    call_arguments(cfg, "all")
+}
+
+/// `name(..)`·`name (..)`이면 괄호 안 — 여는 괄호의 짝이 마지막 글자일 때만이다.
+fn call_arguments<'a>(cfg: &'a str, name: &str) -> Option<&'a str> {
+    let inner = cfg.strip_prefix(name)?.trim_start().strip_prefix('(')?;
     let mut depth = 1usize;
     let mut quoted = false;
     let mut escaped = false;
@@ -2671,6 +2718,76 @@ mod tests {
                 cfg: None,
                 scope: Scope::Within("c".to_string()),
             })
+        );
+    }
+
+    /// `(모듈 경로, 소스)`로 트리를 만들고 아이템 표를 채운다 — 자식 관계는 경로로 잇는다. 돌려주는 파일은 임포트
+    /// 해석의 입력이다.
+    fn tree_from(modules: &[(&str, &str)]) -> (ModTree, Vec<(String, syn::File)>) {
+        let mut t = ModTree::default();
+        let mut files = Vec::new();
+        for (path, src) in modules {
+            t.modules.insert(
+                path.to_string(),
+                Module::new(PathBuf::from(format!("{path}.rs")), true, true),
+            );
+            if let Some((parent, name)) = path.rsplit_once("::") {
+                t.modules
+                    .get_mut(parent)
+                    .expect("parents come first")
+                    .children
+                    .insert(name.to_string(), path.to_string());
+            }
+            files.push((
+                path.to_string(),
+                syn::parse_str::<syn::File>(src).expect("valid items"),
+            ));
+        }
+        for (path, file) in &files {
+            let items: Vec<&syn::Item> = file.items.iter().collect();
+            fill_items(&mut t, path, &items);
+        }
+        (t, files)
+    }
+
+    /// `#[cfg]` 로컬 아이템 옆 글롭 이름이 어느 빌드에서도 보이지 않으면 표에 대안으로 두지 않는다 — 글롭의 조건이
+    /// 아이템의 조건을 함축하거나(같은 `#[cfg(feature = "x")]`), 글롭 대상이 스스로 조건부다(`#[cfg(test)] mod tests`).
+    /// 조건 없는 글롭과 조건 없는 대상이면 부정 조건을 달고 대안이다.
+    #[test]
+    fn glob_alternatives_skip_globs_that_are_never_visible() {
+        let alternatives = |m_src: &str| {
+            let (mut t, files) = tree_from(&[
+                ("c", "mod plat {} #[cfg(test)] mod tests {} mod m {}"),
+                ("c::plat", "pub fn sys() {}"),
+                ("c::tests", "pub fn helper() {}"),
+                ("c::m", m_src),
+            ]);
+            let uses: Vec<(String, Vec<&syn::Item>)> = files
+                .iter()
+                .map(|(path, file)| (path.clone(), file.items.iter().collect()))
+                .collect();
+            fill_imports_settled(&mut t, &uses, &DepCrates::new());
+            let m = &t.modules["c::m"];
+            m.local_alternatives
+                .values()
+                .flat_map(|b| {
+                    b.bound()
+                        .flat_map(Binding::imports)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .map(|imp| (imp.target, imp.cfg))
+                .collect::<Vec<_>>()
+        };
+        let same_gate =
+            "#[cfg(feature = \"x\")] use crate::plat::*; #[cfg(feature = \"x\")] fn sys() {}";
+        assert_eq!(alternatives(same_gate), []);
+        let gated_target = "use crate::*; #[cfg(any(test, kani))] mod tests {}";
+        assert_eq!(alternatives(gated_target), []);
+        let open = "use crate::plat::*; #[cfg(unix)] fn sys() {}";
+        assert_eq!(
+            alternatives(open),
+            [("c::plat::sys".to_string(), Some("not (unix)".to_string()))]
         );
     }
 
