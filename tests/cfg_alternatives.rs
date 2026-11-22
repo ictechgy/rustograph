@@ -739,3 +739,109 @@ fn main() {
         );
     }
 }
+
+/// 필드 타입과 값으로 넘긴 연관 함수(`let open = Handle::open;`)도 대안마다 간선이고 그 임포트의 조건을 싣는다.
+#[test]
+fn field_types_and_associated_fns_as_values_follow_each_alternative() {
+    let doc = harvest(
+        "fieldalt",
+        "",
+        r#"
+mod unix_impl {
+    pub struct Handle;
+    impl Handle {
+        pub fn open() -> Handle {
+            Handle
+        }
+    }
+}
+mod win_impl {
+    pub struct Handle;
+    impl Handle {
+        pub fn open() -> Handle {
+            Handle
+        }
+    }
+}
+#[cfg(unix)]
+use crate::unix_impl::Handle;
+#[cfg(windows)]
+use crate::win_impl::Handle;
+pub struct Holder {
+    pub handle: Handle,
+}
+fn main() {
+    let open = Handle::open;
+    let _ = Holder { handle: open() };
+}
+"#,
+    );
+    for (platform, cfg) in [("unix", "unix"), ("win", "windows")] {
+        assert_eq!(
+            edge_cfg(
+                &doc,
+                "fieldalt::Holder",
+                &format!("fieldalt::{platform}_impl::Handle"),
+                EdgeKind::References
+            ),
+            under(cfg)
+        );
+        assert_eq!(
+            edge_cfg(
+                &doc,
+                "fieldalt::main",
+                &format!("fieldalt::{platform}_impl::Handle::open"),
+                EdgeKind::References
+            ),
+            under(cfg)
+        );
+    }
+}
+
+/// 속성(derive 인자) 경로도 대안마다 간선이고 그 임포트의 조건을 싣는다 — `#[cfg(unix)] use pma as dm;`와
+/// `#[cfg(not(unix))] use pmb as dm;` 옆의 `#[derive(dm::Hello)]`.
+#[test]
+fn attribute_paths_follow_each_alternative() {
+    let pm = |name: &str| {
+        format!(
+            "extern crate proc_macro;\nuse proc_macro::TokenStream;\n#[proc_macro_derive(Hello)]\n\
+             pub fn hello_{name}(_i: TokenStream) -> TokenStream {{\n    TokenStream::new()\n}}\n"
+        )
+    };
+    let manifest = |name: &str| {
+        format!(
+            "[package]\nname='{name}'\nversion='0.1.0'\nedition='2021'\n[lib]\nproc-macro=true\n"
+        )
+    };
+    let (pma, pmb, pma_toml, pmb_toml) = (pm("pma"), pm("pmb"), manifest("pma"), manifest("pmb"));
+    let doc = harvest_files(
+        "attralt",
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers=['app','pma','pmb']\nresolver='2'\n",
+            ),
+            ("pma/Cargo.toml", &pma_toml),
+            ("pma/src/lib.rs", &pma),
+            ("pmb/Cargo.toml", &pmb_toml),
+            ("pmb/src/lib.rs", &pmb),
+            (
+                "app/Cargo.toml",
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n\
+                 [dependencies]\npma={path='../pma'}\npmb={path='../pmb'}\n",
+            ),
+            (
+                "app/src/lib.rs",
+                "#[cfg(unix)]\nuse pma as dm;\n#[cfg(not(unix))]\nuse pmb as dm;\n\n#[derive(dm::Hello)]\npub struct S;\n",
+            ),
+        ],
+    );
+    assert_eq!(
+        edge_cfg(&doc, "app::S", "pma::hello_pma", EdgeKind::References),
+        under("unix")
+    );
+    assert_eq!(
+        edge_cfg(&doc, "app::S", "pmb::hello_pmb", EdgeKind::References),
+        under("not (unix)")
+    );
+}
