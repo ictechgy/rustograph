@@ -211,7 +211,15 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
   derived `T::default()`) also gets a `references` edge to the type itself,
   as a non-call path (`E::W`, `.map(T::new)`) does: rustc counts the path as
   a use of the type, so a struct or enum used only that way is not
-  unreachable. A module prefix (`m::generated()`) gets no such edge.
+  unreachable. The prefix links only when it names a type item (struct,
+  enum, union, trait, type alias): when nothing is bound in the type
+  namespace, resolution falls back to other namespaces, and a local
+  `fn process` beside `use std::process;` is not what `process::exit()`
+  names, nor is `fn u32` what `u32::MAX` names. A module prefix
+  (`m::generated()`) gets no type edge and no same-name method candidates,
+  and a `mod gone;` whose file is missing is never a target. Such calls count
+  as unresolved paths; a call whose prefix is a type does not, like a
+  non-call path.
 - A `macro_rules!` definition gets tentative `references` edges to the
   multi-segment paths in its body (`$crate::m::f`); a macro call whose
   arguments are not a comma-separated expression list (`json!({..})`) gets
@@ -231,9 +239,12 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
   out of `cycles` and `rules`.
 - Items inside a function body (a nested `fn`, a local `impl` or
   `macro_rules!`) have no vertex; their edges belong to the enclosing body.
-  The same holds inside a `const _: () = { .. };` block, so what an `impl`
-  nested there uses stays reachable through that retention root even where
-  rustc would report it unused (rustc treats a nested impl as its own item).
+  The same holds inside a `const _: () = { .. };` block: what an item nested
+  there (`fn`, `struct`, `impl`) uses stays reachable through that retention
+  root even where rustc reports the nested item unused, because rustc treats
+  it as its own item. The edges stay on the constant because the initializer
+  may call a nested `const fn`, which rustc counts as used; `limitations`
+  counts the `const _` roots that contain nested items.
 - An impl whose self type is not a workspace vertex (`impl Tr for String`,
   blanket `impl<T: Tr> Ext for T`, `impl Tr for &Local`) has no method
   vertices. The firm edges of its method bodies belong to the module that
@@ -244,7 +255,9 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
   to the trait, so callers of the trait method reach the body. Every method
   the trait declares gets that `references` edge, including default methods
   the impl does not override (`impl T1 for u8 {}` with `1u8.t1()`), because
-  rustc counts a trait as used when one of its items is. A trait path that
+  rustc counts a trait as used when one of its items is. An override that
+  carries its own `#[cfg]` leaves the default method's edge in place, since
+  the default is used where that condition is false. A trait path that
   goes through `#[cfg]`-split imports gets this for each alternative trait,
   under that import's condition, as `implements` edges do. A module is a
   retention root only under `--retain-public` (a `pub mod`); then the

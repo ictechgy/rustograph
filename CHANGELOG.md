@@ -137,22 +137,33 @@
 - 타입 경로를 거친 호출(`T::new()`, 튜플 배리언트 `E::V(1)`, derive가 만든 `T::default()`)이 타입 자체로도
   references 간선을 단다 — 호출이 아닌 경로(`E::W`, `.map(T::new)`)는 이미 그랬다. 이전에는 메서드에만 잇거나
   (배리언트·derive 연관 함수는 메서드 정점이 없어) 아무 간선도 없어서 그렇게만 쓰는 struct·enum이 `dead`에
-  unreachable로 나왔다(rustc는 그 경로를 타입의 사용으로 보고 경고하지 않는다). 앞부분이 모듈이면(매크로가 만든
-  `m::generated()`) 잇지 않고 미해석 계수는 그대로다. 실제 참조라 type·module 레벨 `cycles`가 그 간선을 쓴다 —
-  반례 말뭉치 17개에서 순환 수는 그대로이고 ra_ap_hir_ty의 type 레벨 큰 강연결 요소가 5개 커졌다.
+  unreachable로 나왔다(rustc는 그 경로를 타입의 사용으로 보고 경고하지 않는다). 앞부분은 타입 아이템일 때만 잇는다 —
+  타입 이름공간에 묶인 것이 없으면 해석이 다른 이름공간으로 넘어가, `use std::process;` 옆 로컬 `fn process`의
+  `process::exit()`·`let f = process::exit;`나 원시 타입 경로 `u32::MAX` 옆 `fn u32`가 그 fn으로 확정 간선을 냈다
+  (값 경로는 이 릴리스 전부터 — rustc가 경고하는 fn이 `dead`에서 빠졌고, 같은 이름 재노출 옆 `env::var(..)`는 거짓
+  심볼 순환이 됐다). 앞부분이 모듈이면(매크로가 만든 `m::generated()`) 타입 간선도 `m` 안 같은 이름 메서드 후보도
+  잇지 않고, 파일이 없는 `mod gone;`(지운 파일)은 대상이 아니다 — 그 유령 경로로 가는 간선이 생겼었다. 그런 호출은
+  "path references could not be resolved"로 세고, 앞부분이 타입인 호출(`E::V(1)`, `D::default()`)은 호출이 아닌
+  경로처럼 세지 않는다. 실제 참조라 type·module 레벨 `cycles`가 그 간선을 쓴다 — 반례 말뭉치 17개에서 순환 수는
+  그대로이고 ra_ap_hir_ty의 type 레벨 큰 강연결 요소가 5개 커졌다.
 - 이름 없는 상수(`const _: () = assert!(..);`)가 보존 루트다 — 컴파일러가 늘 평가하고 rustc는 그것도 그 초기식이
   쓰는 아이템도 미사용으로 경고하지 않는다. 이전에는 정적 단언과 그 안에서만 쓰는 const fn·상수가 `dead`에
   나왔다(zerocopy·rustix·ra_ap_hir_def·ra_ap_hir_ty에서 루트가 된 `const _` 72개, rustix `I64_MAX_STR_LEN`, zerocopy
   `pointer::is_zeroed` — 모두 rustc 경고 없음). 테스트 빌드에만 있는 것(자기나 조상 모듈의 `#[cfg]`가 test 없이
   거짓)은 `#[test]` 함수처럼 `--tests`일 때만 루트다. 그런 루트만 있는 lib은 `--retain-public` 안내 limitation에서
-  여전히 루트 없는 크레이트로 센다. 블록 안에 중첩한 `impl`의 간선은 함수 안 아이템처럼 그 상수가 소유해, rustc가
-  중첩 impl만 따로 미사용으로 보는 경우에도 닿은 것으로 남는다.
+  여전히 루트 없는 크레이트로 센다. 블록 안에 중첩한 아이템(`fn`·`struct`·`impl`)의 간선은 함수 안 아이템처럼 그
+  상수가 소유해, rustc가 중첩 아이템만 따로 미사용으로 보는 경우에도 닿은 것으로 남는다 — 초기식이 부르는 중첩
+  `const fn`은 rustc도 쓰인 것으로 보니 간선을 떼지 않고, 그런 `const _` 루트 수를 "N `const _` retention roots contain
+  nested items ..." limitation으로 싣는다.
 - self 타입이 워크스페이스 밖인 impl(`impl Tr for String`)이 구현한 워크스페이스 트레이트의 선언 메서드는 impl이
   재정의하지 않은 기본 메서드까지 트레이트로 references 간선을 갖는다 — `impl T1 for u8 {}` 옆 `1u8.t1()`이 기본
-  메서드에만 닿아 `T1`이 unreachable이었다(rustc는 쓰인 트레이트 아이템의 트레이트를 쓰인 것으로 본다). 트레이트
+  메서드에만 닿아 `T1`이 unreachable이었다(rustc는 쓰인 트레이트 아이템의 트레이트를 쓰인 것으로 본다). 재정의가 자기
+  `#[cfg]`만 달면(`#[cfg(unix)] fn m`) 기본 메서드 간선도 둔다 — 그 조건이 거짓인 빌드에서는 기본 구현이 쓰인다(이전에는
+  `--target` windows가 쓰이는 트레이트를 냈다). 트레이트
   경로가 `#[cfg]`로 갈린 대안 임포트를 지나면 대안 트레이트마다 대신 소유 본문(추정 간선)과 그 간선을 두고 임포트의
   조건을 싣는다 — 이전에는 대상 하나만 이어 기본 `dead`와 `--target` 리눅스가 리눅스에서 쓰이는 트레이트를 냈다.
-  확정 간선은 impl 모듈이 한 번만 소유한다. 라이브러리 API에 `graph::Vertex::is_anonymous_const`가 더해졌다.
+  확정 간선은 impl 모듈이 한 번만 소유한다. 라이브러리 API에 `graph::Vertex::is_anonymous_const`와
+  `modtree::ModTree::unloaded_mods`(파일을 찾지 못한 `mod` 선언 경로)가 더해졌다.
 - 문서: README·README.ko 그래프 모델이 두 데이터 타입 사이의 필드 간선을 심볼 레벨 `cycles`는 빼고 type·module
   레벨은 세는 근거를 나란히 적는다 — 심볼 레벨은 어느 코드가 재귀하는지, type·module 레벨은 그 단위를 계층으로
   나눌 수 있는지를 묻는다.

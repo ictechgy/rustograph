@@ -73,11 +73,24 @@ can have more vertices and edges than before:
   under `--tests`, like a `#[test]` function. A crate whose only roots are such
   constants still counts as a crate with no retention root for the
   `--retain-public` limitation. The graph document's `roots` lists these
-  constants (source-instance IDs when a module has several).
+  constants (source-instance IDs when a module has several). Items nested in
+  such a block (`const _: () = { fn f() { .. } };`) have no vertex, so their
+  edges belong to the constant, as items inside a function body belong to the
+  function; `limitations` counts the `const _` roots that contain nested
+  items, because what those items use stays reachable even where rustc
+  reports the nested item unused.
 - A call through a type path (`T::new()`, a tuple variant `E::V(1)`, a derived
   `T::default()`) adds a `references` edge to that type, as a non-call path
   (`E::W`) already did. A struct or enum used only through such calls is no
-  longer reported by `dead` (rustc counts the path as a use). These are real
+  longer reported by `dead` (rustc counts the path as a use). The prefix of a
+  call or a non-call path now links only when it names a type item, a module
+  that has a vertex, or an external crate: a local `fn process` beside
+  `use std::process;` no longer receives an edge from `process::exit` (a
+  non-call path did that before this release too), `u32::MAX` no longer
+  points at a local `fn u32`, a module prefix no longer picks same-name
+  methods of the module's types, and a `mod gone;` whose file is missing is
+  never a target. Those paths count as unresolved; a call whose prefix is a
+  type does not. These are real
   references, so type- and module-level `cycles` see them: over the corpus
   below no cycle count changed, and one type-level strongly connected component
   of ra_ap_hir_ty grew by five members.
@@ -88,7 +101,8 @@ can have more vertices and edges than before:
   import's condition). Before, a trait implemented only for foreign types and
   used only through a default method was reported unreachable, and so was the
   alternative trait of the other build (`--target` Linux reported the Unix
-  trait).
+  trait). An override with its own `#[cfg]` keeps the default method's edge,
+  since the default is used where the condition is false.
 - A module's imports keep the type, value and macro namespaces apart, as rustc
   does. A glob import brings in a name in every namespace it has in the target
   module, and an explicit `use` or a local item shadows a glob only in its own
@@ -252,6 +266,9 @@ alike. Add the new fields, or end such patterns with `..`.
 - `harvest::BodyItem` derives `Clone` (additive).
 - `graph::Vertex::is_anonymous_const` is new (additive): whether a vertex is
   a `const _` item, which the source harvest keeps as a retention root.
+- `modtree::ModTree` adds `unloaded_mods`, the module paths of `mod x;`
+  declarations whose file was not found (they have no vertex). Build trees
+  with `ModTree::default()`; a struct literal must add the field.
 - `deps::UnusedDep::kind_label` is new: the text form of `kind`, with cargo's
   empty normal-dependency kind written as `normal`. JSON keeps `kind` as cargo
   reports it.
