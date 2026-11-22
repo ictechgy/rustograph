@@ -7,36 +7,50 @@
 
 use rustograph::cfgeval::Facts;
 use rustograph::graph::{Document, EdgeKind};
-use rustograph::{analysis, source};
+use rustograph::{analysis, deps, source};
 
 const LINUX: &str = "x86_64-unknown-linux-gnu";
 const WINDOWS: &str = "x86_64-pc-windows-msvc";
 
 /// 임시 디렉터리의 단일 패키지 워크스페이스(`[features]`는 `features`)를 심볼 레벨로 수확하고 지운다.
 fn harvest(tag: &str, features: &str, main: &str) -> Document {
+    let manifest = format!(
+        "[package]\nname='{tag}'\nversion='0.1.0'\nedition='2021'\n[features]\n{features}\n[workspace]\n"
+    );
+    harvest_files(tag, &[("Cargo.toml", &manifest), ("src/main.rs", main)])
+}
+
+/// 임시 디렉터리에 `files`(상대 경로, 내용)를 쓴 워크스페이스를 심볼 레벨로 수확하고 지운다.
+fn harvest_files(tag: &str, files: &[(&str, &str)]) -> Document {
+    load_files(tag, files, |root| {
+        source::load(
+            root,
+            &source::Options {
+                symbol_level: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    })
+}
+
+/// 임시 디렉터리에 `files`를 쓰고 `run`을 그 경로로 부른 뒤 지운다.
+fn load_files<T>(tag: &str, files: &[(&str, &str)], run: impl FnOnce(&std::path::Path) -> T) -> T {
     let root = std::env::temp_dir().join(format!(
         "rustograph-cfg-alternatives-{tag}-{}",
         std::process::id()
     ));
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(
-        root.join("Cargo.toml"),
-        format!(
-            "[package]\nname='{tag}'\nversion='0.1.0'\nedition='2021'\n\
-             [features]\n{features}\n[workspace]\n"
-        ),
-    )
-    .unwrap();
-    std::fs::write(root.join("src/main.rs"), main).unwrap();
-    let document = source::load(
-        &root,
-        &source::Options {
-            symbol_level: true,
-            ..Default::default()
-        },
-    );
+    if root.exists() {
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    for (path, text) in files {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let out = run(&root);
     std::fs::remove_dir_all(&root).unwrap();
-    document.unwrap()
+    out
 }
 
 /// `from → to` `kind` 간선의 조건 — 간선이 없으면 `None`, 조건 없는 간선이면 `Some(None)`이다.
@@ -397,6 +411,224 @@ fn main() {
     for tr in ["under::ext::AExt", "under::ext::BExt"] {
         assert_eq!(
             edge_cfg(&doc, "under::user", tr, EdgeKind::Uses),
+            Some(None),
+            "{tr}"
+        );
+    }
+}
+
+/// 조건 없는 글롭 옆의 `#[cfg]` 명시 `use`는 글롭을 가리지 않는다 — 그 조건이 아닌 빌드에서는 글롭의 이름이
+/// 보인다. `use a::*;` 옆 `#[cfg(test)] use a::f;`의 `f()`는 같은 대상이라 조건 없는 간선이고, 재노출을 거쳐도
+/// 같다. 이전 브랜치 머리(187163b)에서는 명시 `use`가 글롭 칸을 바꿔 그 간선이 `cfg(test)`를 달아,
+/// `--exclude-tests`와 `--target`이 테스트가 아닌 빌드에서 쓰이는 `a::f`를 unreachable로 냈다(rustc는 경고 없음).
+#[test]
+fn cfg_explicit_use_does_not_hide_an_unconditional_glob() {
+    let doc = harvest(
+        "glob_and_gated",
+        "",
+        r#"
+mod a {
+    pub fn f() {}
+    pub fn g() {}
+}
+mod util {
+    pub fn h() {}
+}
+mod re {
+    pub use crate::util::*;
+    #[cfg(test)]
+    pub use crate::util::h;
+}
+use a::*;
+#[cfg(test)]
+use a::f;
+fn main() {
+    f();
+    g();
+    re::h();
+}
+"#,
+    );
+    let main = "glob_and_gated::main";
+    assert_eq!(
+        edge_cfg(&doc, main, "glob_and_gated::a::f", EdgeKind::Call),
+        Some(None)
+    );
+    assert_eq!(
+        edge_cfg(&doc, main, "glob_and_gated::util::h", EdgeKind::Call),
+        Some(None)
+    );
+    for filtered in [doc.without_tests(), for_target(&doc, LINUX)] {
+        assert!(dead_ids(&filtered).is_empty(), "{:?}", dead_ids(&filtered));
+    }
+}
+
+/// 다른 대상이면 둘 다 남는다 — `use real::*;` 옆 `#[cfg(test)] use mock::Clock;`의 `Clock::now()`는 테스트 빌드의
+/// `mock`과 그 밖의 빌드의 `real`을 부른다. 예전에는(9a79ce5·187163b 모두) 명시 `use`가 글롭을 늘 가려, 테스트가
+/// 아닌 빌드에서 쓰이는 `real::Clock`·`real::Clock::now`가 기본 `dead`에 나왔다.
+#[test]
+fn cfg_explicit_use_beside_a_glob_of_another_target_is_an_alternative() {
+    let doc = harvest(
+        "mockclock",
+        "",
+        r#"
+mod real {
+    pub struct Clock;
+    impl Clock {
+        pub fn now() -> u32 {
+            1
+        }
+    }
+}
+#[cfg(test)]
+mod mock {
+    pub struct Clock;
+    impl Clock {
+        pub fn now() -> u32 {
+            2
+        }
+    }
+}
+use real::*;
+#[cfg(test)]
+use mock::Clock;
+fn main() {
+    let _ = Clock::now();
+}
+"#,
+    );
+    let main = "mockclock::main";
+    assert_eq!(
+        edge_cfg(&doc, main, "mockclock::mock::Clock::now", EdgeKind::Call),
+        under("test")
+    );
+    assert_eq!(
+        edge_cfg(&doc, main, "mockclock::real::Clock::now", EdgeKind::Call),
+        Some(None)
+    );
+    assert!(!dead_ids(&doc).contains(&"mockclock::real::Clock::now".to_string()));
+    assert!(!dead_ids(&doc.without_tests()).contains(&"mockclock::real::Clock::now".to_string()));
+}
+
+/// 모든 선언이 `#[cfg]`를 단 로컬 아이템 옆의 같은 이름공간 임포트는 그 아이템이 없는 빌드의 대안이다 —
+/// `#[cfg(feature = "x")] fn sum()` 옆 `#[cfg(not(feature = "x"))] use scalar::sum;`의 `sum()`은 두 정점을 부른다.
+/// 예전에는 로컬 아이템이 늘 이겨, 기본 빌드에서 쓰이는 `scalar::sum`이 `dead`에 나왔다.
+#[test]
+fn gated_local_item_and_same_namespace_import_are_alternatives() {
+    let doc = harvest(
+        "gatedlocal",
+        "x = []",
+        r#"
+mod scalar {
+    pub fn sum() -> u32 {
+        1
+    }
+}
+#[cfg(feature = "x")]
+fn sum() -> u32 {
+    2
+}
+#[cfg(not(feature = "x"))]
+use scalar::sum;
+fn main() {
+    let _ = sum();
+}
+"#,
+    );
+    let main = "gatedlocal::main";
+    assert_eq!(
+        edge_cfg(&doc, main, "gatedlocal::sum", EdgeKind::Call),
+        Some(None)
+    );
+    assert_eq!(
+        edge_cfg(&doc, main, "gatedlocal::scalar::sum", EdgeKind::Call),
+        under("not (feature = \"x\")")
+    );
+    assert!(dead_ids(&doc).is_empty(), "{:?}", dead_ids(&doc));
+}
+
+/// 해석되는 `use`와 해석되지 않는 `use`(std 경로)가 같은 칸을 다투면 소스 순서와 무관하게 해석되는 쪽이 남는다 —
+/// `#[cfg(feature = "pl")] use extdep::Mutex;` 뒤에 `#[cfg(not(..))] use std::sync::Mutex;`가 와도 `extdep`을 쓰는
+/// 증거가 남는다. 예전에는(9a79ce5·187163b 모두) 뒤의 std `use`가 이겨 `deps`가 `extdep`을 unused로 냈다.
+#[test]
+fn external_import_survives_a_later_unresolved_alternative() {
+    let unused = load_files(
+        "extalt",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname='extalt'\nversion='0.1.0'\nedition='2021'\n[features]\npl = []\n\
+                 [dependencies]\nextdep = { path = 'extdep' }\n[workspace]\nexclude = ['extdep']\n",
+            ),
+            (
+                "src/main.rs",
+                "#[cfg(feature = \"pl\")]\nuse extdep::Mutex;\n#[cfg(not(feature = \"pl\"))]\nuse std::sync::Mutex;\n\
+                 fn main() {\n    let _m = Mutex::new(());\n}\n",
+            ),
+            (
+                "extdep/Cargo.toml",
+                "[package]\nname='extdep'\nversion='0.1.0'\nedition='2021'\n",
+            ),
+            (
+                "extdep/src/lib.rs",
+                "pub struct Mutex<T>(pub T);\nimpl<T> Mutex<T> {\n    pub fn new(t: T) -> Self {\n        Mutex(t)\n    }\n}\n",
+            ),
+        ],
+        |root| {
+            deps::report(root)
+                .unwrap()
+                .unused
+                .iter()
+                .map(|u| format!("{} -> {}", u.package, u.dep))
+                .collect::<Vec<_>>()
+        },
+    );
+    assert!(unused.is_empty(), "{unused:?}");
+}
+
+/// 명시 `use T as _`는 글롭이 들인 `_`(`pub use AExt as _`를 다시 들인 것)를 가리지 않는다 — 이름을 묶지 않는다.
+#[test]
+fn explicit_underscore_import_keeps_a_glob_underscore_import() {
+    let doc = harvest(
+        "globunder",
+        "",
+        r#"
+mod ext {
+    pub trait AExt {
+        fn a(&self) -> u8;
+    }
+    impl AExt for u8 {
+        fn a(&self) -> u8 {
+            *self
+        }
+    }
+    pub trait BExt {
+        fn b(&self) -> u8;
+    }
+    impl BExt for u8 {
+        fn b(&self) -> u8 {
+            *self
+        }
+    }
+}
+mod prelude {
+    pub use crate::ext::AExt as _;
+}
+mod user {
+    use crate::ext::BExt as _;
+    use crate::prelude::*;
+    pub fn run() -> u8 {
+        1u8.a() + 2u8.b()
+    }
+}
+fn main() {
+    user::run();
+}
+"#,
+    );
+    for tr in ["globunder::ext::AExt", "globunder::ext::BExt"] {
+        assert_eq!(
+            edge_cfg(&doc, "globunder::user", tr, EdgeKind::Uses),
             Some(None),
             "{tr}"
         );
