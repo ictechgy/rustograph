@@ -215,11 +215,20 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
   enum, union, trait, type alias): when nothing is bound in the type
   namespace, resolution falls back to other namespaces, and a local
   `fn process` beside `use std::process;` is not what `process::exit()`
-  names, nor is `fn u32` what `u32::MAX` names. A module prefix
-  (`m::generated()`) gets no type edge and no same-name method candidates,
-  and a `mod gone;` whose file is missing is never a target. Such calls count
-  as unresolved paths; a call whose prefix is a type does not, like a
-  non-call path.
+  names, nor is `fn u32` what `u32::MAX` names. A module prefix, in a call
+  (`m::generated()`) or a non-call path (`let f = m::gen;`), gets no
+  same-name method candidates from the module's types, and a call also gets
+  no type edge. A `mod gone;` whose file is missing is never a target. Such
+  paths count as unresolved. A path whose prefix is a type is unresolved
+  when a workspace method of that name exists but none under that type was
+  linked (a trait's default method called through the type, `S::d()`, or a
+  call through a type alias, `A::new()`). It is resolved when it linked a
+  method, or when no workspace method has that name (a variant `E::V(1)`, a
+  derived `T::default()`). Type positions (`-> u8`, `x: u8`, `<u64>::max`)
+  still fall back to a same-named local `fn` when nothing is bound in the
+  type namespace: const generic arguments and array lengths (`[u8; N]`,
+  `Buf<N>`) parse as type paths but name consts, so that fallback stays
+  until the tree records which value items are functions.
 - A `macro_rules!` definition gets tentative `references` edges to the
   multi-segment paths in its body (`$crate::m::f`); a macro call whose
   arguments are not a comma-separated expression list (`json!({..})`) gets

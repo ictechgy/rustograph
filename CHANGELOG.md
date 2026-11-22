@@ -142,9 +142,11 @@
   `process::exit()`·`let f = process::exit;`나 원시 타입 경로 `u32::MAX` 옆 `fn u32`가 그 fn으로 확정 간선을 냈다
   (값 경로는 이 릴리스 전부터 — rustc가 경고하는 fn이 `dead`에서 빠졌고, 같은 이름 재노출 옆 `env::var(..)`는 거짓
   심볼 순환이 됐다). 앞부분이 모듈이면(매크로가 만든 `m::generated()`) 타입 간선도 `m` 안 같은 이름 메서드 후보도
-  잇지 않고, 파일이 없는 `mod gone;`(지운 파일)은 대상이 아니다 — 그 유령 경로로 가는 간선이 생겼었다. 그런 호출은
-  "path references could not be resolved"로 세고, 앞부분이 타입인 호출(`E::V(1)`, `D::default()`)은 호출이 아닌
-  경로처럼 세지 않는다. 실제 참조라 type·module 레벨 `cycles`가 그 간선을 쓴다 — 반례 말뭉치 17개에서 순환 수는
+  잇지 않고(호출이 아닌 `let f = m::gen;`도 `m` 안 타입의 같은 이름 메서드를 잇지 않는다 — 거짓 심볼 순환이 됐다), 파일이
+  없는 `mod gone;`(지운 파일)은 대상이 아니다 — 그 유령 경로로 가는 간선이 생겼었다. 그런 경로는 "path references could
+  not be resolved"로 센다. 앞부분이 타입인 경로는 그 타입의 같은 이름 메서드를 이었거나 그 이름의 워크스페이스 메서드가
+  없으면(`E::V(1)`, `D::default()`) 세지 않고, 같은 이름 메서드가 있는데 잇지 못하면(트레이트 기본 메서드를 타입으로 부른
+  `S::d()`, 타입 별칭을 거친 `A::new()` — `dead`가 그 메서드를 낼 수 있다) 센다. 실제 참조라 type·module 레벨 `cycles`가 그 간선을 쓴다 — 반례 말뭉치 17개에서 순환 수는
   그대로이고 ra_ap_hir_ty의 type 레벨 큰 강연결 요소가 5개 커졌다.
 - 이름 없는 상수(`const _: () = assert!(..);`)가 보존 루트다 — 컴파일러가 늘 평가하고 rustc는 그것도 그 초기식이
   쓰는 아이템도 미사용으로 경고하지 않는다. 이전에는 정적 단언과 그 안에서만 쓰는 const fn·상수가 `dead`에
@@ -164,6 +166,11 @@
   조건을 싣는다 — 이전에는 대상 하나만 이어 기본 `dead`와 `--target` 리눅스가 리눅스에서 쓰이는 트레이트를 냈다.
   확정 간선은 impl 모듈이 한 번만 소유한다. 라이브러리 API에 `graph::Vertex::is_anonymous_const`와
   `modtree::ModTree::unloaded_mods`(파일을 찾지 못한 `mod` 선언 경로)가 더해졌다.
+- 파일을 찾지 못해 싣지 않은 `mod` 선언(`#[cfg(windows)] mod imp;`처럼 `#[cfg]` 뒤의 것, 빌드 스크립트가 만드는 파일,
+  수확이 따르지 않는 `#[cfg_attr(unix, path = "..")]`)을 "N mod declarations were not loaded because their file was not
+  found ..." limitation으로 센다. 이전에는 셈 없이 조용했고, `#[cfg]`를 단 선언은 "modules behind #[cfg] were included
+  without feature evaluation"으로 실린 것처럼 셌다 — 그 셈은 이제 실은 모듈만이다. 그런 모듈로 가는 `uses` 간선(정점
+  없는 경로 — 반례 말뭉치에서는 rustix 1.1.5의 `rustix::backend`로 가는 90개)을 내지 않는다.
 - 문서: README·README.ko 그래프 모델이 두 데이터 타입 사이의 필드 간선을 심볼 레벨 `cycles`는 빼고 type·module
   레벨은 세는 근거를 나란히 적는다 — 심볼 레벨은 어느 코드가 재귀하는지, type·module 레벨은 그 단위를 계층으로
   나눌 수 있는지를 묻는다.

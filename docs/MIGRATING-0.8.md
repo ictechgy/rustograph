@@ -87,10 +87,13 @@ can have more vertices and edges than before:
   that has a vertex, or an external crate: a local `fn process` beside
   `use std::process;` no longer receives an edge from `process::exit` (a
   non-call path did that before this release too), `u32::MAX` no longer
-  points at a local `fn u32`, a module prefix no longer picks same-name
-  methods of the module's types, and a `mod gone;` whose file is missing is
-  never a target. Those paths count as unresolved; a call whose prefix is a
-  type does not. These are real
+  points at a local `fn u32`, a module prefix (in a call or a non-call path)
+  no longer picks same-name methods of the module's types, and a `mod gone;`
+  whose file is missing is never a target. Those paths count as unresolved.
+  A path whose prefix is a type counts as unresolved only when a workspace
+  method of that name exists and none under that type was linked
+  (`S::d()` for a trait's default method, `A::new()` through an alias);
+  variants and derived associated functions do not count. These are real
   references, so type- and module-level `cycles` see them: over the corpus
   below no cycle count changed, and one type-level strongly connected component
   of ra_ap_hir_ty grew by five members.
@@ -268,7 +271,11 @@ alike. Add the new fields, or end such patterns with `..`.
   a `const _` item, which the source harvest keeps as a retention root.
 - `modtree::ModTree` adds `unloaded_mods`, the module paths of `mod x;`
   declarations whose file was not found (they have no vertex). Build trees
-  with `ModTree::default()`; a struct literal must add the field.
+  with `ModTree::default()`; a struct literal must add the field. The source
+  harvest counts them in a new limitation ("N mod declarations were not
+  loaded because their file was not found ...") and emits no `uses` edge to
+  them; "modules behind #[cfg] were included" now counts only modules that
+  were loaded.
 - `deps::UnusedDep::kind_label` is new: the text form of `kind`, with cargo's
   empty normal-dependency kind written as `normal`. JSON keeps `kind` as cargo
   reports it.
