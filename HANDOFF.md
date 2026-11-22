@@ -9,13 +9,14 @@
   v0.6.0은 2026-10-25, v0.5.0은 2026-10-13에 발행됐다. v0.4.2는 태그 없이 v0.5.0으로 이어졌다.
 - 3차 브랜치(cfg 대안 임포트·임포트 조건 전파·매크로 자리)는 [PR #57](https://github.com/ictechgy/rustograph/pull/57)로
   `main`에 스쿼시 머지됐다(`54b4224`, 아래 그 날짜 절).
-- **브랜치 `ccr-37904670-hxdjsx`**(`origin/main` `54b4224` 위에서 다시 시작)에 아래 커밋이 있다. push·PR은 하지
-  않았다(코디네이터가 한다). 사용자 변화는 CHANGELOG `[Unreleased]`, 공개 Rust API 변화(더하기만)는
+- **브랜치 `ccr-37904670-hxdjsx`**(`origin/main` `54b4224` 위에서 다시 시작)에 아래 커밋이 있다. `ef2edb6`까지는
+  코디네이터가 [PR #58](https://github.com/ictechgy/rustograph/pull/58)로 push했고(CI 7개 성공), 독립 리뷰 반영
+  (`48bf761`부터)은 push하지 않았다. 사용자 변화는 CHANGELOG `[Unreleased]`, 공개 Rust API 변화(더하기만)는
   [0.8 migration](docs/MIGRATING-0.8.md)에 있다. 셋 다 보존을 넓히는 쪽(간선·루트를 더함)이다.
   - `b375d62` fix(harvest): 값 경로로 풀리지 않은 호출 `T::m()`·`E::V(1)`·`T::default()`가 앞부분 타입으로
     references 간선을 단다(`BodyVisitor::type_relative_call`). 이전에는 메서드에만 잇거나(배리언트·derive 연관 함수는
     메서드 정점이 없어) 아무것도 잇지 않았다 — 호출이 아닌 값 경로(`visit_expr_path`)는 이미 타입을 이었다. 앞부분이
-    워크스페이스 모듈이면 잇지 않고, 미해석 계수는 그대로다.
+    워크스페이스 모듈이면 잇지 않는다(앞부분 대상과 미해석 셈은 아래 리뷰 반영에서 다시 정했다).
   - `44a4816` fix(harvest): 이름 없는 상수 `const _`가 보존 루트다(`#[used]` static과 같은 `entry_roots`). 테스트 빌드에만
     있는 것(자기나 조상 모듈 `#[cfg]`가 test=false에서 거짓)은 `--tests`일 때만(`graph::test_only_anonymous_consts`).
     루트 없는 lib limitation은 이 루트를 세지 않는다(`graph::Vertex::is_anonymous_const` — 공개 API에 더함).
@@ -26,6 +27,34 @@
     넘긴다 — source가 두 정점이 남았는지 보고 간선을 둔다(유령 정점 금지). 공개 `harvest::impls`의 결과는 그대로다.
   - `bf8909a` docs: README·README.ko 그래프 모델과 보존 루트, AGENTS.md 수확 의미론, CHANGELOG, 0.8 migration.
   - 이 HANDOFF 커밋.
+- **독립 리뷰(PR #58, `ef2edb6` 대상 — push됨, CI 7개 성공) 반영** — 리뷰어 fixture(스크래치 `r4-review-rustograph/fx/`)를
+  `cargo check`로 다시 확인하고 main(`54b4224`)·`ef2edb6`·고친 뒤 바이너리로 대조했다.
+  - `48bf761` fix(harvest) — BLOCKER: 경로 앞부분이 함수로 넘어간 해석이면 잇지 않는다. 타입 이름공간에 묶인 것이 없으면
+    `resolve_in`이 다른 이름공간으로 넘어가 `use std::process;` 옆 로컬 `fn process`가 `process::exit(1)`의 앞부분이 됐다.
+    fx1(rustc 경고 `process`·`helper`·`fmt`): main 3건, ef2 0건(거짓 간선 `main → process`·`fmt`), 고친 뒤 3건. fx8(같은
+    이름 재노출 옆 `env::var(..)`, rustc 경고 없음): main 0 순환, ef2 `cycle: fx8::a::env -> fx8::b::get`(`--strict` 1),
+    고친 뒤 0. 값 경로 `let f = process::exit;`(fx12, rustc 경고 `process`)는 main부터 거짓이었다 — main·ef2 0건, 고친 뒤
+    `process`. 앞부분은 부모 모듈의 `type_items`(`type_item()`)·모듈·외부 크레이트일 때만 쓴다(`path_prefix_owners`, 호출과
+    값 경로 둘 다). 호출의 모듈 앞부분(`m::gen()`)은 메서드 후보도 잇지 않는다(main부터 `m::S::gen`으로 가던 거짓 call).
+    말뭉치에서 잃은 간선은 getrandom `util::truncate → u32`·`u64` 둘뿐이다 — `u32::MAX`·`u64::from(..)`(원시 타입)이
+    루트의 `fn u32`·`fn u64`로 가던 것(`→ u32`는 main부터). `t-modprefix`(rustc 경고 `u32`·`S`·`S::gen`)로 고정했다
+    (`2404184` test).
+  - `d35b31a` fix(harvest) — SHOULD-FIX 2: 재정의가 모두 자기 `#[cfg]`를 달면 기본 메서드의 트레이트 간선도 둔다. fx10
+    (`impl Tr for u8 { #[cfg(unix)] fn m }` + `1u8.m()`, windows `cargo check` 경고 없음): `--target` windows에서 main·ef2
+    `Tr`, 고친 뒤 0건.
+  - `d19779f` fix(source) — SHOULD-FIX 1: 중첩 아이템을 품은 `const _` 루트를 limitation으로 센다("N `const _` retention
+    roots contain nested items ..."). fx6(rustc 다섯 모두 경고): main 4건(상수 둘은 거짓), ef2·고친 뒤 0건 + limitation 2.
+    간선을 상수에서 떼지 않은 근거: `const _: () = { const fn check() -> bool { helper() } assert!(check()); };`는 rustc
+    경고가 없다(`t-nested`) — 떼면 `helper`가 거짓 dead다. 말뭉치에서 11개(ra_ap_hir_ty 7·zerocopy 3·rustix 1).
+  - `9740c02` fix(harvest) — 리뷰 밖에서 찾은 것: 파일 없는 `mod gone;`의 이름이 아이템 표에 있어 `crate::gone::f()`(ef2)·
+    `crate::gone::X`(main부터)가 정점 없는 경로로 references 간선을 냈다(유령 정점). change-impact 테스트(작업 트리에서
+    지운 `src/target.rs`)가 다음 커밋의 셈 변경으로 드러냈다. `ModTree::unloaded_mods`(공개 필드 추가)가 그 경로를 적고
+    앞부분 대상에서 뺀다.
+  - `1fba4db` fix(harvest) — nit: 타입으로 풀린 타입 경로 호출(`E::V(1)`, `D::default()`)은 값 경로 `E::W`처럼 미해석으로
+    세지 않는다. 말뭉치 합계 25,411 → 22,814(main·ef2는 같았다). 함수로 넘어간 앞부분·유령 경로·모듈 앞부분 호출은 센다.
+  - `e64e90a` docs: README·README.ko·AGENTS.md·CHANGELOG·0.8 migration, 그리고 이 HANDOFF 커밋.
+  - 별칭 우변(`type A = B; A::new()`가 `A`에만 닿음, fx4)은 기존 후속 후보 그대로다. fx2·fx3·fx9·fx11의 남은 거짓 dead
+    (`Gen::mk`, `Self::Assoc::new()`의 `U`, 함수 안 타입이 가리는 모듈 타입, 제네릭 연관 타입)는 main부터 같다.
 - **재현과 근거**(스크래치 fixture, 모두 `cargo check` 통과 — rustc 경고와 대조):
   - a1·t1: `imp::S::m()`·`imp::E::V(1)`·`Local::make()`·`imp::D::default()`. rustc 경고는 `Unused`와 배리언트 필드뿐인데
     main은 `S`·`E`·`D`·`Local`(·a1의 `U` — `Self::helper()`만 부르는 `U::other()`)을 unreachable로 냈다. 고친 뒤 `Unused`만(두 바이너리 모두 내는 아이템 위치 매크로 `gen::make`는 기존
@@ -60,6 +89,12 @@
     `#[cfg(unix)]`/`#[cfg(not(unix))]`로 두 번 선언한 트레이트(소스 인스턴스 ID라 간선이 붙지 않는다 — main·새것 모두
     dead, 기존 한계), `#[cfg]`로 갈린 재정의 메서드, 글롭 대안 `use crate::gu::*;`/`gw::*` 옆 `impl G2 for i64 {}`(리눅스
     `gw::G2`, windows `gu::G2` — rustc와 같음). 순환은 모든 레벨 0.
+- **리뷰 반영 뒤 반례 말뭉치**(같은 17개, `ef2edb6` 바이너리 대 마지막 바이너리): 정점 ID 같음, 잃은 간선 2(getrandom
+  `util::truncate → u32`·`u64` — 위 BLOCKER), 새 (from,to,kind,tentative) 간선 0, 새로 낸 dead 0·사라진 dead 0(여섯 변형
+  모두), 순환은 세 레벨 모두 그대로. limitation: 미해석 경로 합계 25,411 → 22,814(타입으로 풀린 호출), 중첩 아이템을 품은
+  `const _` 루트 11개를 새로 센다. main 대비 누적: 잃은 간선 1(getrandom `truncate → u32`, 원시 타입 `u32::MAX` — 거짓),
+  새 간선 3,898, 새 루트 72, 새로 낸 dead 0, 사라진 dead는 아래와 같다(기본 321·`--tests` 103·`--retain-public` 72·리눅스
+  72·windows 68), type 레벨 큰 강연결 요소 변화(아래) 말고 순환 그대로.
 - **반례 말뭉치**(3차와 같은 크레이트 17개: syn 2.0.119·tokio 1.53.1·regex-syntax 0.8.11·ra_ap_hir_def/hir_ty 0.0.349·rowan
   0.17.0·serde/serde_derive 1.0.229·clap_builder 4.6.7·zerocopy 0.8.50·rustix 1.1.5·mio 1.2.3·getrandom 0.3.4·
   parking_lot_core 0.9.12·crossbeam-utils 0.8.23·hashbrown 0.16.1·이 저장소 `54b4224` 사본. `origin/main` 바이너리와 이
@@ -83,10 +118,14 @@
     call 간선은 이미 지워지던 것)도 지운다.
   - 같은 크레이트에서 두 번 돌린 `graph`는 바이트 단위로 같았다(rustix·zerocopy).
 - **검증**(2026-11-22, 로컬 cargo 1.97, `CARGO_PROFILE_DEV_DEBUG=0`·`-j 2`, `CARGO_TARGET_DIR`는 스크래치): `cargo fmt --check`,
-  `cargo clippy --locked --all-targets -- -D warnings` 0, `cargo test --locked`(26개 실행 단위 584개 통과 — 새 통합 테스트 6개),
-  `scripts/coverage.sh` 94.84%(게이트 90%, 그 안의 테스트 실패 0), `scripts/verify-cli-contract.sh <바이너리>` OK, `rules
-  --strict` 0, `cycles --level symbol --strict` 0(type 23·module 2 — 변경 전과 같음), `scripts/verify-self-dead.sh <바이너리>`
-  0건 일치. 새 통합 테스트 6개는 `origin/main`의 `src/`로 돌리면 6개 모두 실패한다. 변이 10개(타입 간선
+  `cargo clippy --locked --all-targets -- -D warnings` 0, `cargo test --locked`(26개 실행 단위 590개 통과 — 이 브랜치의 새
+  통합 테스트 12개, 리뷰 반영 뒤 다시 잼), `scripts/coverage.sh` 94.84%(게이트 90%, 그 안의 테스트 실패 0), `scripts/verify-cli-
+  contract.sh <바이너리>` OK, `rules --strict` 0, `cycles --level symbol --strict` 0(type 23·module 2 — 변경 전과 같음),
+  `scripts/verify-self-dead.sh <바이너리>` 0건 일치. 리뷰 반영의 새 테스트 6개와 셈을 바꾼 1개는 `ef2edb6`의 `src/`로 돌리면
+  7개 모두 실패하고, 리뷰 반영 변이 9개(앞부분 거르기 빼기·값 경로만/호출만 거르지 않기·모듈 앞부분 메서드 후보 되살리기·
+  재정의가 하나라도 있으면 기본 메서드 빼기·중첩 아이템 limitation 끄기·중첩 아이템 없는 상수도 세기·파일 없는 mod 거르기
+  빼기·메서드에 닿았는지로 세기)를 모두 잡았다(호출만 거르지 않는 변이는 함수 앞부분에서는 `type_item` 거르기와 같은 동작이라
+  파일 없는 mod 테스트가 잡는다). 4차 첫 테스트 6개는 `origin/main`의 `src/`로 돌리면 6개 모두 실패한다. 변이 10개(타입 간선
   빼기·모듈에도 잇기·타입이 풀리면 미해석으로 안 세기, `const _` 루트 끄기·루트 있는 크레이트로 세기·테스트 전용도 늘 루트·
   테스트 전용은 절대 루트 아님, 첫 트레이트 대안만·대신 소유 본문의 임포트 조건 버리기·기본 메서드 간선 끄기)를 모두 해당
   테스트가 잡았다.
@@ -94,7 +133,7 @@
   쓰고 이 변경은 `graph`에 메서드·crate 안 함수를 더할 뿐 sem이 쓰는 것을 바꾸지 않는다. CI `semantic-lint`), MSRV 1.96
   check(로컬 툴체인 없음 — CI `msrv`. 새로 쓴 표준 API는 `BTreeSet::range`·`Option::is_some_and` 정도로 오래전 안정화),
   GLM 리뷰(`packet-ask` 없음).
-- **주의(작업 방식)**: 변이 검사용 스크래치 사본을 본 체크아웃과 같은 `CARGO_TARGET_DIR`로 빌드하면, cargo의 메타데이터
+- **주의(작업 방식)**: 변이 검사용 스크래치 사본은 대상 디렉터리를 따로 쓴다(리뷰 반영에서는 `target-mut`). 같은 `CARGO_TARGET_DIR`로 빌드하면, cargo의 메타데이터
   해시가 워크스페이스 기준 상대 경로라 둘이 같은 산출물을 나눠 쓴다 — 사본을 빌드한 뒤 본 체크아웃을 그대로 빌드하면
   사본의(변이된) 라이브러리를 신선하다고 보고 재사용한다. 이번에 한 번 그렇게 틀린 테스트 결과를 봤다. 사본 빌드 뒤에는 본
   체크아웃의 `src`·`tests`를 `touch`하거나 대상 디렉터리를 나눠라.
@@ -123,12 +162,10 @@
   순환은 말뭉치로 확인할 것).
 - **`use E::*`로 들인 배리언트**(`Red(1)`): 글롭이 enum 배리언트를 펼치지 않아 `Color`가 dead에 나온다(adv2, rustc 경고
   없음). 9a79ce5부터 같다.
-- **모듈 앞부분의 연관 호출 후보**: 값 경로로 풀리지 않은 `m::gen()`(매크로가 만든 함수)은 앞부분 모듈 `m`을 타입처럼
-  다뤄 `m::` 아래 아무 타입의 같은 이름 메서드(`m::S::gen`, 하위 모듈 포함)로 확정 call 간선을 단다 — 거짓 간선이다
-  (`type_relative_call`의 메서드 쪽, 이번 브랜치 전부터 같다). 좁히는 쪽이라 반례 말뭉치 근거가 필요하다.
-- **`const _` 블록 안 아이템**: 함수 안 아이템처럼 그 상수가 간선을 소유해, rustc가 중첩 impl만 따로 미사용으로 보는
-  경우(adv3의 `Wrapped`·`inside_impl`)에도 닿은 것으로 남는다. 블록 안 아이템 간선을 모듈이 소유하게 하면(밖 타입 impl
-  본문처럼) 정확해지지만 간선의 출발점이 바뀐다.
+- **`const _` 블록 안 아이템**: 함수 안 아이템처럼 그 상수가 간선을 소유해, rustc가 중첩 아이템만 따로 미사용으로 보는
+  경우(adv3의 `Wrapped`·`inside_impl`, 리뷰어 fx6)에도 닿은 것으로 남는다 — 이제 limitation으로 센다. 정확히 하려면 중첩
+  아이템에 정점을 주고 초기식이 그것을 부르는지 봐야 한다(간선만 모듈로 옮기면 초기식이 부르는 중첩 `const fn`이 쓰는 것이
+  거짓 dead가 된다). 함수 루트(`fn main` 안 아이템)도 같은 근사인데 세지 않는다.
 - **두 번 선언한 트레이트의 밖 타입 impl**: `#[cfg(unix)] trait Dup`/`#[cfg(not(unix))] trait Dup` 옆 `impl Dup for u8 {}`는
   선언이 소스 인스턴스 ID라 대신 소유·트레이트 간선이 붙지 않는다(adv4 — main부터 같다).
 
