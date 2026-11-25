@@ -450,6 +450,434 @@ fn make<T>() -> Outer<T> { unimplemented!() }
     );
 }
 
+/// 타입 별칭의 우변(`type A = B;`)은 별칭 정점에서 나가는 references 간선이다 — 별칭은 우변 타입의 다른
+/// 이름이라 `A { .. }`·`A::V(..)`·`x: A`는 우변 타입을 쓴다(rustc는 그렇게만 만드는 타입을 경고하지 않는다).
+/// 없으면 별칭으로만 만드는 타입이 unreachable이었다. 별칭의 제네릭 매개변수(`GA<T>`의 `T`)는 같은 이름의
+/// 모듈 아이템이 아니고, 쓰이지 않는 별칭의 우변은 여전히 닿지 않는다 — 이 fixture의 `cargo check` 경고는
+/// `T`·`Never`·`UnusedAlias` 셋이다.
+#[test]
+fn type_alias_right_hand_sides_are_references_from_the_alias() {
+    let ws = Workspace::new(
+        "aliases",
+        &[
+            ("Cargo.toml", &manifest("aliases")),
+            (
+                "src/main.rs",
+                r#"
+mod m {
+    pub enum Only { W(u8) }
+    pub type OnlyAlias = Only;
+    pub struct Lit { pub x: u8 }
+    pub type LitAlias = Lit;
+    pub struct C { pub v: u8 }
+    pub type B = C;
+    pub type A = B;
+    pub struct T;
+    pub struct G<X>(pub X);
+    pub type GA<T> = G<T>;
+    pub struct Q;
+    pub trait Tr { type Assoc; }
+    impl Tr for Q { type Assoc = u8; }
+    pub type Out = <Q as Tr>::Assoc;
+    pub struct Never;
+    pub type UnusedAlias = Never;
+}
+fn main() {
+    let m::Only::W(v) = m::OnlyAlias::W(2);
+    let b = m::LitAlias { x: 1 };
+    let c = m::A { v: 3 };
+    let g: m::GA<u8> = m::G(1);
+    let o: m::Out = 4;
+    let _ = (v, b.x, c.v, g.0, o);
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    for (from, to) in [
+        ("aliases::m::OnlyAlias", "aliases::m::Only"),
+        ("aliases::m::A", "aliases::m::B"),
+        ("aliases::m::B", "aliases::m::C"),
+        ("aliases::m::GA", "aliases::m::G"),
+        ("aliases::m::Out", "aliases::m::Q"),
+    ] {
+        assert!(
+            has_edge(&doc, from, to, EdgeKind::References),
+            "missing {from} -> {to}"
+        );
+    }
+    assert!(
+        !has_edge(
+            &doc,
+            "aliases::m::GA",
+            "aliases::m::T",
+            EdgeKind::References
+        ),
+        "the alias generic T must not resolve to the module struct T"
+    );
+    let report = analysis::dead(&doc).unwrap();
+    assert_not_reported(
+        &report,
+        &[
+            "aliases::m::Only",
+            "aliases::m::Lit",
+            "aliases::m::B",
+            "aliases::m::C",
+            "aliases::m::Q",
+        ],
+    );
+    assert_reported(
+        &report,
+        &[
+            "aliases::m::T",
+            "aliases::m::Never",
+            "aliases::m::UnusedAlias",
+        ],
+    );
+}
+
+/// const 제네릭 매개변수는 선언 타입의 표현식 자리(배열 길이 `[u8; N]`, `{ N }` 인자)에서 같은 이름의 모듈
+/// 아이템을 가린다 — 예전에는 필드 `[u8; N]`이 `struct N`·`const LEN`으로 거짓 references 간선을 달아 rustc가
+/// 경고하는 그 둘(`N` never constructed, `LEN` never used)이 살아 있었다. 표현식 안의 타입 자리
+/// (`size_of::<N>()`)는 타입 이름공간이라 그 모듈의 `struct N`을 쓴다 — rustc는 `k::N`을 경고하지 않는다
+/// (필드를 읽지 않는다는 경고뿐이다).
+#[test]
+fn const_generic_parameters_shadow_items_in_declaration_array_lengths() {
+    let ws = Workspace::new(
+        "constgen",
+        &[
+            ("Cargo.toml", &manifest("constgen")),
+            (
+                "src/main.rs",
+                r#"
+mod m {
+    pub struct N;
+    pub const LEN: usize = 2;
+    pub struct Buf<const N: usize> { pub a: [u8; N] }
+    pub struct Buf2<const LEN: usize> { pub a: [u8; LEN] }
+    pub struct Wrap<const N: usize> { pub b: Buf<{ N }> }
+    pub type Arr<const N: usize> = [u8; N];
+}
+mod k {
+    pub struct N(pub u32);
+    pub type Sized<const N: usize> = ([u8; core::mem::size_of::<N>()], [u8; N]);
+}
+fn main() {
+    let b2 = m::Buf2::<1> { a: [0] };
+    let w = m::Wrap::<1> { b: m::Buf { a: [0] } };
+    let a: m::Arr<1> = [0];
+    let s: k::Sized<1> = ([0; 4], [0]);
+    let _ = (b2.a, w.b.a, a, s);
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    for from in ["constgen::m::Buf", "constgen::m::Wrap", "constgen::m::Arr"] {
+        assert!(
+            !has_edge(&doc, from, "constgen::m::N", EdgeKind::References),
+            "the const parameter N of {from} resolved to the module struct N"
+        );
+    }
+    assert!(has_edge(
+        &doc,
+        "constgen::k::Sized",
+        "constgen::k::N",
+        EdgeKind::References
+    ));
+    let report = analysis::dead(&doc).unwrap();
+    assert_eq!(
+        unreachable_ids(&report),
+        ["constgen::m::LEN", "constgen::m::N"]
+    );
+}
+
+/// 함수·메서드 시그니처도 같은 규칙이다 — `fn f<const N: usize>(a: [u8; N])`, impl·트레이트의 const 매개변수를
+/// 쓰는 메서드 시그니처(`[u8; LEN]`)의 배열 길이는 그 매개변수라 모듈의 `struct N`·`const LEN`으로 signature 간선을
+/// 달지 않는다(이 fixture의 `cargo check` 경고는 `N`·`LEN`과 읽지 않는 필드뿐이다). 표현식 안의 타입 자리
+/// (`size_of::<M>()`)는 모듈의 `struct M`이다.
+#[test]
+fn const_generic_parameters_shadow_items_in_signature_array_lengths() {
+    let ws = Workspace::new(
+        "constsig",
+        &[
+            ("Cargo.toml", &manifest("constsig")),
+            (
+                "src/main.rs",
+                r#"
+mod m {
+    pub struct N;
+    pub const LEN: usize = 4;
+    pub fn f<const N: usize>(a: [u8; N]) -> usize { a.len() }
+    pub struct S<const LEN: usize>;
+    impl<const LEN: usize> S<LEN> {
+        pub fn g(&self, b: [u8; LEN]) -> [u8; LEN] { b }
+    }
+    pub trait Tr<const N: usize> { fn h(&self, c: [u8; N]) -> usize { c.len() } }
+    impl Tr<2> for S<2> {}
+}
+mod k {
+    pub struct M(pub u32);
+    pub fn sized<const M: usize>(a: [u8; core::mem::size_of::<M>()]) -> usize { a.len() }
+}
+fn main() {
+    use m::Tr;
+    let _ = m::f([0u8; 2]);
+    let _ = m::S::<3>.g([0; 3]);
+    let _ = m::S::<2>.h([0; 2]);
+    let _ = k::sized::<1>([0; 4]);
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    for (from, to) in [
+        ("constsig::m::f", "constsig::m::N"),
+        ("constsig::m::S::g", "constsig::m::LEN"),
+        ("constsig::m::Tr::h", "constsig::m::N"),
+    ] {
+        assert!(
+            !has_edge(&doc, from, to, EdgeKind::Signature),
+            "the const parameter in the signature of {from} resolved to {to}"
+        );
+    }
+    assert!(has_edge(
+        &doc,
+        "constsig::k::sized",
+        "constsig::k::M",
+        EdgeKind::Signature
+    ));
+    let report = analysis::dead(&doc).unwrap();
+    assert_eq!(
+        unreachable_ids(&report),
+        ["constsig::m::LEN", "constsig::m::N"]
+    );
+}
+
+/// 맨 제네릭 인자(`Buf<N>`)는 rustc가 타입 이름공간부터 찾고 없으면 값 이름공간을 본다 — 둘러싼 선언의 const
+/// 매개변수와 이름이 같으면 같은 이름의 타입이 있을 때만 그 타입이고, 없으면 그 매개변수다. 예전에는 타입
+/// 이름공간에 없으면 모듈의 `const N`으로 넘어가, 별칭 `type A<const N: usize> = Buf<N>`·필드·시그니처가 rustc가
+/// 경고하는 그 상수를 살려 두었다(이 fixture의 `cargo check` 경고는 `N`·`M` 둘이다). const 매개변수가 아닌 맨 인자
+/// (`Buf<SIZE>`)는 그대로 모듈의 상수이고, 같은 이름의 타입이 있으면(`Vec<N>` 옆 `struct N`) 그 타입이다.
+#[test]
+fn bare_const_arguments_named_like_a_const_parameter_are_the_parameter() {
+    let ws = Workspace::new(
+        "barearg",
+        &[
+            ("Cargo.toml", &manifest("barearg")),
+            (
+                "src/main.rs",
+                r#"
+const N: usize = 7;
+const M: usize = 8;
+const SIZE: usize = 2;
+struct Buf<const K: usize>;
+type A<const N: usize> = Buf<N>;
+struct F<const N: usize> { b: Buf<N> }
+fn sig<const M: usize>(b: Buf<M>) -> Buf<M> { b }
+type Sized = Buf<SIZE>;
+mod t {
+    pub struct N(pub u8);
+    pub type V<const N: usize> = Vec<N>;
+}
+fn main() {
+    let _a: A<3> = Buf;
+    let f = F::<2> { b: Buf };
+    let _s: Sized = Buf;
+    let v: t::V<1> = vec![t::N(1)];
+    let _ = (f.b, sig::<3>(Buf), v[0].0);
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    for (from, to, kind) in [
+        ("barearg::A", "barearg::N", EdgeKind::References),
+        ("barearg::F", "barearg::N", EdgeKind::References),
+        ("barearg::sig", "barearg::M", EdgeKind::Signature),
+    ] {
+        assert!(
+            !has_edge(&doc, from, to, kind),
+            "the const parameter argument of {from} resolved to {to}"
+        );
+    }
+    assert!(has_edge(
+        &doc,
+        "barearg::Sized",
+        "barearg::SIZE",
+        EdgeKind::References
+    ));
+    assert!(has_edge(
+        &doc,
+        "barearg::t::V",
+        "barearg::t::N",
+        EdgeKind::References
+    ));
+    let report = analysis::dead(&doc).unwrap();
+    assert_eq!(unreachable_ids(&report), ["barearg::M", "barearg::N"]);
+}
+
+/// 선언 타입의 표현식 자리(배열 길이)는 값 이름공간이 먼저다 — `use super::k::N;`(상수)과 `struct N`이 함께 있는
+/// 모듈의 `[u8; N]`은 그 상수다. 예전에는 타입 이름공간부터 찾아 별칭·필드·시그니처가 그 struct로 간선을 달고
+/// 상수에는 닿지 않았다 — rustc가 쓰인다고 보는 `k::N`·`k::Z`·`k::Q`가 거짓 dead였고, 별칭의 거짓 간선은 rustc가
+/// 경고하는 `m::N`까지 가렸다(이 fixture의 `cargo check` 경고는 struct `N`·`Z`·`Q` 셋이다).
+#[test]
+fn expression_positions_in_declaration_types_resolve_values_first() {
+    let ws = Workspace::new(
+        "exprns",
+        &[
+            ("Cargo.toml", &manifest("exprns")),
+            (
+                "src/main.rs",
+                r#"
+mod k {
+    pub const N: usize = 2;
+    pub const Z: usize = 3;
+    pub const Q: usize = 4;
+}
+mod m {
+    use super::k::N;
+    pub struct N { pub x: u8 }
+    pub type A = [u8; N];
+}
+mod f {
+    use super::k::Z;
+    pub struct Z { pub x: u8 }
+    pub struct F { pub a: [u8; Z] }
+}
+mod s {
+    use super::k::Q;
+    pub struct Q { pub x: u8 }
+    pub fn sig(a: [u8; Q]) -> usize { a.len() }
+}
+fn main() {
+    let a: m::A = [0; 2];
+    let f = f::F { a: [0; 3] };
+    let _ = (a, f.a, s::sig([0; 4]));
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    for (from, to, kind) in [
+        ("exprns::m::A", "exprns::k::N", EdgeKind::References),
+        ("exprns::f::F", "exprns::k::Z", EdgeKind::References),
+        ("exprns::s::sig", "exprns::k::Q", EdgeKind::Signature),
+    ] {
+        assert!(has_edge(&doc, from, to, kind), "missing {from} -> {to}");
+    }
+    assert!(!has_edge(
+        &doc,
+        "exprns::m::A",
+        "exprns::m::N",
+        EdgeKind::References
+    ));
+    let report = analysis::dead(&doc).unwrap();
+    assert_eq!(
+        unreachable_ids(&report),
+        ["exprns::f::Z", "exprns::m::N", "exprns::s::Q"]
+    );
+}
+
+/// 별칭 제네릭 매개변수의 bound·기본값과 where 절, const 매개변수 기본값도 그 별칭이 이름 붙이는 것이다 —
+/// `pub type Result<T, E = Error> = std::result::Result<T, E>;`의 `Error`는 흔한 형태다. rustc는 이 fixture에
+/// 아무것도 경고하지 않는데, 예전에는 그렇게만 쓰는 `Error`·`OnlyBound`·`OnlyDefault`·`DEF`·`OnlyWhere`가
+/// unreachable이었다.
+#[test]
+fn type_alias_generic_bounds_and_defaults_are_references() {
+    let ws = Workspace::new(
+        "aliasgen",
+        &[
+            ("Cargo.toml", &manifest("aliasgen")),
+            (
+                "src/main.rs",
+                r#"
+pub struct Error;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub trait OnlyBound {}
+pub struct OnlyDefault;
+pub const DEF: usize = 2;
+pub struct Buf<const K: usize>;
+#[allow(type_alias_bounds)]
+pub type Bounded<T: OnlyBound> = Vec<T>;
+pub type Defaulted<T = OnlyDefault> = Vec<T>;
+pub type ConstDefault<const N: usize = DEF> = Buf<N>;
+#[allow(type_alias_bounds)]
+pub type WhereBound<T> where T: OnlyWhere = Vec<T>;
+pub trait OnlyWhere {}
+fn f() -> Result<()> { Ok(()) }
+fn main() {
+    let b: Bounded<u8> = Vec::new();
+    let d: Defaulted = Vec::new();
+    let c: ConstDefault = Buf;
+    let w: WhereBound<u8> = Vec::new();
+    let _ = (f(), b, d, c, w);
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    for (from, to) in [
+        ("aliasgen::Result", "aliasgen::Error"),
+        ("aliasgen::Bounded", "aliasgen::OnlyBound"),
+        ("aliasgen::Defaulted", "aliasgen::OnlyDefault"),
+        ("aliasgen::ConstDefault", "aliasgen::DEF"),
+        ("aliasgen::WhereBound", "aliasgen::OnlyWhere"),
+    ] {
+        assert!(
+            has_edge(&doc, from, to, EdgeKind::References),
+            "missing {from} -> {to}"
+        );
+    }
+    let report = analysis::dead(&doc).unwrap();
+    assert!(report.findings.is_empty(), "{:?}", unreachable_ids(&report));
+}
+
+/// 의존 크레이트를 타입 별칭으로만 쓰는 크레이트(`pub type Mine = Option<dep::Shared>;`)는 그 의존을 쓴다 —
+/// 별칭 우변을 수확하지 않던 때는 `deps`가 `unused: app -> dep`을 냈다(`cargo check`는 그 의존 없이는
+/// 컴파일되지 않는다). 별칭이 가리키는 의존 크레이트의 타입도 그 별칭에서 닿는다.
+#[test]
+fn type_alias_is_a_use_of_its_dependency() {
+    let ws = Workspace::new(
+        "alias-dep",
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = ['dep', 'app']\nresolver = '2'\n",
+            ),
+            (
+                "dep/Cargo.toml",
+                "[package]\nname='dep'\nversion='0.1.0'\nedition='2021'\n",
+            ),
+            (
+                "dep/src/lib.rs",
+                "pub struct Thing;\npub struct Other;\npub type Shared = Thing;\n",
+            ),
+            (
+                "app/Cargo.toml",
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n\
+                 [dependencies]\ndep = { path = '../dep' }\n",
+            ),
+            (
+                "app/src/main.rs",
+                "mod types { pub type Mine = Option<dep::Shared>; }\n\
+                 fn main() { let x: types::Mine = None; let _ = x.is_none(); }\n",
+            ),
+        ],
+    );
+    let deps = deps::report(ws.path()).unwrap();
+    assert!(deps.unused.is_empty(), "{:?}", deps.unused);
+    let report = analysis::dead(&symbols(ws.path())).unwrap();
+    assert_not_reported(&report, &["dep::Shared", "dep::Thing"]);
+    assert_reported(&report, &["dep::Other"]);
+}
+
 /// 링커·런타임이 부르는 진입점 속성 — Rust 2024의 `#[unsafe(no_mangle)]`, `cfg_attr` 안쪽의
 /// `no_mangle`, `#[used]`·`#[no_mangle]`·`#[global_allocator]` static, impl 메서드의 `#[no_mangle]`.
 /// 예제·통합 테스트·벤치 타깃은 수확하지 않는다는 사실도 limitation으로 센다.

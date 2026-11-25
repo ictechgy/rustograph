@@ -137,3 +137,48 @@ fn recursive_data_types_across_modules_are_module_level_cycles() {
     let modules = doc.view(rustograph::graph::Level::Module).unwrap();
     assert_eq!(members(&modules), [["modrec::expr", "modrec::stmt"]]);
 }
+
+/// 별칭을 거친 재귀 데이터 정의(`type Link = Option<Box<Node>>;`·`struct Node { next: Link }`)도 심볼 레벨 순환이
+/// 아니다 — 별칭은 우변 타입의 다른 이름이라 필드끼리의 재귀와 같다. type 레벨에서는 서로를 필드로 담는 두 타입처럼
+/// 순환이고, 별칭이 다른 모듈의 타입을 가리키고 그 모듈이 별칭을 쓰면 module 레벨 순환이다(`a`의 `Res`가
+/// `b::Error`를, `b::g`가 `a::Res`를 쓴다).
+#[test]
+fn alias_recursion_is_not_a_symbol_level_cycle() {
+    let root = std::env::temp_dir().join(format!("rustograph-alias-rec-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='aliasrec'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/main.rs"),
+        "type Link = Option<Box<Node>>;\n\
+         struct Node { next: Link }\n\
+         mod a { pub type Res<T> = Result<T, crate::b::Error>; }\n\
+         mod b { pub struct Error; pub fn g() -> crate::a::Res<u8> { Err(Error) } }\n\
+         fn main() { let n = Node { next: None }; let _ = (n.next.is_none(), b::g().is_err()); }\n",
+    )
+    .unwrap();
+    let doc = source::load(
+        &root,
+        &source::Options {
+            symbol_level: true,
+            ..Default::default()
+        },
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+    let doc = doc.unwrap();
+    let members = |doc: &rustograph::graph::Document| -> Vec<Vec<String>> {
+        analysis::cycles(doc)
+            .cycles
+            .into_iter()
+            .map(|c| c.members)
+            .collect()
+    };
+    assert!(members(&doc).is_empty(), "{:?}", members(&doc));
+    let types = doc.view(rustograph::graph::Level::Type).unwrap();
+    assert_eq!(members(&types), [["aliasrec::Link", "aliasrec::Node"]]);
+    let modules = doc.view(rustograph::graph::Level::Module).unwrap();
+    assert_eq!(members(&modules), [["aliasrec::a", "aliasrec::b"]]);
+}

@@ -186,13 +186,33 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
   two symbols is. Reachability is unaffected — a recursive function is reached
   through its callers.
 - A struct, enum, or union has a `references` edge to each workspace type its
-  fields name (generic parameters and `Self` excluded). Whether `cycles`
-  counts that edge between two data types depends on the question each level
-  asks; `dead` and `rules` always use it.
+  fields name, and a type alias has one to each workspace item named by its
+  right-hand side, its generic bounds and defaults, and its `where` clause:
+  `type A = B;` is another name for `B`, so `A { .. }`, `A::V(..)` or `x: A`
+  use `B`, `type Result<T, E = Error> = ..` uses `Error`, and a crate that
+  names a dependency only in an alias uses that dependency. Paths in field,
+  alias, and signature types resolve by position, as rustc resolves them: a
+  type position looks in the type namespace first, an expression position (an
+  array length `[u8; N]`, a braced argument `Buf<{ N }>`, an alias's const
+  default) in the value namespace first, and a bare generic argument
+  (`Buf<SIZE>`) in the type namespace and then the value namespace. Generic
+  bounds, defaults and `where` clauses are harvested for type aliases only:
+  on a struct, enum, trait or fn they are not read, so `DEF` in
+  `struct D<const N: usize = DEF>` or `OnlyWhere` in `where T: OnlyWhere` on a
+  struct or fn is still reported when nothing else names it. Generic type
+  parameters and `Self` are excluded. A const generic parameter hides
+  same-name module items: `N` in an expression position is the parameter, and
+  a bare `Buf<N>` is the parameter unless a type named `N` is in scope. Whether `cycles` counts that
+  edge between two data types (an alias counts as one) depends on the
+  question each level asks; `dead` and `rules` always use it. `deps` does not
+  evaluate `#[cfg]`: a dependency named only under a condition that no build
+  enables (`#[cfg(any())] type Never = never::X;`, or such a field) still
+  counts as used.
   - Symbol level asks which code recurses — which calls and uses loop back to
     themselves. Mutually recursive data definitions
-    (`enum Expr { Block(Box<Stmt>) }` with `struct Stmt { e: Expr }`) are one
-    type family, not recursion to break, so the edge between the two data
+    (`enum Expr { Block(Box<Stmt>) }` with `struct Stmt { e: Expr }`, or
+    `type Link = Option<Box<Node>>;` with `struct Node { next: Link }`) are
+    one type family, not recursion to break, so the edge between the two data
     types is left out, as direct recursion is. Code that walks such types is
     still a symbol-level cycle when it recurses (`walk_expr` calling
     `walk_stmt` and back), because those are call edges.
@@ -203,7 +223,12 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
     exists without the other. So `cycles --level type` reports the pair, and
     `--level module` reports their modules when the two types live in
     different modules. Leaving the edge out there would hide a coupling that
-    any split into layers or crates has to resolve.
+    any split into layers or crates has to resolve. An alias and a type that
+    name each other (`Link` and `Node` above) are such a pair too. A const or
+    a macro folds into its module at these levels, so an alias or a struct
+    that names a module-level const (`type Arr = [AE; LEN];` at the crate
+    root) forms a cycle with that module when the module's own code uses the
+    alias or struct.
 - `Self` in an impl body or signature resolves to the impl's self type.
   `<T as Tr>::m()` calls `T`'s impl method, `<T>::m()` and an associated
   function passed as a value (`.map(T::new)`) reach `T`'s same-name method.
