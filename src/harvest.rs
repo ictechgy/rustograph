@@ -394,8 +394,11 @@ pub(crate) fn decls_with_markers<'a>(
                     // 별칭은 우변 타입의 다른 이름이다 — `A { .. }`·`A::V(..)`·`x: A`가 닿는 것은 우변이 이름 붙인
                     // 타입이다. 우변을 필드 타입처럼 모으지 않으면 별칭으로만 만드는 타입이 unreachable이었고(rustc는
                     // 경고하지 않는다), 별칭이 다른 모듈의 타입을 가리키는 의존이 규칙·순환에서 사라졌다.
+                    // 제네릭 매개변수의 bound·기본값과 where 절(`type Result<T, E = Error> = ..`의 `Error`)도 그 별칭이
+                    // 이름 붙이는 것이다 — rustc는 그 이름을 쓰인 것으로 본다.
                     let owner = DeclOwner::new(&id, module_path, &t.ident, &t.generics, file, item);
                     owner.push_fields(vec![(&*t.ty, cfg.clone())], &mut out.decl_refs);
+                    owner.push_generics(&t.generics, &cfg, &mut out.decl_refs);
                 }
                 syn::Item::Const(c) => {
                     let id = format!("{module_path}::{}", c.ident);
@@ -1153,6 +1156,40 @@ impl<'a> DeclOwner<'a> {
             paths.visit_type(ty);
             self.push_paths(paths.paths, &cfg, out);
         }
+    }
+
+    /// 제네릭 매개변수의 bound·기본값과 where 절의 경로를 선언 참조로 넣는다 — `type A<T: Tr> = ..`의 `Tr`,
+    /// `type Result<T, E = Error> = ..`의 `Error`, `type B<const N: usize = DEF> = ..`의 `DEF`. const 매개변수의 타입
+    /// (`usize`)은 이름 붙이는 아이템이 아니라 보지 않는다.
+    fn push_generics(
+        &self,
+        generics: &syn::Generics,
+        cfg: &Option<String>,
+        out: &mut Vec<DeclRef>,
+    ) {
+        let mut paths = DeclTypeVisitor::default();
+        for param in &generics.params {
+            match param {
+                syn::GenericParam::Type(t) => {
+                    for bound in &t.bounds {
+                        paths.visit_type_param_bound(bound);
+                    }
+                    if let Some(default) = &t.default {
+                        paths.visit_type(default);
+                    }
+                }
+                syn::GenericParam::Const(c) => {
+                    if let Some(default) = &c.default {
+                        paths.visit_expr(default);
+                    }
+                }
+                syn::GenericParam::Lifetime(_) => {}
+            }
+        }
+        if let Some(clause) = &generics.where_clause {
+            paths.visit_where_clause(clause);
+        }
+        self.push_paths(paths.paths, cfg, out);
     }
 
     /// 모은 (경로, 자리)를 선언 참조로 넣는다 — 이 선언의 제네릭 매개변수는 빼고([`decl_slot`]), `Self`는 이

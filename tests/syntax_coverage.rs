@@ -784,6 +784,61 @@ fn main() {
     );
 }
 
+/// 별칭 제네릭 매개변수의 bound·기본값과 where 절, const 매개변수 기본값도 그 별칭이 이름 붙이는 것이다 —
+/// `pub type Result<T, E = Error> = std::result::Result<T, E>;`의 `Error`는 흔한 형태다. rustc는 이 fixture에
+/// 아무것도 경고하지 않는데, 예전에는 그렇게만 쓰는 `Error`·`OnlyBound`·`OnlyDefault`·`DEF`·`OnlyWhere`가
+/// unreachable이었다.
+#[test]
+fn type_alias_generic_bounds_and_defaults_are_references() {
+    let ws = Workspace::new(
+        "aliasgen",
+        &[
+            ("Cargo.toml", &manifest("aliasgen")),
+            (
+                "src/main.rs",
+                r#"
+pub struct Error;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub trait OnlyBound {}
+pub struct OnlyDefault;
+pub const DEF: usize = 2;
+pub struct Buf<const K: usize>;
+#[allow(type_alias_bounds)]
+pub type Bounded<T: OnlyBound> = Vec<T>;
+pub type Defaulted<T = OnlyDefault> = Vec<T>;
+pub type ConstDefault<const N: usize = DEF> = Buf<N>;
+#[allow(type_alias_bounds)]
+pub type WhereBound<T> where T: OnlyWhere = Vec<T>;
+pub trait OnlyWhere {}
+fn f() -> Result<()> { Ok(()) }
+fn main() {
+    let b: Bounded<u8> = Vec::new();
+    let d: Defaulted = Vec::new();
+    let c: ConstDefault = Buf;
+    let w: WhereBound<u8> = Vec::new();
+    let _ = (f(), b, d, c, w);
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    for (from, to) in [
+        ("aliasgen::Result", "aliasgen::Error"),
+        ("aliasgen::Bounded", "aliasgen::OnlyBound"),
+        ("aliasgen::Defaulted", "aliasgen::OnlyDefault"),
+        ("aliasgen::ConstDefault", "aliasgen::DEF"),
+        ("aliasgen::WhereBound", "aliasgen::OnlyWhere"),
+    ] {
+        assert!(
+            has_edge(&doc, from, to, EdgeKind::References),
+            "missing {from} -> {to}"
+        );
+    }
+    let report = analysis::dead(&doc).unwrap();
+    assert!(report.findings.is_empty(), "{:?}", unreachable_ids(&report));
+}
+
 /// 의존 크레이트를 타입 별칭으로만 쓰는 크레이트(`pub type Mine = Option<dep::Shared>;`)는 그 의존을 쓴다 —
 /// 별칭 우변을 수확하지 않던 때는 `deps`가 `unused: app -> dep`을 냈다(`cargo check`는 그 의존 없이는
 /// 컴파일되지 않는다). 별칭이 가리키는 의존 크레이트의 타입도 그 별칭에서 닿는다.
