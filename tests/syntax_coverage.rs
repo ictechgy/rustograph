@@ -594,6 +594,69 @@ fn main() {
     );
 }
 
+/// 함수·메서드 시그니처도 같은 규칙이다 — `fn f<const N: usize>(a: [u8; N])`, impl·트레이트의 const 매개변수를
+/// 쓰는 메서드 시그니처(`[u8; LEN]`)의 배열 길이는 그 매개변수라 모듈의 `struct N`·`const LEN`으로 signature 간선을
+/// 달지 않는다(이 fixture의 `cargo check` 경고는 `N`·`LEN`과 읽지 않는 필드뿐이다). 표현식 안의 타입 자리
+/// (`size_of::<M>()`)는 모듈의 `struct M`이다.
+#[test]
+fn const_generic_parameters_shadow_items_in_signature_array_lengths() {
+    let ws = Workspace::new(
+        "constsig",
+        &[
+            ("Cargo.toml", &manifest("constsig")),
+            (
+                "src/main.rs",
+                r#"
+mod m {
+    pub struct N;
+    pub const LEN: usize = 4;
+    pub fn f<const N: usize>(a: [u8; N]) -> usize { a.len() }
+    pub struct S<const LEN: usize>;
+    impl<const LEN: usize> S<LEN> {
+        pub fn g(&self, b: [u8; LEN]) -> [u8; LEN] { b }
+    }
+    pub trait Tr<const N: usize> { fn h(&self, c: [u8; N]) -> usize { c.len() } }
+    impl Tr<2> for S<2> {}
+}
+mod k {
+    pub struct M(pub u32);
+    pub fn sized<const M: usize>(a: [u8; core::mem::size_of::<M>()]) -> usize { a.len() }
+}
+fn main() {
+    use m::Tr;
+    let _ = m::f([0u8; 2]);
+    let _ = m::S::<3>.g([0; 3]);
+    let _ = m::S::<2>.h([0; 2]);
+    let _ = k::sized::<1>([0; 4]);
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    for (from, to) in [
+        ("constsig::m::f", "constsig::m::N"),
+        ("constsig::m::S::g", "constsig::m::LEN"),
+        ("constsig::m::Tr::h", "constsig::m::N"),
+    ] {
+        assert!(
+            !has_edge(&doc, from, to, EdgeKind::Signature),
+            "the const parameter in the signature of {from} resolved to {to}"
+        );
+    }
+    assert!(has_edge(
+        &doc,
+        "constsig::k::sized",
+        "constsig::k::M",
+        EdgeKind::Signature
+    ));
+    let report = analysis::dead(&doc).unwrap();
+    assert_eq!(
+        unreachable_ids(&report),
+        ["constsig::m::LEN", "constsig::m::N"]
+    );
+}
+
 /// 의존 크레이트를 타입 별칭으로만 쓰는 크레이트(`pub type Mine = Option<dep::Shared>;`)는 그 의존을 쓴다 —
 /// 별칭 우변을 수확하지 않던 때는 `deps`가 `unused: app -> dep`을 냈다(`cargo check`는 그 의존 없이는
 /// 컴파일되지 않는다). 별칭이 가리키는 의존 크레이트의 타입도 그 별칭에서 닿는다.

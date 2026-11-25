@@ -1098,7 +1098,7 @@ impl<'a> DeclOwner<'a> {
             let mut paths = DeclTypeVisitor::default();
             paths.visit_type(ty);
             for (path, in_expr) in paths.paths {
-                if self.is_generic_param(&path, in_expr) {
+                if is_generic_param(&path, in_expr, &self.type_params, &self.const_params) {
                     continue;
                 }
                 let path = substitute_self(&path, std::slice::from_ref(&self.name)).unwrap_or(path);
@@ -1114,18 +1114,21 @@ impl<'a> DeclOwner<'a> {
             }
         }
     }
+}
 
-    /// 경로가 이 선언의 제네릭 매개변수인가. 타입 매개변수는 첫 세그먼트로 가린다(`T`, `T::Assoc`). const
-    /// 매개변수는 값 이름공간이라 표현식 자리의 한 세그먼트 경로만 가린다 — rustc도 `[u8; N]`의 `N`은 그
-    /// 매개변수로 읽고, 타입 자리의 `N`(`b: N`, `Buf<N>`)은 타입 이름공간에서 먼저 찾는다. 가리지 않으면 같은
-    /// 이름의 모듈 아이템(`struct N`, `const N`)으로 거짓 references 간선이 붙었다.
-    fn is_generic_param(&self, path: &[String], in_expr: bool) -> bool {
-        match path {
-            [name] if in_expr && self.const_params.contains(name) => true,
-            _ => path
-                .first()
-                .is_some_and(|name| self.type_params.contains(name)),
-        }
+/// 선언 타입 안의 경로가 그 선언의 제네릭 매개변수인가. 타입 매개변수는 첫 세그먼트로 가린다(`T`,
+/// `T::Assoc`). const 매개변수는 값 이름공간이라 표현식 자리의 한 세그먼트 경로만 가린다 — rustc도 `[u8; N]`의
+/// `N`은 그 매개변수로 읽고, 타입 자리의 `N`(`b: N`, `Buf<N>`)은 타입 이름공간에서 먼저 찾는다. 가리지 않으면
+/// 같은 이름의 모듈 아이템(`struct N`, `const N`)으로 거짓 간선이 붙었다.
+fn is_generic_param(
+    path: &[String],
+    in_expr: bool,
+    type_params: &BTreeSet<String>,
+    const_params: &BTreeSet<String>,
+) -> bool {
+    match path {
+        [name] if in_expr && const_params.contains(name) => true,
+        _ => path.first().is_some_and(|name| type_params.contains(name)),
     }
 }
 
@@ -1360,12 +1363,19 @@ fn body_edges_within(
 pub fn signature_edges(b: &BodyItem, tree: &ModTree, dep_crates: &DepCrates) -> Vec<Edge> {
     let mut edges = Vec::new();
     let type_params = generic_type_parameters(b);
+    // `fn f<const N: usize>(a: [u8; N])`의 `N`은 그 매개변수다 — 필드·별칭 우변과 같은 규칙이다.
+    let const_params: BTreeSet<String> = b
+        .generic_scopes
+        .iter()
+        .flat_map(|scope| scope.const_params())
+        .map(|param| param.ident.to_string())
+        .collect();
     // 소유 아이템이 cfg면 시그니처 자체가 그 조건 아래 있으니 간선도 물려받는다.
     for t in &b.signature_surface {
-        let mut sv = TypeVisitor { paths: Vec::new() };
+        let mut sv = DeclTypeVisitor::default();
         sv.visit_type(t);
-        for p in sv.paths {
-            if p.first().is_some_and(|name| type_params.contains(name)) {
+        for (p, in_expr) in sv.paths {
+            if is_generic_param(&p, in_expr, &type_params, &const_params) {
                 continue;
             }
             // `-> Self`·`other: &Self`는 impl self 타입이다.
@@ -2242,8 +2252,9 @@ fn generic_type_parameters(body: &BodyItem<'_>) -> BTreeSet<String> {
         .collect()
 }
 
-/// 선언 타입(필드·별칭 우변) 안의 경로를 모으는 방문자 — 경로마다 표현식 자리(배열 길이, `{..}` const
-/// 인자)에 있는지를 함께 적는다. 표현식 안의 타입(`size_of::<N>()`의 `N`)은 다시 타입 자리다.
+/// 선언 타입(필드·별칭 우변·시그니처) 안의 경로를 모으는 방문자 — 제네릭 인자까지 재귀하고, 경로마다
+/// 표현식 자리(배열 길이, `{..}` const 인자)에 있는지를 함께 적는다. 표현식 안의 타입(`size_of::<N>()`의
+/// `N`)은 다시 타입 자리다.
 #[derive(Default)]
 struct DeclTypeVisitor {
     /// (경로 세그먼트, 표현식 자리인가).
@@ -2267,18 +2278,6 @@ impl Visit<'_> for DeclTypeVisitor {
 
     fn visit_path(&mut self, p: &syn::Path) {
         self.paths.push((path_segments(p), self.in_expr));
-        syn::visit::visit_path(self, p);
-    }
-}
-
-/// 타입 안의 경로들을 수집하는 방문자 — 제네릭 인자까지 재귀한다.
-struct TypeVisitor {
-    paths: Vec<Vec<String>>,
-}
-
-impl Visit<'_> for TypeVisitor {
-    fn visit_path(&mut self, p: &syn::Path) {
-        self.paths.push(path_segments(p));
         syn::visit::visit_path(self, p);
     }
 }
