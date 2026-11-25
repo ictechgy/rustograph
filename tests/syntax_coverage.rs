@@ -657,6 +657,133 @@ fn main() {
     );
 }
 
+/// 맨 제네릭 인자(`Buf<N>`)는 rustc가 타입 이름공간부터 찾고 없으면 값 이름공간을 본다 — 둘러싼 선언의 const
+/// 매개변수와 이름이 같으면 같은 이름의 타입이 있을 때만 그 타입이고, 없으면 그 매개변수다. 예전에는 타입
+/// 이름공간에 없으면 모듈의 `const N`으로 넘어가, 별칭 `type A<const N: usize> = Buf<N>`·필드·시그니처가 rustc가
+/// 경고하는 그 상수를 살려 두었다(이 fixture의 `cargo check` 경고는 `N`·`M` 둘이다). const 매개변수가 아닌 맨 인자
+/// (`Buf<SIZE>`)는 그대로 모듈의 상수이고, 같은 이름의 타입이 있으면(`Vec<N>` 옆 `struct N`) 그 타입이다.
+#[test]
+fn bare_const_arguments_named_like_a_const_parameter_are_the_parameter() {
+    let ws = Workspace::new(
+        "barearg",
+        &[
+            ("Cargo.toml", &manifest("barearg")),
+            (
+                "src/main.rs",
+                r#"
+const N: usize = 7;
+const M: usize = 8;
+const SIZE: usize = 2;
+struct Buf<const K: usize>;
+type A<const N: usize> = Buf<N>;
+struct F<const N: usize> { b: Buf<N> }
+fn sig<const M: usize>(b: Buf<M>) -> Buf<M> { b }
+type Sized = Buf<SIZE>;
+mod t {
+    pub struct N(pub u8);
+    pub type V<const N: usize> = Vec<N>;
+}
+fn main() {
+    let _a: A<3> = Buf;
+    let f = F::<2> { b: Buf };
+    let _s: Sized = Buf;
+    let v: t::V<1> = vec![t::N(1)];
+    let _ = (f.b, sig::<3>(Buf), v[0].0);
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    for (from, to, kind) in [
+        ("barearg::A", "barearg::N", EdgeKind::References),
+        ("barearg::F", "barearg::N", EdgeKind::References),
+        ("barearg::sig", "barearg::M", EdgeKind::Signature),
+    ] {
+        assert!(
+            !has_edge(&doc, from, to, kind),
+            "the const parameter argument of {from} resolved to {to}"
+        );
+    }
+    assert!(has_edge(
+        &doc,
+        "barearg::Sized",
+        "barearg::SIZE",
+        EdgeKind::References
+    ));
+    assert!(has_edge(
+        &doc,
+        "barearg::t::V",
+        "barearg::t::N",
+        EdgeKind::References
+    ));
+    let report = analysis::dead(&doc).unwrap();
+    assert_eq!(unreachable_ids(&report), ["barearg::M", "barearg::N"]);
+}
+
+/// 선언 타입의 표현식 자리(배열 길이)는 값 이름공간이 먼저다 — `use super::k::N;`(상수)과 `struct N`이 함께 있는
+/// 모듈의 `[u8; N]`은 그 상수다. 예전에는 타입 이름공간부터 찾아 별칭·필드·시그니처가 그 struct로 간선을 달고
+/// 상수에는 닿지 않았다 — rustc가 쓰인다고 보는 `k::N`·`k::Z`·`k::Q`가 거짓 dead였고, 별칭의 거짓 간선은 rustc가
+/// 경고하는 `m::N`까지 가렸다(이 fixture의 `cargo check` 경고는 struct `N`·`Z`·`Q` 셋이다).
+#[test]
+fn expression_positions_in_declaration_types_resolve_values_first() {
+    let ws = Workspace::new(
+        "exprns",
+        &[
+            ("Cargo.toml", &manifest("exprns")),
+            (
+                "src/main.rs",
+                r#"
+mod k {
+    pub const N: usize = 2;
+    pub const Z: usize = 3;
+    pub const Q: usize = 4;
+}
+mod m {
+    use super::k::N;
+    pub struct N { pub x: u8 }
+    pub type A = [u8; N];
+}
+mod f {
+    use super::k::Z;
+    pub struct Z { pub x: u8 }
+    pub struct F { pub a: [u8; Z] }
+}
+mod s {
+    use super::k::Q;
+    pub struct Q { pub x: u8 }
+    pub fn sig(a: [u8; Q]) -> usize { a.len() }
+}
+fn main() {
+    let a: m::A = [0; 2];
+    let f = f::F { a: [0; 3] };
+    let _ = (a, f.a, s::sig([0; 4]));
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    for (from, to, kind) in [
+        ("exprns::m::A", "exprns::k::N", EdgeKind::References),
+        ("exprns::f::F", "exprns::k::Z", EdgeKind::References),
+        ("exprns::s::sig", "exprns::k::Q", EdgeKind::Signature),
+    ] {
+        assert!(has_edge(&doc, from, to, kind), "missing {from} -> {to}");
+    }
+    assert!(!has_edge(
+        &doc,
+        "exprns::m::A",
+        "exprns::m::N",
+        EdgeKind::References
+    ));
+    let report = analysis::dead(&doc).unwrap();
+    assert_eq!(
+        unreachable_ids(&report),
+        ["exprns::f::Z", "exprns::m::N", "exprns::s::Q"]
+    );
+}
+
 /// 의존 크레이트를 타입 별칭으로만 쓰는 크레이트(`pub type Mine = Option<dep::Shared>;`)는 그 의존을 쓴다 —
 /// 별칭 우변을 수확하지 않던 때는 `deps`가 `unused: app -> dep`을 냈다(`cargo check`는 그 의존 없이는
 /// 컴파일되지 않는다). 별칭이 가리키는 의존 크레이트의 타입도 그 별칭에서 닿는다.

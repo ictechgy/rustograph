@@ -86,10 +86,31 @@ pub struct DeclRef {
     pub cfg: Option<String>,
     /// 쓰임이 확정되지 않은 참조인가 — 매크로 본문이면 true다.
     pub tentative: bool,
+    /// 경로가 놓인 자리 — 어느 이름공간에서 해석할지 정한다.
+    pub slot: DeclSlot,
     /// 소유 아이템의 선언 파일 — 같은 경로의 선언이 여럿이면 소스 인스턴스 ID로 옮길 때 쓴다.
     pub file: PathBuf,
     /// 소유 아이템의 파일 안 바이트 시작 위치(syn span, 속성 포함).
     pub start: usize,
+}
+
+/// 선언 참조 경로([`DeclRef`])·시그니처 경로가 놓인 자리 — 경로를 어느 이름공간에서 해석할지 정한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeclSlot {
+    /// 타입 자리(필드 타입·별칭 우변·제네릭 인자·bound) — 타입 이름공간이 먼저고, 거기 묶인 것이 없으면 자리를
+    /// 모르는 해석으로 넘어간다. rustc도 맨 제네릭 인자(`Buf<SIZE>`)는 타입 이름공간에서 찾다가 없으면 값
+    /// 이름공간에서 찾는다.
+    Type,
+    /// 표현식 자리(배열 길이 `[u8; N]`, `{ .. }` 인자, const 매개변수 기본값) — 값 이름공간이 먼저다. 타입
+    /// 이름공간부터 보면 `use k::N;`(상수)과 `struct N`이 함께 있는 모듈의 `[u8; N]`이 그 struct로 갔다.
+    Value,
+    /// 둘러싼 선언의 const 매개변수와 이름이 같은 맨 제네릭 인자(`type A<const N: usize> = Buf<N>`의 `N`) — 타입
+    /// 이름공간에 그 이름이 있을 때만 그 타입이고, 없으면 그 매개변수라 간선이 없다. rustc는 타입 이름공간 다음에
+    /// 값 이름공간을 보고, 거기서는 매개변수가 같은 이름의 모듈 아이템(`const N`)을 가린다.
+    TypeOrConstParam,
+    /// 자리를 모른다 — `macro_rules!` 정의 본문의 경로.
+    Any,
 }
 
 /// 그래프 정점 하나가 소스에서 차지하는 범위다.
@@ -453,6 +474,7 @@ pub(crate) fn decls_with_markers<'a>(
                                     path,
                                     cfg: cfg.clone(),
                                     tentative: true,
+                                    slot: DeclSlot::Any,
                                     file: file.clone(),
                                     start: item.span().byte_range().start,
                                 });
@@ -1024,10 +1046,9 @@ pub fn decl_edges(refs: &[DeclRef], tree: &ModTree, dep_crates: &DepCrates) -> V
     let mut seen = BTreeSet::new();
     let mut edges = Vec::new();
     for r in refs {
-        // 필드 타입·별칭 우변은 타입 이름공간이고, 매크로 본문의 경로(추정)는 자리를 모른다. `#[cfg]`로 갈린 대안
-        // 임포트를 지나면 대안마다 간선이고, 간선은 거쳐 온 임포트의 조건을 함께 싣는다.
-        let ns = (!r.tentative).then_some(Ns::Type);
-        for to in tree.resolve_all(&r.module, &r.path, dep_crates, ns) {
+        // 이름공간은 경로의 자리가 정한다([`DeclSlot`]). `#[cfg]`로 갈린 대안 임포트를 지나면 대안마다 간선이고,
+        // 간선은 거쳐 온 임포트의 조건을 함께 싣는다.
+        for to in resolve_decl_path(tree, &r.module, &r.path, dep_crates, r.slot) {
             let cfg = with_import_cfg(&r.cfg, &to.cfg);
             if to.target == r.owner
                 || !seen.insert((
@@ -1051,6 +1072,38 @@ pub fn decl_edges(refs: &[DeclRef], tree: &ModTree, dep_crates: &DepCrates) -> V
     edges
 }
 
+/// 선언 경로([`DeclSlot`]의 자리)를 해석한다 — 대상마다 거쳐 온 임포트의 조건을 싣는다([`ModTree::resolve_all`]).
+fn resolve_decl_path(
+    tree: &ModTree,
+    module: &str,
+    path: &[String],
+    dep_crates: &DepCrates,
+    slot: DeclSlot,
+) -> Vec<Resolved> {
+    match slot {
+        DeclSlot::Type => tree.resolve_all(module, path, dep_crates, Some(Ns::Type)),
+        DeclSlot::Value => tree.resolve_all(module, path, dep_crates, Some(Ns::Value)),
+        // 타입 이름공간에 묶인 것이 없으면 해석이 다른 이름공간으로 넘어가니, 그렇게 얻은 대상은 버린다.
+        DeclSlot::TypeOrConstParam => tree
+            .resolve_all(module, path, dep_crates, Some(Ns::Type))
+            .into_iter()
+            .filter(|to| names_type(tree, dep_crates, &to.target))
+            .collect(),
+        DeclSlot::Any => tree.resolve_all(module, path, dep_crates, None),
+    }
+}
+
+/// 정점 `id`가 타입 이름공간에 있을 수 있는가 — 부모 모듈의 타입 이름공간 아이템(struct·enum·union·trait·타입
+/// 별칭)이거나, 안을 보지 못해 이름공간을 모르는 외부 크레이트 정점이다.
+fn names_type(tree: &ModTree, dep_crates: &DepCrates, id: &str) -> bool {
+    dep_crates.external.contains(id)
+        || id.rsplit_once("::").is_some_and(|(parent, name)| {
+            tree.modules
+                .get(parent)
+                .is_some_and(|m| m.type_items.contains(name))
+        })
+}
+
 /// 필드 타입(별칭이면 우변) 참조를 모으는 소유 타입 — 정점 ID·모듈·제네릭·선언 위치를 한데 묶는다.
 struct DeclOwner<'a> {
     id: &'a str,
@@ -1059,7 +1112,8 @@ struct DeclOwner<'a> {
     name: String,
     /// 타입 이름공간을 가리는 제네릭 매개변수 — 필드의 `T`는 경로가 아니다.
     type_params: BTreeSet<String>,
-    /// const 제네릭 매개변수 — 표현식 자리(배열 길이 `[u8; N]`, `{N}` 인자)의 `N`은 그 매개변수다.
+    /// const 제네릭 매개변수 — 표현식 자리(배열 길이 `[u8; N]`, `{N}` 인자)의 `N`은 그 매개변수고, 맨 인자
+    /// (`Buf<N>`)의 `N`은 같은 이름의 타입이 없으면 그 매개변수다.
     const_params: BTreeSet<String>,
     file: &'a PathBuf,
     start: usize,
@@ -1097,38 +1151,59 @@ impl<'a> DeclOwner<'a> {
         for (ty, cfg) in fields {
             let mut paths = DeclTypeVisitor::default();
             paths.visit_type(ty);
-            for (path, in_expr) in paths.paths {
-                if is_generic_param(&path, in_expr, &self.type_params, &self.const_params) {
-                    continue;
-                }
-                let path = substitute_self(&path, std::slice::from_ref(&self.name)).unwrap_or(path);
-                out.push(DeclRef {
-                    owner: self.id.to_string(),
-                    module: self.module.to_string(),
-                    path,
-                    cfg: cfg.clone(),
-                    tentative: false,
-                    file: self.file.clone(),
-                    start: self.start,
-                });
-            }
+            self.push_paths(paths.paths, &cfg, out);
+        }
+    }
+
+    /// 모은 (경로, 자리)를 선언 참조로 넣는다 — 이 선언의 제네릭 매개변수는 빼고([`decl_slot`]), `Self`는 이
+    /// 타입 이름으로 바꾼다.
+    fn push_paths(
+        &self,
+        paths: Vec<(Vec<String>, PathPos)>,
+        cfg: &Option<String>,
+        out: &mut Vec<DeclRef>,
+    ) {
+        for (path, pos) in paths {
+            let Some(slot) = decl_slot(&path, pos, &self.type_params, &self.const_params) else {
+                continue;
+            };
+            let path = substitute_self(&path, std::slice::from_ref(&self.name)).unwrap_or(path);
+            out.push(DeclRef {
+                owner: self.id.to_string(),
+                module: self.module.to_string(),
+                path,
+                cfg: cfg.clone(),
+                tentative: false,
+                slot,
+                file: self.file.clone(),
+                start: self.start,
+            });
         }
     }
 }
 
-/// 선언 타입 안의 경로가 그 선언의 제네릭 매개변수인가. 타입 매개변수는 첫 세그먼트로 가린다(`T`,
-/// `T::Assoc`). const 매개변수는 값 이름공간이라 표현식 자리의 한 세그먼트 경로만 가린다 — rustc도 `[u8; N]`의
-/// `N`은 그 매개변수로 읽고, 타입 자리의 `N`(`b: N`, `Buf<N>`)은 타입 이름공간에서 먼저 찾는다. 가리지 않으면
-/// 같은 이름의 모듈 아이템(`struct N`, `const N`)으로 거짓 간선이 붙었다.
-fn is_generic_param(
+/// 선언 타입 안 경로 하나를 해석할 자리 — 그 선언의 제네릭 매개변수면 `None`(경로가 아니다).
+///
+/// 타입 매개변수는 첫 세그먼트로 가린다(`T`, `T::Assoc`). const 매개변수는 값 이름공간이라 표현식 자리의 한
+/// 세그먼트 경로만 가린다 — rustc도 `[u8; N]`의 `N`은 그 매개변수로 읽는다. 맨 제네릭 인자(`Buf<N>`)는 rustc가
+/// 타입 이름공간부터 찾으니, 이름이 const 매개변수면 타입일 때만 잇는다([`DeclSlot::TypeOrConstParam`]). 가리지
+/// 않으면 같은 이름의 모듈 아이템(`struct N`, `const N`)으로 거짓 간선이 붙었다. 나머지 표현식 자리는 값
+/// 이름공간, 타입 자리는 타입 이름공간이 먼저다.
+fn decl_slot(
     path: &[String],
-    in_expr: bool,
+    pos: PathPos,
     type_params: &BTreeSet<String>,
     const_params: &BTreeSet<String>,
-) -> bool {
-    match path {
-        [name] if in_expr && const_params.contains(name) => true,
-        _ => path.first().is_some_and(|name| type_params.contains(name)),
+) -> Option<DeclSlot> {
+    if path.first().is_some_and(|name| type_params.contains(name)) {
+        return None;
+    }
+    let const_param = matches!(path, [name] if const_params.contains(name));
+    match pos {
+        PathPos::Expr if const_param => None,
+        PathPos::Expr => Some(DeclSlot::Value),
+        PathPos::BareArg if const_param => Some(DeclSlot::TypeOrConstParam),
+        PathPos::Type | PathPos::BareArg => Some(DeclSlot::Type),
     }
 }
 
@@ -1374,10 +1449,10 @@ pub fn signature_edges(b: &BodyItem, tree: &ModTree, dep_crates: &DepCrates) -> 
     for t in &b.signature_surface {
         let mut sv = DeclTypeVisitor::default();
         sv.visit_type(t);
-        for (p, in_expr) in sv.paths {
-            if is_generic_param(&p, in_expr, &type_params, &const_params) {
+        for (p, pos) in sv.paths {
+            let Some(slot) = decl_slot(&p, pos, &type_params, &const_params) else {
                 continue;
-            }
+            };
             // `-> Self`·`other: &Self`는 impl self 타입이다.
             let p = b
                 .self_ty
@@ -1385,7 +1460,7 @@ pub fn signature_edges(b: &BodyItem, tree: &ModTree, dep_crates: &DepCrates) -> 
                 .and_then(|ty| substitute_self(&p, ty))
                 .unwrap_or(p);
             // `#[cfg]`로 갈린 대안 임포트를 지나면 대안마다 간선이고, 간선은 거쳐 온 임포트의 조건을 함께 싣는다.
-            for to in tree.resolve_all(&b.module, &p, dep_crates, Some(Ns::Type)) {
+            for to in resolve_decl_path(tree, &b.module, &p, dep_crates, slot) {
                 if to.target != b.id {
                     let mut e = Edge::new(b.id.clone(), to.target, EdgeKind::Signature);
                     e.cfg = with_import_cfg(&b.cfg, &to.cfg);
@@ -2252,15 +2327,37 @@ fn generic_type_parameters(body: &BodyItem<'_>) -> BTreeSet<String> {
         .collect()
 }
 
-/// 선언 타입(필드·별칭 우변·시그니처) 안의 경로를 모으는 방문자 — 제네릭 인자까지 재귀하고, 경로마다
-/// 표현식 자리(배열 길이, `{..}` const 인자)에 있는지를 함께 적는다. 표현식 안의 타입(`size_of::<N>()`의
-/// `N`)은 다시 타입 자리다.
+/// 선언 타입 안 경로의 자리 — [`DeclTypeVisitor`]가 경로마다 적고 [`decl_slot`]이 해석할 자리로 바꾼다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathPos {
+    /// 타입 자리(필드 타입, 참조·튜플·배열 원소, bound의 트레이트 경로).
+    Type,
+    /// 표현식 자리(배열 길이, `{ .. }` const 인자, const 매개변수 기본값).
+    Expr,
+    /// 맨 제네릭 인자 — 인자 없는 한 세그먼트 경로(`Buf<N>`의 `N`)라 타입인지 const인지 구문으로는 모른다.
+    BareArg,
+}
+
+/// 선언 타입(필드·별칭 우변·시그니처) 안의 경로를 모으는 방문자 — 제네릭 인자까지 재귀하고, 경로마다 자리
+/// ([`PathPos`])를 함께 적는다. 표현식 안의 타입(`size_of::<N>()`의 `N`)은 다시 타입 자리다.
 #[derive(Default)]
 struct DeclTypeVisitor {
-    /// (경로 세그먼트, 표현식 자리인가).
-    paths: Vec<(Vec<String>, bool)>,
+    /// (경로 세그먼트, 자리).
+    paths: Vec<(Vec<String>, PathPos)>,
     /// 지금 방문 중인 자리가 표현식 안인가.
     in_expr: bool,
+}
+
+/// 제네릭 인자가 맨 한 세그먼트 경로(`N` — 앞 `::`·제네릭 인자·qself 없음)면 그 이름.
+fn bare_argument(arg: &syn::GenericArgument) -> Option<String> {
+    let syn::GenericArgument::Type(syn::Type::Path(ty)) = arg else {
+        return None;
+    };
+    if ty.qself.is_some() || ty.path.leading_colon.is_some() || ty.path.segments.len() != 1 {
+        return None;
+    }
+    let seg = &ty.path.segments[0];
+    seg.arguments.is_none().then(|| seg.ident.to_string())
 }
 
 impl Visit<'_> for DeclTypeVisitor {
@@ -2276,8 +2373,20 @@ impl Visit<'_> for DeclTypeVisitor {
         self.in_expr = outer;
     }
 
+    fn visit_generic_argument(&mut self, arg: &syn::GenericArgument) {
+        match bare_argument(arg) {
+            Some(name) => self.paths.push((vec![name], PathPos::BareArg)),
+            None => syn::visit::visit_generic_argument(self, arg),
+        }
+    }
+
     fn visit_path(&mut self, p: &syn::Path) {
-        self.paths.push((path_segments(p), self.in_expr));
+        let pos = if self.in_expr {
+            PathPos::Expr
+        } else {
+            PathPos::Type
+        };
+        self.paths.push((path_segments(p), pos));
         syn::visit::visit_path(self, p);
     }
 }
