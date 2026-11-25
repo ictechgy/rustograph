@@ -255,9 +255,15 @@ A new field on a public struct breaks struct literals and exhaustive patterns
 alike. Add the new fields, or end such patterns with `..`.
 
 - `harvest::ModuleDecls` adds `decl_refs`, the declaration-level path
-  references (field types and `macro_rules!` bodies) as the new public
-  `harvest::DeclRef`. Resolve them with the new `harvest::decl_edges` after the
-  imports are filled, as the source harvest does.
+  references (field types, type alias right-hand sides, generic bounds and
+  defaults, and `macro_rules!` bodies) as the new public `harvest::DeclRef`.
+  Resolve them with the new `harvest::decl_edges` after the imports are filled,
+  as the source harvest does. `DeclRef::slot` (the new `harvest::DeclSlot`,
+  `#[non_exhaustive]`) is the position that picks the namespace: `Type` for
+  type positions, `Value` for expression positions such as array lengths,
+  `TypeOrConstParam` for a bare generic argument named like a const parameter
+  (a type only, otherwise the parameter and no edge), and `Any` for
+  `macro_rules!` bodies.
 - `harvest::Harvest` adds `foreign_self_impls`, the number of impl blocks whose
   self type is not a workspace vertex. `Harvest::default()` starts it at zero.
 - `harvest::impls` keeps its signature but now also returns the method bodies

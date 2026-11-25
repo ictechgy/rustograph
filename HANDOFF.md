@@ -3,16 +3,17 @@
 세션을 이어받는 에이전트가 먼저 읽는 문서입니다. 아래 "현재 상태"만 지금의 지시이고, 그 아래 날짜가 붙은 절은
 당시 기록입니다 — 거기 적힌 "릴리스 준비"·"다음 단계"를 지금 할 일로 되살리지 마세요.
 
-## 현재 상태 (2026-11-25, 5차) — 타입 별칭 우변 간선·선언 타입의 const 제네릭 매개변수
+## 현재 상태 (2026-11-25, 5차) — 타입 별칭 우변·제네릭 간선, 선언 타입 경로의 자리별 해석
 
 - 발행본은 [v0.7.0](https://github.com/ictechgy/rustograph/releases/tag/v0.7.0)(2026-11-03, 자산 6개)이다.
   v0.6.0은 2026-10-25, v0.5.0은 2026-10-13에 발행됐다. v0.4.2는 태그 없이 v0.5.0으로 이어졌다.
 - 4차 브랜치(타입 경로 호출의 타입 참조·`const _` 루트·밖 타입 impl 트레이트 간선)는
   [PR #58](https://github.com/ictechgy/rustograph/pull/58)로 `main`에 스쿼시 머지됐다(`61e719b`, 아래 그 날짜 절).
-- **브랜치 `ccr-37904670-hxdjsx`**(`origin/main` `61e719b` 위에서 다시 시작)에 아래 커밋이 있다. push하지 않았다
-  (2026-11-25). 둘 다 4차 절의 후속 후보("타입 별칭 우변")와 그 수정이 드러낸 같은 계열 결함이다. 공개 Rust API는
-  그대로다(`harvest::DeclRef`·`decl_edges`·`signature_edges` 시그니처 같음 — 비공개 `TypeVisitor`를
-  `DeclTypeVisitor`로 바꿨다). 사용자 변화는 CHANGELOG `[Unreleased]`, README·README.ko 그래프 모델에 있다.
+- **브랜치 `ccr-37904670-hxdjsx`**(`origin/main` `61e719b` 위에서 다시 시작)에 아래 커밋이 있다. `2c548be`까지는
+  코디네이터가 [PR #60](https://github.com/ictechgy/rustograph/pull/60)으로 push했고, 독립 리뷰 반영(`ca36e69`부터)은
+  push하지 않았다(2026-11-25). 모두 4차 절의 후속 후보("타입 별칭 우변")와 그 수정이 드러낸 같은 계열 결함이다. 공개
+  Rust API 변화는 0.8에서 새로 생긴 `harvest::DeclRef`의 필드 `slot`과 새 `harvest::DeclSlot`뿐이다
+  ([0.8 migration](docs/MIGRATING-0.8.md)). 사용자 변화는 CHANGELOG `[Unreleased]`, README·README.ko 그래프 모델에 있다.
   - `115103e` fix(harvest): 타입 별칭 우변(`type A = B;`)을 필드 타입처럼 `DeclOwner`로 모아 별칭에서 나가는
     references 간선으로 낸다(타입 이름공간 `resolve_all` — 대안 임포트마다, 별칭·임포트 조건을 싣고, `#[cfg]`로 두 번
     선언한 별칭은 소스 인스턴스 ID마다). 별칭을 그대로 모으면 `type Arr<const N: usize> = [u8; N];`의 `N`이 모듈의
@@ -21,7 +22,31 @@
     심볼 레벨 cycles는 별칭을 데이터 타입으로 본다(`analysis::symbol_level_data_types`).
   - `97d2ca1` fix(harvest): 시그니처(`signature_edges`)도 같은 규칙 — `fn f<const N: usize>(a: [u8; N])`, impl·트레이트
     const 매개변수를 쓰는 메서드 시그니처가 모듈의 `struct N`·`const LEN`으로 signature 간선을 달던 것.
-  - docs: README·README.ko 그래프 모델, CHANGELOG, 이 HANDOFF.
+  - `2c548be` docs: README·README.ko 그래프 모델, CHANGELOG, HANDOFF.
+  - `ca36e69` fix(harvest) — 리뷰 S1·S2: 선언 타입 경로를 자리대로 푼다(`DeclSlot`). 표현식 자리는 값 이름공간이 먼저고,
+    둘러싼 선언의 const 매개변수와 이름이 같은 맨 제네릭 인자는 타입 이름공간의 대상만 잇는다(`TypeOrConstParam`).
+  - `f010e35` fix(harvest) — 리뷰 S3: 별칭 제네릭의 bound·기본값·where 절과 const 기본값을 수확한다(`push_generics`).
+  - docs: README·README.ko·CHANGELOG·0.8 migration, 이 HANDOFF.
+- **독립 리뷰(PR #60, `2c548be` 대상 — blocker 없음) 반영** — 리뷰어 스크래치가 지워져 설명된 fixture를 다시 만들었다
+  (스크래치 `r5-rustograph/rv/`, 모두 `cargo check` 통과). main·`2c548be`·고친 뒤로 대조했다. f02~f08·f10~f14·
+  f16~f18·f20·f21은 내용이 전해지지 않아 다시 만들지 못했다 — 대신 이 세션의 a1~a18·t1~t5를 `2c548be`와 고친 뒤로
+  다시 돌렸고, 바뀐 것은 a5c(아래)뿐이다.
+  - S1(이 브랜치의 회귀): f09 `type A<const N: usize> = Buf<N>;` 옆 `const N` — rustc 경고 `N`. main `N`, `2c548be`
+    0건과 거짓 type 레벨 순환 `crate -> A`, 고친 뒤 `N`·순환 0. f22(필드 `Buf<N>`·시그니처 `Buf<M>`, rustc 경고 `N`·
+    `M`): main·`2c548be` 0건, 고친 뒤 `M`·`N`(main부터 있던 거짓 type 순환 `crate -> F`도 사라짐). a5c(`Buf2<LEN>`, rustc
+    경고 `LEN`): main·`2c548be` 0건, 고친 뒤 `LEN`. `Vec<N>` 옆 `struct N`(s1의 `t::V`)은 rustc처럼 그 struct다.
+  - S2: f19(`use super::k::N;` + `struct N` + `[u8; N]` — 별칭·필드·시그니처, rustc 경고 struct `N`·`Z`·`Q`): main
+    `k::N`·`k::Q`·`k::Z`(거짓)·`m::N`, `2c548be` `k::*`만(거짓 간선 `m::A -> m::N`이 `m::N`을 가림), 고친 뒤 `f::Z`·
+    `m::N`·`s::Q` — rustc와 같다.
+  - S3: f23(`pub type Result<T, E = Error> = ..`, rustc 경고 없음): main·`2c548be` `Error`, 고친 뒤 0건. f15(bound·기본값·
+    where 절·const 기본값 `DEF`): main·`2c548be` 넷, 고친 뒤 0건.
+  - nit: 별칭을 거친 자기 재귀(n1 `type Link2 = Option<Box<Node2>>;`)는 type 레벨 순환이고 같은 struct 직접 재귀는 아니다
+    — 기록만(아래 후속 후보, 사용자 결정). 모듈 상수·매크로를 가리키는 별칭은 type·module 레벨에서 상수가 모듈로 접혀
+    그 모듈과 순환일 수 있다(f01 `type Arr = [AE; LEN];`, 같은 필드를 가진 struct도 main부터 같다) — README에 적었다.
+    `deps`는 `#[cfg]`를 평가하지 않아 n5 `#[cfg(any())] type Never = never::X;`가 `never`를 쓰인 것으로 센다(rustc
+    `-W unused-crate-dependencies`는 경고, main은 별칭을 수확하지 않아 unused로 냈다 — 필드와 같은 규칙) — README에
+    적었다. impl 연관 타입 `type Item = OnlyItem`과 `macro_rules!`가 만든 별칭(n4)은 main부터 거짓 dead로 남는다(아래 후속
+    후보).
 - **재현과 근거**(스크래치 `r5-rustograph/fx/`, 모두 `cargo check` 통과 — 리눅스, cfg 갈림은
   `--target x86_64-pc-windows-msvc`도 — main(`61e719b`) 바이너리와 새 바이너리로 대조):
   - a1·a4·t1(별칭으로만 만드는 enum·struct, 별칭 사슬 `A = B = C`, `<Q as Tr>::Assoc`, 제네릭 `GA<T>` 옆 `struct T`,
@@ -49,33 +74,40 @@
   변화 없음), lib `--retain-public`(a13 — 변화 없음), 다른 크레이트의 별칭(a14 — main의 거짓 `dep::Shared` 사라짐),
   `use std::process;` 옆 `fn process`와 `type C = process::Child`·글롭으로 들인 타입의 별칭·`pub use user::X as Re`·
   `#[cfg(test)]` 모듈 안 별칭(a18 — 새것은 rustc처럼 `fn process`·`Other`만, `--tests`는 테스트 별칭의 `Helper`도 살림).
-  새로 낸 dead는 모두 rustc가 경고하는 것이다. 남은 차이(main과 같음): a5c `type ArrLen<const LEN: usize> =
-  Buf2<LEN>;`·필드 `Buf2<LEN>`의 맨 인자 `LEN`이 모듈 `const LEN`으로 간다(rustc 경고 `LEN` — 아래 후속 후보).
-- **반례 말뭉치**(4차와 같은 크레이트 17개, 이 저장소는 `61e719b` 사본. main 바이너리와 새 바이너리로 `graph --level
-  symbol --tests`, `dead` 여섯 변형, `cycles` 세 레벨 × `--tests` 유무, `deps` — 스크립트는 스크래치 `r5-rustograph/bin/`):
-  - 정점 ID·그래프 limitation·`deps`는 17개 모두 같다. 잃은 간선 0, 새 간선 268개(모두 별칭에서 나가는 references —
-    ra_ap_hir_ty 135·ra_ap_hir_def 54·zerocopy 24·rowan 22·rustix 10·이 저장소 10·tokio 5·clap_builder 4·regex-syntax 2·
-    syn 2, 추정 8개는 rustix `Opcode → _Opcode`(선언 8개인 cfg 별칭)). const 매개변수 규칙(필드·시그니처)으로 사라진 간선은
-    0이다 — 커밋별로 나누면 `115103e`가 +268, `97d2ca1`은 변화 없음.
-  - 새로 낸 dead 0(여섯 변형 모두). 사라진 것: 기본 23(ra_ap_hir_def 19 — `BlockIdLt`·`Binding`·`Pat` 등 `Idx<..>`·
-    `..Lt<'static>` 별칭 뒤 타입, ra_ap_hir_ty 3 — `DbInterner`·`HirDatabase`·`DbInternerInferExt`, zerocopy 1 —
-    `ConvertError`), `--tests` 18(rustix `_Opcode` 선언 8·ra_ap_hir_ty 4·ra_ap_hir_def 3·clap_builder 3 — `pub type Error
-    = error::Error<error::DefaultFormatter>` 뒤 포매터), `--retain-public`·`--tests --retain-public`·리눅스·windows 각 1
-    (ra_ap_hir_ty `infer::MinCaptureList` — 별칭 `RootVariableMinCaptureList`가 쓴다). 바뀐 dead limitation은 셈만 바뀐다(루트 없는 lib의 공개
-    아이템 수가 줄고, 새로 닿은 타입의 외부 트레이트 impl 메서드 수가 는다).
-  - 심볼·module 레벨 순환은 17개 모두 그대로다. type 레벨은 8개 크레이트에서 강연결 요소가 커지거나 합쳐져 합계 99 →
-    97개다: syn 9 → 7(`ParseStream<'a> = &'a ParseBuffer<'a>`·`Result<T> = ..<T, Error>` 간선으로 7·2·2개짜리 셋이 15개짜리
-    하나로), zerocopy 11 → 10(`CastError ↔ TryCastError`가 큰 것에
-    합쳐짐), ra_ap_hir_ty 4 → 5(330 → 428개와 새 4개짜리 — 별칭 `DeconstructedPat`·`MatchArm`·`WitnessPat`과
-    `MatchCheckCtx`), 나머지는 수 같고 크기만(clap_builder 45 → 49, ra_ap_hir_def 134 → 189, regex-syntax 38 → 40,
-    rowan 7 → 9·3 → 5, 이 저장소 `source` 4 → 5 — `type VertexSpans`).
+  새로 낸 dead는 모두 rustc가 경고하는 것이다. `2c548be`에서는 a5c `type ArrLen<const LEN: usize> = Buf2<LEN>;`·필드
+  `Buf2<LEN>`의 맨 인자 `LEN`이 모듈 `const LEN`으로 갔다(main은 필드에서 같았고, 별칭에서는 이 브랜치가 새로 드러냈다 —
+  리뷰 S1). `ca36e69`부터 rustc처럼 `LEN`을 낸다.
+- **반례 말뭉치**(4차와 같은 크레이트 17개, 이 저장소는 `61e719b` 사본. main·`2c548be`·마지막 바이너리로 `graph --level
+  symbol --tests`, `dead` 여섯 변형, `cycles` 세 레벨 × `--tests` 유무, `deps` — 스크립트는 스크래치 `r5-rustograph/bin/`,
+  리뷰 반영 뒤 셋 모두 다시 돌렸다):
+  - 정점 ID·그래프 limitation·`deps`는 17개 모두 같다. main 대비 잃은 간선 0, 새 간선 280개(모두 별칭에서 나가는
+    references — ra_ap_hir_ty 141·ra_ap_hir_def 55·zerocopy 28·rowan 22·rustix 10·이 저장소 10·tokio 5·clap_builder 5·
+    regex-syntax 2·syn 2, 추정 8개는 rustix `Opcode → _Opcode`(선언 8개인 cfg 별칭)). 커밋별로: `115103e` +268,
+    `97d2ca1` 0, `ca36e69`(자리 규칙) 0 — 필드·시그니처·별칭의 간선 가운데 대상이 바뀌거나 사라진 것이 없다, `f010e35`
+    +12(별칭 bound·기본값: clap_builder·ra_ap_hir_ty의 `Result<T, E = ..>`류, ra_ap_hir_ty `Autoderef`의 기본값,
+    ra_ap_hir_def `ItemTreeAstId<T: ItemTreeNode>`, zerocopy의 `TryFromBytes` bound 등).
+  - 새로 낸 dead 0(여섯 변형 모두). main 대비 사라진 것: 기본 23(ra_ap_hir_def 19 — `BlockIdLt`·`Binding`·`Pat` 등
+    `Idx<..>`·`..Lt<'static>` 별칭 뒤 타입, ra_ap_hir_ty 3 — `DbInterner`·`HirDatabase`·`DbInternerInferExt`, zerocopy 1 —
+    `ConvertError`), `--tests` 19(rustix `_Opcode` 선언 8·ra_ap_hir_def 4·ra_ap_hir_ty 4·clap_builder 3 — `pub type Error =
+    error::Error<error::DefaultFormatter>` 뒤 포매터), `--retain-public`·`--tests --retain-public`·리눅스·windows 각 2
+    (ra_ap_hir_ty `infer::MinCaptureList` — 별칭 `RootVariableMinCaptureList`가 쓴다, ra_ap_hir_def `ItemTreeNode` —
+    `f010e35`의 bound 간선). 바뀐 dead limitation은 셈만 바뀐다(루트 없는 lib의 공개 아이템 수가 줄고, 새로 닿은 타입의
+    외부 트레이트 impl 메서드 수가 는다).
+  - 심볼(29)·module(34) 레벨 순환은 17개 모두 그대로다. type 레벨은 8개 크레이트에서 강연결 요소가 커지거나 합쳐져 합계
+    99 → 97개다: syn 9 → 7(`ParseStream<'a> = &'a ParseBuffer<'a>`·`Result<T> = ..<T, Error>` 간선으로 7·2·2개짜리 셋이
+    15개짜리 하나로), zerocopy 11 → 10(`CastError ↔ TryCastError`가 큰 것에 합쳐짐), ra_ap_hir_ty 4 → 5(330 → 428개와
+    새 4개짜리 — 별칭 `DeconstructedPat`·`MatchArm`·`WitnessPat`과 `MatchCheckCtx`), 나머지는 수 같고 크기만
+    (clap_builder 45 → 50, ra_ap_hir_def 134 → 189, regex-syntax 38 → 40, rowan 7 → 9·3 → 5, 이 저장소 `source` 4 → 5 —
+    `type VertexSpans`).
   - 같은 크레이트에서 두 번 돌린 `graph`는 바이트 단위로 같았다(zerocopy).
-- **검증**(2026-11-25, 로컬 cargo 1.97, `CARGO_PROFILE_DEV_DEBUG=0`·`-j 2`, `CARGO_TARGET_DIR`는 스크래치): `cargo fmt
-  --check`, `cargo clippy --locked --all-targets -- -D warnings` 0, `cargo test --locked`(26개 실행 단위 599개 통과 —
-  새 통합 테스트 6개), `scripts/coverage.sh` 94.86%(게이트 90%, 그 안의 테스트 실패 0), `scripts/verify-cli-contract.sh
-  <바이너리>` OK, `rules --strict` 0, `cycles --level symbol --strict` 0(type 23·module 2 — 변경 전과 같음, type 레벨
-  `source` 강연결 요소만 4 → 5개), `scripts/verify-self-dead.sh <바이너리>` 0건 일치, MSRV `cargo +1.96.0 check --locked
-  --all-targets` 통과. 새 통합 테스트 5개(`115103e`)는 `origin/main`의 `src/`로 돌리면 모두 실패하고, 변이 6개(우변 수확
+- **검증**(2026-11-25 리뷰 반영 뒤, 로컬 cargo 1.97, `CARGO_PROFILE_DEV_DEBUG=0`·`-j 2`, `CARGO_TARGET_DIR`는 스크래치):
+  `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` 0, `cargo test --locked`(26개 실행 단위 602개
+  통과 — 이 브랜치의 새 통합 테스트 9개), `scripts/coverage.sh` 94.87%(게이트 90%, 그 안의 테스트 실패 0),
+  `scripts/verify-cli-contract.sh <바이너리>` OK, `rules --strict` 0, `cycles --level symbol --strict` 0(type 23·module 2 —
+  변경 전과 같음), `scripts/verify-self-dead.sh <바이너리>` 0건 일치. MSRV `cargo +1.96.0 check --locked --all-targets` 통과
+  (리뷰 반영 뒤 다시 돌림). 리뷰 반영의 새 테스트
+  3개는 `2c548be`의 `src/`로 돌리면 3개 모두 실패하고, 변이 7개(타입 이름공간 거르기 끄기·const 이름 맨 인자를 늘 버리기·
+  값 자리를 타입으로·맨 인자를 따로 적지 않기·제네릭 수확 끄기·where 절 빼기·const 기본값 빼기)를 모두 잡는다. 새 통합 테스트 5개(`115103e`)는 `origin/main`의 `src/`로 돌리면 모두 실패하고, 변이 6개(우변 수확
   끄기·별칭을 데이터 타입에서 빼기·const 매개변수 가리기 끄기·표현식 안 타입 자리를 되돌리지 않기·모든 자리에서 가리기·
   별칭 조건 버리기)를 모두 잡는다. 시그니처 테스트(`97d2ca1`)는 `115103e`의 `src/`로 돌리면 실패하고 시그니처에서 const
   매개변수를 가리지 않는 변이를 잡는다.
@@ -88,24 +120,26 @@
 
 ### 다음 할 일
 
-1. 코디네이터가 이 브랜치를 push하고 PR을 연다(템플릿 제목 Change / Verification / Contract and policy — 본문 초안은 이
-   세션의 스크래치 `pr/rustograph-r5.md`). CI(특히 `msrv`·`semantic-lint`·coverage)를 확인한다.
+1. 코디네이터가 리뷰 반영 커밋(`ca36e69`부터)을 [PR #60](https://github.com/ictechgy/rustograph/pull/60)에 push하고 본문을
+   갱신한다(초안은 이 세션의 스크래치 `pr/rustograph-r5.md`). CI(특히 `msrv`·`semantic-lint`·coverage)를 확인한다.
 2. **0.8.0 릴리스**(사용자 결정): 절차는 아래 3차 절 "다음 할 일" 2번과 같다.
 3. isthmus `compatibility.json`의 rustograph 핀(현재 0.4.1) 갱신을 isthmus 쪽에 알린다.
 
 ### 후속 후보 (사용자가 고른다)
 
-- **맨 const 인자의 폴백**: `Buf2<LEN>`처럼 const 매개변수를 맨 인자로 넘기면 타입으로 먼저 찾고, 그 이름의 타입이 없으면
-  매개변수가 아니라 같은 이름의 모듈 아이템(`const LEN`)으로 간다(a5c, main부터 — 필드·시그니처·별칭 모두). 4차 절의
-  "타입 자리의 값 이름공간 폴백"과 같은 뿌리다 — 해석기가 "타입 이름공간만, 폴백 없음"을 알아야 고쳐진다.
 - **별칭을 거친 연관 함수 호출**(`type A = B; A::new()`): 이제 `B`는 별칭 간선으로 닿지만 `B::new`는 앞부분 별칭 아래에서
   메서드를 찾지 못해 거짓 dead일 수 있다(미해석으로 센다 — 4차 절 후보 그대로). 별칭 우변의 바깥 경로 하나(`Box<B>`면
   `Box`)만 따라가야 한다.
-- **impl 연관 타입·별칭 제네릭 기본값·bounds**: `impl Iterator for X { type Item = Y; }`의 `Y`, `type A<T = Req> = Vec<T>`의
-  `Req`, `type A<T: Tr> = ..`의 `Tr`은 수확하지 않는다 — 그 자리에서만 이름 붙는 타입은 dead에 나올 수 있다(드물다).
+- **impl 연관 타입·별칭이 아닌 아이템의 bound·기본값·매크로가 만든 별칭**: `impl Iterator for X { type Item = Y; }`의
+  `Y`, struct·enum·trait·fn 제네릭의 bound·기본값(`struct S<T: Tr = D>`)과 supertrait, `macro_rules!`가 펼치는
+  `type Gen = OnlyMacro;`의 `OnlyMacro`는 수확하지 않는다 — 그 자리에서만 이름 붙는 타입은 dead에 나올 수 있고
+  limitation으로 세지도 않는다(n4, main부터). 별칭의 것은 `f010e35`에서 고쳤다.
+- **`deps`의 `#[cfg]`**: `deps`는 조건을 평가하지 않아 어느 빌드도 켜지 않는 조건 아래(`#[cfg(any())]`)에서만 이름 붙인
+  의존도 쓰인 것으로 센다(필드·별칭 모두 — README에 적었다). 대상 빌드의 cfg 팩트로 간선을 거르는 것은 `--target`과
+  같은 선택지가 필요하다.
 - type 레벨에서 별칭과 그 우변 타입이 서로를 가리키면 순환이다(서로를 필드로 담는 두 struct와 같은 판단). 직접 재귀
   (`struct Node { next: Option<Box<Node>> }`)는 순환이 아니므로, 별칭을 투명하게 보고 싶다면 type 레벨 투영에서 별칭을
-  우변으로 접는 선택지가 있다 — 출력 의미를 바꾸니 사용자 결정이다.
+  우변으로 접는 선택지가 있다 — 출력 의미를 바꾸니 사용자 결정이다(리뷰 nit n1도 같은 것이다).
 - 4차 절의 나머지 후보(타입 자리의 값 이름공간 폴백, 모든 빌드를 덮는 `#[cfg]` 재정의, 트레이트 기본 메서드를 타입으로
   부른 호출, `use E::*` 배리언트, `const _` 블록 안 아이템, 두 번 선언한 트레이트의 밖 타입 impl)와 3차 절 후보는 그
   설명대로 유효하다.

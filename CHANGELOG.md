@@ -13,7 +13,7 @@
 크레이트의 비공개 struct)과, 다른 이름공간의 로컬 아이템이나 임포트로 가던 값·타입 경로(글롭이 들인 `fn Foo` 옆
 `use crate::types::Foo`(이름 있는 struct)의 `Foo()`는 이제 fn이다), 임포트 표가 수렴하는 동안 거둬진 앞 바퀴의
 대상(rustc가 쓰이지 않는다고 경고하는 정점으로 가던 거짓 간선)이다. 그 밖에 거짓 간선을 지워 보존이 좁아지는
-곳은 아래 항목마다 적었다(타입 경로의 앞부분, 파일을 찾지 못한 `mod`, 선언 타입의 const 제네릭 매개변수). 반례
+곳은 아래 항목마다 적었다(타입 경로의 앞부분, 파일을 찾지 못한 `mod`, 선언 타입의 const 제네릭 매개변수와 표현식 자리). 반례
 말뭉치(크레이트 10개와 zerocopy 0.8.50, 대안 임포트·조건 전파는 크레이트 17개)에서 이름공간·대안 임포트 변경으로
 사라진 간선은 어느 빌드에도 없는 tokio 간선 6개(조건이 출발 모듈의 조건과 모순)뿐이다. Rust 라이브러리 호출자를
 깨는 변경은 공개 구조체 필드 추가, `modtree::Module::imports`의 타입 변경(`Binding::Alternatives` 포함), `modtree::Module::unresolved_imports`
@@ -172,29 +172,38 @@
   found ..." limitation으로 센다. 이전에는 셈 없이 조용했고, `#[cfg]`를 단 선언은 "modules behind #[cfg] were included
   without feature evaluation"으로 실린 것처럼 셌다 — 그 셈은 이제 실은 모듈만이다. 그런 모듈로 가는 `uses` 간선(정점
   없는 경로 — 반례 말뭉치에서는 rustix 1.1.5의 `rustix::backend`로 가는 90개)을 내지 않는다.
-- 타입 별칭 우변(`type A = B;`)을 별칭 정점에서 나가는 `references` 간선으로 수확한다 — 별칭은 우변 타입의 다른
-  이름이라 `A { .. }`·`A::V(..)`·`x: A`는 우변 타입을 쓴다. 이전에는 별칭 정점에 간선이 없어 별칭으로만 쓰는 타입이
-  `dead`에 unreachable로 나왔고(rustc는 경고하지 않는다 — ra_ap_hir_def의 `pub type BlockId = BlockIdLt<'static>;`
-  뒤 `BlockIdLt`, zerocopy의 `CastError` 같은 별칭 뒤 `ConvertError`), 의존 크레이트를 별칭에서만 쓰는 크레이트(`pub
+- 타입 별칭 우변(`type A = B;`)과 별칭 제네릭의 bound·기본값·`where` 절·const 기본값(`pub type Result<T, E = Error>
+  = ..`의 `Error`)을 별칭 정점에서 나가는 `references` 간선으로 수확한다 — 별칭은 우변 타입의 다른 이름이라
+  `A { .. }`·`A::V(..)`·`x: A`는 우변 타입을 쓴다. 이전에는 별칭 정점에 간선이 없어 별칭으로만 쓰는 타입이 `dead`에
+  unreachable로 나왔고(rustc는 경고하지 않는다 — ra_ap_hir_def의 `pub type BlockId = BlockIdLt<'static>;` 뒤
+  `BlockIdLt`, zerocopy의 `CastError` 같은 별칭 뒤 `ConvertError`), 의존 크레이트를 별칭에서만 쓰는 크레이트(`pub
   type Mine = Option<dep::Shared>;`)에서 `deps`가 그 의존을 unused로 보고했고(`cargo check`는 그 의존 없이
   컴파일되지 않는다), 별칭이 다른 모듈의 타입을 가리키는 의존이 rules·cycles에서 빠졌다. 간선은 별칭 선언과 거쳐 온
   임포트의 `#[cfg]`를 싣고, `#[cfg]`로 두 번 선언한 별칭은 선언마다 자기 우변을 가리킨다(`--target`은 그 빌드에서
   쓰이지 않는 쪽만 낸다). 별칭의 타입 매개변수(`type GA<T> = G<T>`의 `T`)는 같은 이름의 모듈 아이템이 아니다. 심볼
   레벨 `cycles`는 별칭을 데이터 타입으로 보아 별칭을 거친 재귀 데이터 정의(`type Link = Option<Box<Node>>;`·`struct
   Node { next: Link }`)를 순환으로 세지 않는다. type·module 레벨은 이 간선을 쓴다 — 서로를 가리키는 별칭과 타입은
-  type 레벨 순환이고 둘이 다른 모듈이면 module 레벨 순환이라, `cycles --level type`·`--level module`의 `--strict`가
-  새로 실패할 수 있다. 반례 말뭉치 17개: 새 간선 268개(모두 별칭에서 나가는 references), 잃은 간선 0, 정점 ID·
-  그래프 limitation 같음, 새로 낸 dead 0, 사라진 dead는 기본 23·`--tests` 18·`--retain-public`·`--tests
-  --retain-public`·리눅스·windows 각 1, `deps` 그대로. 심볼·module 레벨 순환은 그대로이고, type 레벨은 강연결 요소가
-  커지거나 합쳐져 99개에서 97개가 됐다(ra_ap_hir_ty에는 별칭 `DeconstructedPat`·`WitnessPat`·`MatchArm`과 그 별칭을
-  시그니처에 쓰는 `MatchCheckCtx`의 순환 하나가 새로 생겼다).
-- 선언 타입(필드·별칭 우변·fn과 메서드 시그니처)의 표현식 자리(배열 길이 `[u8; N]`, 중괄호 인자 `Buf<{ N }>`)에서
-  const 제네릭 매개변수와 이름이 같은 한 세그먼트 경로는 그 매개변수다. 이전에는 `struct Buf<const N: usize> { a:
-  [u8; N] }`·`fn f<const N: usize>(a: [u8; N])`·impl의 const 매개변수를 쓰는 메서드 시그니처가 같은 이름의 모듈
-  아이템(`struct N`, `const N`)으로 거짓 references·signature 간선을 달아, rustc가 경고하는 그 아이템이 `dead`에서
-  빠졌다 — 이제 `dead`가 그 아이템을 낼 수 있다. 표현식 안의 타입 자리(`size_of::<N>()`)와 맨 인자(`Buf<N>`)는
-  rustc처럼 타입으로 먼저 찾는다. 맨 인자는 그 이름의 타입이 없으면 매개변수가 아니라 같은 이름의 모듈 아이템으로
-  넘어가는 폴백이 남아 있다(rustc는 매개변수로 읽는다). 반례 말뭉치에서 이 규칙으로 사라진 간선은 없다.
+  type 레벨 순환이고 둘이 다른 모듈이면 module 레벨 순환이며, 모듈 상수를 가리키는 별칭(`type Arr = [AE; LEN];`)은
+  상수가 모듈로 접혀 그 모듈과 순환일 수 있다(같은 필드를 가진 struct처럼). 그래서 `cycles --level type`·`--level
+  module`의 `--strict`가 새로 실패할 수 있다. `deps`는 `#[cfg]`를 평가하지 않아, 어느 빌드도 켜지 않는 조건 아래
+  별칭(`#[cfg(any())] type Never = never::X;`)에서만 이름 붙인 의존도 쓰인 것으로 센다(필드와 같다). struct·enum·
+  trait·fn 제네릭의 bound·기본값과 impl 연관 타입(`type Item = Y;`)은 수확하지 않는다.
+- 선언 타입(필드·별칭 우변과 제네릭·fn과 메서드 시그니처)의 경로를 rustc처럼 자리대로 푼다. 표현식 자리(배열 길이
+  `[u8; N]`, 중괄호 인자 `Buf<{ N }>`, const 기본값)는 값 이름공간이 먼저다 — 이전에는 타입 이름공간부터 찾아,
+  `use super::k::N;`(상수)과 `struct N`이 함께 있는 모듈의 `[u8; N]`이 그 struct로 갔다(쓰이는 상수가 `dead`에
+  나오고, 쓰이지 않는 struct가 빠졌다). 둘러싼 선언의 const 제네릭 매개변수와 이름이 같은 한 세그먼트 경로는 그
+  매개변수다 — 표현식 자리에서는 늘, 맨 제네릭 인자(`Buf<N>`)에서는 그 이름의 타입이 보이지 않을 때다(rustc는 맨
+  인자를 타입 이름공간 다음 값 이름공간에서 찾고, 거기서는 매개변수가 모듈 아이템을 가린다 — `Vec<N>` 옆 `struct N`은
+  그 struct다). 이전에는 `struct Buf<const N: usize> { a: [u8; N] }`·`struct F<const N: usize> { b: Buf<N> }`·
+  `fn f<const N: usize>(a: [u8; N])`·impl의 const 매개변수를 쓰는 메서드 시그니처가 같은 이름의 모듈 아이템(`struct N`,
+  `const N`)으로 거짓 references·signature 간선을 달아 rustc가 경고하는 그 아이템이 `dead`에서 빠졌다 — 이제 `dead`가
+  그 아이템을 낼 수 있다. const 매개변수가 아닌 맨 인자(`Buf<SIZE>`)는 그대로 모듈 상수다. 라이브러리 API:
+  `harvest::DeclRef`에 자리 `slot`(새 `harvest::DeclSlot`)이 더해졌다([0.8 migration](docs/MIGRATING-0.8.md)).
+- 위 두 항목의 반례 말뭉치 17개 결과(main 대비): 새 간선 280개(모두 별칭에서 나가는 references — 우변 268·제네릭
+  bound·기본값 12), 잃은 간선 0, 자리 규칙으로 바뀐 간선 0, 정점 ID·그래프 limitation·`deps` 같음. 새로 낸 dead 0,
+  사라진 dead는 기본 23·`--tests` 19·`--retain-public`·`--tests --retain-public`·리눅스·windows 각 2. 심볼·module 레벨
+  순환은 그대로이고, type 레벨은 강연결 요소가 커지거나 합쳐져 99개에서 97개가 됐다(ra_ap_hir_ty에는 별칭
+  `DeconstructedPat`·`WitnessPat`·`MatchArm`과 그 별칭을 시그니처에 쓰는 `MatchCheckCtx`의 순환 하나가 새로 생겼다).
 - 문서: README·README.ko 그래프 모델이 두 데이터 타입 사이의 필드 간선을 심볼 레벨 `cycles`는 빼고 type·module
   레벨은 세는 근거를 나란히 적는다 — 심볼 레벨은 어느 코드가 재귀하는지, type·module 레벨은 그 단위를 계층으로
   나눌 수 있는지를 묻는다.
