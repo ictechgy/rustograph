@@ -186,13 +186,23 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
   two symbols is. Reachability is unaffected — a recursive function is reached
   through its callers.
 - A struct, enum, or union has a `references` edge to each workspace type its
-  fields name (generic parameters and `Self` excluded). Whether `cycles`
-  counts that edge between two data types depends on the question each level
-  asks; `dead` and `rules` always use it.
+  fields name, and a type alias has one to each workspace item its right-hand
+  side names: `type A = B;` is another name for `B`, so `A { .. }`, `A::V(..)`
+  or `x: A` use `B`, and a crate that names a dependency only in an alias uses
+  that dependency. Generic type parameters and `Self` are excluded, and so is
+  a const generic parameter in an expression position of a field, alias, or
+  signature type (an array length `[u8; N]`, a braced argument `Buf<{ N }>`),
+  where rustc reads `N` as the parameter, not a same-name module item. A bare
+  argument (`Buf<N>`) is looked up as a type first, as rustc does; when no
+  type has that name it still falls back to a same-name module item instead
+  of the parameter. Whether `cycles` counts that edge between two data types
+  (an alias counts as one) depends on the question each level asks; `dead`
+  and `rules` always use it.
   - Symbol level asks which code recurses — which calls and uses loop back to
     themselves. Mutually recursive data definitions
-    (`enum Expr { Block(Box<Stmt>) }` with `struct Stmt { e: Expr }`) are one
-    type family, not recursion to break, so the edge between the two data
+    (`enum Expr { Block(Box<Stmt>) }` with `struct Stmt { e: Expr }`, or
+    `type Link = Option<Box<Node>>;` with `struct Node { next: Link }`) are
+    one type family, not recursion to break, so the edge between the two data
     types is left out, as direct recursion is. Code that walks such types is
     still a symbol-level cycle when it recurses (`walk_expr` calling
     `walk_stmt` and back), because those are call edges.
@@ -203,7 +213,8 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
     exists without the other. So `cycles --level type` reports the pair, and
     `--level module` reports their modules when the two types live in
     different modules. Leaving the edge out there would hide a coupling that
-    any split into layers or crates has to resolve.
+    any split into layers or crates has to resolve. An alias and a type that
+    name each other (`Link` and `Node` above) are such a pair too.
 - `Self` in an impl body or signature resolves to the impl's self type.
   `<T as Tr>::m()` calls `T`'s impl method, `<T>::m()` and an associated
   function passed as a value (`.map(T::new)`) reach `T`'s same-name method.
