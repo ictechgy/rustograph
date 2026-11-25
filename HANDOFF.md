@@ -38,8 +38,10 @@
   - S2: f19(`use super::k::N;` + `struct N` + `[u8; N]` — 별칭·필드·시그니처, rustc 경고 struct `N`·`Z`·`Q`): main
     `k::N`·`k::Q`·`k::Z`(거짓)·`m::N`, `2c548be` `k::*`만(거짓 간선 `m::A -> m::N`이 `m::N`을 가림), 고친 뒤 `f::Z`·
     `m::N`·`s::Q` — rustc와 같다.
-  - S3: f23(`pub type Result<T, E = Error> = ..`, rustc 경고 없음): main·`2c548be` `Error`, 고친 뒤 0건. f15(bound·기본값·
-    where 절·const 기본값 `DEF`): main·`2c548be` 넷, 고친 뒤 0건.
+  - S3: f23(`pub type Result<T, E = Error> = ..`, rustc 경고 없음): main·`2c548be` `Error`, 고친 뒤 0건. 별칭만으로 다시
+    만든 f15(별칭의 bound·기본값·where 절·const 기본값 `DEF`): main·`2c548be` 넷, 고친 뒤 0건. 리뷰어의 원래 f15는
+    `struct D<const N: usize = DEF>`도 담아, 고친 뒤에도 `DEF`를 낸다(재확인에서 확인) — struct·enum·trait·fn 제네릭의
+    bound·기본값·where 절은 수확하지 않는다(아래 후속 후보, README에 적었다).
   - nit: 별칭을 거친 자기 재귀(n1 `type Link2 = Option<Box<Node2>>;`)는 type 레벨 순환이고 같은 struct 직접 재귀는 아니다
     — 기록만(아래 후속 후보, 사용자 결정). 모듈 상수·매크로를 가리키는 별칭은 type·module 레벨에서 상수가 모듈로 접혀
     그 모듈과 순환일 수 있다(f01 `type Arr = [AE; LEN];`, 같은 필드를 가진 struct도 main부터 같다) — README에 적었다.
@@ -134,6 +136,18 @@
   `Y`, struct·enum·trait·fn 제네릭의 bound·기본값(`struct S<T: Tr = D>`)과 supertrait, `macro_rules!`가 펼치는
   `type Gen = OnlyMacro;`의 `OnlyMacro`는 수확하지 않는다 — 그 자리에서만 이름 붙는 타입은 dead에 나올 수 있고
   limitation으로 세지도 않는다(n4, main부터). 별칭의 것은 `f010e35`에서 고쳤다.
+- **표현식 자리의 연관 상수·배리언트 경로**(재확인 리뷰, main부터 — 회귀 아님): 선언 타입의 표현식 자리에서
+  `Type::ITEM`(연관 상수 `OnlyAssoc::K`, 배리언트 `E::B as usize`)은 타입을 살리지 못한다. 리뷰어 n11 `struct OnlyAssoc;
+  impl OnlyAssoc { const K: usize = 2; } enum E { A, B } struct H { a: [u8; OnlyAssoc::K] } fn sig(x: [u8; E::B as
+  usize]) -> usize`는 rustc가 아무것도 경고하지 않는데 모든 빌드가 `E`·`OnlyAssoc`을 낸다. 별칭의 const 기본값
+  `{ Al::D }`도 같다. `resolve_decl_path`(`src/harvest.rs`)가 값 이름공간에서 `Type::ITEM`을 풀지 못해 아무것도 돌려주지
+  않기 때문이다. 본문 방문처럼 해석되는 가장 긴 타입 앞부분을 잇거나(`BodyVisitor::path_prefix_owners`) limitation으로
+  세면 된다.
+- **windows 전용 별칭이 `#[cfg(unix)]` 임포트를 거치면** 간선 조건이 `all(unix, windows)`다(재확인 리뷰). 어느 빌드에도
+  없는 조건이라 `--target`이 걸러 무해하지만, 글자로 보이는 모순(`P`와 `not (P)`)만 지우는 `drop_impossible_edges`는
+  `unix`와 `windows`의 배타를 모르니 조건 없는 그래프에는 남는다.
+- **매크로로만 쓰는 배열 길이 상수**(재확인 리뷰): 배열 길이 `[u8; len!()]`의 매크로 정의 본문에서만 이름 붙는 `LEN`은
+  거짓 dead다 — 매크로 정의 본문은 두 세그먼트 이상의 경로만 추정 간선으로 모으는 기존 한계(main부터)다.
 - **`deps`의 `#[cfg]`**: `deps`는 조건을 평가하지 않아 어느 빌드도 켜지 않는 조건 아래(`#[cfg(any())]`)에서만 이름 붙인
   의존도 쓰인 것으로 센다(필드·별칭 모두 — README에 적었다). 대상 빌드의 cfg 팩트로 간선을 거르는 것은 `--target`과
   같은 선택지가 필요하다.

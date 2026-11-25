@@ -193,12 +193,16 @@ Vertices: `crate`, `module`, `struct`, `enum`, `trait`, `union`, `typealias`,
   names a dependency only in an alias uses that dependency. Paths in field,
   alias, and signature types resolve by position, as rustc resolves them: a
   type position looks in the type namespace first, an expression position (an
-  array length `[u8; N]`, a braced argument `Buf<{ N }>`, a const default) in
-  the value namespace first, and a bare generic argument (`Buf<SIZE>`) in the
-  type namespace and then the value namespace. Generic type parameters and
-  `Self` are excluded. A const generic parameter hides same-name module items:
-  `N` in an expression position is the parameter, and a bare `Buf<N>` is the
-  parameter unless a type named `N` is in scope. Whether `cycles` counts that
+  array length `[u8; N]`, a braced argument `Buf<{ N }>`, an alias's const
+  default) in the value namespace first, and a bare generic argument
+  (`Buf<SIZE>`) in the type namespace and then the value namespace. Generic
+  bounds, defaults and `where` clauses are harvested for type aliases only:
+  on a struct, enum, trait or fn they are not read, so `DEF` in
+  `struct D<const N: usize = DEF>` or `OnlyWhere` in `where T: OnlyWhere` on a
+  struct or fn is still reported when nothing else names it. Generic type
+  parameters and `Self` are excluded. A const generic parameter hides
+  same-name module items: `N` in an expression position is the parameter, and
+  a bare `Buf<N>` is the parameter unless a type named `N` is in scope. Whether `cycles` counts that
   edge between two data types (an alias counts as one) depends on the
   question each level asks; `dead` and `rules` always use it. `deps` does not
   evaluate `#[cfg]`: a dependency named only under a condition that no build

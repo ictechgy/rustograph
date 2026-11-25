@@ -255,8 +255,10 @@ A new field on a public struct breaks struct literals and exhaustive patterns
 alike. Add the new fields, or end such patterns with `..`.
 
 - `harvest::ModuleDecls` adds `decl_refs`, the declaration-level path
-  references (field types, type alias right-hand sides, generic bounds and
-  defaults, and `macro_rules!` bodies) as the new public `harvest::DeclRef`.
+  references (field types, type alias right-hand sides, the generic bounds,
+  defaults and `where` clauses of type aliases only — not of structs, enums,
+  traits or fns — and `macro_rules!` bodies) as the new public
+  `harvest::DeclRef`.
   Resolve them with the new `harvest::decl_edges` after the imports are filled,
   as the source harvest does. `DeclRef::slot` (the new `harvest::DeclSlot`,
   `#[non_exhaustive]`) is the position that picks the namespace: `Type` for
