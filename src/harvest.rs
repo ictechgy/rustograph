@@ -62,20 +62,21 @@ pub struct ModuleDecls<'a> {
     /// 범위 — persistence 사실을 감싸는 그래프 정점으로 귀속할 때 쓴다.
     /// 본문 아이템의 범위는 BodyItem이 이미 들고 있다.
     pub owner_spans: Vec<OwnerSpan>,
-    /// 본문 밖 선언이 담은 경로 참조 — 필드 타입과 `macro_rules!` 정의 본문. 해석은 임포트가
-    /// 채워진 뒤 2패스에서 [`decl_edges`]가 한다.
+    /// 본문 밖 선언이 담은 경로 참조 — 필드 타입, 타입 별칭 우변, `macro_rules!` 정의 본문. 해석은
+    /// 임포트가 채워진 뒤 2패스에서 [`decl_edges`]가 한다.
     pub decl_refs: Vec<DeclRef>,
 }
 
 /// 본문 밖 선언이 담은 경로 참조 하나.
 ///
 /// struct·enum·union 필드의 타입은 그 타입이 쓰는 타입이다 — 모으지 않으면 DTO 필드로만 쓰는
-/// 타입이 unreachable로 보이고, 필드가 다른 모듈을 가리키는 의존이 규칙·순환에서 사라진다.
+/// 타입이 unreachable로 보이고, 필드가 다른 모듈을 가리키는 의존이 규칙·순환에서 사라진다. 타입 별칭
+/// 우변(`type A = B;`)도 같다 — 별칭을 거친 쓰임은 우변 타입의 쓰임이다.
 /// `macro_rules!` 정의 본문의 경로(`$crate::m::f`)는 매크로를 펼친 곳에서 쓰이는 이름이라 확정
 /// 사용이 아니다 — 추정(tentative) 간선으로 dead·도달성에만 쓰인다.
 #[derive(Debug, Clone)]
 pub struct DeclRef {
-    /// 참조를 소유한 정점 ID — 필드면 그 타입, 매크로 본문이면 그 매크로.
+    /// 참조를 소유한 정점 ID — 필드면 그 타입, 별칭 우변이면 그 별칭, 매크로 본문이면 그 매크로.
     pub owner: String,
     /// 경로를 해석할 모듈 — 선언이 사는 모듈이다.
     pub module: String,
@@ -366,12 +367,14 @@ pub(crate) fn decls_with_markers<'a>(
                     owner.push_fields(fields.collect(), &mut out.decl_refs);
                 }
                 syn::Item::Type(t) => {
-                    out.vertices.push(v(
-                        format!("{module_path}::{}", t.ident),
-                        Kind::TypeAlias,
-                        is_pub(&t.vis),
-                        false,
-                    ));
+                    let id = format!("{module_path}::{}", t.ident);
+                    out.vertices
+                        .push(v(id.clone(), Kind::TypeAlias, is_pub(&t.vis), false));
+                    // 별칭은 우변 타입의 다른 이름이다 — `A { .. }`·`A::V(..)`·`x: A`가 닿는 것은 우변이 이름 붙인
+                    // 타입이다. 우변을 필드 타입처럼 모으지 않으면 별칭으로만 만드는 타입이 unreachable이었고(rustc는
+                    // 경고하지 않는다), 별칭이 다른 모듈의 타입을 가리키는 의존이 규칙·순환에서 사라졌다.
+                    let owner = DeclOwner::new(&id, module_path, &t.ident, &t.generics, file, item);
+                    owner.push_fields(vec![(&*t.ty, cfg.clone())], &mut out.decl_refs);
                 }
                 syn::Item::Const(c) => {
                     let id = format!("{module_path}::{}", c.ident);
@@ -1021,8 +1024,8 @@ pub fn decl_edges(refs: &[DeclRef], tree: &ModTree, dep_crates: &DepCrates) -> V
     let mut seen = BTreeSet::new();
     let mut edges = Vec::new();
     for r in refs {
-        // 필드 타입은 타입 이름공간이고, 매크로 본문의 경로(추정)는 자리를 모른다. `#[cfg]`로 갈린 대안 임포트를
-        // 지나면 대안마다 간선이고, 간선은 거쳐 온 임포트의 조건을 함께 싣는다.
+        // 필드 타입·별칭 우변은 타입 이름공간이고, 매크로 본문의 경로(추정)는 자리를 모른다. `#[cfg]`로 갈린 대안
+        // 임포트를 지나면 대안마다 간선이고, 간선은 거쳐 온 임포트의 조건을 함께 싣는다.
         let ns = (!r.tentative).then_some(Ns::Type);
         for to in tree.resolve_all(&r.module, &r.path, dep_crates, ns) {
             let cfg = with_import_cfg(&r.cfg, &to.cfg);
@@ -1048,7 +1051,7 @@ pub fn decl_edges(refs: &[DeclRef], tree: &ModTree, dep_crates: &DepCrates) -> V
     edges
 }
 
-/// 필드 타입 참조를 모으는 소유 타입 — 정점 ID·모듈·제네릭·선언 위치를 한데 묶는다.
+/// 필드 타입(별칭이면 우변) 참조를 모으는 소유 타입 — 정점 ID·모듈·제네릭·선언 위치를 한데 묶는다.
 struct DeclOwner<'a> {
     id: &'a str,
     module: &'a str,
@@ -1056,6 +1059,8 @@ struct DeclOwner<'a> {
     name: String,
     /// 타입 이름공간을 가리는 제네릭 매개변수 — 필드의 `T`는 경로가 아니다.
     type_params: BTreeSet<String>,
+    /// const 제네릭 매개변수 — 표현식 자리(배열 길이 `[u8; N]`, `{N}` 인자)의 `N`은 그 매개변수다.
+    const_params: BTreeSet<String>,
     file: &'a PathBuf,
     start: usize,
 }
@@ -1078,6 +1083,10 @@ impl<'a> DeclOwner<'a> {
                 .type_params()
                 .map(|param| param.ident.to_string())
                 .collect(),
+            const_params: generics
+                .const_params()
+                .map(|param| param.ident.to_string())
+                .collect(),
             file,
             start: item.span().byte_range().start,
         }
@@ -1086,13 +1095,10 @@ impl<'a> DeclOwner<'a> {
     /// 필드 (타입, 조건) 목록의 경로를 선언 참조로 넣는다.
     fn push_fields(&self, fields: Vec<(&syn::Type, Option<String>)>, out: &mut Vec<DeclRef>) {
         for (ty, cfg) in fields {
-            let mut paths = TypeVisitor { paths: Vec::new() };
+            let mut paths = DeclTypeVisitor::default();
             paths.visit_type(ty);
-            for path in paths.paths {
-                if path
-                    .first()
-                    .is_some_and(|name| self.type_params.contains(name))
-                {
+            for (path, in_expr) in paths.paths {
+                if self.is_generic_param(&path, in_expr) {
                     continue;
                 }
                 let path = substitute_self(&path, std::slice::from_ref(&self.name)).unwrap_or(path);
@@ -1106,6 +1112,19 @@ impl<'a> DeclOwner<'a> {
                     start: self.start,
                 });
             }
+        }
+    }
+
+    /// 경로가 이 선언의 제네릭 매개변수인가. 타입 매개변수는 첫 세그먼트로 가린다(`T`, `T::Assoc`). const
+    /// 매개변수는 값 이름공간이라 표현식 자리의 한 세그먼트 경로만 가린다 — rustc도 `[u8; N]`의 `N`은 그
+    /// 매개변수로 읽고, 타입 자리의 `N`(`b: N`, `Buf<N>`)은 타입 이름공간에서 먼저 찾는다. 가리지 않으면 같은
+    /// 이름의 모듈 아이템(`struct N`, `const N`)으로 거짓 references 간선이 붙었다.
+    fn is_generic_param(&self, path: &[String], in_expr: bool) -> bool {
+        match path {
+            [name] if in_expr && self.const_params.contains(name) => true,
+            _ => path
+                .first()
+                .is_some_and(|name| self.type_params.contains(name)),
         }
     }
 }
@@ -2221,6 +2240,35 @@ fn generic_type_parameters(body: &BodyItem<'_>) -> BTreeSet<String> {
         .flat_map(|scope| scope.type_params())
         .map(|param| param.ident.to_string())
         .collect()
+}
+
+/// 선언 타입(필드·별칭 우변) 안의 경로를 모으는 방문자 — 경로마다 표현식 자리(배열 길이, `{..}` const
+/// 인자)에 있는지를 함께 적는다. 표현식 안의 타입(`size_of::<N>()`의 `N`)은 다시 타입 자리다.
+#[derive(Default)]
+struct DeclTypeVisitor {
+    /// (경로 세그먼트, 표현식 자리인가).
+    paths: Vec<(Vec<String>, bool)>,
+    /// 지금 방문 중인 자리가 표현식 안인가.
+    in_expr: bool,
+}
+
+impl Visit<'_> for DeclTypeVisitor {
+    fn visit_type(&mut self, t: &syn::Type) {
+        let outer = std::mem::replace(&mut self.in_expr, false);
+        syn::visit::visit_type(self, t);
+        self.in_expr = outer;
+    }
+
+    fn visit_expr(&mut self, e: &syn::Expr) {
+        let outer = std::mem::replace(&mut self.in_expr, true);
+        syn::visit::visit_expr(self, e);
+        self.in_expr = outer;
+    }
+
+    fn visit_path(&mut self, p: &syn::Path) {
+        self.paths.push((path_segments(p), self.in_expr));
+        syn::visit::visit_path(self, p);
+    }
 }
 
 /// 타입 안의 경로들을 수집하는 방문자 — 제네릭 인자까지 재귀한다.

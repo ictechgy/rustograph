@@ -450,6 +450,189 @@ fn make<T>() -> Outer<T> { unimplemented!() }
     );
 }
 
+/// 타입 별칭의 우변(`type A = B;`)은 별칭 정점에서 나가는 references 간선이다 — 별칭은 우변 타입의 다른
+/// 이름이라 `A { .. }`·`A::V(..)`·`x: A`는 우변 타입을 쓴다(rustc는 그렇게만 만드는 타입을 경고하지 않는다).
+/// 없으면 별칭으로만 만드는 타입이 unreachable이었다. 별칭의 제네릭 매개변수(`GA<T>`의 `T`)는 같은 이름의
+/// 모듈 아이템이 아니고, 쓰이지 않는 별칭의 우변은 여전히 닿지 않는다 — 이 fixture의 `cargo check` 경고는
+/// `T`·`Never`·`UnusedAlias` 셋이다.
+#[test]
+fn type_alias_right_hand_sides_are_references_from_the_alias() {
+    let ws = Workspace::new(
+        "aliases",
+        &[
+            ("Cargo.toml", &manifest("aliases")),
+            (
+                "src/main.rs",
+                r#"
+mod m {
+    pub enum Only { W(u8) }
+    pub type OnlyAlias = Only;
+    pub struct Lit { pub x: u8 }
+    pub type LitAlias = Lit;
+    pub struct C { pub v: u8 }
+    pub type B = C;
+    pub type A = B;
+    pub struct T;
+    pub struct G<X>(pub X);
+    pub type GA<T> = G<T>;
+    pub struct Q;
+    pub trait Tr { type Assoc; }
+    impl Tr for Q { type Assoc = u8; }
+    pub type Out = <Q as Tr>::Assoc;
+    pub struct Never;
+    pub type UnusedAlias = Never;
+}
+fn main() {
+    let m::Only::W(v) = m::OnlyAlias::W(2);
+    let b = m::LitAlias { x: 1 };
+    let c = m::A { v: 3 };
+    let g: m::GA<u8> = m::G(1);
+    let o: m::Out = 4;
+    let _ = (v, b.x, c.v, g.0, o);
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    for (from, to) in [
+        ("aliases::m::OnlyAlias", "aliases::m::Only"),
+        ("aliases::m::A", "aliases::m::B"),
+        ("aliases::m::B", "aliases::m::C"),
+        ("aliases::m::GA", "aliases::m::G"),
+        ("aliases::m::Out", "aliases::m::Q"),
+    ] {
+        assert!(
+            has_edge(&doc, from, to, EdgeKind::References),
+            "missing {from} -> {to}"
+        );
+    }
+    assert!(
+        !has_edge(
+            &doc,
+            "aliases::m::GA",
+            "aliases::m::T",
+            EdgeKind::References
+        ),
+        "the alias generic T must not resolve to the module struct T"
+    );
+    let report = analysis::dead(&doc).unwrap();
+    assert_not_reported(
+        &report,
+        &[
+            "aliases::m::Only",
+            "aliases::m::Lit",
+            "aliases::m::B",
+            "aliases::m::C",
+            "aliases::m::Q",
+        ],
+    );
+    assert_reported(
+        &report,
+        &[
+            "aliases::m::T",
+            "aliases::m::Never",
+            "aliases::m::UnusedAlias",
+        ],
+    );
+}
+
+/// const 제네릭 매개변수는 선언 타입의 표현식 자리(배열 길이 `[u8; N]`, `{ N }` 인자)에서 같은 이름의 모듈
+/// 아이템을 가린다 — 예전에는 필드 `[u8; N]`이 `struct N`·`const LEN`으로 거짓 references 간선을 달아 rustc가
+/// 경고하는 그 둘(`N` never constructed, `LEN` never used)이 살아 있었다. 표현식 안의 타입 자리
+/// (`size_of::<N>()`)는 타입 이름공간이라 그 모듈의 `struct N`을 쓴다 — rustc는 `k::N`을 경고하지 않는다
+/// (필드를 읽지 않는다는 경고뿐이다).
+#[test]
+fn const_generic_parameters_shadow_items_in_declaration_array_lengths() {
+    let ws = Workspace::new(
+        "constgen",
+        &[
+            ("Cargo.toml", &manifest("constgen")),
+            (
+                "src/main.rs",
+                r#"
+mod m {
+    pub struct N;
+    pub const LEN: usize = 2;
+    pub struct Buf<const N: usize> { pub a: [u8; N] }
+    pub struct Buf2<const LEN: usize> { pub a: [u8; LEN] }
+    pub struct Wrap<const N: usize> { pub b: Buf<{ N }> }
+    pub type Arr<const N: usize> = [u8; N];
+}
+mod k {
+    pub struct N(pub u32);
+    pub type Sized<const N: usize> = ([u8; core::mem::size_of::<N>()], [u8; N]);
+}
+fn main() {
+    let b2 = m::Buf2::<1> { a: [0] };
+    let w = m::Wrap::<1> { b: m::Buf { a: [0] } };
+    let a: m::Arr<1> = [0];
+    let s: k::Sized<1> = ([0; 4], [0]);
+    let _ = (b2.a, w.b.a, a, s);
+}
+"#,
+            ),
+        ],
+    );
+    let doc = symbols(ws.path());
+    for from in ["constgen::m::Buf", "constgen::m::Wrap", "constgen::m::Arr"] {
+        assert!(
+            !has_edge(&doc, from, "constgen::m::N", EdgeKind::References),
+            "the const parameter N of {from} resolved to the module struct N"
+        );
+    }
+    assert!(has_edge(
+        &doc,
+        "constgen::k::Sized",
+        "constgen::k::N",
+        EdgeKind::References
+    ));
+    let report = analysis::dead(&doc).unwrap();
+    assert_eq!(
+        unreachable_ids(&report),
+        ["constgen::m::LEN", "constgen::m::N"]
+    );
+}
+
+/// 의존 크레이트를 타입 별칭으로만 쓰는 크레이트(`pub type Mine = Option<dep::Shared>;`)는 그 의존을 쓴다 —
+/// 별칭 우변을 수확하지 않던 때는 `deps`가 `unused: app -> dep`을 냈다(`cargo check`는 그 의존 없이는
+/// 컴파일되지 않는다). 별칭이 가리키는 의존 크레이트의 타입도 그 별칭에서 닿는다.
+#[test]
+fn type_alias_is_a_use_of_its_dependency() {
+    let ws = Workspace::new(
+        "alias-dep",
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = ['dep', 'app']\nresolver = '2'\n",
+            ),
+            (
+                "dep/Cargo.toml",
+                "[package]\nname='dep'\nversion='0.1.0'\nedition='2021'\n",
+            ),
+            (
+                "dep/src/lib.rs",
+                "pub struct Thing;\npub struct Other;\npub type Shared = Thing;\n",
+            ),
+            (
+                "app/Cargo.toml",
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n\
+                 [dependencies]\ndep = { path = '../dep' }\n",
+            ),
+            (
+                "app/src/main.rs",
+                "mod types { pub type Mine = Option<dep::Shared>; }\n\
+                 fn main() { let x: types::Mine = None; let _ = x.is_none(); }\n",
+            ),
+        ],
+    );
+    let deps = deps::report(ws.path()).unwrap();
+    assert!(deps.unused.is_empty(), "{:?}", deps.unused);
+    let report = analysis::dead(&symbols(ws.path())).unwrap();
+    assert_not_reported(&report, &["dep::Shared", "dep::Thing"]);
+    assert_reported(&report, &["dep::Other"]);
+}
+
 /// 링커·런타임이 부르는 진입점 속성 — Rust 2024의 `#[unsafe(no_mangle)]`, `cfg_attr` 안쪽의
 /// `no_mangle`, `#[used]`·`#[no_mangle]`·`#[global_allocator]` static, impl 메서드의 `#[no_mangle]`.
 /// 예제·통합 테스트·벤치 타깃은 수확하지 않는다는 사실도 limitation으로 센다.

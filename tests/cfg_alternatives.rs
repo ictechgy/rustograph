@@ -1897,3 +1897,74 @@ fn main() {
         .any(|e| e.from == "kani2::m::run" && e.to == "kani2::tests::helper"));
     assert!(dead_ids(&doc).contains(&"kani2::tests::helper".to_string()));
 }
+
+/// `#[cfg]`로 갈린 타입 별칭 두 선언(`#[cfg(unix)] pub type Sys = U;`과 windows 쪽)과 갈린 임포트를 우변으로 쓴
+/// 별칭(`pub type Imp = Impl;`)은 빌드마다 다른 타입을 가리킨다. 우변 간선이 별칭 선언과 거쳐 온 임포트의 조건을
+/// 실어, 모든 빌드를 보는 그래프는 넷 다 살리고 `--target`은 그 빌드에서 쓰이지 않는 쪽만 낸다 — rustc 리눅스
+/// 경고는 `plat::W`·`w::Impl`, windows는 `plat::U`·`u::Impl`이다. 별칭 우변을 수확하지 않던 때는 넷 모두
+/// 모든 빌드에서 unreachable이었다.
+#[test]
+fn cfg_split_type_aliases_reach_the_type_of_each_build() {
+    let doc = harvest(
+        "cfgalias",
+        "",
+        r#"
+mod plat {
+    pub struct U;
+    pub struct W;
+    #[cfg(unix)]
+    pub type Sys = U;
+    #[cfg(windows)]
+    pub type Sys = W;
+}
+mod u { pub struct Impl; }
+mod w { pub struct Impl; }
+#[cfg(unix)]
+use crate::u::Impl;
+#[cfg(windows)]
+use crate::w::Impl;
+pub type Imp = Impl;
+fn main() { let _ = (plat::Sys {}, Imp {}); }
+"#,
+    );
+    // 두 `Sys` 선언은 소스 인스턴스 ID라 출발 정점은 목적지로 찾는다.
+    let alias_edge_cfgs = |to: &str| -> Vec<Option<String>> {
+        doc.edges
+            .iter()
+            .filter(|e| e.to == to && e.kind == EdgeKind::References && !e.tentative)
+            .map(|e| e.cfg.clone())
+            .collect()
+    };
+    assert_eq!(alias_edge_cfgs("cfgalias::plat::U"), [Some("unix".into())]);
+    assert_eq!(
+        alias_edge_cfgs("cfgalias::plat::W"),
+        [Some("windows".into())]
+    );
+    assert_eq!(
+        edge_cfg(
+            &doc,
+            "cfgalias::Imp",
+            "cfgalias::u::Impl",
+            EdgeKind::References
+        ),
+        under("unix")
+    );
+    assert_eq!(
+        edge_cfg(
+            &doc,
+            "cfgalias::Imp",
+            "cfgalias::w::Impl",
+            EdgeKind::References
+        ),
+        under("windows")
+    );
+    assert!(dead_ids(&doc).is_empty(), "{:?}", dead_ids(&doc));
+    assert_eq!(
+        dead_ids(&for_target(&doc, LINUX)),
+        ["cfgalias::plat::W", "cfgalias::w::Impl"]
+    );
+    assert_eq!(
+        dead_ids(&for_target(&doc, WINDOWS)),
+        ["cfgalias::plat::U", "cfgalias::u::Impl"]
+    );
+}
